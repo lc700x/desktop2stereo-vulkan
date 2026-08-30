@@ -289,10 +289,12 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
             and getattr(self.presenter.config, "filament_glb_path", None)
         )
         if self.backend_name != "cuda":
-            # The GPU glow path (VulkanGlowSourceComputeBackend) on AMD LLPC
-            # destabilizes the OpenXR compositor (headset goes idle / screen
-            # stops updating). Keep the ROCm glow on the CPU fallback path for
-            # OpenXR stability; GPU glow on ROCm needs separate work.
+            # The GPU glow path (VulkanGlowSourceComputeBackend, incl. the HIP
+            # buffer importer) renders black and stops the OpenXR compositor on
+            # AMD LLPC (screen dark, present ~0, headset idle), even without the
+            # device-wide-lock contention and VkErrorUnknown. Keep the ROCm glow
+            # on the cpu_fallback path for OpenXR stability; v2.5's glow used a
+            # different HIP-GL approach that needs porting to fix properly.
             self._set_glow_gpu_status(f"cpu_fallback backend={self.backend_name}")
             return {}
         # The source image is produced by the Vulkan Glow worker.  Do not use

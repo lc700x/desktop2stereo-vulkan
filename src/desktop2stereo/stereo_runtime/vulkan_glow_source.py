@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import struct
+import threading
 import time
 from typing import Any
 
@@ -142,6 +143,13 @@ class VulkanGlowSourceComputeBackend:
         self._history_key: tuple[object, ...] | None = None
         self._history_last_submit = 0.0
         self._closed = False
+        # Glow compute submits happen on the dedicated compute queue and must
+        # NOT wait on the device-wide context._lock used by the graphics-queue
+        # compositor. Contending on that lock serialized the glow compute with
+        # the compositor and stalled OpenXR (compositor present dropped to ~9
+        # FPS / headset idled). A per-glow lock keeps the glow submissions
+        # mutually exclusive with themselves while the compositor runs free.
+        self._submit_lock = threading.Lock()
 
     def _create_command_pool(self):
         return self.vk.vkCreateCommandPool(
@@ -205,8 +213,11 @@ class VulkanGlowSourceComputeBackend:
         )
 
     def _submit_queue(self, *args) -> None:
-        # ponytail: device-wide lock; split by VkQueue handle if contention matters.
-        with self.context._lock:
+        # Use a dedicated lock (not the device-wide context._lock, which the
+        # graphics-queue compositor contends on). Swapchains/queues are
+        # submitted from distinct queues, so exclusivity against the compositor
+        # is unnecessary and only introduced stalls.
+        with self._submit_lock:
             self.vk.vkQueueSubmit(*args)
 
     def _ensure_inputs(self, required_size: int) -> None:
