@@ -793,6 +793,33 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             )
             from streaming.stream_calibration import build_calibration_fingerprint
 
+            # Stream aspect: follow local viewer's keep-ratio logic to avoid distortion when not 16:9
+            stream_fit_mode = str(settings.get("Stream Display Fit Mode", settings.get("Display Fit Mode", "contain"))).strip()
+            # Shared input_size (tex_w,tex_h) for dynamic eye ratio like VulkanLocalViewer
+            cap_mode_stream = str(settings.get("Capture Mode", "")).strip()
+            stream_input_size: tuple[int, int] | None = None
+            try:
+                if cap_mode_stream.casefold() == "window":
+                    title_stream = str(settings.get("Window Title", "")).strip()
+                    if title_stream and OS_NAME == "Windows":
+                        try:
+                            import win32gui
+                            hwnd_stream = win32gui.FindWindow(None, title_stream)
+                            if hwnd_stream:
+                                _, _, w_stream, h_stream = win32gui.GetClientRect(hwnd_stream)
+                                if w_stream > 0 and h_stream > 0:
+                                    stream_input_size = (int(w_stream), int(h_stream))
+                        except Exception:
+                            pass
+                    if stream_input_size is None:
+                        from utils.display import get_monitor_size
+                        stream_input_size = get_monitor_size(int(MONITOR_INDEX))
+                else:
+                    from utils.display import get_monitor_size
+                    stream_input_size = get_monitor_size(int(MONITOR_INDEX))
+            except Exception:
+                stream_input_size = None
+
             if configured_run_mode in CALIBRATABLE_STREAM_MODES:
                 audio_backend = str(
                     settings.get("Audio Capture Backend", "auto") or "auto"
@@ -821,6 +848,8 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                         and "NVIDIA" in str(DEVICE_INFO).upper()
                     ),
                     display_mode=stream_config.display_mode,
+                    fit_mode=stream_fit_mode,
+                    input_size=stream_input_size,
                     target_bitrate_mbps=(
                         stream_config.target_bitrate_mbps
                         if bool(settings.get("Use Stream Calibration", True))
@@ -944,6 +973,10 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     port=int(settings.get("Streamer Port", 1122)),
                     fps=int(FPS),
                     quality=int(settings.get("Stream Quality", 90)),
+                    display_mode=str(settings.get("Display Mode", "Half-SBS")),
+                    fit_mode=stream_fit_mode,
+                    input_size=stream_input_size,
+                    on_stream_fps_selected=adaptive_capture_rate.finish_stream_probe,
                 )
             callbacks.set_stream_output(network_output)
             network_output.start()

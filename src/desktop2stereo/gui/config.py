@@ -196,6 +196,7 @@ DEFAULTS = {
     "Lossless Scaling Support": False,
     "Capture Tool": "none",
     "Display Fit Mode": "contain",
+    "Stream Display Fit Mode": "contain",
     "Fill 16:9": True,
     "Fix Viewer Aspect": False,
     "Stereo Output": None,

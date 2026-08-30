@@ -816,6 +816,9 @@ class GUIHandlerMixin:
         self.display_fit_dd.options = self._display_fit_options()
         self.display_fit_dd.value = self._display_fit_to_display(display_fit_mode)
         self.display_fit_dd.set_tooltip(t["tooltip_display_fit"])
+        if hasattr(self, "stream_display_fit_label"):
+            self.stream_display_fit_label.value = t.get("Stream Fit:", "Stream Fit:")
+            self.stream_display_fit_label.tooltip = t["tooltip_display_fit"]
         self.lossless_cb.label = t["Lossless Scaling Support"]
         self.lossless_cb.tooltip = t["tooltip_nvfruc"]
         self.controller_label.value = t["Controller:"]

@@ -191,6 +191,10 @@ class GUIConfigMixin:
         self.display_fit_dd.options = self._display_fit_options()
         self.display_fit_dd.value = self._display_fit_to_display(
             cfg.get("Display Fit Mode", DEFAULTS["Display Fit Mode"]))
+        if hasattr(self, "stream_display_fit_dd"):
+            self.stream_display_fit_dd.options = self._display_fit_options()
+            self.stream_display_fit_dd.value = self._display_fit_to_display(
+                cfg.get("Stream Display Fit Mode", cfg.get("Display Fit Mode", DEFAULTS["Stream Display Fit Mode"])))
         self.lossless_cb.value = cfg.get(
             "NVIDIA Frame Generation",
             cfg.get("Lossless Scaling Support", DEFAULTS["NVIDIA Frame Generation"]),
@@ -425,6 +429,9 @@ class GUIConfigMixin:
             **recompile_values,
             "Capture Tool": self.capture_tool_dd.value,
             "Display Fit Mode": self._display_to_display_fit(self.display_fit_dd.value),
+            "Stream Display Fit Mode": self._display_to_display_fit(
+                getattr(self, "stream_display_fit_dd", self.display_fit_dd).value
+            ),
             # Retain the legacy keys for older runtime packages reading the same YAML.
             "Fill 16:9": self._display_to_display_fit(self.display_fit_dd.value) == "contain",
             "Fix Viewer Aspect": self._display_to_display_fit(self.display_fit_dd.value) != "stretch",
@@ -534,9 +541,13 @@ class GUIConfigMixin:
         parallax_budget = self._display_to_parallax_budget(self.parallax_budget_dd.value)
 
         display_fit_mode = self._display_to_display_fit(self.display_fit_dd.value)
+        stream_fit_mode = self._display_to_display_fit(
+            getattr(self, "stream_display_fit_dd", self.display_fit_dd).value
+        )
         cfg.update({
             "Show FPS": bool(self.showfps_cb.value),
             "Display Fit Mode": display_fit_mode,
+            "Stream Display Fit Mode": stream_fit_mode,
             "Fill 16:9": display_fit_mode == "contain",
             "Fix Viewer Aspect": display_fit_mode != "stretch",
             "Stereo Preset": stereo_preset,

@@ -243,8 +243,8 @@ def test_advanced_streaming_exposes_shared_calibration_rows() -> None:
     end = source.index("\n    # ── data population ──", start)
     row_map = source[start:end]
 
-    assert '"RTMP Streamer": [0, 1, 2, 3, 5, 6, 7]' in row_map
-    assert '"MJPEG Streamer": [0]' in row_map
+    assert '"RTMP Streamer": [0, 1, 2, 3, 5, 6, 7, 8]' in row_map
+    assert '"MJPEG Streamer": [0, 5]' in row_map
     assert '"GPU Streamer"' not in row_map
 
 

@@ -296,6 +296,7 @@ class GUIBuilderMixin:
             self.stream_url_label, self.stream_port_label,
             self.stream_proto_label, self.audio_label, self.crf_label,
             self.stream_calibration_label,
+            self.stream_display_fit_label,
             self.color_brightness_label, self.color_saturation_label,
             self.color_temperature_label, self.projection_min_lod_label,
             self.projection_mip_lod_bias_label,
@@ -1058,9 +1059,20 @@ class GUIBuilderMixin:
             on_change=self.on_audio_delay_change, filter=r"[0-9\-\.]", max_length=6)
         self.crf_row = ft.Row([self.crf_label, self.crf_tf, ft.Container(width=S(40)),
             self.audio_delay_label, self.audio_delay_tf], spacing=1)
+        fit_tooltip = UI_MESSAGES[self.locale]["tooltip_display_fit"]
+        self.stream_display_fit_label = ft.Text("Stream Fit:", size=FONT_SIZE, width=S(150), tooltip=fit_tooltip)
+        self.stream_display_fit_dd = CompactDropdown(
+            options=self._display_fit_options(),
+            value=self._display_fit_to_display("contain"),
+            width=S(130),
+            on_select=self.on_stereo_hot_param_change,
+            tooltip=fit_tooltip,
+        )
+        self.stream_fit_row = ft.Row([self.stream_display_fit_label, self.stream_display_fit_dd], spacing=1)
         self._streamer_rows = [
             self.stream_port_quality_row, self.stream_proto_row,
             self.crf_row, self.audio_row, self.video_backend_row,
+            self.stream_fit_row,
             self.stream_calibration_row,
             self.stream_calibration_warning_row,
             self.stream_calibration_result_row,
@@ -1087,8 +1099,8 @@ class GUIBuilderMixin:
     def _get_streamer_row_map():
         return {
             "Local Viewer": [], "3D Monitor": [], "OpenXR Link": [],
-            "MJPEG Streamer": [0],
-            "RTMP Streamer": [0, 1, 2, 3, 5, 6, 7],
+            "MJPEG Streamer": [0, 5],
+            "RTMP Streamer": [0, 1, 2, 3, 5, 6, 7, 8],
         }
 
     # ── data population ──
