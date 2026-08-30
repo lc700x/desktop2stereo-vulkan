@@ -1540,6 +1540,15 @@ class _TransferSource:
             try:
                 self._cuda_importer.copy_tensor(pixels, self._external_image)
                 self._cuda_importer.signal_semaphore(self._cuda_ready)
+                # HIP (ROCm) async ops above must complete before the Vulkan
+                # submit reads the imported external image. Synchronize on the
+                # HIP stream so the next depth-frame stream sync (torch
+                # cuda.synchronize) does not hang waiting on a surface the
+                # driver left in-flight. CUDA importer exposes no synchronize
+                # and keeps its established behavior.
+                sync = getattr(self._cuda_importer, "synchronize", None)
+                if callable(sync):
+                    sync()
             except Exception as exc:
                 self._disable_cuda_interop(exc)
                 cuda_source = False
