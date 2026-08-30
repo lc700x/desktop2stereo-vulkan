@@ -151,6 +151,23 @@ class RocmVulkanImageImporter:
         candidates.extend(
             glob.glob(str(site_packages / "torch" / "lib" / "amdhip64*.dll"))
         )
+        # ROCm SDK wheels ship the versioned HIP runtime (amdhip64_7.dll) under
+        # their bin directories; mirror Triton's rocm_sdk discovery so the
+        # external-memory API is found without D2S_HIP_RUNTIME_PATH.
+        try:
+            import rocm_sdk
+
+            candidates.extend(
+                str(path) for path in rocm_sdk.find_libraries("amdhip64")
+            )
+        except Exception:  # pragma: no cover - optional discovery path
+            pass
+        for sdk_dir in ("_rocm_sdk_core", "_rocm_sdk_devel"):
+            candidates.extend(
+                glob.glob(
+                    str(site_packages / sdk_dir / "bin" / "amdhip64*.dll")
+                )
+            )
         candidates.extend(("amdhip64.dll", "libamdhip64.so", "libamdhip64.so.6"))
         for candidate in candidates:
             try:
@@ -268,9 +285,9 @@ class RocmVulkanImageImporter:
         )
         mapped_desc = _ExternalMipmappedArrayDesc(
             offset=0,
-            format_desc=_ChannelFormatDesc(8, 8, 8, 8, 0),
+            format_desc=_ChannelFormatDesc(8, 8, 8, 8, 1),
             extent=_Extent(target.width, target.height, 0),
-            flags=self._HIP_ARRAY_COLOR_ATTACHMENT,
+            flags=0,
             num_levels=1,
         )
         mipmap = ctypes.c_void_p()
