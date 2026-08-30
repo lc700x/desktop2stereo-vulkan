@@ -7,7 +7,7 @@ to ensure identical letterbox/crop/stretch behavior between local and streaming 
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Any, Tuple
 
 # Pure-math helpers from local viewer (no Vulkan deps)
 # These are copied here to avoid import cycles and keep streaming self-contained.
@@ -36,33 +36,59 @@ def normalize_display_fit_mode(value: str | None) -> str:
     return aliases.get(normalized, "contain")
 
 
+def _aspect_close(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
+    """Return whether two sizes have the same aspect within rounding tolerance."""
+    aw, ah = a
+    bw, bh = b
+    if min(aw, ah, bw, bh) <= 0:
+        return False
+    return abs(aw * bh - ah * bw) <= max(2, (aw * bh) // 100)
+
+
+def frame_hw(frame: Any) -> Tuple[int, int]:
+    """Return (h, w) for CHW/HWC torch or numpy frames."""
+    shape = tuple(int(value) for value in getattr(frame, "shape", ()))
+    if len(shape) == 4:
+        if shape[-1] in (1, 3, 4):
+            return shape[-3], shape[-2]  # B,H,W,C
+        return shape[-2], shape[-1]  # B,C,H,W
+    if len(shape) == 3:
+        if shape[0] in (1, 3, 4) and shape[-1] not in (1, 3, 4):
+            return shape[-2], shape[-1]  # C,H,W
+        return shape[0], shape[1]  # H,W,C
+    return 0, 0
+
+
 def _input_eye_size(
     source: Tuple[int, int],
     display_mode: str | None,
     input_size: Tuple[int, int] | None,
 ) -> Tuple[int, int]:
-    """Return the original per-eye capture size before SBS/TAB packing.
+    """Return the per-eye capture size for the given packed source.
 
-    ``input_size`` (tex_w, tex_h) is preferred because it is the true capture
-    aspect (mirrors ``input_size`` in viewer.vulkan_local_viewer). When it is
-    unavailable the packed ``source`` is un-packed according to ``display_mode``:
-    half modes keep the packed aspect (each eye is squeezed inside the frame),
-    full modes halve the packed SBS width / TAB height.
+    The packed ``source`` is un-packed according to ``display_mode`` (half
+    modes keep the packed aspect, full modes halve the packed SBS width / TAB
+    height). This is the ground truth of the current frame, so it is always
+    preferred: a stale ``input_size`` captured at startup would otherwise make
+    the per-eye fit non-uniform and distort the eye content. ``input_size`` is
+    kept only as an advisory cross-check for aspect-close sizes.
     """
-    if input_size is not None:
-        try:
-            iw, ih = int(input_size[0]), int(input_size[1])
-            if iw > 0 and ih > 0:
-                return iw, ih
-        except (TypeError, ValueError):
-            pass
     sw, sh = source
     packed_mode = str(display_mode or "").strip().casefold().replace("_", "-")
     if packed_mode == "full-sbs":
-        return max(1, sw // 2), sh
-    if packed_mode == "full-tab":
-        return sw, max(1, sh // 2)
-    return sw, sh
+        eye_size = max(1, sw // 2), sh
+    elif packed_mode == "full-tab":
+        eye_size = sw, max(1, sh // 2)
+    else:
+        eye_size = sw, sh
+    if input_size is not None:
+        try:
+            iw, ih = int(input_size[0]), int(input_size[1])
+        except (TypeError, ValueError):
+            return eye_size
+        if iw > 0 and ih > 0 and _aspect_close((iw, ih), eye_size):
+            return iw, ih
+    return eye_size
 
 
 def pad_eye_to_16_9(eye_size: Tuple[int, int]) -> Tuple[int, int]:
@@ -117,7 +143,7 @@ def transport_canvas_size(
         return source
     iw, ih = _input_eye_size(source, display_mode, input_size)
     padded = pad_eye_to_16_9((iw, ih))
-    if padded == (iw, ih):
+    if _aspect_close(padded, (iw, ih)):
         # The input aspect ratio is already 16:9; keep the packed size.
         return source
     pw, ph = padded
@@ -213,15 +239,14 @@ def presentation_blit_regions(
 
         if mode == "contain":
             half_w, half_h = (tw // 2, th) if is_sbs else (tw, th // 2)
-            if input_size is not None:
-                iw, ih = input_size
-                if is_sbs:
-                    eye_fit_size = (max(1, iw // 2), ih) if is_half else (iw, ih)
-                else:
-                    eye_fit_size = (iw, max(1, ih // 2)) if is_half else (iw, ih)
-            else:
-                eye_fit_size = encoded_eye_size
-            x, y, w, h = fit_rect(eye_fit_size, (half_w, half_h))
+            # Fit the ENCODED (packed) eye into each half. The destination rect
+            # then always has the same aspect as the source crop, so the blit
+            # scales uniformly and the eye content can never be distorted --
+            # even when a startup-captured input_size goes stale (window or
+            # monitor resized mid-stream). With the transport canvas derived
+            # from the packed frame, this is exactly the legacy fill_16_9
+            # pad-then-place geometry (identity 1:1 placement + bars).
+            x, y, w, h = fit_rect(encoded_eye_size, (half_w, half_h))
             if is_sbs:
                 left_dest = (x, y, x + w, y + h)
                 right_dest = (half_w + x, y, half_w + x + w, y + h)

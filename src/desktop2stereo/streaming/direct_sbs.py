@@ -382,12 +382,14 @@ class DirectSbsOutputConsumer:
         ``fill_16_9`` semantics). Native GPU surface paths (Intel D3D11/oneVPL
         final-SBS and the deferred Vulkan compose) present the packed SBS at
         its native aspect and cannot letterbox, so the consumer must bypass
-        them when this is required. The per-eye size is taken from the frame
-        itself when available, falling back to the configured ``input_size``.
+        them when this is required. The per-eye size is always taken from the
+        actual frame (eyes, native surface, or packed sbs) so the gate can
+        never disagree with the frame-derived transport canvas; the configured
+        ``input_size`` is only a last resort.
         """
         if normalize_display_fit_mode(getattr(self.output, "fit_mode", "contain")) != "contain":
             return False
-        from streaming.aspect import input_needs_16_9_canvas
+        from streaming.aspect import _input_eye_size, input_needs_16_9_canvas
 
         left_eye = getattr(runtime_result, "left_eye", None)
         if left_eye is not None and getattr(left_eye, "width", 0) and getattr(left_eye, "height", 0):
@@ -397,17 +399,26 @@ class DirectSbsOutputConsumer:
         native_surface = getattr(runtime_result, "native_final_sbs_surface", None)
         if native_surface is not None and getattr(native_surface, "width", 0) and getattr(native_surface, "height", 0):
             # The surface is the actual packed SBS this frame would send; derive
-            # the per-eye size from it directly (never from the possibly stale
-            # configured input_size) so the gate reflects the real frame.
+            # the per-eye size from it directly so the gate reflects the frame.
             sw, sh = int(native_surface.width), int(native_surface.height)
-            packed_mode = str(getattr(self.output, "display_mode", "Half-SBS") or "").strip().casefold().replace("_", "-")
-            if packed_mode == "full-sbs":
-                eye_size = (max(1, sw // 2), sh)
-            elif packed_mode == "full-tab":
-                eye_size = (sw, max(1, sh // 2))
-            else:
-                eye_size = (sw, sh)
+            eye_size = _input_eye_size(
+                (sw, sh),
+                getattr(self.output, "display_mode", "Half-SBS"),
+                None,
+            )
             return input_needs_16_9_canvas(eye_size)
+        sbs = getattr(runtime_result, "sbs", None)
+        if sbs is not None and getattr(sbs, "shape", None):
+            from streaming.aspect import frame_hw
+
+            h, w = frame_hw(sbs)
+            if h > 0 and w > 0:
+                eye_size = _input_eye_size(
+                    (w, h),
+                    getattr(self.output, "display_mode", "Half-SBS"),
+                    None,
+                )
+                return input_needs_16_9_canvas(eye_size)
         input_size = getattr(self.output, "input_size", None)
         if input_size is None:
             return False
