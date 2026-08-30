@@ -346,7 +346,9 @@ class MJPEGStreamer:
                 ):
                     effective_fit = "stretch"
 
-                if cuda_frame is not None and torch.cuda.is_available():
+                if cuda_frame is not None:
+                    # A CUDA tensor implies CUDA is available; GPU letterboxing
+                    # is mandatory here (never route to the CPU aspect path).
                     # Wait for producer event if provided
                     if cuda_event is not None:
                         cuda_event.synchronize()

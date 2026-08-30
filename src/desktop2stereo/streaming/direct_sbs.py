@@ -204,43 +204,43 @@ class RuntimeSbsRgbConverter:
             display_mode=self.display_mode,
         )
         process_aspect = normalize_display_fit_mode(self.fit_mode) == "contain"
-        # For GPU path, keep on GPU and apply per-eye aspect before download
+        # For GPU path, keep on GPU and apply per-eye aspect before download.
+        # The 16:9 canvas processing is GPU-mandatory for CUDA frames: a
+        # failure must surface, never silently degrade to a CPU download that
+        # is both slower and skips the aspect requirement.
         if is_cuda:
             if process_aspect:
-                try:
-                    # Keep aspect on GPU: convert to HWC uint8 CUDA first, apply, then download
-                    import torch
-                    gpu_img = image
-                    # Normalize to HWC uint8 CUDA for aspect func
-                    if gpu_img.ndim == 4:
-                        gpu_img = gpu_img[0]
-                    if gpu_img.ndim == 3 and int(gpu_img.shape[0]) in (1, 3, 4) and int(gpu_img.shape[-1]) not in (1, 3, 4):
-                        gpu_img = gpu_img.permute(1, 2, 0)
-                    if gpu_img.shape[-1] == 4:
-                        gpu_img = gpu_img[..., :3]
-                    if gpu_img.shape[-1] == 1:
-                        gpu_img = gpu_img.expand(-1, -1, 3)
-                    if gpu_img.dtype != torch.uint8:
-                        gpu_img = gpu_img.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
-                    gpu_img = gpu_img.contiguous()
-                    processed = apply_aspect_on_gpu(
-                        gpu_img,
-                        source_size=(w, h),
-                        target_size=(tw, th),
-                        fit_mode=self.fit_mode,
-                        display_mode=self.display_mode,
-                        input_size=self.input_size,
-                    )
-                    # download processed
-                    if self._host_rgb is None or tuple(self._host_rgb.shape) != tuple(processed.shape):
-                        self._host_rgb = torch.empty(tuple(processed.shape), dtype=torch.uint8, device="cpu", pin_memory=True)
-                    self._host_rgb.copy_(processed, non_blocking=True)
-                    torch.cuda.current_stream(device=processed.device).synchronize()
-                    result = self._host_rgb.numpy()
-                    return result.copy() if self.copy_output else result
-                except Exception:
-                    pass
-            # Fallback to original cuda->rgb without aspect if GPU aspect fails
+                # Keep aspect on GPU: convert to HWC uint8 CUDA first, apply, then download
+                import torch
+                gpu_img = image
+                # Normalize to HWC uint8 CUDA for aspect func
+                if gpu_img.ndim == 4:
+                    gpu_img = gpu_img[0]
+                if gpu_img.ndim == 3 and int(gpu_img.shape[0]) in (1, 3, 4) and int(gpu_img.shape[-1]) not in (1, 3, 4):
+                    gpu_img = gpu_img.permute(1, 2, 0)
+                if gpu_img.shape[-1] == 4:
+                    gpu_img = gpu_img[..., :3]
+                if gpu_img.shape[-1] == 1:
+                    gpu_img = gpu_img.expand(-1, -1, 3)
+                if gpu_img.dtype != torch.uint8:
+                    gpu_img = gpu_img.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
+                gpu_img = gpu_img.contiguous()
+                processed = apply_aspect_on_gpu(
+                    gpu_img,
+                    source_size=(w, h),
+                    target_size=(tw, th),
+                    fit_mode=self.fit_mode,
+                    display_mode=self.display_mode,
+                    input_size=self.input_size,
+                )
+                # download processed
+                if self._host_rgb is None or tuple(self._host_rgb.shape) != tuple(processed.shape):
+                    self._host_rgb = torch.empty(tuple(processed.shape), dtype=torch.uint8, device="cpu", pin_memory=True)
+                self._host_rgb.copy_(processed, non_blocking=True)
+                torch.cuda.current_stream(device=processed.device).synchronize()
+                result = self._host_rgb.numpy()
+                return result.copy() if self.copy_output else result
+            # No aspect required (cover/stretch): plain CUDA -> RGB download.
             return self._cuda_to_rgb(image)
         # CPU path: use aspect module for consistent letterbox/crop/stretch (mirrors local viewer)
         rgb = runtime_sbs_to_rgb(image)
@@ -604,10 +604,9 @@ class DirectSbsOutputConsumer:
                         # MJPEG applies aspect inside its encoder loop.
                         and not isinstance(self.output, MjpegDirectSbsOutput)
                     ):
-                        try:
-                            cuda_frame = self._apply_cuda_aspect(cuda_frame)
-                        except Exception:
-                            pass
+                        # GPU letterboxing is mandatory for CUDA frames (never a
+                        # silent CPU fallback); a failure must surface.
+                        cuda_frame = self._apply_cuda_aspect(cuda_frame)
                     convert_started = self._clock()
                     submit_cuda_frame(cuda_frame)
                     self._fps_submit_seconds += self._clock() - convert_started
