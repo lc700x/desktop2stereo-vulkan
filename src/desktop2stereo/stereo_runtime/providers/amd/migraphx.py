@@ -135,6 +135,8 @@ class MIGraphXDepthProvider:
         depth_upsample_edge_strength: float = 0.35,
     ) -> None:
         self.device = torch.device(device)
+        # cuDNN autotuning is disabled for the ROCm depth path (per project policy).
+        torch.backends.cudnn.benchmark = False
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         self.onnx_path = Path(onnx_path) if onnx_path is not None else None
         self.graph_path = Path(graph_path) if graph_path is not None else None
