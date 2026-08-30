@@ -1,15 +1,15 @@
 Capture Mode: Monitor
-Monitor Index: 3
+Monitor Index: 1
 Monitor Identity:
-  stable_id: DISPLAY\HWP317F\5&3482c9ed&0&UID16642
-  name: HP Z27s
-  manufacturer: HWP
-  model: HP Z27s
-  serial: CNK72916XG
+  stable_id: DISPLAY\TUP0270\5&3b49acb3&8&UID4357
+  name: DELL U2410
+  manufacturer: TUP
+  model: D270H
+  serial: '808728147'
   left: 0
   top: 0
-  width: 3840
-  height: 2160
+  width: 1920
+  height: 1200
 Window Title: ''
 Show FPS: true
 Model List:
@@ -529,7 +529,7 @@ Recompile MIGraphX: false
 Recompile OpenVINO: false
 Computing Device: 0
 Language: CN
-Run Mode: Local Viewer
+Run Mode: MJPEG Streamer
 XR Headset Model: Pico 4 / 4 Ultra
 XR Preview Window: true
 VSync: false
@@ -562,22 +562,22 @@ Environment Model: Default
 NVIDIA Frame Generation: false
 Lossless Scaling Support: false
 Capture Tool: WindowsCaptureCUDA
-Display Fit Mode: stretch
-Fill 16:9: false
-Fix Viewer Aspect: false
-Stereo Output: 2
+Display Fit Mode: contain
+Fill 16:9: true
+Fix Viewer Aspect: true
+Stereo Output: 1
 Stereo Output Identity:
-  stable_id: DISPLAY\MTT1337\1&33320f0&0&UID256
-  name: VITURE
-  manufacturer: MTT
-  model: VITURE
-  serial: '2290649088'
-  left: 5760
+  stable_id: DISPLAY\TUP0270\5&3b49acb3&8&UID4357
+  name: DELL U2410
+  manufacturer: TUP
+  model: D270H
+  serial: '808728147'
+  left: 0
   top: 0
-  width: 3840
-  height: 2400
+  width: 1920
+  height: 1200
 Show Log Panel: true
-Input Display Resolution Tier: 4K
+Input Display Resolution Tier: 1K
 Synthetic View: quality_4k
 OpenVINO: null
 Stream Target FPS: 0

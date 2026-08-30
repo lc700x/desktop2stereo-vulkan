@@ -825,13 +825,17 @@ class GUIBuilderMixin:
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
             border_radius=6, padding=ft.Padding(S(16), S(10), S(16), S(10)))
+        self._build_streamer_rows()
         device_group = ft.Container(
             ft.Column([row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, self.row6b, self.row6d, self.row6e, self.row6f,
-                       self.row7a, self.xr_headset_row, self.row7b, row8, self.row6c, self.row9], spacing=S(8)),
+                       self.row7a, self.xr_headset_row, self.row7b, row8, self.row6c, self.row9,
+                       self.stream_url_row], spacing=S(8)),
             margin=ft.Margin(0, 0, 0, S(8)),
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
             border_radius=6, padding=ft.Padding(S(16), S(10), S(16), S(10)))
+        self.device_group = device_group
+
         lang_group = ft.Container(
             ft.Column([lang_row], spacing=S(8)),
             margin=ft.Margin(0, 0, 0, S(8)),
@@ -840,11 +844,10 @@ class GUIBuilderMixin:
             border_radius=6, padding=ft.Padding(S(16), S(10), S(16), S(10)))
         self.lang_group = lang_group
         self.depth_group = depth_group
-        self.device_group = device_group
-        self._build_streamer_rows()
 
         scroll_area = ft.Column([
-            self.lang_group, self.depth_group, self.device_group, self.stream_container,
+            self.lang_group, self.depth_group, self.device_group,
+            self.stream_container,
         ], scroll=ft.ScrollMode.AUTO, expand=True, tight=True, spacing=S(8))
         self.log_level_dd = CompactDropdown(
             options=["ALL", "STATUS", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -1056,7 +1059,7 @@ class GUIBuilderMixin:
         self.crf_row = ft.Row([self.crf_label, self.crf_tf, ft.Container(width=S(40)),
             self.audio_delay_label, self.audio_delay_tf], spacing=1)
         self._streamer_rows = [
-            self.stream_url_row, self.stream_port_quality_row, self.stream_proto_row,
+            self.stream_port_quality_row, self.stream_proto_row,
             self.crf_row, self.audio_row, self.video_backend_row,
             self.stream_calibration_row,
             self.stream_calibration_warning_row,
@@ -1084,8 +1087,8 @@ class GUIBuilderMixin:
     def _get_streamer_row_map():
         return {
             "Local Viewer": [], "3D Monitor": [], "OpenXR Link": [],
-            "MJPEG Streamer": [0, 1],
-            "RTMP Streamer": [0, 1, 2, 3, 4, 6, 7, 8],
+            "MJPEG Streamer": [0],
+            "RTMP Streamer": [0, 1, 2, 3, 5, 6, 7],
         }
 
     # ── data population ──
@@ -1107,7 +1110,7 @@ class GUIBuilderMixin:
             display_number = mon["display_number"]
             is_primary = capture_index == primary_index
             suffix = PRIMARY_MONITOR_SUFFIX if is_primary else ""
-            display_name = mon.get("model") or mon.get("name")
+            display_name = mon.get("name") or mon.get("model") or ""
             if display_name:
                 label = f"{display_number}: {display_name} {mon['width']}x{mon['height']}{suffix}"
             else:

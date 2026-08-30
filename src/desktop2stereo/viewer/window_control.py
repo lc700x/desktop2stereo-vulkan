@@ -55,6 +55,8 @@ if OS_NAME == "Windows":
     SetWindowDisplayAffinity.restype = wintypes.BOOL
     WDA_NONE = 0x00000000
     WDA_EXCLUDEFROMCAPTURE = 0x00000011
+    WS_EX_TRANSPARENT = 0x00000020
+    GWL_EXSTYLE = -20
 
     def _set_window_capture_affinity(glfw_window, affinity):
         hwnd = glfw.get_win32_window(glfw_window)
@@ -110,6 +112,73 @@ if OS_NAME == "Windows":
                 win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE,
             )
 
+    def set_window_mouse_passthrough(glfw_window, enabled: bool) -> bool:
+        """Enable or disable mouse click-through for the Vulkan viewer window.
+
+        When 3D Monitor mode runs on a single display without a second output
+        monitor, the fullscreen SBS window covers the captured desktop. Enabling
+        WS_EX_TRANSPARENT lets the system cursor remain visible over the SBS
+        image and lets mouse input pass through to the underlying desktop (GLFW
+        ``GLFW_MOUSE_PASSTHROUGH`` equivalence on Win32). This is a no-op on
+        non-Windows platforms.
+        """
+        try:
+            hwnd = glfw.get_win32_window(glfw_window)
+        except Exception:
+            hwnd = 0
+        if not hwnd:
+            return False
+        try:
+            # Prefer GLFW 3.4+ native passthrough attribute when available.
+            passthrough_attr = getattr(glfw, "MOUSE_PASSTHROUGH", None)
+            if passthrough_attr is not None:
+                try:
+                    glfw.set_window_attrib(glfw_window, passthrough_attr, 1 if enabled else 0)
+                    # Ensure cursor remains visible over the stereo image.
+                    try:
+                        cursor_attr = getattr(glfw, "CURSOR", None)
+                        cursor_normal = getattr(glfw, "CURSOR_NORMAL", 0x00034001)
+                        if cursor_attr is not None:
+                            glfw.set_input_mode(glfw_window, cursor_attr, cursor_normal)
+                    except Exception:
+                        pass
+                    print(
+                        f"[WindowCapture] Cursor passthrough {'enabled' if enabled else 'disabled'} "
+                        "(GLFW_MOUSE_PASSTHROUGH).",
+                        flush=True,
+                    )
+                    return True
+                except Exception:
+                    pass
+            # Fallback: toggle WS_EX_TRANSPARENT directly.
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            if enabled:
+                style |= WS_EX_TRANSPARENT
+            else:
+                style &= ~WS_EX_TRANSPARENT
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            # Ensure cursor is visible when passthrough is active.
+            if enabled:
+                try:
+                    cursor_attr = getattr(glfw, "CURSOR", None)
+                    cursor_normal = getattr(glfw, "CURSOR_NORMAL", 0x00034001)
+                    if cursor_attr is not None:
+                        glfw.set_input_mode(glfw_window, cursor_attr, cursor_normal)
+                except Exception:
+                    pass
+            print(
+                f"[WindowCapture] Cursor passthrough {'enabled' if enabled else 'disabled'} "
+                f"(WS_EX_TRANSPARENT=0x{WS_EX_TRANSPARENT:X}).",
+                flush=True,
+            )
+            return True
+        except Exception as exc:
+            print(
+                f"[WindowCapture] Cursor passthrough failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return False
+
 else:
     def hide_window_from_capture(*args, **kwargs):
         return None
@@ -118,4 +187,7 @@ else:
         return None
 
     def set_window_to_bottom(*args, **kwargs):
+        return None
+
+    def set_window_mouse_passthrough(*args, **kwargs):
         return None

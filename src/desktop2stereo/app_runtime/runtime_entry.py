@@ -494,47 +494,56 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         if not nvfruc_probe.available:
             print(
                 "[NvFRUC] Frame generation requested but unavailable: "
-                f"{nvfruc_probe.reason}",
+                f"{nvfruc_probe.reason}. Continuing without NvFRUC.",
                 flush=True,
             )
-            shutdown_event.set()
-            close_runtime = getattr(context.stereo_runtime, "close", None)
-            if callable(close_runtime):
-                close_runtime()
-            if stop_request_thread is not None:
-                stop_request_thread.join(timeout=0.2)
-            return 1
-
-        calibration_values = {
-            "device": str(DEVICE_INFO),
-            "depth_model": str(settings.get("Depth Model", "")),
-            "inference_backend": str(settings.get("Inference Backend", "")),
-            "precision": str(settings.get("Precision", "")),
-            "input_resolution": str(OUTPUT_RESOLUTION),
-            "run_mode": configured_run_mode,
-            "output_format": str(settings.get("Output Format", "")),
-            "encoder": str(settings.get("Video Encoder Backend", "auto")),
-        }
-        calibration_fingerprint_value = calibration_fingerprint(calibration_values)
-        calibration_cache = NvFrucCalibrationCache(
-            Path(context.base_dir) / "models" / "nvfruc"
-        )
-
-        def apply_nvfruc_limit(output_limit: int) -> None:
-            base_limit = output_base_fps(output_limit, enabled=True)
-            adaptive_capture_rate.set_calibration_limit(base_limit)
-            print(
-                "[NvFRUC] calibrated output limit: "
-                f"output={int(output_limit)} base_runtime={int(base_limit)}",
-                flush=True,
+            # Disable NvFRUC for this session and continue
+            context.nvfruc_frame_generation = False
+            base_runtime_fps = output_base_fps(FPS, enabled=False)
+            adaptive_capture_rate = AdaptiveCaptureRate(
+                base_runtime_fps,
+                enabled=adaptive_capture_enabled_for_mode(
+                    configured_run_mode, configured_target_fps
+                ),
+            )
+            if is_network_stream_mode(configured_run_mode):
+                probe_capture_fps = adaptive_capture_rate.begin_stream_probe(int(base_runtime_fps))
+                print(
+                    "[DirectSbsStream] Stream-rate probe capture headroom: "
+                    f"requested={int(base_runtime_fps)} capture={probe_capture_fps} FPS",
+                    flush=True,
+                )
+        else:
+            calibration_values = {
+                "device": str(DEVICE_INFO),
+                "depth_model": str(settings.get("Depth Model", "")),
+                "inference_backend": str(settings.get("Inference Backend", "")),
+                "precision": str(settings.get("Precision", "")),
+                "input_resolution": str(OUTPUT_RESOLUTION),
+                "run_mode": configured_run_mode,
+                "output_format": str(settings.get("Output Format", "")),
+                "encoder": str(settings.get("Video Encoder Backend", "auto")),
+            }
+            calibration_fingerprint_value = calibration_fingerprint(calibration_values)
+            calibration_cache = NvFrucCalibrationCache(
+                Path(context.base_dir) / "models" / "nvfruc"
             )
 
-        nvfruc_calibration = NvFrucCalibrationController(
-            output_target_fps=int(FPS),
-            fingerprint=calibration_fingerprint_value,
-            cache=calibration_cache,
-            on_limit=apply_nvfruc_limit,
-        )
+            def apply_nvfruc_limit(output_limit: int) -> None:
+                base_limit = output_base_fps(output_limit, enabled=True)
+                adaptive_capture_rate.set_calibration_limit(base_limit)
+                print(
+                    "[NvFRUC] calibrated output limit: "
+                    f"output={int(output_limit)} base_runtime={int(base_limit)}",
+                    flush=True,
+                )
+
+            nvfruc_calibration = NvFrucCalibrationController(
+                output_target_fps=int(FPS),
+                fingerprint=calibration_fingerprint_value,
+                cache=calibration_cache,
+                on_limit=apply_nvfruc_limit,
+            )
 
     callbacks = RuntimeCallbacks(
         context,
@@ -1005,19 +1014,102 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     f"source={target_source} mode={fullscreen_policy}",
                     flush=True,
                 )
+            exclude_from_capture = _exclude_local_output_from_capture(
+                settings,
+                os_name=OS_NAME,
+            )
+            # Enable cursor passthrough when the SBS fullscreen window covers
+            # the same display that is being captured. This applies to
+            # 3D Monitor single-display (no second output) and to Window capture
+            # when the selected window lives on the chosen stereo-output
+            # monitor. The window is made click-through (WS_EX_TRANSPARENT /
+            # GLFW_MOUSE_PASSTHROUGH) so the system cursor stays visible over
+            # the stereo image and input reaches the underlying desktop.
+            cursor_passthrough = False
+            capture_mode = str(settings.get("Capture Mode", "")).strip()
+            if exclude_from_capture:
+                try:
+                    no_second_output = not bool(STEREO_DISPLAY_SELECTION) or int(
+                        STEREO_DISPLAY_INDEX
+                    ) == int(MONITOR_INDEX)
+                    if no_second_output:
+                        cursor_passthrough = True
+                    else:
+                        try:
+                            import mss
+
+                            with mss.mss() as sct:
+                                if len(sct.monitors) - 1 <= 1:
+                                    cursor_passthrough = True
+                        except Exception:
+                            pass
+                except Exception:
+                    cursor_passthrough = True
+            # Window capture on the same monitor as the stereo output also
+            # needs passthrough even when a second display exists (Local Viewer
+            # or 3 to 2 case). The monitor index for Window mode is the window's
+            # display (via get_monitor_index_for_point), so equality means the
+            # window and the SBS output share one screen.
+            if not cursor_passthrough and capture_mode.casefold() == "window":
+                try:
+                    if bool(STEREO_DISPLAY_SELECTION) and int(
+                        STEREO_DISPLAY_INDEX
+                    ) == int(MONITOR_INDEX):
+                        cursor_passthrough = True
+                except Exception:
+                    pass
+            if cursor_passthrough:
+                reason = (
+                    "single-display 3D Monitor mode"
+                    if exclude_from_capture
+                    else "window capture on stereo-output display"
+                )
+                print(
+                    f"[VulkanLocalViewer] Cursor passthrough enabled for {reason}",
+                    flush=True,
+                )
+            # tex_w,tex_h in legacy viewer: original capture size before packing,
+            # used so eye ratio stays dynamic with input (W/2 for HalfSBS etc.).
+            input_size: tuple[int, int] | None = None
+            try:
+                cap_mode = str(settings.get("Capture Mode", "")).strip()
+                if cap_mode.casefold() == "window":
+                    title = str(settings.get("Window Title", "")).strip()
+                    if title and OS_NAME == "Windows":
+                        try:
+                            import win32gui
+
+                            hwnd = win32gui.FindWindow(None, title)
+                            if hwnd:
+                                _, _, w, h = win32gui.GetClientRect(hwnd)
+                                if w > 0 and h > 0:
+                                    input_size = (int(w), int(h))
+                        except Exception:
+                            pass
+                    if input_size is None:
+                        from utils.display import get_monitor_size
+
+                        input_size = get_monitor_size(int(MONITOR_INDEX))
+                else:
+                    from utils.display import get_monitor_size
+
+                    input_size = get_monitor_size(int(MONITOR_INDEX))
+            except Exception:
+                input_size = None
             local_viewer_config = VulkanLocalViewerConfig(
                 title=f"{WINDOW_TITLE or 'Desktop2Stereo'} Vulkan Viewer",
                 monitor_index=max(0, selected_monitor),
-                fullscreen=bool(STEREO_DISPLAY_SELECTION),
+                fullscreen=bool(STEREO_DISPLAY_SELECTION) or bool(cursor_passthrough),
                 capture_compatible_fullscreen=(
                     fullscreen_policy == "capture_compatible"
                 ),
                 window_preview=bool(settings.get("Window Preview", False)),
                 preview_monitor_index=max(0, int(MONITOR_INDEX)),
-                exclude_from_capture=_exclude_local_output_from_capture(
-                    settings,
-                    os_name=OS_NAME,
-                ),
+                exclude_from_capture=exclude_from_capture,
+                cursor_passthrough=cursor_passthrough,
+                input_size=input_size,
+                capture_mode=str(settings.get("Capture Mode", "Monitor")),
+                window_title=str(settings.get("Window Title", "") or "") if str(settings.get("Capture Mode", "")).casefold() == "window" else None,
                 vsync=bool(LOCAL_VSYNC),
                 show_fps=bool(SHOW_FPS),
                 show_fps_provider=callbacks.show_fps,
@@ -1077,7 +1169,10 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             if callable(close_output_consumer):
                 close_output_consumer()
         if network_output is not None:
-            network_output.close()
+            try:
+                network_output.close()
+            except Exception:
+                pass
         if presenter_thread is not None:
             # run_until owns Filament/Vulkan teardown on the Presenter thread.
             # Do not let the main thread race that teardown after a timeout.

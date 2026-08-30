@@ -115,6 +115,7 @@ class Desktop2StereoGUI(
 
         # Build UI
         self.build_ui()
+        self.page.update()
         self._log_poll_task = asyncio.create_task(self._poll_log_queue())
         self._auto_align_labels()
         self.page.on_close = self._on_page_close
@@ -122,9 +123,9 @@ class Desktop2StereoGUI(
         self._startup_fit_armed = True
         self._startup_fit_task = None
 
-        # Populate monitors. Torch-backed compute-device discovery is deferred
-        # until after the first complete GUI frame.
+        # Populate monitors first so apply_config can select the saved monitor
         self.monitor_label_to_index = self.populate_monitors()
+        self.page.update()
 
         # Load config
         self._config = DEFAULTS.copy()
@@ -145,6 +146,20 @@ class Desktop2StereoGUI(
                     f"{UI_MESSAGES[self.locale]['Failed to load settings.yaml:']} {e}")
         else:
             self.apply_config(self._config)
+
+        self.page.update()
+
+        # Now that config is applied (which sets monitor_dd.value), populate windows
+        # and select the saved window if in Window capture mode
+        self.refresh_window_list()
+        self.update_stereo_monitor_menu()
+        self._sync_visibility()
+        self._fit_window_to_content()
+
+        # Apply the monitor selection to the UI
+        if hasattr(self, 'monitor_dd') and self.monitor_dd.value:
+            self.monitor_dd.update()
+        self.page.update()
 
         self.on_device_change(None)
         self._refresh_stream_calibration_status()

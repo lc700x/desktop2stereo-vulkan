@@ -581,7 +581,10 @@ class GUIHandlerMixin:
         self.run_mode_dd.value = mode_reverse.get(mode, texts["Local Viewer"])
         streamer_modes = {"MJPEG Streamer", "RTMP Streamer"}
         is_streamer = mode in streamer_modes
-        self.stream_url_row.visible = is_streamer
+        if hasattr(self, "stream_url_row"):
+            self.stream_url_row.visible = is_streamer
+        if hasattr(self, "stream_url_container"):
+            self.stream_url_container.visible = is_streamer
         self.stream_settings_cb.visible = is_streamer
         is_openxr = mode == "OpenXR Link"
         self.display_mode_label.visible = not is_openxr

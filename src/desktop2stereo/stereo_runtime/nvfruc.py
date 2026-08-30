@@ -71,6 +71,10 @@ def _prepare_cuda_dll_search_path() -> None:
         / "cuda_runtime"
         / "bin",
     ]
+    # Add the nvfruc directory so the bridge can find NvOFFRUC.dll
+    nvfruc_dir = Path(__file__).resolve().parent / "nvfruc"
+    if nvfruc_dir.is_dir():
+        runtime_dirs.insert(0, nvfruc_dir)
     cuda_path = os.environ.get("CUDA_PATH", "").strip()
     if cuda_path:
         runtime_dirs.insert(0, Path(cuda_path) / "bin")

@@ -898,7 +898,7 @@ class GUIProcessMixin:
         if not supports_network_calibration(self.run_mode_key, self.stream_proto_dd.value):
             self.set_status(UI_MESSAGES[self.locale].get(
                 "calibration_requires_advanced",
-                "Automatic calibration requires Advanced Network Streaming with WebRTC.",
+                "Automatic calibration requires Advanced Streaming with WebRTC.",
             ))
             return
         if int(self.stream_port_tf.value or DEFAULT_PORT) >= 65535:
@@ -1264,9 +1264,15 @@ class GUIProcessMixin:
             getattr(self, "_missing_stereo_output_identity", False)
             or not self.stereo_monitor_dd.value
         ):
-            return False, UI_MESSAGES[self.locale][
-                "Selected stereo output display is unavailable"
-            ]
+            # 3D Monitor with a single display has no second output monitor;
+            # cursor passthrough keeps the system cursor visible over the
+            # fullscreen SBS window covering the captured display.
+            if self.run_mode_key == "3D Monitor" and self._get_monitor_count() <= 1:
+                pass
+            else:
+                return False, UI_MESSAGES[self.locale][
+                    "Selected stereo output display is unavailable"
+                ]
         try:
             port_val = int(self.stream_port_tf.value) if self.stream_port_tf.value else DEFAULT_PORT
             if not (1 <= port_val <= 65535):
@@ -2088,7 +2094,7 @@ class GUIProcessMixin:
         )
         # Reset uses the Cinema preset with hole filling disabled.
         dynamic_defaults["Hole Fill Mode"] = "none"
-        dynamic_defaults["Run Mode"] = "Local Viewer"
+        dynamic_defaults["Run Mode"] = getattr(self, "run_mode_key", "Local Viewer")
         dynamic_defaults["XR Preview Window"] = False
         if is_nvidia_cuda:
             dynamic_defaults["torch.compile"] = True

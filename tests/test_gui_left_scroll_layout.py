@@ -243,7 +243,8 @@ def test_advanced_streaming_exposes_shared_calibration_rows() -> None:
     end = source.index("\n    # ── data population ──", start)
     row_map = source[start:end]
 
-    assert '"RTMP Streamer": [0, 1, 2, 3, 4, 6, 7, 8]' in row_map
+    assert '"RTMP Streamer": [0, 1, 2, 3, 5, 6, 7]' in row_map
+    assert '"MJPEG Streamer": [0]' in row_map
     assert '"GPU Streamer"' not in row_map
 
 
@@ -358,7 +359,7 @@ def test_model_and_mode_tooltips_explain_recommendations_and_tradeoffs() -> None
     assert "其次选择 InfiniDepth" in localization
     assert "Monitor captures the selected full display" in localization
     assert "屏幕模式捕获选定显示器的完整画面" in localization
-    assert "Advanced Network Streaming publishes compressed H.264/H.265" in localization
+    assert "Advanced Streaming publishes compressed H.264/H.265" in localization
     assert "高级网络推流：通过 WebRTC/RTSP/RTMP 发布 H.264/H.265" in localization
     assert "Half-SBS packs left/right views" in localization
     assert "Half-SBS：左右眼并排" in localization

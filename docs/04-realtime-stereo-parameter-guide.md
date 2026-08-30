@@ -149,7 +149,7 @@ per_eye_shift_px = actual_disparity_px / 2
 
 | 参数 | GUI / 字段 | 当前选项或范围 | 默认 / 预设 | 作用 | 调参建议 |
 |---|---|---|---|---|---|
-| Run Mode | `Run Mode` | Local Viewer, Basic Network Streaming, Advanced Network Streaming, 3D Monitor, OpenXR Link | OpenXR Link | 选择输出运行链路 | 旧配置中的 `Legacy Streamer` 会自动迁移为 低级网络推流；合规检查要分别覆盖本地、OpenXR、推流路径公式一致性 |
+| Run Mode | `Run Mode` | Local Viewer, Basic Streaming, Advanced Streaming, 3D Monitor, OpenXR Link | OpenXR Link | 选择输出运行链路 | 旧配置中的 `Legacy Streamer` 会自动迁移为 低级网络推流；合规检查要分别覆盖本地、OpenXR、推流路径公式一致性 |
 | Computing Device | `Computing Device` | 设备列表 | 0 | 深度推理设备 | 不改变立体公式，只影响性能/后端可用性 |
 | FP16 | `FP16` | true / false | false | 半精度推理/加速开关 | 可能影响速度和少量数值稳定性；不应改变参数语义 |
 | TensorRT / MIGraphX / CoreML / OpenVINO | 加速开关 | 平台相关 | false | 模型推理加速 | 改后要做 provider 级验证；视觉参数不应因加速后端改变 |

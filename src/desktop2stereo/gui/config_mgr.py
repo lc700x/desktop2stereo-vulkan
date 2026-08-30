@@ -49,11 +49,45 @@ class GUIConfigMixin:
             cfg["Stereo Output"] = resolved_stereo_index
         self._config = cfg.copy()
         self._config.pop("Debug Mode", None)
-        label = next(
-            (lbl for lbl, i in self.monitor_label_to_index.items() if i == mon_idx),
-            None,
-        )
+        
+        # Try to find the saved monitor by index, fallback to primary or first available
+        label = None
+        if mon_idx is not None:
+            label = next(
+                (lbl for lbl, i in self.monitor_label_to_index.items() if i == mon_idx),
+                None,
+            )
+        if label is None and self.monitor_label_to_index:
+            # Fallback: try primary monitor, then first available
+            primary_index = get_primary_monitor_index()
+            label = next((lbl for lbl, i in self.monitor_label_to_index.items() if i == primary_index), None)
+            if label is None:
+                label = list(self.monitor_label_to_index.keys())[0]
+            # Update config with fallback monitor's identity
+            fallback_idx = self.monitor_label_to_index.get(label)
+            if fallback_idx is not None:
+                self._config["Monitor Index"] = fallback_idx
+                self._config["Monitor Identity"] = self._display_identity_for_capture_index(fallback_idx)
+                # Clear missing flag since we have a valid fallback
+                self._missing_monitor_identity = False
         self.monitor_dd.value = label or ""
+        
+        # Also apply fallback for stereo output if missing
+        stereo_label = None
+        stereo_idx = self._config.get("Stereo Output")
+        if stereo_idx is not None:
+            stereo_label = next((lbl for lbl, i in self.monitor_label_to_index.items() if i == stereo_idx), None)
+        if stereo_label is None and self.monitor_label_to_index:
+            # Use same fallback as main monitor
+            stereo_label = label
+            if stereo_label:
+                stereo_fallback_idx = self.monitor_label_to_index.get(stereo_label)
+                if stereo_fallback_idx is not None:
+                    self._config["Stereo Output"] = stereo_fallback_idx
+                    self._config["Stereo Output Identity"] = self._display_identity_for_capture_index(stereo_fallback_idx)
+                    # Clear missing flag since we have a valid fallback
+                    self._missing_stereo_output_identity = False
+        self.stereo_monitor_dd.value = stereo_label or ""
         self.selected_window_name = cfg.get("Window Title", "")
         self.selected_window_handle = None
         self.selected_window_rect = None

@@ -188,7 +188,7 @@ DEFAULTS = {
     "Audio Capture Backend": "auto",
     "Video Encoder Backend": "auto",
     "CRF": 23,
-    "Audio Delay": -0.1,
+    "Audio Delay": 0.0,
     "Controller Model": "PICO",
     "Environment Model": "Default",
     "NVIDIA Frame Generation": False,

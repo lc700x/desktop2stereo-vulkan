@@ -148,10 +148,12 @@ def test_display_fit_feature_is_enabled_by_default() -> None:
 
 
 def test_display_fit_contain_adds_only_expected_letterbox_bars() -> None:
+    # Half-SBS contain: eye W/2xH, Full vs Half keep original capture ratio
     assert presentation_blit_regions(
         (3840, 2160), (3840, 2400), "contain", "Half-SBS"
     ) == (
-        ((0, 0, 3840, 2160), (0, 120, 3840, 2280)),
+        ((0, 0, 1920, 2160), (0, 120, 1920, 2280)),
+        ((1920, 0, 3840, 2160), (1920, 120, 3840, 2280)),
     )
 
 
@@ -159,7 +161,8 @@ def test_display_fit_contain_uses_single_eye_aspect_for_full_sbs() -> None:
     assert presentation_blit_regions(
         (7680, 2160), (3840, 2400), "contain", "Full-SBS"
     ) == (
-        ((0, 0, 7680, 2160), (0, 660, 3840, 1740)),
+        ((0, 0, 3840, 2160), (0, 660, 1920, 1740)),
+        ((3840, 0, 7680, 2160), (1920, 660, 3840, 1740)),
     )
 
 
@@ -182,11 +185,12 @@ def test_display_fit_cover_reverses_crop_axis_for_taller_input() -> None:
 
 
 def test_display_fit_cover_preserves_full_sbs_eye_boundaries() -> None:
+    # FullSBS WxH per eye, cover short side to half
     assert presentation_blit_regions(
         (7680, 2160), (3840, 2400), "cover", "Full-SBS"
     ) == (
-        ((192, 0, 3648, 2160), (0, 0, 1920, 2400)),
-        ((4032, 0, 7488, 2160), (1920, 0, 3840, 2400)),
+        ((1056, 0, 2784, 2160), (0, 0, 1920, 2400)),
+        ((4896, 0, 6624, 2160), (1920, 0, 3840, 2400)),
     )
 
 
@@ -200,10 +204,12 @@ def test_display_fit_cover_preserves_half_tab_eye_boundaries() -> None:
 
 
 def test_display_fit_stretch_uses_the_complete_source_and_target() -> None:
+    # Stretch for packed SBS is per-eye to avoid cross-eye filtering
     assert presentation_blit_regions(
         (3840, 2160), (3840, 2400), "stretch", "Half-SBS"
     ) == (
-        ((0, 0, 3840, 2160), (0, 0, 3840, 2400)),
+        ((0, 0, 1920, 2160), (0, 0, 1920, 2400)),
+        ((1920, 0, 3840, 2160), (1920, 0, 3840, 2400)),
     )
 
 
@@ -211,7 +217,8 @@ def test_display_fit_normalizes_localized_stretch_label() -> None:
     assert presentation_blit_regions(
         (3840, 2160), (3840, 2400), "拉伸铺满", "Half-SBS"
     ) == (
-        ((0, 0, 3840, 2160), (0, 0, 3840, 2400)),
+        ((0, 0, 1920, 2160), (0, 0, 1920, 2400)),
+        ((1920, 0, 3840, 2160), (1920, 0, 3840, 2400)),
     )
 
 

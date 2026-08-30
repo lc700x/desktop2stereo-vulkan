@@ -221,7 +221,18 @@ def _mss_displays() -> list[DisplayInfo]:
 def _enrich_windows(displays: list[DisplayInfo]) -> list[DisplayInfo]:
     metadata = _windows_wmi_metadata()
     display_config = _windows_display_config_metadata()
-    device_numbers: dict[tuple[int, int, int, int], int] = {}
+
+    # Build geometry-based lookup from display_config source rects.
+    # mss uses (left, top, width, height); display_config stores
+    # (left, top, right, bottom) from QueryDisplayConfig source modes.
+    config_rect_to_number: dict[tuple[int, int, int, int], int] = {}
+    for number, cfg in display_config.items():
+        r = cfg.get("rect")
+        if r is not None:
+            config_rect_to_number[r] = number
+
+    # Also build win32api lookup if available (same rect format).
+    win32_rect_to_number: dict[tuple[int, int, int, int], int] = {}
     try:
         import win32api
 
@@ -229,22 +240,36 @@ def _enrich_windows(displays: list[DisplayInfo]) -> list[DisplayInfo]:
             info = win32api.GetMonitorInfo(handle)
             number = _windows_display_number(info.get("Device", ""))
             if number is not None:
-                device_numbers[tuple(int(value) for value in rect)] = number
+                win32_rect_to_number[tuple(int(v) for v in rect)] = number
     except Exception:
         pass
 
     enriched = []
     for display in displays:
         monitor_metadata = metadata.get(_windows_instance_key(display.stable_id), {})
-        device_display_number = device_numbers.get(display.rect)
+        # Match display to Windows display number by rect.
+        # display.rect = (left, top, left+width, top+height) = (l, t, r, b)
+        device_display_number = (
+            win32_rect_to_number.get(display.rect)
+            or config_rect_to_number.get(display.rect)
+        )
         target_metadata = display_config.get(device_display_number, {})
+        wmi_model = monitor_metadata.get("model")
+        friendly_name = target_metadata.get("monitor_friendly_name")
+        mss_name = display.name or ""
+        is_generic = mss_name.lower().replace(" ", "").startswith("genericpnp")
+        # mss EDID > display config friendly > WMI model
+        if is_generic:
+            display_name = friendly_name or wmi_model or mss_name
+        else:
+            display_name = mss_name or friendly_name or wmi_model
         enriched.append(
             replace(
                 display,
                 stable_id=monitor_metadata.get("stable_id") or display.stable_id,
-                name=monitor_metadata.get("model") or display.name,
+                name=display_name or mss_name,
                 manufacturer=monitor_metadata.get("manufacturer"),
-                model=monitor_metadata.get("model"),
+                model=wmi_model or friendly_name,
                 serial=monitor_metadata.get("serial"),
                 device_display_number=device_display_number,
                 output_technology=target_metadata.get("output_technology"),
@@ -527,7 +552,7 @@ def _windows_display_config_metadata() -> dict[int, dict[str, Any]]:
             return {}
 
         result_by_number: dict[int, dict[str, Any]] = {}
-        for path in paths[: int(path_count.value)]:
+        for idx, path in enumerate(paths[: int(path_count.value)]):
             source = SOURCE_DEVICE_NAME()
             source.header.type = 1
             source.header.size = ctypes.sizeof(SOURCE_DEVICE_NAME)
@@ -561,11 +586,30 @@ def _windows_display_config_metadata() -> dict[int, dict[str, Any]]:
             if virtual_parent is True:
                 display_kind = "virtual"
                 display_kind_source = f"pnp_parent:{parent_id}"
+            friendly_name = (
+                str(target.monitorFriendlyDeviceName or "").strip() or None
+                if target_result == 0
+                else None
+            )
+            source_rect = None
+            if (
+                0 <= int(path.sourceInfo.modeInfoIdx) < int(mode_count.value)
+                and int(modes[int(path.sourceInfo.modeInfoIdx)].infoType) == 1
+            ):
+                sm = modes[int(path.sourceInfo.modeInfoIdx)].sourceMode
+                source_rect = (
+                    int(sm.position.x),
+                    int(sm.position.y),
+                    int(sm.position.x) + int(sm.width),
+                    int(sm.position.y) + int(sm.height),
+                )
             result_by_number[display_number] = {
                 "output_technology": technology,
                 "display_kind": display_kind,
                 "display_kind_source": display_kind_source,
                 "monitor_device_path": monitor_device_path,
+                "monitor_friendly_name": friendly_name,
+                "rect": source_rect,
             }
         return result_by_number
     except Exception:

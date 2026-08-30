@@ -98,6 +98,7 @@ _VIEWER_ATTRS = {
     "get_font_type",
     "hide_window_from_capture",
     "send_ctrl_cmd_f",
+    "set_window_mouse_passthrough",
     "set_window_to_bottom",
     "show_window_in_capture",
 }
@@ -230,6 +231,7 @@ __all__ = [
     "hide_window_from_capture",
     "read_yaml",
     "send_ctrl_cmd_f",
+    "set_window_mouse_passthrough",
     "set_window_to_bottom",
     "settings",
     "show_window_in_capture",

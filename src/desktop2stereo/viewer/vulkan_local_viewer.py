@@ -15,7 +15,7 @@ from typing import Any, Callable
 from utils.display_info import resolve_glfw_monitor_index
 from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
 from viewer.vulkan_resources import VulkanExportableImage, VulkanExportableSemaphore
-from viewer.window_control import hide_window_from_capture
+from viewer.window_control import hide_window_from_capture, set_window_mouse_passthrough
 
 
 LOCAL_VIEWER_SOURCE_FORMAT = "VK_FORMAT_R8G8B8A8_SRGB"
@@ -155,7 +155,7 @@ def display_refresh_warning_needed(
     produced = float(sbs_fps)
     if refresh <= 0.0 or produced <= 0.0:
         return False
-    return refresh + 0.5 < produced or refresh + 0.5 < minimum_refresh_hz
+    return refresh + 3 < produced or refresh + 3 < minimum_refresh_hz
 
 
 def capture_refresh_warning_needed(refresh_hz: float, capture_target: int) -> bool:
@@ -219,8 +219,15 @@ def presentation_blit_regions(
     target: tuple[int, int],
     fit_mode: str,
     display_mode: str = "Half-SBS",
+    input_size: tuple[int, int] | None = None,
 ) -> tuple[tuple[tuple[int, int, int, int], tuple[int, int, int, int]], ...]:
-    """Resolve source/destination blits without mixing the two packed eyes."""
+    """Resolve source/destination blits without mixing the two packed eyes.
+
+    ``input_size`` is the original capture WxH (monitor or window) before
+    packing, used so the left/right eye ratio stays dynamic with input
+    (tex_w,tex_h in legacy viewer). When not provided, falls back to
+    deriving eye size from packed ``source``.
+    """
     sw, sh = source
     tw, th = target
     if min(sw, sh, tw, th) <= 0:
@@ -230,13 +237,8 @@ def presentation_blit_regions(
     full_target = (0, 0, tw, th)
     packed_mode = str(display_mode or "").strip().casefold().replace("_", "-")
 
-    if mode == "stretch":
-        return ((full_source, full_target),)
-    if mode == "contain":
-        x, y, width, height = fit_rect(source, target)
-        return ((full_source, (x, y, x + width, y + height)),)
-
     if packed_mode in {"half-sbs", "full-sbs", "half-tab", "full-tab"}:
+        # Keep packed eyes separate; do not mix them in one blit.
         is_sbs = packed_mode.endswith("sbs")
         is_half = packed_mode.startswith("half-")
         if is_sbs:
@@ -250,11 +252,91 @@ def presentation_blit_regions(
             logical_eye_size = (sw, source_split * (2 if is_half else 1))
             source_origins = ((0, 0), (0, source_split))
 
+        # Local-mode SBS/TAB presentation. Per the updated spec, "contain"
+        # (keep ratio complete) must center the capture view in each half and
+        # expand its long side to fill that half's height (or width when the
+        # capture is narrower). Stretch fills each half; cover crops.
+        if mode == "stretch":
+            half_w, half_h = (tw // 2, th) if is_sbs else (tw, th // 2)
+            if is_sbs:
+                destinations = ((0, 0, half_w, th), (half_w, 0, tw, th))
+            else:
+                destinations = ((0, 0, tw, half_h), (0, half_h, tw, th))
+            regions = []
+            for (ox, oy), dest in zip(source_origins, destinations):
+                ew, eh = encoded_eye_size
+                regions.append(((ox, oy, ox + ew, oy + eh), dest))
+            return tuple(regions)
         if mode == "contain":
-            x, y, width, height = fit_rect(logical_eye_size, target)
-            target_box = (x, y, x + width, y + height)
-        else:
-            target_box = full_target
+            half_w, half_h = (tw // 2, th) if is_sbs else (tw, th // 2)
+            # Dynamic eye ratio from original capture (tex_w,tex_h).
+            # Keep original W/2 etc. for Half, then fit long side to half
+            # with black bars (limit to half complete, avoid zoom/crop).
+            if input_size is not None:
+                iw, ih = input_size
+                if is_sbs:
+                    eye_fit_size = (max(1, iw // 2), ih) if is_half else (iw, ih)
+                else:
+                    eye_fit_size = (iw, max(1, ih // 2)) if is_half else (iw, ih)
+            else:
+                eye_fit_size = encoded_eye_size
+            x, y, w, h = fit_rect(eye_fit_size, (half_w, half_h))
+            if is_sbs:
+                left_dest = (x, y, x + w, y + h)
+                right_dest = (half_w + x, y, half_w + x + w, y + h)
+                destinations = (left_dest, right_dest)
+            else:
+                top_dest = (x, y, x + w, y + h)
+                bottom_dest = (x, half_h + y, x + w, half_h + y + h)
+                destinations = (top_dest, bottom_dest)
+            regions = []
+            for (ox, oy), dest in zip(source_origins, destinations):
+                ew, eh = encoded_eye_size
+                regions.append(((ox, oy, ox + ew, oy + eh), dest))
+            return tuple(regions)
+
+        # cover ("铺满"): short side expands to half, cropping long side,
+        # keeping fixed eye ratios: FullSBS WxH, HalfSBS W/2xH, etc., dynamic
+        # with original input (tex_w,tex_h). Map eye crop to packed eye coords.
+        if mode == "cover":
+            half_w, half_h = (tw // 2, th) if is_sbs else (tw, th // 2)
+            if input_size is not None:
+                iw, ih = input_size
+                if is_sbs:
+                    eye_size = (max(1, iw // 2), ih) if is_half else (iw, ih)
+                else:
+                    eye_size = (iw, max(1, ih // 2)) if is_half else (iw, ih)
+            else:
+                eye_size = encoded_eye_size
+            cx_eye, cy_eye, cw_eye, ch_eye = _cover_crop_rect(
+                eye_size, (half_w, half_h)
+            )
+            # Map eye crop to packed eye coords (encoded is stretched eye)
+            if eye_size != encoded_eye_size:
+                sx = encoded_eye_size[0] / eye_size[0] if eye_size[0] else 1.0
+                sy = encoded_eye_size[1] / eye_size[1] if eye_size[1] else 1.0
+                crop_x = int(round(cx_eye * sx))
+                crop_y = int(round(cy_eye * sy))
+                crop_w = int(round(cw_eye * sx))
+                crop_h = int(round(ch_eye * sy))
+            else:
+                crop_x, crop_y, crop_w, crop_h = cx_eye, cy_eye, cw_eye, ch_eye
+            if is_sbs:
+                destinations = ((0, 0, half_w, th), (half_w, 0, tw, th))
+            else:
+                destinations = ((0, 0, tw, half_h), (0, half_h, tw, th))
+            regions = []
+            for (ox, oy), dest in zip(source_origins, destinations):
+                regions.append((
+                    (ox + crop_x, oy + crop_y, ox + crop_x + crop_w, oy + crop_y + crop_h),
+                    dest,
+                ))
+            return tuple(regions)
+
+        # fallback (should not reach for packed modes)
+        crop_x, crop_y = 0, 0
+        crop_w, crop_h = encoded_eye_size
+        target_box = full_target
         tx0, ty0, tx1, ty1 = target_box
         if is_sbs:
             target_split = tx0 + (tx1 - tx0) // 2
@@ -268,18 +350,6 @@ def presentation_blit_regions(
                 (tx0, ty0, tx1, target_split),
                 (tx0, target_split, tx1, ty1),
             )
-
-        if mode == "cover":
-            expansion_x = 2 if packed_mode == "half-sbs" else 1
-            expansion_y = 2 if packed_mode == "half-tab" else 1
-            crop_x, crop_y, crop_w, crop_h = _cover_crop_rect(
-                encoded_eye_size,
-                (tw * expansion_y, th * expansion_x),
-            )
-        else:
-            crop_x, crop_y = 0, 0
-            crop_w, crop_h = encoded_eye_size
-
         regions = []
         for (origin_x, origin_y), destination_rect in zip(
             source_origins, destination_regions
@@ -440,6 +510,13 @@ class VulkanLocalViewerConfig:
     preview_monitor_index: int | None = None
     manage_glfw_lifecycle: bool = True
     exclude_from_capture: bool = False
+    cursor_passthrough: bool = False
+    # Original capture size (tex_w,tex_h in legacy viewer) for dynamic eye ratio.
+    # When set, HalfSBS uses W/2×H etc. based on this, not packed sw/sh.
+    # Kept for startup fallback; per-frame size is queried dynamically.
+    input_size: tuple[int, int] | None = None
+    capture_mode: str = "Monitor"
+    window_title: str | None = None
     vsync: bool = True
     show_fps: bool = False
     show_fps_provider: Callable[[], bool] | None = None
@@ -608,6 +685,8 @@ class VulkanLocalViewer:
             glfw.poll_events()
         if self.config.exclude_from_capture:
             hide_window_from_capture(self.window)
+        if self.config.cursor_passthrough:
+            set_window_mouse_passthrough(self.window, True)
         glfw.set_key_callback(self.window, self._on_key)
         self._create_device()
         self._create_swapchain()
@@ -677,11 +756,15 @@ class VulkanLocalViewer:
             )
             extended_style |= 0x00000008 | 0x00000080 | 0x08000000
             extended_style &= ~0x00040000
+            if self.config.cursor_passthrough:
+                extended_style |= 0x00000020  # WS_EX_TRANSPARENT for cursor passthrough
             self._win32_user32.SetWindowLongW(
                 self._win32_hwnd, -20, extended_style
             )
             self._refresh_win32_monitor()
             self._set_win32_topmost(self._exclusive_fullscreen)
+            if self.config.cursor_passthrough:
+                set_window_mouse_passthrough(self.window, True)
         except Exception as exc:
             self._win32_hwnd = 0
             self._win32_hmonitor = 0
@@ -757,6 +840,8 @@ class VulkanLocalViewer:
                 self._configure_persistent_fullscreen()
             self._refresh_win32_monitor()
             self._set_win32_topmost(True)
+            if self.config.cursor_passthrough:
+                set_window_mouse_passthrough(self.window, True)
         else:
             if not self._exclusive_fullscreen:
                 return
@@ -766,6 +851,8 @@ class VulkanLocalViewer:
             glfw.set_window_attrib(self.window, glfw.DECORATED, glfw.TRUE)
             glfw.set_window_pos(self.window, x, y)
             glfw.set_window_size(self.window, width, height)
+            if self.config.cursor_passthrough:
+                set_window_mouse_passthrough(self.window, True)
         if self.device is not None:
             self.recreate_swapchain()
         print(
@@ -1467,11 +1554,46 @@ class _TransferSource:
         elif o.config.display_fit_enabled:
             fit_mode = o.config.display_fit_mode
         fit_mode = normalize_display_fit_mode(fit_mode)
+        # Dynamic tex_w,tex_h: query current window/monitor size per frame
+        # so input aspect changes (e.g., window resized) are reflected.
+        dyn_input_size = o.config.input_size
+        try:
+            cap_mode = str(getattr(o.config, "capture_mode", "") or "").strip()
+            if cap_mode.casefold() == "window":
+                title = str(getattr(o.config, "window_title", "") or "").strip()
+                if title and sys.platform == "win32":
+                    try:
+                        import win32gui
+
+                        hwnd = win32gui.FindWindow(None, title)
+                        if hwnd:
+                            _, _, w, h = win32gui.GetClientRect(hwnd)
+                            if w > 0 and h > 0:
+                                dyn_input_size = (int(w), int(h))
+                    except Exception:
+                        pass
+            elif cap_mode:
+                # Monitor mode: use current monitor size (may change with resolution)
+                try:
+                    from utils.display import get_monitor_size
+
+                    # o.config.monitor_index is the stereo output monitor; input monitor
+                    # is preview_monitor_index or monitor_index depending on config
+                    inp_idx = int(getattr(o.config, "preview_monitor_index", 0) or 0)
+                    if inp_idx <= 0:
+                        inp_idx = int(getattr(o.config, "monitor_index", 0) or 0)
+                    if inp_idx > 0:
+                        dyn_input_size = get_monitor_size(inp_idx)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         regions = presentation_blit_regions(
             self.size,
             o.extent,
             fit_mode,
             o.config.display_mode,
+            input_size=dyn_input_size,
         )
         geometry = (fit_mode, o.config.display_mode, self.size, o.extent, regions)
         if geometry != o._last_presentation_geometry:

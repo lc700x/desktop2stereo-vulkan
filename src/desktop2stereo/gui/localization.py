@@ -6,8 +6,8 @@ DEFAULT_LOCALE = "EN"
 
 MESSAGE_CATALOGS = {
     "EN": {
-        "Monitor": "Input Monitor",
-        "Window": "Input Window",
+        "Monitor": "Mointor",
+        "Window": "Window",
         "Refresh": "Refresh",
         "Show FPS": "Show FPS",
         "Debug Mode": "Debug Mode",
@@ -155,8 +155,8 @@ MESSAGE_CATALOGS = {
         "Run Mode:": "Run Mode:",
         "Stream Settings": "Stream Settings",
         "Local Viewer": "Local Viewer",
-        "MJPEG Streamer": "Basic Network Streaming",
-        "RTMP Streamer": "Advanced Network Streaming",
+        "MJPEG Streamer": "Basic Streaming",
+        "RTMP Streamer": "Advanced Streaming",
         "Intel QSV (D3D11)": "Intel QSV (D3D11)",
         "full_sbs_stream_advisory": "Full-SBS will be streamed unchanged with H.265/HEVC. Half-SBS is recommended for wider browser compatibility and lower decoding load.",
         "Stream Protocol:": "Stream Protocol:",
@@ -164,7 +164,7 @@ MESSAGE_CATALOGS = {
         "Stereo Mix": "Stereo Mix:",
         "CRF": "CRF:",
         "Audio Delay": "Audio Delay (s):",
-        "Lossless Scaling Support": "NvFRUC Frame Generation",
+        "Lossless Scaling Support": "Frame Generation",
         "3D Monitor": "3D Monitor",
         "OpenXR Link": "OpenXR Link",
         "Headset Model:": "Headset Model:",
