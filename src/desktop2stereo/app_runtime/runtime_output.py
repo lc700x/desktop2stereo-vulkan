@@ -541,9 +541,10 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                 if len(release_semaphores) <= slot_index:
                     # No external release semaphores (e.g. ROCm/HIP timeline
                     # unsupported). The import was GPU-copied + synchronized by
-                    # convert(); just release the source frame without a
-                    # producer-release semaphore, otherwise this indexes an
-                    # empty list and aborts the output frame.
+                    # convert(); return the image to producer-writable GENERAL
+                    # so the next frame's sampling transition sees GENERAL,
+                    # otherwise the composer raises "must be in GENERAL".
+                    context.release_external_image_from_sampling(resource)
                     self._prepared_source_eyes.discard((frame_key, eye_index))
                     continue
                 release_values = (
