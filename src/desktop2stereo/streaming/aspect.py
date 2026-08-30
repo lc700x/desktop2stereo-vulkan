@@ -95,8 +95,10 @@ def pad_eye_to_16_9(eye_size: Tuple[int, int]) -> Tuple[int, int]:
     """Contain-pad one eye to a 16:9 canvas (legacy ``fill_16_9`` semantics).
 
     Wider than 16:9 grows the height (top/bottom bars); narrower than 16:9
-    grows the width (left/right bars). Dimensions are even-aligned so the
-    resulting canvas stays encoder friendly (yuv420p / NV12).
+    grows the width (left/right bars). Only the canvas width is even-aligned;
+    the height is kept exactly as derived so it still matches the source frame
+    height. Truncating the height (e.g. 801 -> 800) made the per-eye fit
+    non-uniform and distorted the eye content for odd-height inputs.
     """
     iw, ih = eye_size
     if min(iw, ih) <= 0:
@@ -106,7 +108,6 @@ def pad_eye_to_16_9(eye_size: Tuple[int, int]) -> Tuple[int, int]:
     else:
         pw, ph = max(1, round(ih * 16 / 9)), ih
     pw -= pw % 2
-    ph -= ph % 2
     return max(1, pw), max(1, ph)
 
 
