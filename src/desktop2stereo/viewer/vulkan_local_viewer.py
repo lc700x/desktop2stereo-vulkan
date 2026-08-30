@@ -555,6 +555,10 @@ class _LocalInteropContext:
     def unregister_external_image(self, resource: Any) -> None:
         self._resources.discard(id(resource))
 
+    def prepare_external_image_for_producer(self, resource: Any) -> int:
+        """Prepare an exportable image for any GPU producer backend (HIP too)."""
+        return self.prepare_external_image_for_cuda(resource)
+
     def prepare_external_image_for_cuda(self, resource: Any) -> int:
         """Transition once into GENERAL, the layout CUDA owns between frames."""
         vk, owner = self.vk, self.owner
@@ -1445,12 +1449,31 @@ class _TransferSource:
                     self._interop_context,
                     label="local-viewer-cuda-ready",
                 )
-                self._cuda_importer = CudaVulkanImageImporter()
+                is_rocm = False
+                try:
+                    import torch
+
+                    is_rocm = bool(getattr(torch.version, "hip", None))
+                    if is_rocm:
+                        from viewer.rocm_vulkan_interop import (
+                            RocmVulkanImageImporter,
+                        )
+
+                        self._cuda_importer = RocmVulkanImageImporter()
+                    else:
+                        self._cuda_importer = CudaVulkanImageImporter()
+                except Exception:
+                    self._cuda_importer = CudaVulkanImageImporter()
                 # Imports and establishes GENERAL once, before any frame is sent.
                 self._cuda_importer.register_slot(self._external_image)
                 self._cuda_importer.register_semaphore(self._cuda_ready)
                 self._cuda_active = True
-                print("[VulkanLocalViewer] CUDA external-image zero-copy active", flush=True)
+                print(
+                    "[VulkanLocalViewer] "
+                    + ("ROCm" if is_rocm else "CUDA")
+                    + " external-image zero-copy active",
+                    flush=True,
+                )
             except Exception as exc:
                 self._disable_cuda_interop(exc)
         else:
@@ -1464,9 +1487,11 @@ class _TransferSource:
         self, reason: Exception | str, *, announce: bool = True
     ) -> None:
         if announce and (self._cuda_active or self._external_image is not None):
+            detail = str(reason)
             print(
                 "[VulkanLocalViewer] CUDA external-image zero-copy unavailable: "
-                f"{type(reason).__name__ if isinstance(reason, Exception) else reason}",
+                f"{type(reason).__name__}: {detail}" if isinstance(reason, Exception)
+                else f"[VulkanLocalViewer] CUDA external-image zero-copy unavailable: {detail}",
                 flush=True,
             )
         self._cuda_active = False
@@ -1520,8 +1545,14 @@ class _TransferSource:
                 cuda_source = False
                 pixels, _width, _height = frame_to_rgba_bytes(pixels)
         if not cuda_source:
+            if not isinstance(pixels, (bytes, bytearray, memoryview)):
+                # CUDA/ROCm interop unavailable: the caller may hand us a GPU
+                # tensor; convert it to tightly packed RGBA8 host bytes first.
+                pixels, _width, _height = frame_to_rgba_bytes(pixels)
             mapped = vk.vkMapMemory(o.device, self.memory, 0, self.capacity, 0)
-            vk.ffi.buffer(mapped, self.capacity)[:] = pixels
+            # PyVulkan's vkMapMemory already returns a writable cffi buffer;
+            # wrapping it again in ffi.buffer() fails with a TypeError.
+            mapped[:] = pixels
             vk.vkUnmapMemory(o.device, self.memory)
         upload_ms = (time.perf_counter() - stage_started) * 1000.0
         stage_started = time.perf_counter()
