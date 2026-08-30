@@ -35,6 +35,14 @@ class _ExternalMemoryHandleDesc(ctypes.Structure):
     ]
 
 
+class _ExternalMemoryBufferDesc(ctypes.Structure):
+    _fields_ = [
+        ("offset", ctypes.c_uint64),
+        ("size", ctypes.c_uint64),
+        ("flags", ctypes.c_uint),
+    ]
+
+
 class _ChannelFormatDesc(ctypes.Structure):
     _fields_ = [
         ("x", ctypes.c_int),
@@ -108,6 +116,13 @@ class _HipSemaphore:
         self.external = external
 
 
+class _HipBufferSlot:
+    def __init__(self, target, external_memory, pointer):
+        self.target = target
+        self.external_memory = external_memory
+        self.pointer = pointer
+
+
 class RocmVulkanImageImporter:
     """Import Vulkan memory once and copy HIP RGBA tensors into it."""
 
@@ -119,6 +134,7 @@ class RocmVulkanImageImporter:
     def __init__(self, *, hip_runtime_path: str | None = None) -> None:
         self._hip = self._load_hip_runtime(hip_runtime_path)
         self._slots: dict[int, _HipSlot] = {}
+        self._buffer_slots: dict[int, _HipBufferSlot] = {}
         self._semaphores: dict[int, _HipSemaphore] = {}
 
     @property
@@ -245,6 +261,27 @@ class RocmVulkanImageImporter:
                 else:
                     function.argtypes = [ctypes.c_void_p]
                 function.restype = ctypes.c_int
+        for name, argtypes, restype in (
+            (
+                "hipExternalMemoryGetMappedBuffer",
+                [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.POINTER(_ExternalMemoryBufferDesc)],
+                ctypes.c_int,
+            ),
+            (
+                "hipMemcpyAsync",
+                [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p],
+                ctypes.c_int,
+            ),
+            (
+                "hipMemcpy",
+                [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int],
+                ctypes.c_int,
+            ),
+        ):
+            function = getattr(lib, name, None)
+            if function is not None:
+                function.argtypes = argtypes
+                function.restype = restype
         return lib
 
     @staticmethod
@@ -346,6 +383,115 @@ class RocmVulkanImageImporter:
             "hipMemcpy2DToArrayAsync",
         )
         return resource
+
+    def register_buffer(self, target: Any) -> None:
+        """Import an exportable Vulkan storage buffer into HIP once."""
+        key = id(target)
+        if key in self._buffer_slots:
+            return
+        handle = getattr(target, "export_handle", None)
+        allocation_size = int(getattr(target, "allocation_size", 0))
+        if handle is None or allocation_size < 1:
+            raise RocmVulkanInteropError(
+                "exportable Vulkan buffer has no memory handle"
+            )
+        desc = _ExternalMemoryHandleDesc(
+            type=(
+                self._HIP_MEM_HANDLE_OPAQUE_WIN32
+                if os.name == "nt"
+                else self._HIP_MEM_HANDLE_OPAQUE_FD
+            ),
+            size=allocation_size,
+            flags=0,
+        )
+        if os.name == "nt":
+            desc.handle.win32.handle = ctypes.c_void_p(int(handle))
+        else:
+            desc.handle.fd = int(handle)
+        external_memory = ctypes.c_void_p()
+        self._check(
+            self._hip.hipImportExternalMemory(
+                ctypes.byref(external_memory), ctypes.byref(desc)
+            ),
+            "hipImportExternalMemory(buffer)",
+        )
+        mapped_desc = _ExternalMemoryBufferDesc(
+            offset=0,
+            size=allocation_size,
+            flags=0,
+        )
+        pointer = ctypes.c_void_p()
+        try:
+            self._check(
+                self._hip.hipExternalMemoryGetMappedBuffer(
+                    ctypes.byref(pointer), external_memory, ctypes.byref(mapped_desc)
+                ),
+                "hipExternalMemoryGetMappedBuffer",
+            )
+        except Exception:
+            self._hip.hipDestroyExternalMemory(external_memory)
+            raise
+        target.close_export_handle()
+        self._buffer_slots[key] = _HipBufferSlot(
+            target, external_memory, pointer
+        )
+
+    def copy_tensor_to_buffer(
+        self, tensor: Any, target: Any, *, stream=None
+    ) -> None:
+        """Copy a contiguous HIP float tensor into an imported Vulkan buffer."""
+        self.register_buffer(target)
+        if (
+            getattr(tensor, "device", None) is None
+            or str(tensor.device.type) != "cuda"
+        ):
+            raise RocmVulkanInteropError(
+                "HIP Vulkan buffer copy requires a HIP tensor"
+            )
+        if str(getattr(tensor, "dtype", "")) != "torch.float32":
+            raise RocmVulkanInteropError(
+                "HIP Vulkan buffer copy requires torch.float32"
+            )
+        if not bool(tensor.is_contiguous()):
+            raise RocmVulkanInteropError(
+                "HIP Vulkan buffer copy requires a contiguous tensor"
+            )
+        byte_count = int(tensor.numel()) * 4
+        if byte_count > int(getattr(target, "size", 0)):
+            raise RocmVulkanInteropError(
+                "HIP tensor does not fit in the Vulkan buffer"
+            )
+        if stream is None:
+            import torch
+
+            stream = int(torch.cuda.current_stream(device=tensor.device).cuda_stream)
+        slot = self._buffer_slots[id(target)]
+        sync_memcpy = getattr(self._hip, "hipMemcpy", None)
+        if sync_memcpy is not None:
+            # Synchronous hipMemcpy: completes before returning, so the glow
+            # compute submit can read the buffer without a stream synchronize.
+            # (hipMemcpyAsync + hipStreamSynchronize in the pipeline thread could
+            # hang intermittently and stall the OpenXR compositor.)
+            self._check(
+                sync_memcpy(
+                    slot.pointer,
+                    ctypes.c_void_p(int(tensor.data_ptr())),
+                    byte_count,
+                    self._HIP_MEMCPY_DEVICE_TO_DEVICE,
+                ),
+                "hipMemcpy(buffer)",
+            )
+        else:
+            self._check(
+                self._hip.hipMemcpyAsync(
+                    slot.pointer,
+                    ctypes.c_void_p(int(tensor.data_ptr())),
+                    byte_count,
+                    self._HIP_MEMCPY_DEVICE_TO_DEVICE,
+                    ctypes.c_void_p(int(stream)),
+                ),
+                "hipMemcpyAsync(buffer)",
+            )
 
     def synchronize(self, *, stream=None) -> None:
         if stream is None:
@@ -451,3 +597,9 @@ class RocmVulkanImageImporter:
                 "hipDestroyExternalMemory",
             )
         self._slots.clear()
+        for slot in tuple(self._buffer_slots.values()):
+            self._check(
+                self._hip.hipDestroyExternalMemory(slot.external_memory),
+                "hipDestroyExternalMemory",
+            )
+        self._buffer_slots.clear()

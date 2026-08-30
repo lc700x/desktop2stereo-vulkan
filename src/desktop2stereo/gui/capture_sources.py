@@ -196,10 +196,14 @@ def get_capture_tool_options(device_label):
         return ["ScreenCaptureKit", "Quartz"]
     if OS_NAME != "Windows":
         return ["DXCamera"]
-    device_label_upper = device_label.upper()
-    is_nvidia = "CUDA" in device_label_upper and not devices_module.IS_ROCM
-    if is_nvidia:
-        return ["WindowsCaptureCUDA", "DesktopDuplication", "WindowsCapture", "DXCamera"]
-    if "CUDA" in device_label_upper and devices_module.IS_ROCM:
+    # ``device_label`` may be the device name ("CUDA 0: AMD Radeon...") or, from
+    # the build path, the resolved default capture-tool name ("WindowsCaptureROCm").
+    # Never key the vendor branch on the label containing "CUDA" (the ROCm tool
+    # name has no such substring) — use the authoritative hardware detection.
+    is_rocm = devices_module.IS_ROCM
+    is_cuda = "CUDA" in str(device_label or "").upper()
+    if is_rocm:
         return ["WindowsCaptureROCm", "DesktopDuplication", "WindowsCapture", "DXCamera"]
+    if is_cuda:
+        return ["WindowsCaptureCUDA", "DesktopDuplication", "WindowsCapture", "DXCamera"]
     return ["WindowsCapture", "DesktopDuplication", "DXCamera"]

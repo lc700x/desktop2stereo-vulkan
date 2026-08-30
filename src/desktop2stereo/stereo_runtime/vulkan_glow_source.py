@@ -310,15 +310,6 @@ class VulkanGlowSourceComputeBackend:
         self._reset_command(slot.compute_command, slot.compute_fence)
         self.importer.copy_tensor_to_buffer(value, slot.input_buffer)
         self.importer.signal_semaphore(slot.input_ready)
-        # AMD LLPC returns VK_ERROR_UNKNOWN when a compute-queue submit waits on
-        # the HIP-signaled external binary semaphore (the graphics-queue path in
-        # the local viewer is unaffected). Synchronize the HIP stream instead so
-        # the buffer copy is complete before the compute submit, and let the
-        # submit run without the external-semaphore wait. Ordering is preserved
-        # by hipStreamSynchronize; the input_ready signal is then advisory only.
-        sync = getattr(self.importer, "synchronize", None)
-        if callable(sync):
-            sync()
         self._begin_command(slot.compute_command)
         self._record_history_barrier(slot.compute_command)
         self.effect_pass.record(
