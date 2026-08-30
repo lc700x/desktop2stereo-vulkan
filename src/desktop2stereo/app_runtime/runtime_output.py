@@ -462,6 +462,14 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         if entry is None:
             raise RuntimeError(f"unknown Vulkan source frame {frame_id}")
         left, right, slot_index = entry
+        if len(self.left_visible_semaphores) <= slot_index:
+            # External-semaphore path was never initialized (e.g. on ROCm/HIP
+            # where timeline external semaphores are unsupported). convert()
+            # already GPU-copied and synchronized (hipStreamSynchronize) the
+            # eyes, so the composer may sample the imported images directly
+            # without a producer-ready semaphore; an empty list here would
+            # otherwise IndexError and blank the projection layer.
+            return None
         visible = (
             self.left_visible_semaphores[slot_index]
             if eye == 0
