@@ -199,14 +199,23 @@ def runtime_config_from_d2s_settings(
         raise ValueError("D2S settings must include 'Depth Model' or 'model_id'")
 
     depth_backend: DepthBackend
+    import torch
+
+    # TensorRT is NVIDIA-only.  On AMD ROCm the stale "TensorRT" setting
+    # (defaulted on by the GUI for CUDA machines) must not select the
+    # tensorrt_native backend, otherwise the frame loop fails importing
+    # tensorrt.  ROCm defaults to the AMD-native MIGraphX path instead.
+    is_rocm = bool(getattr(torch.version, "hip", None))
     if settings.get("MIGraphX", False):
         depth_backend = "migraphx_rocm"
-    elif settings.get("TensorRT", False):
+    elif settings.get("TensorRT", False) and not is_rocm:
         depth_backend = "tensorrt_native"
     elif settings.get("ONNX", False):
         depth_backend = "onnx_cuda"
     elif settings.get("Depth Backend"):
         depth_backend = _normalize_depth_backend(settings["Depth Backend"])
+    elif is_rocm:
+        depth_backend = "migraphx_rocm"
     else:
         depth_backend = "auto"
 
@@ -299,7 +308,11 @@ def runtime_config_from_d2s_settings(
         stereo_compute_backend=_normalize_stereo_compute_backend(
             settings.get("Stereo Compute Backend", "auto")
         ),
-        output_quality_enabled=True,
+        # The headset output-quality upscale (EASU to the headset 4K tier) is
+        # meaningless for network streaming and costs hundreds of ms per frame
+        # through the torch fallback. A 1920x1200 input must stay 1920x1200 for
+        # the streamers; the 16:9 transport canvas is applied downstream.
+        output_quality_enabled=not _streamer_mode_output_quality_disabled(settings),
         output_headset_tier_k=headset_tier,
         output_min_lod=max(0.0, min(16.0, float(settings.get("Vulkan Projection Min LOD", 0.0)))),
         output_max_lod=max(0.0, min(16.0, float(settings.get("Vulkan Projection Max LOD", 0.35)))),
@@ -324,6 +337,28 @@ def _output_headset_tier_from_settings(settings: dict[str, Any]) -> int:
 
     preset = resolve_xr_headset_preset(settings.get("XR Headset Model"))
     return int(preset.resolution_tier_k)
+
+
+def _streamer_mode_output_quality_disabled(settings: dict[str, Any]) -> bool:
+    """Return whether the headset output-quality upscale should be skipped.
+
+    Streamers publish to browsers/network players, not a headset, so upscaling
+    the packed SBS to the headset 4K tier only adds hundreds of ms of EASU
+    work per frame (the torch fallback is ~300 ms at 1920x1200). Local Viewer,
+    3D Monitor and OpenXR keep the upscale.
+    """
+    try:
+        from utils.run_mode import normalize_run_mode
+    except Exception:
+        return False
+    run_mode = normalize_run_mode(str(settings.get("Run Mode", "") or ""))
+    return run_mode in {
+        "MJPEG Streamer",
+        "RTMP Streamer",
+        "Streamer",
+        "MJPEG",
+        "RTMP",
+    }
 
 
 def _optional_int_setting(settings: dict[str, Any], *keys: str) -> int | None:
