@@ -124,6 +124,26 @@ class ModelOnnxPreprocessor:
             return tensor
         return (tensor - self._mean) / self._std
 
+    def prepare(self, rgb: torch.Tensor, *, height: int, width: int) -> torch.Tensor:
+        """Resize ``rgb`` to an explicit ``(height, width)`` and normalize.
+
+        Same math as ``__call__``, but with the target size fixed by the caller.
+        Used when an inference engine fixes the input resolution (e.g. a compiled
+        MIGraphX graph), so the resize does not have to follow the model-default
+        input size computation.
+        """
+        rgb = ensure_bchw(rgb, name="rgb").to(self.device).float().clamp(0, 1)
+        tensor = F.interpolate(
+            rgb,
+            size=(height, width),
+            mode="bicubic" if self.device.type == "cuda" else "bilinear",
+            align_corners=False,
+            antialias=True if self.device.type == "cuda" else False,
+        ).to(self.dtype)
+        if self._is_infinidepth:
+            return tensor
+        return (tensor - self._mean) / self._std
+
 
 class DistillPreprocessor(ModelOnnxPreprocessor):
     def __init__(

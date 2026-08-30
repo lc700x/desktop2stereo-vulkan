@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from stereo_runtime.depth_onnx_provider import DistillPreprocessor
+from stereo_runtime.depth_onnx_provider import DistillPreprocessor, _dtype_from_onnx_name
 from stereo_runtime.depth_provider import (
     DISTILL_ANY_DEPTH_BASE_MODEL_ID,
     DepthProfileResult,
@@ -142,7 +142,11 @@ class MIGraphXDepthProvider:
         self.force_rebuild = bool(force_rebuild)
         self.depth_upsample = depth_upsample
         self.depth_upsample_edge_strength = float(depth_upsample_edge_strength)
-        self.preprocessor = DistillPreprocessor(device=self.device)
+        # MIGraphX graphs are built fp16 by default (build_migraphx_graph quantizes
+        # to fp16 unless force_fp32), so the preprocessor must emit fp16 tensors to
+        # feed the engine without a dtype cast on the hot path.
+        self._preprocessor_dtype = _dtype_from_onnx_name(self.onnx_path, torch.float16)
+        self.preprocessor = DistillPreprocessor(device=self.device, dtype=self._preprocessor_dtype)
         self.engine: MIGraphXEngine | None = None
         self.info = DepthProviderInfo(
             provider="MIGraphX",
