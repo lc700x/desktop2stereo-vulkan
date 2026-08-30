@@ -9633,7 +9633,18 @@ class OpenXrVulkanPresenter(
     def _render_quad_layers(self, output_frame: VulkanStereoOutputFrame | None) -> list[Any]:
         # The main SBS screen is Projection Composer-only. Quad layers carry
         # controller tools and 2D overlays; they never replace the screen.
-        return self._render_tool_quad_layers(output_frame)
+        # A panel/guide render error must not take down the XR session.
+        try:
+            return self._render_tool_quad_layers(output_frame)
+        except Exception:
+            import traceback
+
+            print(
+                "[OpenXRViewer] quad layer render error; skipping overlays:\n"
+                + traceback.format_exc().rstrip(),
+                flush=True,
+            )
+            return []
 
     def _can_use_screen_quad_reprojection(
         self, frame: VulkanStereoOutputFrame | None
