@@ -1,5 +1,7 @@
 import threading
-import time, os
+import time
+import os
+from typing import Any, Optional, Tuple
 import numpy as np
 import cv2
 from socketserver import ThreadingMixIn
@@ -34,8 +36,19 @@ class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
             with self.connection_lock:
                 self.active_connections -= 1
 
+
 class MJPEGStreamer:
-    def __init__(self, host="0.0.0.0", port=1303, fps=60, quality=90, profile: EncoderProfile | None = None):
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 1303,
+        fps: int = 60,
+        quality: int = 90,
+        profile: EncoderProfile | None = None,
+        display_mode: str = "Half-SBS",
+        fit_mode: str = "contain",
+        input_size: Tuple[int, int] | None = None,
+    ):
         """
         Initialize the MJPEG streamer with configuration parameters.
         Legacy fps/quality arguments remain supported; EncoderProfile is the
@@ -47,11 +60,14 @@ class MJPEGStreamer:
         # MJPEG stream boundary marker
         self.boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
         self.quality = int(self.profile.quality)
-        self.fps = int(self.profile.target_fps)
-        self.delay = 1.0 / self.fps
+        self.requested_fps = int(self.profile.target_fps)
+        self.fps = self.requested_fps  # actual fps (updated after probe)
+        self.delay = 1.0 / max(1, self.fps)
 
-        self.raw_frame = None       # Latest frame (numpy RGB)
-        self.encoded_frame = None   # Latest JPEG
+        self.raw_frame: Optional[np.ndarray] = None       # Latest frame (numpy RGB)
+        self.cuda_frame: Any = None                       # Latest frame (CUDA tensor)
+        self.cuda_event: Any = None                       # CUDA event for sync
+        self.encoded_frame: Optional[bytes] = None        # Latest JPEG
         self.lock = threading.Lock()
 
         self.shutdown = threading.Event()
@@ -60,12 +76,16 @@ class MJPEGStreamer:
         self._started = False
 
         # Stream dimensions
-        self.sbs_width = None
-        self.sbs_height = None
-        self.index_bytes = None
+        self.sbs_width: Optional[int] = None
+        self.sbs_height: Optional[int] = None
+        self.index_bytes: Optional[bytes] = None
+
+        # Aspect ratio config (from local viewer)
+        self.display_mode = str(display_mode or "Half-SBS").strip()
+        self.fit_mode = str(fit_mode or "contain").strip()
+        self.input_size = input_size
 
         # HTML template with auto reconnect and fullscreen
-        # Modified: Optimized render loop to skip redundant draws and added onerror for robust reconnection
         self.template = """<!DOCTYPE html>
 <html>
     <head>
@@ -85,9 +105,6 @@ class MJPEGStreamer:
                 let ctx = canvas.getContext("2d");
                 let canvasStream = null;
 
-                // Create an <img> that will receive the MJPEG stream. For MJPEG the
-                // image's onload handler fires for each frame, which lets us detect
-                // size changes and redraw without a full page refresh.
                 const img = new Image();
                 img.crossOrigin = "anonymous";
                 img.src = STREAM_URI;
@@ -95,25 +112,19 @@ class MJPEGStreamer:
                 function ensureCanvasSize(w, h) {{
                     if (!w || !h) return;
                     if (canvas.width !== w || canvas.height !== h) {{
-                        // Update canvas size to match incoming MJPEG frame size
                         canvas.width = w;
                         canvas.height = h;
-
-                        // Stop old tracks if present and re-create capture stream so
-                        // the <video> element gets the new resolution automatically.
                         if (canvasStream) {{
                             try {{ canvasStream.getTracks().forEach(t => t.stop()); }} catch(e) {{}}
                         }}
                         try {{
                             canvasStream = canvas.captureStream(FPS || 30);
                             video.srcObject = canvasStream;
-                        }} catch(e) {{ /* captureStream may not be available in some browsers */ }}
+                        }} catch(e) {{}}
                     }}
                 }}
 
                 let last_timestamp = 0;
-                // Draw each time the <img> fires onload (MJPEG frames), and also use
-                // requestAnimationFrame to throttle to FPS.
                 img.onload = () => {{
                     const w = img.naturalWidth || img.width || canvas.width;
                     const h = img.naturalHeight || img.height || canvas.height;
@@ -122,25 +133,22 @@ class MJPEGStreamer:
                     function render(timestamp) {{
                         if (timestamp - last_timestamp < 1000.0 / (FPS || 30)) {{
                             requestAnimationFrame(render);
-                            return; // Skip redundant draws to reduce client CPU usage
+                            return;
                         }}
                         last_timestamp = timestamp;
                         try {{ ctx.drawImage(img, 0, 0, canvas.width, canvas.height); }} catch(e) {{ console.error("Failed to draw frame:", e); }}
                         requestAnimationFrame(render);
                     }}
 
-                    // Start (or continue) the render loop
                     requestAnimationFrame(render);
                 }};
 
-                // Modified: Added onerror to reconnect on stream failure, reducing client stalls
                 img.onerror = () => {{
                     setTimeout(() => {{
-                        img.src = STREAM_URI + "?t=" + new Date().getTime(); // Prevent cache
+                        img.src = STREAM_URI + "?t=" + new Date().getTime();
                     }}, 1000);
                 }};
 
-                // insert canvas into the page visually hidden (video shows the captured stream)
                 canvas.style.display = 'none';
                 document.body.appendChild(canvas);
             }};
@@ -161,7 +169,6 @@ class MJPEGStreamer:
 """
 
         # WSGI application handler
-        # Note: No quality or scale query parsing, keeping original quality
         def app(environ, start_response):
             path = environ.get("PATH_INFO", "/")
 
@@ -206,27 +213,27 @@ class MJPEGStreamer:
             pass
         self.new_raw_event.set()
 
-    def _transport_frame_size(self, frame_np):
+    def _transport_frame_size(self, frame_np: np.ndarray) -> Tuple[int, int]:
         h, w = frame_np.shape[:2]
         if self.profile.resize_size is not None:
             return self.profile.resize_size
-        return w, h
+        # Mirror local viewer / legacy fill_16_9: contain pads each eye into a
+        # 16:9 canvas, cover/stretch keep the original input aspect.
+        from streaming.aspect import transport_canvas_size
 
-    def set_frame(self, frame_np):
+        return transport_canvas_size(
+            (w, h),
+            self.fit_mode,
+            input_size=self.input_size,
+            display_mode=self.display_mode,
+        )
+
+    def set_frame(self, frame_np: np.ndarray):
         """
-        Set the current frame to be streamed. This will also update the cached HTML
-        page if the output resolution changes so newly-connecting clients see the
-        correct initial dimensions.
-        Network streaming consumes packed SBS RGB frames by default. Transport
-        resize and JPEG conversion happen inside the streamer according to the
-        EncoderProfile, not in stereo_runtime.
+        Set the current CPU frame to be streamed.
         """
         with self.lock:
             w, h = self._transport_frame_size(frame_np)
-            # If the transport resolution changed, update cached index page so new
-            # clients get the correct encoded-stream metadata. Existing clients
-            # will auto-resize in the browser (JS checks the incoming MJPEG frame
-            # size), so no manual refresh is needed.
             if (self.sbs_width, self.sbs_height) != (w, h):
                 self.sbs_width = w
                 self.sbs_height = h
@@ -237,47 +244,169 @@ class MJPEGStreamer:
                         height=self.sbs_height
                     ).encode("utf-8")
                 except Exception:
-                    # Fallback to a minimal page if formatting fails
                     self.index_bytes = b"<html><body>Desktop2Stereo Streamer</body></html>"
 
             self.raw_frame = frame_np
+            self.cuda_frame = None
+            self.cuda_event = None
+            self.new_raw_event.set()
+
+    @staticmethod
+    def _hw_of(tensor: Any) -> Tuple[int, int]:
+        """Return (h, w) for a CUDA/CPU tensor in CHW or HWC layout."""
+        if tensor.ndim == 4:
+            if int(tensor.shape[-1]) in (1, 3, 4):
+                return int(tensor.shape[-3]), int(tensor.shape[-2])  # B,H,W,C
+            return int(tensor.shape[-2]), int(tensor.shape[-1])  # B,C,H,W
+        if tensor.ndim == 3:
+            if int(tensor.shape[0]) in (1, 3, 4) and int(tensor.shape[-1]) not in (1, 3, 4):
+                return int(tensor.shape[-2]), int(tensor.shape[-1])  # C,H,W
+            return int(tensor.shape[0]), int(tensor.shape[1])  # H,W,C
+        raise ValueError(f"unexpected tensor shape {tuple(tensor.shape)}")
+
+    def set_cuda_frame(self, cuda_tensor: Any, cuda_event: Any = None):
+        """
+        Set the current CUDA frame to be streamed (zerocopy path).
+        cuda_tensor: torch.Tensor on CUDA, shape [H,W,3] or [1,3,H,W] or [3,H,W] (uint8 or float32 0..1)
+        cuda_event: optional torch.cuda.Event to wait for before processing
+        """
+        with self.lock:
+            # Determine source size from tensor
+            h, w = self._hw_of(cuda_tensor)
+
+            if self.profile.resize_size is not None:
+                w, h = self.profile.resize_size
+            else:
+                from streaming.aspect import transport_canvas_size
+
+                w, h = transport_canvas_size(
+                    (w, h),
+                    self.fit_mode,
+                    input_size=self.input_size,
+                    display_mode=self.display_mode,
+                )
+
+            if (self.sbs_width, self.sbs_height) != (w, h):
+                self.sbs_width = w
+                self.sbs_height = h
+                try:
+                    self.index_bytes = self.template.format(
+                        fps=self.fps,
+                        width=self.sbs_width,
+                        height=self.sbs_height
+                    ).encode("utf-8")
+                except Exception:
+                    self.index_bytes = b"<html><body>Desktop2Stereo Streamer</body></html>"
+
+            self.raw_frame = None
+            self.cuda_frame = cuda_tensor
+            self.cuda_event = cuda_event
             self.new_raw_event.set()
 
     def _encoder_loop(self):
-        # Modified: Reduced wait timeout for lower latency, added frame copy to avoid race conditions, ensured FPS maintenance
-        prev_time = 0
+        """
+        Encoder loop: process CUDA frames (zerocopy aspect+resize) or CPU frames.
+        JPEG encoding stays on CPU (cv2.imencode).
+        """
+        import torch
+
+        # Pre-allocate pinned host buffer for CUDA->CPU download
+        host_buffer: Optional[np.ndarray] = None
+
         while not self.shutdown.is_set():
-            if not self.new_raw_event.wait(timeout=0.1):  # Reduced timeout for faster response
+            if not self.new_raw_event.wait(timeout=0.02):
                 continue
             self.new_raw_event.clear()
 
+            cuda_frame = None
+            cuda_event = None
+            raw_frame = None
+
             with self.lock:
-                if self.raw_frame is None:
+                if self.cuda_frame is not None:
+                    cuda_frame = self.cuda_frame
+                    cuda_event = self.cuda_event
+                    self.cuda_frame = None
+                    self.cuda_event = None
+                elif self.raw_frame is not None:
+                    raw_frame = self.raw_frame
+                    self.raw_frame = None
+                else:
                     continue
-                raw = self.raw_frame.copy()  # Copy to prevent race conditions during encoding
 
-            # Skip if not enough time has passed to maintain FPS
-            current_time = time.perf_counter()
-            if current_time - prev_time < self.delay:
-                continue
-            prev_time = current_time
-
-            # Encode the packed SBS frame according to the transport profile.
-            frame_for_jpeg = self._prepare_frame_for_jpeg(raw)
             try:
-                success, buf = cv2.imencode(".jpg", frame_for_jpeg, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
-                if success:
-                    with self.lock:
-                        self.encoded_frame = buf.tobytes()
-                        self.new_encoded_event.set()
-            except:
-                pass
+                # Without a resize profile the canvas equals the source size, so
+                # cover/stretch must pass the frame through (same as local viewer
+                # on a matching canvas) instead of cropping against itself.
+                from streaming.aspect import normalize_display_fit_mode
+                effective_fit = self.fit_mode
+                if (
+                    self.profile.resize_size is None
+                    and normalize_display_fit_mode(self.fit_mode) != "contain"
+                ):
+                    effective_fit = "stretch"
+
+                if cuda_frame is not None and torch.cuda.is_available():
+                    # Wait for producer event if provided
+                    if cuda_event is not None:
+                        cuda_event.synchronize()
+
+                    # Apply aspect/ratio on GPU, result is [H_t, W_t, 3] uint8 CUDA
+                    from streaming.aspect import apply_aspect_on_gpu
+                    src_h, src_w = self._hw_of(cuda_frame)
+                    processed = apply_aspect_on_gpu(
+                        cuda_frame,
+                        source_size=(src_w, src_h),
+                        target_size=(self.sbs_width, self.sbs_height),
+                        fit_mode=effective_fit,
+                        display_mode=self.display_mode,
+                        input_size=self.input_size,
+                    )
+
+                    # Download to pinned host buffer (single copy, no CPU resize)
+                    if host_buffer is None or host_buffer.shape != (processed.shape[0], processed.shape[1], 3):
+                        host_buffer = np.empty(
+                            (processed.shape[0], processed.shape[1], 3),
+                            dtype=np.uint8,
+                        )
+                    torch.cuda.current_stream(processed.device).synchronize()
+                    np.copyto(host_buffer, processed.cpu().numpy(), casting="unsafe")
+
+                    # JPEG encode on CPU (contiguous, correct size)
+                    # OpenCV expects BGR, but host_buffer is RGB from GPU path
+                    host_buffer_bgr = host_buffer[..., ::-1]
+                    success, buf = cv2.imencode(".jpg", host_buffer_bgr, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+                    if success:
+                        with self.lock:
+                            self.encoded_frame = buf.tobytes()
+                            self.new_encoded_event.set()
+
+                elif raw_frame is not None:
+                    # CPU fallback path
+                    from streaming.aspect import apply_aspect_on_cpu
+                    processed = apply_aspect_on_cpu(
+                        raw_frame,
+                        source_size=(raw_frame.shape[1], raw_frame.shape[0]),
+                        target_size=(self.sbs_width, self.sbs_height),
+                        fit_mode=effective_fit,
+                        display_mode=self.display_mode,
+                        input_size=self.input_size,
+                    )
+                    # OpenCV expects BGR
+                    processed_bgr = processed[..., ::-1]
+                    success, buf = cv2.imencode(".jpg", processed_bgr, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+                    if success:
+                        with self.lock:
+                            self.encoded_frame = buf.tobytes()
+                            self.new_encoded_event.set()
+
+            except Exception as e:
+                print(f"[MJPEGStreamer] encoder error: {type(e).__name__}: {e}", flush=True)
 
     def _generate(self):
-        # Modified: Reduced wait timeout for lower latency, no quality/scale adjustments to preserve original quality
         next_frame_time = time.perf_counter()
         while not self.shutdown.is_set():
-            if not self.new_encoded_event.wait(timeout=0.1):  # Reduced timeout for faster response
+            if not self.new_encoded_event.wait(timeout=0.02):
                 continue
             self.new_encoded_event.clear()
 
@@ -294,11 +423,11 @@ class MJPEGStreamer:
             if sleep_time > 0:
                 time.sleep(sleep_time)
             else:
-                # Frame processing fell behind, reset clock
                 next_frame_time = time.perf_counter()
         yield b""
 
     def _prepare_frame_for_jpeg(self, arr: np.ndarray) -> np.ndarray:
+        """Legacy CPU-only path (kept for compatibility)."""
         if arr is None:
             return arr
         frame = arr

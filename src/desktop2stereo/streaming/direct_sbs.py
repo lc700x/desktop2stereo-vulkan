@@ -13,7 +13,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Tuple
 from urllib.parse import quote
 from urllib.request import urlopen
 
@@ -30,6 +30,12 @@ from streaming.wasapi_audio import SoundcardLoopbackSender
 from streaming.vulkan_capabilities import probe_vulkan_video
 from streaming.vulkan_bridge import VulkanNativeBridge
 from streaming.opengl_stream_backend import OpenGLFallbackBackend
+from streaming.aspect import (
+    apply_aspect_on_cpu,
+    apply_aspect_on_gpu,
+    normalize_display_fit_mode,
+    transport_canvas_size,
+)
 
 
 _PYNVVIDEO_CODEC = None
@@ -66,6 +72,64 @@ def _load_pynvvideo_codec() -> Any | None:
         return None
 
 
+def _kill_process_on_port(port: int, proto: str = "tcp") -> None:
+    """Kill process occupying given port (best-effort, Windows)."""
+    try:
+        # Use netstat to find PID
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
+        proto_flag = "-p tcp" if proto == "tcp" else "-p udp"
+        result = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True, text=True, timeout=3.0, creationflags=creationflags,
+        )
+        target = f":{port}"
+        for line in result.stdout.splitlines():
+            if target not in line:
+                continue
+            # Filter by proto
+            if proto == "tcp" and "TCP" not in line:
+                continue
+            if proto == "udp" and "UDP" not in line:
+                continue
+            parts = line.strip().split()
+            if not parts:
+                continue
+            pid = parts[-1]
+            if not pid.isdigit():
+                continue
+            if int(pid) <= 4:
+                continue
+            # The MJPEG server binds its port in the streamer constructor, so
+            # netstat may list OUR OWN pid on this port. Never kill self.
+            if int(pid) == os.getpid():
+                continue
+            try:
+                subprocess.run(["taskkill", "/F", "/PID", pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, creationflags=creationflags)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _kill_orphan_mediamtx_processes(ports: list[int] | None = None) -> None:
+    """Kill orphan MediaMTX / FFmpeg processes that hold streaming ports."""
+    if ports is None:
+        ports = [9998, 9997, 9999, 8000, 8001, 8189, 8554, 1935, 8888, 8889, 8890]
+    # 1) Kill by image name (fast path) - only mediamtx/ffmpeg under streaming rtmp
+    for img in ["mediamtx.exe", "ffmpeg.exe"]:
+        try:
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
+            # Use tasklist to check existence first to reduce noise
+            subprocess.run(["taskkill", "/F", "/IM", img], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3.0, creationflags=creationflags)
+        except Exception:
+            pass
+    # 2) Kill by port for cases where exe renamed or multiple versions
+    for p in ports:
+        # try tcp and udp both for 8000/8189 which use udp
+        for proto in ("tcp", "udp"):
+            _kill_process_on_port(p, proto)
+    # give OS time to release
+    time.sleep(0.15)
+
 def runtime_sbs_to_rgb(frame_or_result: Any) -> np.ndarray:
     """Convert a packed SBS runtime tensor/array to contiguous RGB8 HWC."""
     frame = getattr(frame_or_result, "sbs", frame_or_result)
@@ -97,8 +161,18 @@ def runtime_sbs_to_rgb(frame_or_result: Any) -> np.ndarray:
 class RuntimeSbsRgbConverter:
     """Convert runtime SBS frames with a reusable pinned CUDA download buffer."""
 
-    def __init__(self, *, copy_output: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        copy_output: bool = False,
+        display_mode: str = "Half-SBS",
+        fit_mode: str = "contain",
+        input_size: Tuple[int, int] | None = None,
+    ) -> None:
         self.copy_output = bool(copy_output)
+        self.display_mode = str(display_mode or "Half-SBS").strip()
+        self.fit_mode = str(fit_mode or "contain").strip()
+        self.input_size = input_size
         self._host_rgb = None
 
     def convert(self, frame_or_result: Any) -> np.ndarray:
@@ -106,9 +180,82 @@ class RuntimeSbsRgbConverter:
         if frame is None:
             raise ValueError("runtime result does not contain an SBS frame")
         image = frame.detach() if hasattr(frame, "detach") else frame
-        if not bool(getattr(image, "is_cuda", False)):
-            return runtime_sbs_to_rgb(image)
-        return self._cuda_to_rgb(image)
+        is_cuda = bool(getattr(image, "is_cuda", False))
+        # Determine source size before any conversion for aspect handling
+        # image may be [1,3,H,W] or [H,W,3] or [3,H,W]
+        def _hw_of(t):
+            if t.ndim == 4:
+                if int(t.shape[-1]) in (1, 3, 4):
+                    return int(t.shape[-3]), int(t.shape[-2])  # B,H,W,C
+                return int(t.shape[-2]), int(t.shape[-1])  # B,C,H,W
+            if t.ndim == 3:
+                if int(t.shape[0]) in (1, 3, 4) and int(t.shape[-1]) not in (1, 3, 4):
+                    return int(t.shape[-2]), int(t.shape[-1])  # C,H,W
+                return int(t.shape[0]), int(t.shape[1])  # H,W,C
+            return 0, 0
+        h, w = _hw_of(image)
+        # Transport canvas mirrors local viewer presentation / legacy
+        # fill_16_9: contain pads each eye to a 16:9 canvas before packing;
+        # cover/stretch keep the original input aspect.
+        tw, th = transport_canvas_size(
+            (w, h),
+            self.fit_mode,
+            input_size=self.input_size,
+            display_mode=self.display_mode,
+        )
+        process_aspect = normalize_display_fit_mode(self.fit_mode) == "contain"
+        # For GPU path, keep on GPU and apply per-eye aspect before download
+        if is_cuda:
+            if process_aspect:
+                try:
+                    # Keep aspect on GPU: convert to HWC uint8 CUDA first, apply, then download
+                    import torch
+                    gpu_img = image
+                    # Normalize to HWC uint8 CUDA for aspect func
+                    if gpu_img.ndim == 4:
+                        gpu_img = gpu_img[0]
+                    if gpu_img.ndim == 3 and int(gpu_img.shape[0]) in (1, 3, 4) and int(gpu_img.shape[-1]) not in (1, 3, 4):
+                        gpu_img = gpu_img.permute(1, 2, 0)
+                    if gpu_img.shape[-1] == 4:
+                        gpu_img = gpu_img[..., :3]
+                    if gpu_img.shape[-1] == 1:
+                        gpu_img = gpu_img.expand(-1, -1, 3)
+                    if gpu_img.dtype != torch.uint8:
+                        gpu_img = gpu_img.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
+                    gpu_img = gpu_img.contiguous()
+                    processed = apply_aspect_on_gpu(
+                        gpu_img,
+                        source_size=(w, h),
+                        target_size=(tw, th),
+                        fit_mode=self.fit_mode,
+                        display_mode=self.display_mode,
+                        input_size=self.input_size,
+                    )
+                    # download processed
+                    if self._host_rgb is None or tuple(self._host_rgb.shape) != tuple(processed.shape):
+                        self._host_rgb = torch.empty(tuple(processed.shape), dtype=torch.uint8, device="cpu", pin_memory=True)
+                    self._host_rgb.copy_(processed, non_blocking=True)
+                    torch.cuda.current_stream(device=processed.device).synchronize()
+                    result = self._host_rgb.numpy()
+                    return result.copy() if self.copy_output else result
+                except Exception:
+                    pass
+            # Fallback to original cuda->rgb without aspect if GPU aspect fails
+            return self._cuda_to_rgb(image)
+        # CPU path: use aspect module for consistent letterbox/crop/stretch (mirrors local viewer)
+        rgb = runtime_sbs_to_rgb(image)
+        h2, w2 = rgb.shape[0], rgb.shape[1]
+        if not process_aspect:
+            return rgb
+        # Use same aspect logic as local viewer: input_size is tex_w,tex_h
+        return apply_aspect_on_cpu(
+            rgb,
+            source_size=(w2, h2),
+            target_size=(tw, th),
+            fit_mode=self.fit_mode,
+            display_mode=self.display_mode,
+            input_size=self.input_size,
+        )
 
     def _cuda_to_rgb(self, image) -> np.ndarray:
         import torch
@@ -187,9 +334,90 @@ class DirectSbsOutputConsumer:
         self._fps_submitted_frames = 0
         self._fps_convert_seconds = 0.0
         self._fps_submit_seconds = 0.0
+        # Pass aspect config to converter for CPU fallback path
         self._frame_converter = RuntimeSbsRgbConverter(
-            copy_output=not bool(getattr(output, "synchronous_submit", False))
+            copy_output=not bool(getattr(output, "synchronous_submit", False)),
+            display_mode=getattr(output, "display_mode", "Half-SBS"),
+            fit_mode=getattr(output, "fit_mode", "contain"),
+            input_size=getattr(output, "input_size", None),
         )
+
+    def _apply_cuda_aspect(self, frame: Any) -> Any:
+        """Pad a CUDA frame into the 16:9 transport canvas (contain only).
+
+        The letterboxing runs entirely on the GPU (torch resize + blit into a
+        device canvas), so CUDA paths stay zero-copy with respect to the host:
+        the padded tensor is handed straight to the GPU encoder.
+        """
+        from streaming.aspect import apply_aspect_on_gpu, transport_canvas_size
+
+        if frame.ndim == 4:
+            h, w = int(frame.shape[-2]), int(frame.shape[-1])
+        elif frame.ndim == 3 and int(frame.shape[0]) in (1, 3, 4) and int(frame.shape[-1]) not in (1, 3, 4):
+            h, w = int(frame.shape[-2]), int(frame.shape[-1])
+        else:
+            h, w = int(frame.shape[0]), int(frame.shape[1])
+        tw, th = transport_canvas_size(
+            (w, h),
+            "contain",
+            input_size=getattr(self.output, "input_size", None),
+            display_mode=getattr(self.output, "display_mode", "Half-SBS"),
+        )
+        if (tw, th) == (w, h):
+            return frame
+        return apply_aspect_on_gpu(
+            frame,
+            source_size=(w, h),
+            target_size=(tw, th),
+            fit_mode="contain",
+            display_mode=getattr(self.output, "display_mode", "Half-SBS"),
+            input_size=getattr(self.output, "input_size", None),
+        )
+
+    def _frame_letterbox_required(self, runtime_result: Any) -> bool:
+        """Return whether this frame must be padded into the 16:9 canvas.
+
+        Only the contain ("keep ratio complete") fit mode pads each eye to
+        16:9, and only when the input aspect ratio is not already 16:9 (legacy
+        ``fill_16_9`` semantics). Native GPU surface paths (Intel D3D11/oneVPL
+        final-SBS and the deferred Vulkan compose) present the packed SBS at
+        its native aspect and cannot letterbox, so the consumer must bypass
+        them when this is required. The per-eye size is taken from the frame
+        itself when available, falling back to the configured ``input_size``.
+        """
+        if normalize_display_fit_mode(getattr(self.output, "fit_mode", "contain")) != "contain":
+            return False
+        from streaming.aspect import input_needs_16_9_canvas
+
+        left_eye = getattr(runtime_result, "left_eye", None)
+        if left_eye is not None and getattr(left_eye, "width", 0) and getattr(left_eye, "height", 0):
+            return input_needs_16_9_canvas(
+                (int(left_eye.width), int(left_eye.height))
+            )
+        native_surface = getattr(runtime_result, "native_final_sbs_surface", None)
+        if native_surface is not None and getattr(native_surface, "width", 0) and getattr(native_surface, "height", 0):
+            # The surface is the actual packed SBS this frame would send; derive
+            # the per-eye size from it directly (never from the possibly stale
+            # configured input_size) so the gate reflects the real frame.
+            sw, sh = int(native_surface.width), int(native_surface.height)
+            packed_mode = str(getattr(self.output, "display_mode", "Half-SBS") or "").strip().casefold().replace("_", "-")
+            if packed_mode == "full-sbs":
+                eye_size = (max(1, sw // 2), sh)
+            elif packed_mode == "full-tab":
+                eye_size = (sw, max(1, sh // 2))
+            else:
+                eye_size = (sw, sh)
+            return input_needs_16_9_canvas(eye_size)
+        input_size = getattr(self.output, "input_size", None)
+        if input_size is None:
+            return False
+        try:
+            eye_size = (int(input_size[0]), int(input_size[1]))
+        except (TypeError, ValueError):
+            return False
+        if eye_size[0] <= 0 or eye_size[1] <= 0:
+            return False
+        return input_needs_16_9_canvas(eye_size)
 
     def _take_latest(self):
         try:
@@ -275,9 +503,29 @@ class DirectSbsOutputConsumer:
                 if callable(should_submit) and not should_submit(self._clock()):
                     self._report_fps_if_due()
                     continue
+                # Native GPU surface paths (Intel D3D11/oneVPL final-SBS and the
+                # deferred Vulkan compose) present the packed SBS at its native
+                # aspect and cannot letterbox into the 16:9 transport canvas.
+                # When the input aspect ratio is not 16:9 (contain fit mode),
+                # bypass them so this frame goes through the aspect-aware
+                # CUDA/CPU paths below. The CUDA path keeps the letterboxing on
+                # the GPU (zero host round trip) as the first priority.
+                letterbox_required = self._frame_letterbox_required(runtime_result)
+                if letterbox_required and not getattr(self, "_letterbox_notice", False):
+                    self._letterbox_notice = True
+                    print(
+                        "[DirectSbsStream] Non-16:9 input: native GPU surface "
+                        "paths bypassed; frames are padded into a 16:9 "
+                        "transport canvas (legacy fill_16_9)",
+                        flush=True,
+                    )
                 submit_vulkan_stereo = getattr(
-                    self.output, "submit_vulkan_stereo_frame", None
+                    self.output,
+                    "submit_vulkan_stereo_frame",
+                    None,
                 )
+                if letterbox_required:
+                    submit_vulkan_stereo = None
                 left_eye = getattr(runtime_result, "left_eye", None)
                 right_eye = getattr(runtime_result, "right_eye", None)
                 if callable(submit_vulkan_stereo) and getattr(
@@ -310,6 +558,8 @@ class DirectSbsOutputConsumer:
                 submit_native_surface = getattr(
                     self.output, "submit_native_d3d11_surface", None
                 )
+                if letterbox_required:
+                    submit_native_surface = None
                 if native_surface is not None and callable(submit_native_surface):
                     handled = submit_native_surface(native_surface)
                     if handled is False:
@@ -332,6 +582,21 @@ class DirectSbsOutputConsumer:
                 if callable(submit_cuda_frame) and bool(
                     getattr(cuda_frame, "is_cuda", False)
                 ):
+                    # GPU zerocopy paths skip RuntimeSbsRgbConverter, so apply the
+                    # same aspect rule here: contain letterboxes into a 16:9
+                    # transport canvas, cover/stretch pass the frame through.
+                    if (
+                        normalize_display_fit_mode(
+                            getattr(self.output, "fit_mode", "contain")
+                        )
+                        == "contain"
+                        # MJPEG applies aspect inside its encoder loop.
+                        and not isinstance(self.output, MjpegDirectSbsOutput)
+                    ):
+                        try:
+                            cuda_frame = self._apply_cuda_aspect(cuda_frame)
+                        except Exception:
+                            pass
                     convert_started = self._clock()
                     submit_cuda_frame(cuda_frame)
                     self._fps_submit_seconds += self._clock() - convert_started
@@ -604,21 +869,189 @@ class _PyNvDirectSbsOutputMixin:
 
 
 class MjpegDirectSbsOutput:
-    def __init__(self, *, port: int, fps: int, quality: int) -> None:
+    """
+    MJPEG streaming output with probe-first rate selection and GPU zerocopy aspect processing.
+    Mirrors FfmpegDirectSbsOutput rate calibration logic for consistent behavior.
+    """
+    synchronous_submit = False
+
+    def __init__(
+        self,
+        *,
+        port: int,
+        fps: int,
+        quality: int,
+        display_mode: str = "Half-SBS",
+        fit_mode: str = "contain",
+        input_size: Tuple[int, int] | None = None,
+        on_stream_fps_selected: Callable[[int], Any] | None = None,
+    ) -> None:
+        self.port = max(1, int(port))
+        self.requested_fps = max(1, int(fps))
+        self.fps = self.requested_fps
+        self.quality = max(1, min(100, int(quality)))
+        self.display_mode = str(display_mode or "Half-SBS").strip()
+        self.fit_mode = str(fit_mode or "contain").strip()
+        self.input_size = input_size
+        self._on_stream_fps_selected = on_stream_fps_selected
+
         profile = EncoderProfile(
             codec="mjpeg",
-            quality=quality,
-            target_fps=fps,
+            quality=self.quality,
+            target_fps=self.requested_fps,
             pixel_format="rgb",
         )
-        self.streamer = MJPEGStreamer(port=int(port), profile=profile)
+        self.streamer = MJPEGStreamer(
+            port=self.port,
+            profile=profile,
+            display_mode=self.display_mode,
+            fit_mode=self.fit_mode,
+            input_size=self.input_size,
+        )
+
+        # Probe state (mirror FfmpegDirectSbsOutput)
+        self._rate_probe_started: float | None = None
+        self._rate_window_started: float | None = None
+        self._rate_window_frames = 0
+        self._rate_window_fps: list[float] = []
+        self._rate_probe_min_seconds = 5.0
+        self._rate_probe_max_seconds = 15.0
+        self._stream_rate_calibrated = False
+        self._next_submit_at = 0.0
 
     def start(self) -> None:
+        # Kill orphan MediaMTX / streaming ports from previous run (esp. when switching modes)
+        try:
+            _kill_orphan_mediamtx_processes(ports=[self.port, 9998, 8000, 8001, 8189])
+        except Exception:
+            pass
         self.streamer.start()
         print("[DirectSbsStream] MJPEG consumes packed SBS frames directly", flush=True)
 
     def submit_frame(self, frame: np.ndarray) -> None:
         self.streamer.set_frame(frame)
+
+    def submit_cuda_frame(self, frame: Any) -> None:
+        """
+        Submit CUDA frame for zerocopy processing (aspect/resize on GPU, JPEG on CPU).
+        frame: torch.Tensor on CUDA
+        """
+        import torch
+        if not (hasattr(frame, "is_cuda") and frame.is_cuda):
+            # Fallback to CPU path
+            self.submit_frame(runtime_sbs_to_rgb(frame))
+            return
+        # Create CUDA event for synchronization
+        cuda_event = torch.cuda.Event()
+        cuda_event.record(torch.cuda.current_stream(frame.device))
+        self.streamer.set_cuda_frame(frame, cuda_event)
+
+    @property
+    def current_network_bitrate_mbps(self) -> float:
+        """MJPEG has no MediaMTX bitrate tracking."""
+        return 0.0
+
+    def should_submit_frame(self, now: float | None = None) -> bool:
+        """Probe-first rate selection, mirroring FfmpegDirectSbsOutput logic."""
+        timestamp = time.perf_counter() if now is None else float(now)
+
+        if not self._stream_rate_calibrated:
+            if self._rate_probe_started is None:
+                self._rate_probe_started = timestamp
+                self._rate_window_started = timestamp
+                self._rate_window_frames = 1
+                return False
+
+            self._rate_window_frames += 1
+            window_elapsed = timestamp - float(self._rate_window_started)
+            if window_elapsed >= 1.0:
+                self._rate_window_fps.append(
+                    self._rate_window_frames / window_elapsed
+                )
+                self._rate_window_started = timestamp
+                self._rate_window_frames = 0
+
+            elapsed = timestamp - self._rate_probe_started
+            stable_fps = self._stable_rate_sample(self._rate_window_fps)
+            if elapsed < self._rate_probe_min_seconds or (
+                stable_fps is None and elapsed < self._rate_probe_max_seconds
+            ):
+                return False
+
+            measured_fps = (
+                stable_fps
+                if stable_fps is not None
+                else self._fallback_rate_sample(self._rate_window_fps)
+            )
+            self.fps = self._select_sustainable_stream_fps(
+                measured_fps, self.requested_fps
+            )
+            self._stream_rate_calibrated = True
+            self.streamer.fps = self.fps
+            self.streamer.delay = 1.0 / max(1, self.fps)
+            self._next_submit_at = timestamp + 1.0 / float(self.fps)
+            if self._on_stream_fps_selected is not None:
+                self._on_stream_fps_selected(self.fps)
+            print(
+                f"[DirectSbsStream] Stable stream rate selected: "
+                f"measured={measured_fps:.1f} target={self.fps} FPS "
+                f"windows={len(self._rate_window_fps)}",
+                flush=True,
+            )
+            return True
+
+        interval = 1.0 / float(self.fps)
+        if timestamp + 1e-9 < self._next_submit_at:
+            return False
+        if timestamp - self._next_submit_at > interval:
+            self._next_submit_at = timestamp + interval
+        else:
+            self._next_submit_at += interval
+        return True
+
+    @staticmethod
+    def _stable_rate_sample(window_fps: list[float]) -> float | None:
+        recent = window_fps[-5:]
+        if len(recent) < 5:
+            return None
+        import statistics
+        median_fps = float(statistics.median(recent))
+        if statistics.pstdev(recent) > max(1.0, median_fps * 0.06):
+            return None
+        ordered = sorted(recent)
+        return float(ordered[max(0, int((len(ordered) - 1) * 0.20))])
+
+    @staticmethod
+    def _fallback_rate_sample(window_fps: list[float]) -> float:
+        ordered = sorted(window_fps[-10:])
+        if not ordered:
+            return 1.0
+        return float(ordered[max(0, int((len(ordered) - 1) * 0.20))])
+
+    @staticmethod
+    def _select_sustainable_stream_fps(
+        measured_fps: float, maximum_fps: int
+    ) -> int:
+        maximum = max(1, int(maximum_fps))
+        measured = max(1.0, float(measured_fps))
+        if measured >= float(maximum):
+            return maximum
+        safe_limit = min(float(maximum), measured * 0.90)
+        for candidate in (60, 50, 48, 40, 30, 25, 24, 20, 15, 12, 10):
+            if candidate <= maximum and candidate <= safe_limit:
+                return candidate
+        return max(5, min(maximum, int(safe_limit)))
+
+    def observe_calibration_window(
+        self,
+        *,
+        sbs_fps: float,
+        submitted_fps: float,
+        convert_ms: float,
+        submit_ms: float,
+    ) -> None:
+        # MJPEG has no calibration controller, but keep interface for consumer
+        pass
 
     def close(self) -> None:
         self.streamer.stop()
@@ -643,6 +1076,8 @@ class FfmpegDirectSbsOutput:
         os_name: str | None = None,
         prefer_nvenc: bool = False,
         display_mode: str = "Half-SBS",
+        fit_mode: str = "contain",
+        input_size: Tuple[int, int] | None = None,
         target_bitrate_mbps: int = 0,
         peak_bitrate_mbps: int = 0,
         auto_calibration: bool = False,
@@ -664,6 +1099,13 @@ class FfmpegDirectSbsOutput:
         self.os_name = str(os_name or platform.system())
         self.prefer_nvenc = bool(prefer_nvenc)
         self.display_mode = str(display_mode or "Half-SBS").strip()
+        self.fit_mode = str(fit_mode or "contain").strip()
+        self.input_size = input_size
+        if self.input_size is not None:
+            try:
+                self.input_size = (int(self.input_size[0]), int(self.input_size[1]))
+            except Exception:
+                self.input_size = None
         self.use_hevc = self.display_mode.casefold() == "full-sbs"
         self.target_bitrate_mbps = max(0, int(target_bitrate_mbps))
         self.peak_bitrate_mbps = max(0, int(peak_bitrate_mbps))
@@ -1174,6 +1616,11 @@ class FfmpegDirectSbsOutput:
                 )
 
     def start(self) -> None:
+        # Kill orphan MediaMTX from previous run (port already in use -> ERR listen udp :8000)
+        try:
+            _kill_orphan_mediamtx_processes(ports=[self.port, 9998, 8000, 8001, 8189, 8554, 1935, 8888, 8889, 8890])
+        except Exception:
+            pass
         if self.protocol != "WEBRTC":
             print(
                 f"[DirectSbsStream] WARNING: {self.protocol} selected; "
@@ -1238,19 +1685,19 @@ class FfmpegDirectSbsOutput:
             return []
         if self.os_name == "Windows":
             if device.casefold().startswith("soundcard:"):
-                if self._soundcard_audio is None:
-                    return []
+                # Fix broken audio: revert to old stable dshow path (gfxcapture+ffmpeg handles loopback directly)
+                # Old main.py used: -f dshow -rtbufsize 256M -i audio={device} with -fflags nobuffer
+                # Python wasapi UDP loopback (s16le udp://...) causes fragmentation/discontinuity -> broken sound
+                device_name = device.split(":", 1)[1].strip()
                 return [
                     "-itsoffset",
                     str(self.audio_delay),
                     "-f",
-                    "s16le",
-                    "-ar",
-                    "48000",
-                    "-ac",
-                    "2",
+                    "dshow",
+                    "-rtbufsize",
+                    "256M",
                     "-i",
-                    self._soundcard_audio.ffmpeg_url,
+                    f"audio={device_name}",
                 ]
             if device.casefold().startswith("wasapi:"):
                 return [
@@ -1636,7 +2083,10 @@ class FfmpegDirectSbsOutput:
         return command
 
     def _start_ffmpeg(self, width: int, height: int) -> None:
-        if (
+        # Audio: old main.py used dshow directly (ffmpeg -f dshow -i audio={device}) with no broken sound.
+        # Previous wasapi UDP loopback (SoundcardLoopbackSender) caused fragmentation/discontinuity -> broken audio.
+        # Kept dshow path in _audio_input_args, so disable python loopback start here.
+        if False and (
             self._calibration_controller is None
             and self.os_name == "Windows"
             and self.stereo_mix_device.casefold().startswith("soundcard:")
@@ -1856,6 +2306,11 @@ class FfmpegDirectSbsOutput:
         self._server_log_thread = None
         self._ffmpeg_log_thread = None
         self._ffmpeg_stderr_tail = []
+        # Ensure orphan MediaMTX/FFmpeg ports are freed on stop (previous run left :8000/:9998 occupied)
+        try:
+            _kill_orphan_mediamtx_processes(ports=[self.port, 9998, 8000, 8001, 8189, 8554, 1935, 8888, 8889, 8890])
+        except Exception:
+            pass
 
 
 class IntelQsvDirectSbsOutput(FfmpegDirectSbsOutput):
@@ -2160,7 +2615,8 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
         self._load_native_vulkan_bridge()
         if self._native_vulkan_bridge is None:
             raise RuntimeError("native Vulkan FFmpeg bridge is unavailable")
-        if (
+        # See _start_ffmpeg above: disable python wasapi loopback for same broken-audio reason; use dshow
+        if False and (
             self._calibration_controller is None
             and self.os_name == "Windows"
             and self.stereo_mix_device.casefold().startswith("soundcard:")
