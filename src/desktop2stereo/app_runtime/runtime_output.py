@@ -378,9 +378,20 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                 metadata["glow_composer_source_owner"] = "vulkan_projection_composer"
             return metadata
         except Exception as exc:
+            import traceback as _tb
+
             self._set_glow_gpu_status(
                 f"reuse_last_completed reason={type(exc).__name__}: {exc}"
             )
+            if type(exc).__name__ == "VkErrorUnknown" and not getattr(
+                self, "_glow_vk_error_traceback_logged", False
+            ):
+                self._glow_vk_error_traceback_logged = True
+                print(
+                    "[VulkanOutput] Glow VkErrorUnknown traceback:\n"
+                    + _tb.format_exc().rstrip(),
+                    flush=True,
+                )
             backend = self._glow_gpu_backend
             self._glow_gpu_submission_disabled = True
             if backend is not None:
