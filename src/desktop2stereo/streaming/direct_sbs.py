@@ -919,16 +919,6 @@ class MjpegDirectSbsOutput:
             input_size=self.input_size,
         )
 
-        # Probe state (mirror FfmpegDirectSbsOutput)
-        self._rate_probe_started: float | None = None
-        self._rate_window_started: float | None = None
-        self._rate_window_frames = 0
-        self._rate_window_fps: list[float] = []
-        self._rate_probe_min_seconds = 5.0
-        self._rate_probe_max_seconds = 15.0
-        self._stream_rate_calibrated = False
-        self._next_submit_at = 0.0
-
     def start(self) -> None:
         # Kill orphan MediaMTX / streaming ports from previous run (esp. when switching modes)
         try:
@@ -962,95 +952,15 @@ class MjpegDirectSbsOutput:
         return 0.0
 
     def should_submit_frame(self, now: float | None = None) -> bool:
-        """Probe-first rate selection, mirroring FfmpegDirectSbsOutput logic."""
-        timestamp = time.perf_counter() if now is None else float(now)
+        """MJPEG streams every runtime frame immediately.
 
-        if not self._stream_rate_calibrated:
-            if self._rate_probe_started is None:
-                self._rate_probe_started = timestamp
-                self._rate_window_started = timestamp
-                self._rate_window_frames = 1
-                return False
-
-            self._rate_window_frames += 1
-            window_elapsed = timestamp - float(self._rate_window_started)
-            if window_elapsed >= 1.0:
-                self._rate_window_fps.append(
-                    self._rate_window_frames / window_elapsed
-                )
-                self._rate_window_started = timestamp
-                self._rate_window_frames = 0
-
-            elapsed = timestamp - self._rate_probe_started
-            stable_fps = self._stable_rate_sample(self._rate_window_fps)
-            if elapsed < self._rate_probe_min_seconds or (
-                stable_fps is None and elapsed < self._rate_probe_max_seconds
-            ):
-                return False
-
-            measured_fps = (
-                stable_fps
-                if stable_fps is not None
-                else self._fallback_rate_sample(self._rate_window_fps)
-            )
-            self.fps = self._select_sustainable_stream_fps(
-                measured_fps, self.requested_fps
-            )
-            self._stream_rate_calibrated = True
-            self.streamer.fps = self.fps
-            self.streamer.delay = 1.0 / max(1, self.fps)
-            self._next_submit_at = timestamp + 1.0 / float(self.fps)
-            if self._on_stream_fps_selected is not None:
-                self._on_stream_fps_selected(self.fps)
-            print(
-                f"[DirectSbsStream] Stable stream rate selected: "
-                f"measured={measured_fps:.1f} target={self.fps} FPS "
-                f"windows={len(self._rate_window_fps)}",
-                flush=True,
-            )
-            return True
-
-        interval = 1.0 / float(self.fps)
-        if timestamp + 1e-9 < self._next_submit_at:
-            return False
-        if timestamp - self._next_submit_at > interval:
-            self._next_submit_at = timestamp + interval
-        else:
-            self._next_submit_at += interval
+        There is no network-rate probe for MJPEG: dropping frames for a
+        multi-second calibration window froze the stream at startup and the
+        0.9x sustainable-rate cap needlessly throttled it below the runtime
+        rate. The encoder loop keeps only the newest frame and _generate paces
+        the HTTP output at ``delay``, so rate control is already handled.
+        """
         return True
-
-    @staticmethod
-    def _stable_rate_sample(window_fps: list[float]) -> float | None:
-        recent = window_fps[-5:]
-        if len(recent) < 5:
-            return None
-        import statistics
-        median_fps = float(statistics.median(recent))
-        if statistics.pstdev(recent) > max(1.0, median_fps * 0.06):
-            return None
-        ordered = sorted(recent)
-        return float(ordered[max(0, int((len(ordered) - 1) * 0.20))])
-
-    @staticmethod
-    def _fallback_rate_sample(window_fps: list[float]) -> float:
-        ordered = sorted(window_fps[-10:])
-        if not ordered:
-            return 1.0
-        return float(ordered[max(0, int((len(ordered) - 1) * 0.20))])
-
-    @staticmethod
-    def _select_sustainable_stream_fps(
-        measured_fps: float, maximum_fps: int
-    ) -> int:
-        maximum = max(1, int(maximum_fps))
-        measured = max(1.0, float(measured_fps))
-        if measured >= float(maximum):
-            return maximum
-        safe_limit = min(float(maximum), measured * 0.90)
-        for candidate in (60, 50, 48, 40, 30, 25, 24, 20, 15, 12, 10):
-            if candidate <= maximum and candidate <= safe_limit:
-                return candidate
-        return max(5, min(maximum, int(safe_limit)))
 
     def observe_calibration_window(
         self,
