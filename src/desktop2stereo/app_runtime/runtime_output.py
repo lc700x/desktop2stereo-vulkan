@@ -466,9 +466,14 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
             # External-semaphore path was never initialized (e.g. on ROCm/HIP
             # where timeline external semaphores are unsupported). convert()
             # already GPU-copied and synchronized (hipStreamSynchronize) the
-            # eyes, so the composer may sample the imported images directly
-            # without a producer-ready semaphore; an empty list here would
-            # otherwise IndexError and blank the projection layer.
+            # eyes; just transition the imported image to shader-readable so
+            # Filament can sample it (no producer-ready semaphore to wait on).
+            resource = left if eye == 0 else right
+            if (frame_key, eye) not in self._prepared_source_eyes:
+                self.presenter.vulkan.prepare_external_image_for_sampling(
+                    resource.resource
+                )
+                self._prepared_source_eyes.add((frame_key, eye))
             return None
         visible = (
             self.left_visible_semaphores[slot_index]
@@ -533,6 +538,14 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                     if eye_index == 0
                     else self.right_release_semaphores
                 )
+                if len(release_semaphores) <= slot_index:
+                    # No external release semaphores (e.g. ROCm/HIP timeline
+                    # unsupported). The import was GPU-copied + synchronized by
+                    # convert(); just release the source frame without a
+                    # producer-release semaphore, otherwise this indexes an
+                    # empty list and aborts the output frame.
+                    self._prepared_source_eyes.discard((frame_key, eye_index))
+                    continue
                 release_values = (
                     self.left_release_values
                     if eye_index == 0
