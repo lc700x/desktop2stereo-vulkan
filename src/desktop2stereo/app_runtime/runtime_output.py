@@ -288,7 +288,7 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
             getattr(self.presenter, "_environment_screen_light_enabled", False)
             and getattr(self.presenter.config, "filament_glb_path", None)
         )
-        if self.backend_name != "cuda":
+        if self.backend_name not in {"cuda", "rocm", "hip"}:
             self._set_glow_gpu_status(f"cpu_fallback backend={self.backend_name}")
             return {}
         # The source image is produced by the Vulkan Glow worker.  Do not use

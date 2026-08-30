@@ -19,6 +19,21 @@ from viewer.vulkan_descriptors import VulkanStorageBuffer
 from .vulkan_glow_source_pass import VulkanGlowSourcePass
 
 
+def _create_interop_importer():
+    """Pick the CUDA or ROCm/HIP external-memory importer for the glow source."""
+    try:
+        import torch
+
+        is_rocm = bool(getattr(torch.version, "hip", None))
+    except Exception:
+        is_rocm = False
+    if is_rocm:
+        from viewer.rocm_vulkan_interop import RocmVulkanImageImporter
+
+        return RocmVulkanImageImporter()
+    return CudaVulkanImageImporter()
+
+
 class VulkanGlowSourceUnavailable(RuntimeError):
     pass
 
@@ -66,7 +81,7 @@ class VulkanGlowSourceComputeBackend:
             )
         self.compute_queue = context.compute_queue
         self.graphics_queue = context.graphics_queue
-        self.importer = CudaVulkanImageImporter()
+        self.importer = _create_interop_importer()
         capabilities = self.importer.capabilities
         if not capabilities.external_memory or not capabilities.external_semaphore:
             self.importer.close()
@@ -213,7 +228,7 @@ class VulkanGlowSourceComputeBackend:
                 slot.input_buffer.close()
             slot.input_ready = None
             slot.input_buffer = None
-        self.importer = CudaVulkanImageImporter()
+        self.importer = _create_interop_importer()
         self._input_capacity = required
         for slot in self.slots:
             slot.input_buffer = VulkanExportableBuffer(
