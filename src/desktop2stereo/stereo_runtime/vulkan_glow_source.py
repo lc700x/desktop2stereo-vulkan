@@ -281,6 +281,23 @@ class VulkanGlowSourceComputeBackend:
             value = value.to(dtype=torch.float32).div_(255.0)
         elif value.dtype != torch.float32:
             value = value.to(dtype=torch.float32)
+        # Downsample so the HIP buffer copy + glow compute are cheap. The glow
+        # target is only 320x180, so a ~512px source is ample; copying the full
+        # 4K source every sample saturated the GPU and dropped the OpenXR
+        # compositor to ~8 FPS on AMD. Capping the longest side keeps the glow
+        # visually identical on NVIDIA and ROCm.
+        hist, wid = int(value.shape[-2]), int(value.shape[-1])
+        longest = max(hist, wid)
+        max_side = 512
+        if longest > max_side:
+            scale = max_side / float(longest)
+            nh = max(1, int(round(hist * scale)))
+            nw = max(1, int(round(wid * scale)))
+            import torch.nn.functional as _F
+
+            value = _F.interpolate(
+                value, size=(nh, nw), mode="bilinear", align_corners=False
+            )
         return value.contiguous()
 
     def submit(
