@@ -131,7 +131,7 @@ def configure_glfw_window_hints(glfw: Any, *, fullscreen: bool) -> None:
     glfw.window_hint(glfw.DECORATED, glfw.TRUE)
     glfw.window_hint(glfw.FLOATING, glfw.FALSE)
     glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.TRUE)
-    if fullscreen:
+    if fullscreen and sys.platform == "win32":
         # Create the output hidden so Windows cannot register a taskbar button
         # before WS_EX_TOOLWINDOW is applied by _configure_persistent_fullscreen.
         glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
@@ -379,7 +379,15 @@ def frame_to_rgba_bytes(frame: Any) -> tuple[bytes, int, int]:
     import numpy as np
 
     image = frame.detach() if hasattr(frame, "detach") else frame
-    if bool(getattr(image, "is_cuda", False)):
+    # Accelerator tensors (CUDA, MPS, ...) must be copied to host memory
+    # before numpy conversion. Quantize floating frames on-device first:
+    # shipping float32 makes the transfer ~4x larger and turns every
+    # present into slow per-frame NumPy math.
+    if hasattr(image, "device") and getattr(image.device, "type", "cpu") != "cpu":
+        if callable(getattr(image, "is_floating_point", None)) and image.is_floating_point():
+            import torch
+
+            image = (image.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
         image = image.cpu()
     if hasattr(image, "numpy"):
         image = image.numpy()
@@ -402,6 +410,55 @@ def frame_to_rgba_bytes(frame: Any) -> tuple[bytes, int, int]:
     if channels == 3:
         image = np.concatenate((image, np.full((height, width, 1), 255, dtype=np.uint8)), axis=2)
     return np.ascontiguousarray(image).tobytes(), int(width), int(height)
+
+
+def pack_frame_to_rgba8(frame: Any) -> tuple[Any, int, int] | None:
+    """Pack an accelerator frame to HWC RGBA8 entirely on its device.
+
+    Quantization, CHW->HWC layout, and alpha expansion run on the GPU before
+    one device->host copy, so the host receives tightly packed upload-ready
+    bytes (numpy supports the buffer protocol and can be handed to Metal's
+    replaceRegion without another copy). Returns ``None`` when the input is
+    not a supported accelerator tensor; callers fall back to
+    ``frame_to_rgba_bytes``.
+    """
+    import numpy as np
+
+    image = frame.detach() if hasattr(frame, "detach") else frame
+    if not (hasattr(image, "device") and getattr(image.device, "type", "cpu") != "cpu"):
+        return None
+    try:
+        import torch
+
+        if image.ndim == 4:
+            image = image[0]
+        if image.ndim != 3:
+            return None
+        channels_first = image.shape[0] in (1, 3, 4) and image.shape[-1] not in (1, 3, 4)
+        if channels_first:
+            image = image.permute(1, 2, 0)
+        channels = int(image.shape[-1])
+        if channels not in (1, 3, 4):
+            return None
+        if image.is_floating_point():
+            image = (image.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
+        elif image.dtype != torch.uint8:
+            return None
+        height, width = int(image.shape[0]), int(image.shape[1])
+        if channels == 1:
+            image = image.expand(height, width, 3)
+            channels = 3
+        if channels == 3:
+            alpha = torch.full(
+                (height, width, 1), 255, dtype=torch.uint8, device=image.device
+            )
+            image = torch.cat((image, alpha), dim=2)
+        if not image.is_contiguous():
+            image = image.contiguous()
+        host = image.cpu().numpy()
+        return host, int(width), int(height)
+    except Exception:
+        return None
 
 
 def frame_to_cuda_rgba(frame: Any) -> Any | None:
@@ -637,7 +694,15 @@ class VulkanLocalViewer:
 
     def initialize(self) -> None:
         import glfw
-        import vulkan as vk
+        try:
+            import vulkan as vk
+        except OSError as exc:
+            if sys.platform == "darwin":
+                raise RuntimeError(
+                    "Vulkan loader not found on macOS. Install MoltenVK with "
+                    "`brew install molten-vk` (or the LunarG Vulkan SDK), then restart."
+                ) from exc
+            raise
 
         self.glfw, self.vk = glfw, vk
         if not glfw.init():
@@ -683,10 +748,28 @@ class VulkanLocalViewer:
         )
         if not self.window:
             raise RuntimeError("could not create Vulkan local viewer window")
-        glfw.set_window_pos(self.window, x, y)
         if self._exclusive_fullscreen:
-            self._configure_persistent_fullscreen()
-            glfw.poll_events()
+            if sys.platform == "darwin":
+                # The hidden-until-styled startup is a Windows trick
+                # (_configure_persistent_fullscreen); macOS must simply make
+                # the already-created borderless window a real monitor
+                # fullscreen or it stays invisible forever.
+                mode = glfw.get_video_mode(monitor)
+                glfw.set_window_monitor(
+                    self.window,
+                    monitor,
+                    int(mx),
+                    int(my),
+                    int(mode.size.width),
+                    int(mode.size.height),
+                    int(mode.refresh_rate),
+                )
+                # The VISIBLE=FALSE creation hint still applies.
+                glfw.show_window(self.window)
+            else:
+                self._configure_persistent_fullscreen()
+                glfw.poll_events()
+        glfw.set_window_pos(self.window, x, y)
         if self.config.exclude_from_capture:
             hide_window_from_capture(self.window)
         if self.config.cursor_passthrough:
@@ -929,6 +1012,15 @@ class VulkanLocalViewer:
             and FULL_SCREEN_EXCLUSIVE_INSTANCE_EXTENSION not in extensions
         ):
             extensions.append(FULL_SCREEN_EXCLUSIVE_INSTANCE_EXTENSION)
+        # Through a Vulkan loader, MoltenVK physical devices are only listed
+        # when portability enumeration is explicitly enabled.
+        instance_flags = 0
+        if (
+            sys.platform == "darwin"
+            and "VK_KHR_portability_enumeration" in available_instance_extensions
+        ):
+            extensions.append("VK_KHR_portability_enumeration")
+            instance_flags = 0x00000001  # VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
         app_info = vk.VkApplicationInfo(
             sType=vk.VK_STRUCTURE_TYPE_APPLICATION_INFO,
             pApplicationName=self.config.title,
@@ -939,6 +1031,7 @@ class VulkanLocalViewer:
         )
         self.instance = vk.vkCreateInstance(vk.VkInstanceCreateInfo(
             sType=vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            flags=instance_flags,
             pApplicationInfo=app_info,
             enabledExtensionCount=len(extensions),
             ppEnabledExtensionNames=extensions,
@@ -1346,11 +1439,25 @@ class VulkanLocalViewer:
         if self.window is None:
             raise RuntimeError("Vulkan local viewer has not been initialized")
         self.poll_events()
-        cuda_rgba = frame_to_cuda_rgba(frame)
-        if cuda_rgba is not None:
-            height, width = (int(cuda_rgba.shape[0]), int(cuda_rgba.shape[1]))
+        # Runtime-packed host frame: pure memcpy, no device sync.
+        host_np = getattr(frame, "viewer_frame_np", None)
+        cuda_rgba = None
+        if host_np is not None:
+            pixels, width, height = host_np
         else:
-            pixels, width, height = frame_to_rgba_bytes(frame)
+            cuda_rgba = frame_to_cuda_rgba(frame)
+            if cuda_rgba is not None:
+                height, width = (int(cuda_rgba.shape[0]), int(cuda_rgba.shape[1]))
+            else:
+                # Device-side pack first (quantize+permute+alpha on the tensor's
+                # own device, one host copy): the numpy fallback costs ~4
+                # full-frame CPU copies plus an MPS sync and dominated the
+                # present budget (~47ms) before this.
+                packed = pack_frame_to_rgba8(frame)
+                if packed is not None:
+                    pixels, width, height = packed
+                else:
+                    pixels, width, height = frame_to_rgba_bytes(frame)
         if (
             self._source is None
             or self._source.size != (width, height)
@@ -1402,6 +1509,7 @@ class _TransferSource:
         self.format = int(owner.source_format)
         self.capacity = width * height * 4
         self.buffer = self.memory = self.image = self.image_memory = None
+        self._mapped = None
         self._image_initialized = False
         self._interop_context: _LocalInteropContext | None = None
         self._external_image: VulkanExportableImage | None = None
@@ -1424,6 +1532,19 @@ class _TransferSource:
         req = vk.vkGetBufferMemoryRequirements(device, self.buffer)
         self.memory = vk.vkAllocateMemory(device, vk.VkMemoryAllocateInfo(sType=vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, allocationSize=req.size, memoryTypeIndex=self._memory_type(req.memoryTypeBits, vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)), None)
         vk.vkBindBufferMemory(device, self.buffer, self.memory, 0)
+        # Persistent mapping for zero-copy present path: keep host-visible staging
+        # buffer mapped for the lifetime of the source. This eliminates
+        # per-frame vkMapMemory/vkUnmapMemory and the extra tobytes() copy
+        # in frame_to_rgba_bytes when used via memoryview.
+        try:
+            self._mapped = vk.vkMapMemory(device, self.memory, 0, self.capacity, 0)
+        except Exception as exc:
+            print(
+                f"[VulkanLocalViewer] persistent map failed: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            self._mapped = None
         width, height = self.size
         source_format = self.format
         self.image = vk.vkCreateImage(device, vk.VkImageCreateInfo(sType=vk.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, imageType=vk.VK_IMAGE_TYPE_2D, format=source_format, extent=vk.VkExtent3D(width=width, height=height, depth=1), mipLevels=1, arrayLayers=1, samples=vk.VK_SAMPLE_COUNT_1_BIT, tiling=vk.VK_IMAGE_TILING_OPTIMAL, usage=vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT, sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE, initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED), None)
@@ -1558,11 +1679,24 @@ class _TransferSource:
                 # CUDA/ROCm interop unavailable: the caller may hand us a GPU
                 # tensor; convert it to tightly packed RGBA8 host bytes first.
                 pixels, _width, _height = frame_to_rgba_bytes(pixels)
-            mapped = vk.vkMapMemory(o.device, self.memory, 0, self.capacity, 0)
-            # PyVulkan's vkMapMemory already returns a writable cffi buffer;
-            # wrapping it again in ffi.buffer() fails with a TypeError.
-            mapped[:] = pixels
-            vk.vkUnmapMemory(o.device, self.memory)
+            # Zero-copy: use the persistently mapped staging buffer. Falls back
+            # to per-frame map/unmap if the persistent mapping is unavailable
+            # (e.g. driver re-alloc after swapchain recreate).
+            #
+            # pixels may be a numpy HWC array (pack_frame_to_rgba8) or flat
+            # bytes; cast through memoryview so the slice length is in bytes
+            # (len(ndarray) is only its first dimension).
+            payload = memoryview(pixels)
+            if payload.format != "B":
+                payload = payload.cast("B")
+            if self._mapped is not None:
+                self._mapped[0 : payload.nbytes] = payload
+            else:
+                mapped = vk.vkMapMemory(o.device, self.memory, 0, self.capacity, 0)
+                # PyVulkan's vkMapMemory already returns a writable cffi buffer;
+                # wrapping it again in ffi.buffer() fails with a TypeError.
+                mapped[0 : payload.nbytes] = payload
+                vk.vkUnmapMemory(o.device, self.memory)
         upload_ms = (time.perf_counter() - stage_started) * 1000.0
         stage_started = time.perf_counter()
         cmd = o.command_buffer
@@ -1718,6 +1852,12 @@ class _TransferSource:
     def close(self) -> None:
         vk, device = self.owner.vk, self.owner.device
         self._disable_cuda_interop("close", announce=False)
+        if getattr(self, "_mapped", None) is not None:
+            try:
+                vk.vkUnmapMemory(device, self.memory)
+            except Exception:
+                pass
+            self._mapped = None
         if self.image is not None: vk.vkDestroyImage(device, self.image, None)
         if self.image_memory is not None: vk.vkFreeMemory(device, self.image_memory, None)
         if self.buffer is not None: vk.vkDestroyBuffer(device, self.buffer, None)
@@ -1755,13 +1895,50 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     if config.on_breakdown_inc is not None:
                         config.on_breakdown_inc("viewer_get", 1)
                         config.on_breakdown_inc("viewer_drop", 1)
-            frame = getattr(result, "sbs", None)
+            # Pass the whole result when the runtime shipped a host-packed
+            # frame; present() unpacks viewer_frame_np directly.
+            frame = (
+                result
+                if getattr(result, "viewer_frame_np", None) is not None
+                else getattr(result, "sbs", None)
+            )
             if frame is None:
                 continue
             if viewer is None:
-                viewer = VulkanLocalViewer(config)
-                viewer.initialize()
-                print("[VulkanLocalViewer] Vulkan local window initialized", flush=True)
+                # Primary: Vulkan. Fallback chain: Metal -> OpenGL (macOS).
+                # Keeps Vulkan as main viewer; Metal/OpenGL are fallbacks when
+                # Vulkan/MoltenVK is unavailable (e.g., missing SDK).
+                try:
+                    viewer = VulkanLocalViewer(config)
+                    viewer.initialize()
+                    print("[VulkanLocalViewer] Vulkan local window initialized", flush=True)
+                except Exception as vulkan_exc:
+                    print(f"[VulkanLocalViewer] Vulkan init failed ({vulkan_exc}); trying fallback", flush=True)
+                    viewer = None
+                    # Try Metal fallback on macOS
+                    if sys.platform == "darwin":
+                        try:
+                            from viewer.metal_local_viewer import MetalLocalViewer
+
+                            viewer = MetalLocalViewer(config)
+                            viewer.initialize()
+                            print("[VulkanLocalViewer] Using Metal fallback viewer", flush=True)
+                        except Exception as metal_exc:
+                            print(f"[MetalLocalViewer] Metal fallback failed ({metal_exc}); trying OpenGL", flush=True)
+                            viewer = None
+                    # Try OpenGL fallback (cross-platform)
+                    if viewer is None:
+                        try:
+                            from viewer.opengl_local_viewer import OpenGLLocalViewer
+
+                            viewer = OpenGLLocalViewer(config)
+                            viewer.initialize()
+                            print("[VulkanLocalViewer] Using OpenGL fallback viewer", flush=True)
+                        except Exception as gl_exc:
+                            raise RuntimeError(
+                                f"All viewer backends failed: Vulkan({vulkan_exc}), "
+                                f"Metal/OpenGL({gl_exc})"
+                            ) from vulkan_exc
             if preview_viewer is None and not preview_disabled:
                 preview_config = replace(
                     config,

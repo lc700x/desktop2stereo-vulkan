@@ -991,7 +991,8 @@ class GUIBuilderMixin:
         self.stream_proto_row = ft.Row([self.stream_proto_label, self.stream_proto_dd,
             ft.Container(width=S(40)), self.stream_key_label, self.stream_key_tf], spacing=1)
         self.audio_label = ft.Text("Stereo Mix:", size=FONT_SIZE, width=S(150))
-        self.audio_dd = CompactDropdown(options=[], min_width=S(130))
+        self.audio_dd = CompactDropdown(options=[], min_width=S(130),
+            on_select=self.on_audio_device_change)
         self.audio_row = ft.Row([self.audio_label, self.audio_dd], spacing=1)
         self.video_backend_label = ft.Text("Video Encoder:", size=FONT_SIZE, width=S(150))
         self.video_backend_dd = CompactDropdown(

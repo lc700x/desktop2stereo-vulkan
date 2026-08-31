@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .output import ensure_b1hw
+from .output import ensure_b1hw, ensure_bchw
 
 
 def apply_depth_pop(depth: torch.Tensor, depth_pop: float, mid: float = 0.5, eps: float = 1e-6) -> torch.Tensor:
@@ -41,14 +41,50 @@ def anti_alias_depth(depth: torch.Tensor, strength: float) -> torch.Tensor:
     return out.clamp(0.0, 1.0)
 
 
+def anti_alias_depth_guided(
+    depth: torch.Tensor,
+    guide: torch.Tensor,
+    strength: float,
+    sigma_color: float = 0.1,
+    max_keep: float = 0.85,
+) -> torch.Tensor:
+    """Edge-aware antialiasing guided by the RGB frame (dispatch-cheap form).
+
+    arXiv 1911.07036 stage-1 intent -- denoise depth WITHOUT widening
+    object edges -- realized as an edge-masked blend instead of a
+    per-neighbour joint bilateral: the bilateral issued ~60 tiny kernels
+    per frame and drained the MPS dispatch budget (docs/33 "MPS drain
+    wall", ~1ms per submit cycle), collapsing Local Viewer FPS. Here the
+    plain gaussian runs once (2 convs), a 3x3 high-pass of the guide
+    yields an edge-likeness map, and the result blends back toward the
+    raw depth by ``max_keep * edge``. Flat regions denoise fully; object
+    edges keep most of their sharpness but never all of it, bounding the
+    disparity step so the warp does not tear into double contours.
+    """
+    depth = ensure_b1hw(depth).float()
+    guide = ensure_bchw(guide, name="guide").float()
+    if strength <= 0.0:
+        return depth
+    smooth = anti_alias_depth(depth, strength)
+    blur = F.avg_pool2d(guide, kernel_size=3, stride=1, padding=1)
+    grad = (guide - blur).abs().sum(dim=1, keepdim=True)
+    edge = (grad / (sigma_color * float(guide.shape[1]))).clamp(0.0, 1.0)
+    w = max_keep * edge
+    return (w * depth + (1.0 - w) * smooth).clamp(0.0, 1.0)
+
+
 def postprocess_depth(
     depth: torch.Tensor,
     *,
     depth_pop: float = 0.0,
     antialias_strength: float = 0.0,
+    guide: torch.Tensor | None = None,
 ) -> torch.Tensor:
     out = ensure_b1hw(depth).float().clamp(0.0, 1.0)
     if abs(float(depth_pop)) >= 1e-6:
         out = apply_depth_pop(out, depth_pop)
-    out = anti_alias_depth(out, antialias_strength)
+    if guide is None:
+        out = anti_alias_depth(out, antialias_strength)
+    else:
+        out = anti_alias_depth_guided(out, guide, antialias_strength)
     return out

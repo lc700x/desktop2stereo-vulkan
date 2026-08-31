@@ -439,6 +439,52 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
     configured_run_mode = normalize_run_mode(
         settings.get("Run Mode", "Local Viewer")
     )
+    if configured_run_mode in {"Local Viewer", "Viewer"} and platform.system() == "Darwin":
+        # Local Viewer presents to a physical display; skip the headset-tier
+        # upscale chain (see output_sampling_plan_for_config).
+        os.environ.setdefault("D2S_CAP_OUTPUT_UPSCALE", "1")
+        # Ship packed uint8 SBS so the viewer skips float32 transport
+        # and re-quantization (pack once in the runtime, upload once in the
+        # viewer). setdefault keeps an explicit user override authoritative.
+        os.environ.setdefault("D2S_RUNTIME_OUTPUT_UINT8", "1")
+        # Deferred Metal shader warp is armed for the Metal viewer (the
+        # macOS default) and dropped if it falls back; see the Darwin viewer
+        # selection below.
+        # Vulkan fused warp-pack ships INPUT-RESOLUTION SBS (NVIDIA-path
+        # contract: 1080p in -> half_sbs 1920x1080). Quarter-res synth-scale
+        # preprocess would read as blur once packed at input res, so the
+        # fused path runs the pipeline at full render size. Explicit user
+        # overrides of either env stay authoritative.
+        _mac_viewer = os.environ.get("D2S_MAC_VIEWER") or "vulkan"
+        _vk_fused_on = os.environ.get("D2S_VK_FUSED_WARP", "1") not in {
+            "0", "false", "off",
+        }
+        if _mac_viewer == "vulkan" and _vk_fused_on:
+            os.environ.setdefault("D2S_HALF_RES_SYNTH", "0")
+            os.environ.setdefault("D2S_PREPROCESS_AT_SYNTH_SCALE", "0")
+        else:
+            # Halve synthesis resolution and upscale: warp cost scales with
+            # pixel count, so this cuts the dominant stage ~4x for the Metal
+            # viewer (its warp path skips synthesis; sampling upscales).
+            os.environ.setdefault("D2S_HALF_RES_SYNTH", "1")
+            # Preprocess directly at synthesis scale: skips a display-size
+            # upscale plus redundant downscale per frame.
+            os.environ.setdefault("D2S_PREPROCESS_AT_SYNTH_SCALE", "1")
+        # Depth input scale is OPT-IN (e.g. D2S_DEPTH_INPUT_SCALE=0.75 buys
+        # ~2x faster M1 MPS depth at corr 0.95); no default anymore. The
+        # softened 0.75x depth made object-edge parallax flicker vs v2.5.0,
+        # so the Local Viewer runs full export resolution unless this is
+        # explicitly set. "0"/"false"/"off" disable it explicitly as well.
+        # Default macOS viewer is now Vulkan (fused Metal warp-pack
+        # kernel beat the CAMetalLayer path in round-24 A/Bs:
+        # 46.7 vs 45.5-45.9 fps). D2S_MAC_VIEWER=metal restores it.
+        os.environ.setdefault("D2S_MAC_VIEWER", "vulkan")
+        # Pack the presentation frame on the runtime thread (queue drained)
+        # so viewers memcpy instead of syncing MPS mid-present.
+        os.environ.setdefault("D2S_VIEWER_HOST_FRAME", "1")
+        # Wrap every SCK frame as an owned CVPixelBuffer+CVMetalTexture so
+        # the warp viewer can sample the capture directly (zero-copy).
+        os.environ.setdefault("D2S_SCK_ZEROCOPY_TEX", "1")
     direct_stream_mode = is_network_stream_mode(configured_run_mode) or configured_run_mode == "MJPEG Streamer"
     if direct_stream_mode:
         os.environ["D2S_RUNTIME_OUTPUT_UINT8"] = "1"
@@ -713,6 +759,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
     output_thread = None
     local_viewer_thread = None
     network_output = None
+    main_thread_job = None
     nvfruc_stage = None
     nvfruc_thread = None
     presentation_q = context.runtime_q
@@ -1155,17 +1202,97 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 on_breakdown_inc=callbacks.breakdown_inc,
                 on_breakdown_add_time=callbacks.breakdown_add_time,
             )
-            local_viewer_thread = threading.Thread(
-                target=run_vulkan_local_viewer,
-                kwargs={
-                    "runtime_q": presentation_q,
-                    "shutdown_event": shutdown_event,
-                    "config": local_viewer_config,
-                },
-                name="VulkanLocalViewer",
-                daemon=True,
-            )
-            local_viewer_thread.start()
+            local_viewer_kwargs = {
+                "runtime_q": presentation_q,
+                "shutdown_event": shutdown_event,
+                "config": local_viewer_config,
+            }
+            if OS_NAME == "Darwin":
+                from viewer.host_frame_packer import (
+                    maybe_install_local_viewer_packer,
+                )
+
+                def _packer_on_stat(name: str, value: float) -> None:
+                    # Durations aggregate as times; counters as increments.
+                    if name == "packer_ms":
+                        # add_time appends _ms; store as packer_ms directly.
+                        callbacks.breakdown_add_time("packer", value / 1000.0)
+                    else:
+                        callbacks.breakdown_inc(name, int(value))
+
+                _maybe_install_local_viewer_packer = (
+                    maybe_install_local_viewer_packer
+                )
+            else:
+                def _maybe_install_local_viewer_packer(**_kw):
+                    return False
+            if _maybe_install_local_viewer_packer(
+                pipeline_q=presentation_q,
+                local_viewer_kwargs=local_viewer_kwargs,
+                on_stat=_packer_on_stat,
+                os_name=OS_NAME,
+            ):
+                # Pipeline still writes to presentation_q untouched; the
+                # viewer consumes from the packer's output instead.
+                pass
+            if OS_NAME == "Darwin":
+                # macOS GLFW/NSApp requires every windowing call on the
+                # process main thread (glfw.init deadlocks off it). The idle
+                # wait loop below is parked on a helper thread instead and the
+                # viewer owns the main thread.
+                #
+                # Default viewer on macOS is Vulkan since round 24 (fused
+                # Metal warp-pack kernel via torch.mps.compile_shader beats
+                # the CAMetalLayer path). D2S_MAC_VIEWER=metal selects the
+                # full CAMetalLayer deferred-warp path; on its failure this
+                # still falls back to run_vulkan_local_viewer, which chains
+                # Vulkan -> Metal stub -> OpenGL.
+                use_metal_viewer = (
+                    os.environ.get("D2S_MAC_VIEWER", "vulkan").strip().lower()
+                    == "metal"
+                )
+
+                def _run_viewer_on_main_thread():
+                    try:
+                        if use_metal_viewer:
+                            try:
+                                os.environ.setdefault("D2S_METAL_SHADER_WARP", "1")
+                                from viewer.macos_metal_viewer import (
+                                    run_metal_local_viewer,
+                                )
+
+                                run_metal_local_viewer(**local_viewer_kwargs)
+                                return
+                            except Exception as exc:
+                                # Fallback viewers consume synthesized SBS;
+                                # drop the deferred-warp flag so the runtime
+                                # stops shipping raw rgb+depth.
+                                os.environ.pop("D2S_METAL_SHADER_WARP", None)
+                                print(
+                                    f"[MetalLocalViewer] Metal viewer failed "
+                                    f"({type(exc).__name__}: {exc}); falling "
+                                    "back to Vulkan",
+                                    flush=True,
+                                )
+                        else:
+                            # Primary/fallback Vulkan path: the fused
+                            # warp-pack needs the runtime to ship raw
+                            # rgb+depth tensors instead of synthesized SBS.
+                            os.environ.setdefault("D2S_METAL_SHADER_WARP", "1")
+                        # Vulkan first; internally falls back Metal -> OpenGL.
+                        run_vulkan_local_viewer(**local_viewer_kwargs)
+                    finally:
+                        shutdown_event.set()
+
+                main_thread_job = _run_viewer_on_main_thread
+            else:
+                local_viewer_thread = threading.Thread(
+                    target=run_vulkan_local_viewer,
+                    kwargs=local_viewer_kwargs,
+                    name="VulkanLocalViewer",
+                    daemon=True,
+                )
+                local_viewer_thread.start()
         print(
             f"Desktop2Stereo Vulkan runtime started: mode={RUN_MODE} device={DEVICE_INFO}",
             flush=True,
@@ -1175,10 +1302,24 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             if max_seconds is None
             else time.monotonic() + max(0.0, max_seconds)
         )
-        while not shutdown_event.is_set():
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            time.sleep(0.05)
+
+        def _wait_until_shutdown():
+            while not shutdown_event.is_set():
+                if deadline is not None and time.monotonic() >= deadline:
+                    # Also unblock a viewer that owns the main thread.
+                    shutdown_event.set()
+                    break
+                time.sleep(0.05)
+
+        if main_thread_job is not None:
+            threading.Thread(
+                target=_wait_until_shutdown,
+                name="RuntimeWait",
+                daemon=True,
+            ).start()
+            main_thread_job()
+        else:
+            _wait_until_shutdown()
     except KeyboardInterrupt:
         pass
     finally:

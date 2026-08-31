@@ -254,7 +254,11 @@ def overlay_cursor_on_frame(frame_bgr, cursor_bgra, hotspot, cursor_pos,
 class DesktopGrabber:
     def __init__(self, output_resolution=1080, fps=60, window_title=None,
                 capture_mode="Monitor", monitor_index=1, with_cursor=True):
-        self.scaled_height = output_resolution
+        # Normalize (width, height) tuples to a target height; see
+        # macos_screencapturekit for details.
+        if isinstance(output_resolution, (tuple, list)):
+            output_resolution = int(output_resolution[1])
+        self.scaled_height = int(output_resolution)
         self.fps = fps
         self.with_cursor = with_cursor
         self.window_title = window_title

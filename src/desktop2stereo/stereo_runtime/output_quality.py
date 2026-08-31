@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -18,11 +19,27 @@ def output_sampling_plan_for_config(
 ) -> OutputSamplingPlan | None:
     if not bool(getattr(config, "output_quality_enabled", False)):
         return None
-    return build_output_sampling_plan(
+    plan = build_output_sampling_plan(
         source_width,
         source_height,
         headset_tier_k=int(getattr(config, "output_headset_tier_k", 4)),
     )
+    # Local Viewer presents to a physical display; inflating every frame to
+    # the headset tier before presenting wastes the whole GPU budget there.
+    # Other modes (XR/streaming consumers of the tier canvas) are unaffected.
+    if (
+        plan.mode == "upscale_easu"
+        and os.environ.get("D2S_CAP_OUTPUT_UPSCALE", "") == "1"
+    ):
+        return OutputSamplingPlan(
+            source_width=plan.source_width,
+            source_height=plan.source_height,
+            target_width=plan.source_width,
+            target_height=plan.source_height,
+            mode="native_mip",
+            target_kind=plan.target_kind,
+        )
+    return plan
 
 
 def output_quality_requires_eye_images(config: Any, width: int, height: int) -> bool:
@@ -207,6 +224,30 @@ def _torch_easu(
     return output
 
 
+def _mps_upscale(image: torch.Tensor, target_height: int, target_width: int) -> torch.Tensor:
+    """Bicubic stand-in for the Triton EASU pass on MPS.
+
+    Neither the Triton kernels nor the tile-looped ``_torch_easu`` reference
+    are viable on Apple GPUs (the reference costs seconds per frame), so the
+    upscale degrades to hardware bicubic there.
+    """
+    upscaled = F.interpolate(
+        image.float(),
+        size=(target_height, target_width),
+        mode="bicubic",
+        align_corners=False,
+    )
+    return upscaled.clamp_(0.0, 1.0)
+
+
+def _mps_rcas(image: torch.Tensor, sharpness: float) -> torch.Tensor:
+    """Unsharp-mask stand-in for RCAS on MPS (see _mps_upscale rationale)."""
+    source = image.float()
+    blurred = F.avg_pool2d(source, kernel_size=3, stride=1, padding=1, count_include_pad=False)
+    amount = 1.5 * max(0.0, min(1.0, float(sharpness)))
+    return (source + amount * (source - blurred)).clamp_(0.0, 1.0)
+
+
 def apply_output_quality(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -243,9 +284,14 @@ def apply_output_quality(
             right = easu_resize(right, plan.target_height, plan.target_width)
             backend = "triton_easu" if backend == "native" else backend + "+triton_easu"
         except Exception:
-            left = _torch_easu(left, plan.target_height, plan.target_width)
-            right = _torch_easu(right, plan.target_height, plan.target_width)
-            backend = "torch_easu_reference" if backend == "native" else backend + "+torch_easu_reference"
+            if left.device.type == "mps":
+                left = _mps_upscale(left, plan.target_height, plan.target_width)
+                right = _mps_upscale(right, plan.target_height, plan.target_width)
+                backend = "mps_bicubic" if backend == "native" else backend + "+mps_bicubic"
+            else:
+                left = _torch_easu(left, plan.target_height, plan.target_width)
+                right = _torch_easu(right, plan.target_height, plan.target_width)
+                backend = "torch_easu_reference" if backend == "native" else backend + "+torch_easu_reference"
     sharpness = max(0.0, min(1.0, float(getattr(config, "output_rcas_sharpness", 0.5))))
     if plan.mode != "native_mip" and sharpness > 0.0:
         try:
@@ -257,9 +303,14 @@ def apply_output_quality(
             right = apply_rcas(right, sharpness)
             backend += "+triton_rcas"
         except Exception:
-            left = _torch_rcas(left, sharpness)
-            right = _torch_rcas(right, sharpness)
-            backend += "+torch_rcas"
+            if left.device.type == "mps":
+                left = _mps_rcas(left, sharpness)
+                right = _mps_rcas(right, sharpness)
+                backend += "+mps_unsharp_rcas"
+            else:
+                left = _torch_rcas(left, sharpness)
+                right = _torch_rcas(right, sharpness)
+                backend += "+torch_rcas"
     return left, right, {
         "output_quality_applied": int(plan.mode != "native_mip" or mip_lod > 0.0),
         "output_quality_mode": plan.mode,

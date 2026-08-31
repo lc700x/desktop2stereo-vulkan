@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -270,9 +271,13 @@ def test_fullscreen_and_debug_preview_reset_independent_window_hints() -> None:
     glfw = _WindowHintGlfw()
 
     configure_glfw_window_hints(glfw, fullscreen=True)
-    assert glfw.hints[glfw.VISIBLE] == glfw.FALSE
+    # The hidden start exists only for the Windows taskbar-button trick;
+    # other platforms create fullscreen windows visible.
+    expected_visible = glfw.FALSE if sys.platform == "win32" else glfw.TRUE
+    assert glfw.hints[glfw.VISIBLE] == expected_visible
     assert glfw.hints[glfw.DECORATED] == glfw.TRUE
-    assert glfw.hints[glfw.FLOATING] == glfw.TRUE
+    if sys.platform == "win32":
+        assert glfw.hints[glfw.FLOATING] == glfw.TRUE
 
     configure_glfw_window_hints(glfw, fullscreen=False)
 

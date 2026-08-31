@@ -1015,6 +1015,29 @@ class GUIHandlerMixin:
         self.update_stream_url()
         self._fit_window_to_content()
 
+    def on_audio_device_change(self, e):
+        # Persist an explicit Stereo Mix selection on macOS only (v2.5.0
+        # parity: the configured device name is captured by the runtime).
+        # Windows/Linux resolve the default output device on every start and
+        # must not save a stale name. Placeholder labels are never saved.
+        if OS_NAME != "Darwin":
+            return
+        value = str(getattr(e, "control", None) and e.control.value or "").strip()
+        if not value:
+            return
+        placeholders = (
+            "no stereo mix device found",
+            "sounddevice not available",
+            "no audio capture devices found",
+            "no audio devices found",
+            "no audio sources found",
+            "pacmd not available",
+        )
+        if value.casefold() in placeholders:
+            self._config.pop("Stereo Mix", None)
+            return
+        self._config["Stereo Mix"] = value
+
     def _on_stream_key_change(self, e):
         val = e.control.value or ""
         if not re.match(r'^[A-Za-z0-9_-]*$', val) or len(val) > 64:
@@ -1031,10 +1054,35 @@ class GUIHandlerMixin:
             self._populate_audio_generic()
         self._apply_audio_devices_to_dropdown()
 
+    def _saved_audio_device(self):
+        """Return the persisted Stereo Mix device when it is still present.
+
+        The runtime (and the old GUI) may store a bare device name or a
+        "soundcard:"/"wasapi:"-prefixed label; match case-insensitively
+        against the currently discovered devices so the dropdown reflects the
+        saved choice instead of defaulting to the first discovered device.
+        """
+        saved = str((getattr(self, "_config", None) or {}).get("Stereo Mix", "") or "").strip()
+        if not saved:
+            return None
+        for prefix in ("soundcard:", "wasapi:"):
+            if saved.casefold().startswith(prefix):
+                saved = saved.split(":", 1)[1].strip()
+                break
+        if not saved:
+            return None
+        for device in self.audio_devices or []:
+            if str(device).casefold() == saved.casefold():
+                return device
+        return None
+
     def _apply_audio_devices_to_dropdown(self):
         if self.audio_devices:
             self.audio_dd.options = [d for d in self.audio_devices]
-            self.audio_dd.value = self.audio_devices[0]
+            # Prefer the persisted Stereo Mix device so the dropdown reflects
+            # what the stream will actually capture (macOS persists the
+            # selection; Windows/Linux keep the auto-resolved default).
+            self.audio_dd.value = self._saved_audio_device() or self.audio_devices[0]
             self.audio_dd.update()
             if self.audio_devices[0] in ["No Stereo Mix device found", "sounddevice not available"]:
                 self.set_status(self.audio_devices[0])
@@ -1142,6 +1190,13 @@ class GUIHandlerMixin:
 
     def auto_select_stereo_mix(self):
         if not self.audio_devices:
+            return
+        # A persisted macOS selection wins over the first-discovered loopback
+        # (e.g. a silent BlackHole); Windows/Linux keep their auto behavior.
+        saved = self._saved_audio_device()
+        if saved is not None:
+            self.audio_dd.value = saved
+            self.audio_dd.update()
             return
         for dev in self.audio_devices:
             dl = dev.lower()

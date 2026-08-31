@@ -90,7 +90,7 @@ def test_legacy_gpu_streamer_normalizes_to_advanced_stream_mode() -> None:
     assert resolved.fix_viewer_aspect
 
 
-def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode() -> None:
+def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode(monkeypatch) -> None:
     from streaming.stream_session import (
         NetworkStreamSessionConfig,
         is_network_stream_mode,
@@ -112,6 +112,9 @@ def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode() -> N
 
     # Advanced Auto keeps a distinct lazy chain so vendor-native GPU encoding
     # is attempted before Vulkan. Explicit Vulkan remains unchanged.
+    # The vendor chain is a Windows/CUDA/ROCm concept; pin the platform so
+    # the assertions hold regardless of the host running the suite.
+    monkeypatch.setattr("streaming.stream_session.sys.platform", "win32")
     nvidia_auto = resolve_network_video_backend(
         "RTMP Streamer", "auto", device_info="NVIDIA RTX 3090"
     )
@@ -129,6 +132,14 @@ def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode() -> N
     assert resolve_network_video_backend(
         "RTMP Streamer", "vulkan", device_info="NVIDIA RTX 3090"
     ).backend == "vulkan"
+    # macOS has no vendor/Vulkan encoder: Auto must land on the FFmpeg
+    # backend (VideoToolbox/libx264) instead of h264_vulkan.
+    monkeypatch.setattr("streaming.stream_session.sys.platform", "darwin")
+    mac_auto = resolve_network_video_backend(
+        "RTMP Streamer", "auto", device_info="Apple Silicon (MPS)"
+    )
+    assert mac_auto.backend == "ffmpeg"
+    assert "VideoToolbox" in mac_auto.reason
 
 
 def test_only_windows_3d_display_is_excluded_from_capture() -> None:

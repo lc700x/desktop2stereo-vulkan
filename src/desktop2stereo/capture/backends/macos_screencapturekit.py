@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 import ctypes
@@ -11,6 +12,43 @@ from Foundation import NSObject
 from Quartz import CoreVideo as CV
 from CoreMedia import CMTimeMake, CMSampleBufferGetImageBuffer
 from AppKit import NSScreen
+
+# Optional Metal zero-copy path (Milestone 2)
+try:
+    import Metal
+    _metal_device = None
+    _cv_metal_cache = None
+
+    def _get_metal_device():
+        global _metal_device
+        if _metal_device is None:
+            _metal_device = Metal.MTLCreateSystemDefaultDevice()
+        return _metal_device
+
+    def _get_cv_metal_cache():
+        global _cv_metal_cache
+        if _cv_metal_cache is not None:
+            return _cv_metal_cache
+        device = _get_metal_device()
+        if device is None:
+            return None
+        # pyobjc 12.x returns (err, cache) via the bridge's out-param
+        # metadata; objc.Variable does not exist in this version.
+        res = CV.CVMetalTextureCacheCreate(None, None, device, None, None)
+        err, cache = res if isinstance(res, tuple) else (res, None)
+        if err == 0 and cache is not None:  # kCVReturnSuccess
+            _cv_metal_cache = cache
+        return _cv_metal_cache
+except Exception:
+    Metal = None
+    _metal_device = None
+    _cv_metal_cache = None
+
+    def _get_metal_device():
+        return None
+
+    def _get_cv_metal_cache():
+        return None
 
 # Load ScreenCaptureKit framework
 objc.loadBundle('ScreenCaptureKit', globals(),
@@ -80,6 +118,51 @@ def get_window_client_bounds_mac(window_title):
         return None, None, None, None
     return info["left"], info["top"], info["width"], info["height"]
 
+
+class _OwnedSCKFrame:
+    """Own a CVPixelBuffer + its CVMetalTexture for zero-copy sampling.
+
+    Holds +1 on both objects; ``release()`` (or GC via ``__del__``) frees
+    them, so frames dropped anywhere along the queue chain cannot leak.
+    """
+
+    __slots__ = ("texture", "pixel_buffer", "_released")
+
+    def __init__(self, cv_texture, pixel_buffer):
+        self.texture = cv_texture
+        self.pixel_buffer = pixel_buffer
+        self._released = False
+        CV.CVPixelBufferRetain(pixel_buffer)
+        cv_texture.retain()
+
+    def mtl_texture(self):
+        """Return the live MTLTexture (BGRA8Unorm), or None after release."""
+        if self._released or self.texture is None:
+            return None
+        return CV.CVMetalTextureGetTexture(self.texture)
+
+    def release(self):
+        if self._released:
+            return
+        self._released = True
+        try:
+            if self.texture is not None:
+                self.texture.release()
+        except Exception:
+            pass
+        try:
+            if self.pixel_buffer is not None:
+                CV.CVPixelBufferRelease(self.pixel_buffer)
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
 class _SCKFrameReceiver(NSObject):
     def init(self):
         self = objc.super(_SCKFrameReceiver, self).init()
@@ -87,7 +170,11 @@ class _SCKFrameReceiver(NSObject):
             return None
         self._lock = threading.Lock()
         self._latest_frame = None
+        self._latest_mtl_texture = None
+        self._latest_owned = None
+        self._latest_texture_size = (0, 0)
         self._frame_count = 0
+        self._texture_diag_logged = False
         self._condition = threading.Condition(self._lock)
         return self
 
@@ -98,6 +185,74 @@ class _SCKFrameReceiver(NSObject):
             imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
             if imageBuffer is None:
                 return
+
+            # Zero-copy Metal texture path (survey doc milestone 5): every
+            # frame is wrapped as an owned CVPixelBuffer+CVMetalTexture pair
+            # that downstream stages (warp viewer) can sample directly,
+            # skipping the 8MB device->host->device color round-trip.
+            # D2S_SCK_ZEROCOPY_TEX=0 reverts to v2.5 parity (CPU readout only;
+            # the old D2S_SCK_METAL_TEXTURE_DIAG=1 diagnostic still prints).
+            zc_enabled = os.environ.get("D2S_SCK_ZEROCOPY_TEX", "1") != "0"
+            diag_enabled = os.environ.get("D2S_SCK_METAL_TEXTURE_DIAG") == "1"
+            if (
+                (zc_enabled or (diag_enabled and self._frame_count == 0))
+                and _get_metal_device() is not None
+                and _get_cv_metal_cache() is not None
+            ):
+                try:
+                    # Retain pixel buffer for texture lifetime
+                    CV.CVPixelBufferRetain(imageBuffer)
+                    try:
+                        cache = _get_cv_metal_cache()
+                        w = CV.CVPixelBufferGetWidth(imageBuffer)
+                        h = CV.CVPixelBufferGetHeight(imageBuffer)
+                        # BGRA8Unorm == kCVPixelFormatType_32BGRA.
+                        # pyobjc 12.x: out-param returns as (err, cvtex).
+                        res = CV.CVMetalTextureCacheCreateTextureFromImage(
+                            None, cache, imageBuffer, None,
+                            Metal.MTLPixelFormatBGRA8Unorm, w, h, 0, None
+                        )
+                        err, cv_tex = (
+                            res if isinstance(res, tuple) else (res, None)
+                        )
+                        if err == 0 and cv_tex is not None:
+                            mtl_tex = CV.CVMetalTextureGetTexture(cv_tex)
+                            if mtl_tex is not None:
+                                if not self._texture_diag_logged and (
+                                    zc_enabled or diag_enabled
+                                ):
+                                    self._texture_diag_logged = True
+                                    print(
+                                        "[ScreenCaptureKit] Metal zero-copy texture OK: "
+                                        f"{w}x{h} BGRA8Unorm via CVMetalTextureCache "
+                                        "(no CPU base-address read)",
+                                        flush=True,
+                                    )
+                                if zc_enabled:
+                                    owned = _OwnedSCKFrame(cv_tex, imageBuffer)
+                                    replaced = None
+                                    with self._condition:
+                                        replaced = self._latest_owned
+                                        self._latest_owned = owned
+                                        self._latest_texture_size = (w, h)
+                                    # Release AFTER the swap so a concurrent
+                                    # taker never sees a freed ref.
+                                    if replaced is not None:
+                                        replaced.release()
+                                else:
+                                    cv_tex.release()
+                    finally:
+                        CV.CVPixelBufferRelease(imageBuffer)
+                except Exception as exc:
+                    # Never silent again: the pyobjc out-param convention
+                    # changed under us once and zero-copy died invisibly.
+                    if not getattr(self, "_zc_err_logged", False):
+                        self._zc_err_logged = True
+                        print(
+                            f"[ScreenCaptureKit] zero-copy texture wrap failed "
+                            f"(once): {type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
 
             w = CV.CVPixelBufferGetWidth(imageBuffer)
             h = CV.CVPixelBufferGetHeight(imageBuffer)
@@ -120,6 +275,12 @@ class _SCKFrameReceiver(NSObject):
                 self._latest_frame = frame
                 self._frame_count += 1
                 self._condition.notify_all()
+            try:
+                from utils.residency import mark as _rz_mark
+
+                _rz_mark("capture_frame(host bytes)", frame, "SCK contract")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -128,12 +289,42 @@ class _SCKFrameReceiver(NSObject):
             print(f"[ScreenCaptureKit] Stream stopped with error: {error}")
 
     def get_latest_frame(self, timeout=0.1):
+        """Return the newest frame, transferring ownership instead of copying.
+
+        Each SCK callback allocates a fresh contiguous array and replaces the
+        slot atomically under the lock, so the returned array is never written
+        again by this receiver. The extra defensive `.copy()` cost a full-frame
+        memcpy per frame; D2S_SCK_LATEST_FRAME_COPY=1 restores it.
+        """
+        defensive_copy = os.environ.get("D2S_SCK_LATEST_FRAME_COPY") == "1"
         with self._condition:
             if self._latest_frame is None and timeout > 0:
                 self._condition.wait(timeout=timeout)
             if self._latest_frame is not None:
-                return self._latest_frame.copy()
+                if defensive_copy:
+                    return self._latest_frame.copy()
+                frame = self._latest_frame
+                # Detach the slot so a blocked consumer cannot observe a frame
+                # twice while a newer one has already replaced it.
+                self._latest_frame = None
+                return frame
             return None
+
+    def get_latest_mtl_texture(self):
+        """Zero-copy path diagnostic: return (MTLTexture, (w,h)) without CPU read."""
+        with self._condition:
+            return self._latest_mtl_texture, self._latest_texture_size
+
+    def take_latest_zero_copy(self):
+        """Transfer the newest owned zero-copy frame, or None.
+
+        Ownership of the +1 refs moves to the caller; it must call
+        ``release()`` when done drawing (or let GC do it).
+        """
+        with self._condition:
+            owned = self._latest_owned
+            self._latest_owned = None
+        return owned
 
     @property
     def frame_count(self):
@@ -142,9 +333,15 @@ class _SCKFrameReceiver(NSObject):
 class DesktopGrabber:
     def __init__(self, output_resolution=1080, fps=60, window_title=None,
                 capture_mode="Monitor", monitor_index=1, with_cursor=True):
-        self.scaled_height = output_resolution
+        # OUTPUT_RESOLUTION may be an int or a (width, height) tuple when
+        # "Processing Resolution: Auto"; the grabber needs a target height.
+        if isinstance(output_resolution, (tuple, list)):
+            output_resolution = int(output_resolution[1])
+        self.scaled_height = int(output_resolution)
         self.fps = fps
         self.with_cursor = with_cursor
+        # Native ScreenCaptureKit pixel format handed to consumers by grab().
+        self.frame_format = "bgra"
         self.window_title = window_title
         self.capture_mode = capture_mode
         self._stream = None
@@ -261,7 +458,14 @@ class DesktopGrabber:
         self._stream.updateContentFilter_completionHandler_(fid, lambda e: done.set())
         done.wait(timeout=3.0)
 
-    def grab(self, output_format="bgr"):
+    def grab(self, output_format="bgra"):
+        """Return the newest captured frame.
+
+        Defaults to ``bgra`` so the ScreenCaptureKit native format passes
+        through without a per-frame ``cv2.cvtColor``; the tensor preprocess
+        path (capture.preprocess) accepts 4-channel BGRA directly. ``bgr``
+        remains available for CPU consumers.
+        """
         self._update_window_filter()
 
         frame = self._receiver.get_latest_frame(timeout=1.0 / max(1, self.fps))
@@ -282,6 +486,16 @@ class DesktopGrabber:
             return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR), self.scaled_height
         else:
             raise ValueError("output_format must be 'bgr' or 'bgra'")
+
+    def take_latest_zero_copy(self):
+        """Transfer the newest owned zero-copy frame (or None).
+
+        Only valid between start() and stop(); returns None otherwise.
+        """
+        receiver = self._receiver
+        if receiver is None:
+            return None
+        return receiver.take_latest_zero_copy()
 
     def stop(self):
         if self._stream is not None:

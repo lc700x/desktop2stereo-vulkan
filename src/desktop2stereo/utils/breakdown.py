@@ -162,7 +162,9 @@ class FPSBreakdown:
         timing = getattr(runtime_result, "timing", None) or {}
         debug = getattr(runtime_result, "debug_info", None) or {}
         with self.lock:
-            for key in ("depth_total_ms", "depth_model_ms", "depth_slot_wait_ms", "synthesis_ms", "pack_ms", "total_ms"):
+            for key in ("depth_total_ms", "depth_model_ms", "depth_slot_wait_ms", "synthesis_ms", "pack_ms", "total_ms",
+                        "sbs_host_ms", "sbs_host_device_ms", "sbs_host_copy_ms", "sbs_host_numpy_ms",
+                        "packer_ms"):
                 value = timing.get(key)
                 if value is not None:
                     self.stats[f"rt_{key}"] = float(value)
@@ -311,6 +313,7 @@ class FPSBreakdown:
             f"viewer_drop={rate('viewer_drop'):.1f} "
             f"local_present={rate('local_presented_frame'):.1f} "
             f"local_present_ms={avg_ms('local_present'):.2f}ms "
+            f"local_present_pack_ms={avg_ms('local_present_pack'):.2f}ms "
             f"screen_new={rate('openxr_new_screen_frame'):.1f} "
             f"screen_reuse={rate('openxr_reused_screen_frame'):.1f} "
             f"screen_proj={rate('openxr_projection_screen_present'):.1f} "
@@ -521,6 +524,11 @@ class FPSBreakdown:
             f"rt_slot_wait={stats.get('rt_depth_slot_wait_ms', 0.0):.2f}ms "
             f"rt_synth={stats.get('rt_synthesis_ms', 0.0):.2f}ms "
             f"rt_total={stats.get('rt_total_ms', 0.0):.2f}ms "
+            f"rt_sbs_host={stats.get('rt_sbs_host_ms', 0.0):.2f}ms "
+            f"rt_sbs_host_copy={stats.get('rt_sbs_host_copy_ms', 0.0):.2f}ms "
+            f"rt_sbs_host_numpy={stats.get('rt_sbs_host_numpy_ms', 0.0):.2f}ms "
+            f"rt_sbs_host_presync={stats.get('rt_sbs_host_presync_ms', 0.0):.2f}ms "
+            f"packer={stats.get('packer_ms', 0.0):.2f}ms "
             f"rt_depth_backend={stats.get('rt_depth_backend', 'unknown')} "
             f"rt_depth_slot={stats.get('rt_depth_slot', 'n/a')}/{stats.get('rt_depth_slot_count', 1)} "
             f"rt_out={stats.get('rt_output_dtype', 'unknown')} "

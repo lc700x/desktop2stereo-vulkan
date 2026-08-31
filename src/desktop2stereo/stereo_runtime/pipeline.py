@@ -724,9 +724,21 @@ def _runtime_supports_parallel_cuda_pending(ctx: RuntimePipelineContext) -> bool
         getattr(runtime, "_resolved_stereo_compute_backend", "") or ""
     ).strip().lower()
     if resolved_backend not in {"triton", "cuda", "cuda_triton"}:
-        # Vulkan deferred stereo has a separate presenter-side consumer lease;
-        # keep its depth queue single-pending until that path is made safe.
-        return False
+        # On macOS the "vulkan" label just means "not triton": synthesis runs
+        # the torch-fast backend on MPS (the Vulkan fused kernel path is
+        # unavailable without a GLSL compiler), so the presenter-side consumer
+        # lease concern does not apply. Opt in via D2S_RUNTIME_PARALLEL_MPS=1.
+        import sys as _sys
+
+        # "" is the steady state on the torch-fast path: the resolver only
+        # runs for the fused/vulkan kernel attempt, which macOS never takes.
+        if not resolved_backend and _sys.platform == "darwin":
+            resolved_backend = "vulkan"
+        is_mps_mac = _sys.platform == "darwin" and resolved_backend == "vulkan"
+        if not (is_mps_mac and os.environ.get("D2S_RUNTIME_PARALLEL_MPS", "0") == "1"):
+            # Vulkan deferred stereo has a separate presenter-side consumer lease;
+            # keep its depth queue single-pending until that path is made safe.
+            return False
     if ctx.run_mode == "OpenXR":
         realtime_config = _openxr_realtime_synthesis_config(
             getattr(runtime, "stereo_config", None)
@@ -1588,6 +1600,7 @@ class RuntimePipelineLoop:
                         runtime_rgb,
                         skip_sbs_output=False,
                         depth_profile=depth_profile,
+                        pixel_buffer=getattr(captured_frame, "sck_zero_copy", None),
                     )
                 ctx.breakdown_add_time("rt_call", time.perf_counter() - runtime_call_start_time)
                 _attach_pipeline_debug(

@@ -117,6 +117,8 @@ class DepthProviderConfig:
     execution_slot_count: int = 1
     depth_upsample: DepthUpsampleMode = "bilinear"
     depth_upsample_edge_strength: float = 0.35
+    use_coreml: bool = False
+    recompile_coreml: bool = False
 
 
 def default_lab_cache_dir() -> Path:
@@ -167,7 +169,13 @@ def _normalize_depth(depth: torch.Tensor, subsample_cap: int = 6_144) -> torch.T
         sorted_vals = torch.sort(sampled, dim=-1).values
         amin = sorted_vals[..., lo_idx].view(depth.shape[0], 1, 1, 1)
         amax = sorted_vals[..., hi_idx].view(depth.shape[0], 1, 1, 1)
-    return ((depth - amin) / (amax - amin).clamp_min(1e-6)).clamp(0, 1)
+    normalized = (depth - amin) / (amax - amin).clamp_min(1e-6)
+    if normalized.is_floating_point():
+        # fp16 depth sources can poison normalization with NaN/Inf; sanitize
+        # at this choke point so every downstream consumer (synthesis, warp,
+        # host-frame pack) only ever sees finite [0,1] depth.
+        normalized = torch.nan_to_num(normalized, nan=1.0, posinf=1.0, neginf=0.0)
+    return normalized.clamp(0, 1)
 
 
 def _is_infinidepth_model(model_id: str) -> bool:
@@ -543,12 +551,9 @@ class DistillAnyDepthBase518:
         sync()
         preprocess_ms = (time.perf_counter() - start) * 1000.0
 
-        model = self.load()
-        use_autocast = self.device.type == "cuda" and self.dtype == torch.float16
         sync()
         start = time.perf_counter()
-        with torch.inference_mode(), torch.autocast(device_type=self.device.type, enabled=use_autocast):
-            predicted = model(pixel_values=tensor).predicted_depth
+        predicted = self._run_depth_model(tensor).predicted_depth
         sync()
         model_ms = (time.perf_counter() - start) * 1000.0
 
@@ -566,6 +571,19 @@ class DistillAnyDepthBase518:
         sync()
         postprocess_ms = (time.perf_counter() - start) * 1000.0
         return DepthProfileResult(depth, preprocess_ms, model_ms, postprocess_ms)
+
+    def _run_depth_model(self, tensor: torch.Tensor):
+        """Model-call hook; override to route through an alternate engine.
+
+        Must be safe to call from multiple threads (parallel depth slots);
+        the default runs the torch module with the CUDA autocast policy.
+        """
+        model = self.load()
+        use_autocast = self.device.type == "cuda" and self.dtype == torch.float16
+        with torch.inference_mode(), torch.autocast(
+            device_type=self.device.type, enabled=use_autocast
+        ):
+            return model(pixel_values=tensor)
 
 
 class GenericAutoDepthProvider:
@@ -627,6 +645,11 @@ class GenericAutoDepthProvider:
         self._model = model.to(self.device).eval()
         return self._model
 
+    def _run_depth_model(self, tensor):
+        use_autocast = self.device.type == "cuda" and self.dtype == torch.float16
+        with torch.inference_mode(), torch.autocast(device_type=self.device.type, enabled=use_autocast):
+            return self.load()(pixel_values=tensor)
+
     def predict(self, rgb: torch.Tensor) -> torch.Tensor:
         return self.predict_profile(rgb).depth
 
@@ -659,12 +682,9 @@ class GenericAutoDepthProvider:
         sync()
         preprocess_ms = (time.perf_counter() - start) * 1000.0
 
-        model = self.load()
-        use_autocast = self.device.type == "cuda" and self.dtype == torch.float16
         sync()
         start = time.perf_counter()
-        with torch.inference_mode(), torch.autocast(device_type=self.device.type, enabled=use_autocast):
-            output = model(pixel_values=tensor)
+        output = self._run_depth_model(tensor)
         predicted = _extract_depth_output(output)
         sync()
         model_ms = (time.perf_counter() - start) * 1000.0
@@ -1029,6 +1049,8 @@ class AutoDepthProvider:
                     force_download=cfg.force_download,
                     depth_upsample=cfg.depth_upsample,
                     depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
+                    use_coreml=cfg.use_coreml,
+                    recompile_coreml=cfg.recompile_coreml,
                 ),
             ))
         if os.name == "nt":
@@ -1230,6 +1252,8 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
             force_download=cfg.force_download,
             depth_upsample=cfg.depth_upsample,
             depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
+            use_coreml=cfg.use_coreml,
+            recompile_coreml=cfg.recompile_coreml,
         )
 
     if backend in {"tensorrt_native", "native_tensorrt", "tensorrt_native_graph"} or (
@@ -1303,6 +1327,23 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
             )
 
     if backend in {"distill_base_518", "distill_base_nvidia", "nvidia_chain", "tensorrt", "tensorrt_ort", "onnx_cuda", "onnx_cuda_iobinding", "pytorch_cuda", "pytorch"}:
+        if device.type == "mps":
+            from .providers.apple import create_pytorch_mps_provider
+
+            return create_pytorch_mps_provider(
+                model_id=cfg.model_id,
+                model_name=cfg.model_name,
+                device=device,
+                cache_dir=cfg.cache_dir,
+                depth_resolution=cfg.depth_resolution,
+                patch_size=cfg.patch_size,
+                local_files_only=cfg.local_files_only,
+                force_download=cfg.force_download,
+                depth_upsample=cfg.depth_upsample,
+                depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
+                use_coreml=cfg.use_coreml,
+                recompile_coreml=cfg.recompile_coreml,
+            )
         if cfg.model_id != DISTILL_ANY_DEPTH_BASE_MODEL_ID:
             if _is_infinidepth_model(cfg.model_id):
                 return InfiniDepthProvider(

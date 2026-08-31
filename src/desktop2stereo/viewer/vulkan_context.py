@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from threading import RLock
 from time import perf_counter
@@ -308,6 +309,18 @@ class VulkanContext:
             cfg.required_instance_extensions,
             available_extensions,
         )
+        # Through a Vulkan loader, MoltenVK physical devices are only listed
+        # when portability enumeration is explicitly enabled.
+        instance_flags = 0
+        if (
+            sys.platform == "darwin"
+            and "VK_KHR_portability_enumeration" in available_extensions
+        ):
+            required_instance_extensions = (
+                *required_instance_extensions,
+                "VK_KHR_portability_enumeration",
+            )
+            instance_flags = 0x00000001  # VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
         layers: tuple[str, ...] = ()
         if cfg.enable_validation:
             validation_layer = "VK_LAYER_KHRONOS_validation"
@@ -329,6 +342,7 @@ class VulkanContext:
         )
         create_info = vk.VkInstanceCreateInfo(
             sType=vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            flags=instance_flags,
             pApplicationInfo=app_info,
             enabledLayerCount=len(layers),
             ppEnabledLayerNames=list(layers) or None,
@@ -2084,9 +2098,13 @@ def _import_vulkan() -> Any:
     try:
         import vulkan as vk
     except (ImportError, OSError) as exc:
-        raise VulkanUnavailableError(
-            "Python Vulkan bindings or the Vulkan loader are unavailable"
-        ) from exc
+        message = "Python Vulkan bindings or the Vulkan loader are unavailable"
+        if sys.platform == "darwin":
+            message += (
+                ". On macOS install MoltenVK with `brew install molten-vk` "
+                "(or the LunarG Vulkan SDK), then restart."
+            )
+        raise VulkanUnavailableError(message) from exc
     return vk
 
 
@@ -2191,7 +2209,11 @@ def _find_graphics_queue_family(vk: Any, physical_device: Any) -> int | None:
 
 
 def _find_queue_families(vk: Any, physical_device: Any) -> QueueFamilySelection | None:
-    families = list(vk.vkGetPhysicalDeviceQueueFamilyProperties(physical_device))
+    # Do NOT wrap in list(): the python-vulkan binding returns an owning
+    # cffi array whose per-element structs are only valid while iterating it
+    # directly -- list() materializes fresh structs with zeroed fields, so
+    # every family looks empty and no graphics queue is ever found.
+    families = vk.vkGetPhysicalDeviceQueueFamilyProperties(physical_device)
     graphics = next(
         (
             index

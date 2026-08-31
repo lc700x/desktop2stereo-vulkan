@@ -130,13 +130,105 @@ def _kill_orphan_mediamtx_processes(ports: list[int] | None = None) -> None:
     # give OS time to release
     time.sleep(0.15)
 
+
+def _darwin_safe_mediamtx_config(config_path: Path) -> Path:
+    """Return a runtime-generated MediaMTX config that runs on macOS.
+
+    MediaMTX sets udpReadBufferSize via a socket option that is unimplemented
+    on macOS; any non-zero value makes it abort at startup ("read buffer size
+    is unimplemented on the current operating system") and close every
+    listener. Rewrite it to the OS default (0) in a sibling file and point the
+    launch at that copy. Windows/Linux configs are untouched.
+    """
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return config_path
+    if re.search(r"(?m)^udpReadBufferSize:\s*[1-9]", text) is None:
+        return config_path  # already at the OS default
+    patched = re.sub(
+        r"(?m)^(udpReadBufferSize:\s*)[0-9]+",
+        r"\g<1>0",
+        text,
+    )
+    target = config_path.with_name("mediamtx.macos.yml")
+    try:
+        target.write_text(patched, encoding="utf-8")
+    except OSError:
+        return config_path
+    return target
+
+
+def _list_darwin_audio_devices(ffmpeg_path: Path) -> list[tuple[int, str]]:
+    """Return ``(index, name)`` pairs for every AVFoundation audio device.
+
+    Runs ``ffmpeg -f avfoundation -list_devices true -i ""`` (the reference
+    v2.5.0 macOS discovery command) and parses the stderr device listing.
+    macOS only; returns [] on any error.
+    """
+    try:
+        result = subprocess.run(
+            [
+                str(ffmpeg_path),
+                "-f",
+                "avfoundation",
+                "-list_devices",
+                "true",
+                "-i",
+                "",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    output = result.stderr or ""
+    in_audio = False
+    devices: list[tuple[int, str]] = []
+    for line in output.splitlines():
+        if "AVFoundation audio devices:" in line:
+            in_audio = True
+            continue
+        if "AVFoundation video devices:" in line:
+            in_audio = False
+            continue
+        if in_audio:
+            match = re.search(r"\[(\d+)\]\s*(.+)", line)
+            if match:
+                devices.append((int(match.group(1)), match.group(2).strip()))
+    return devices
+
+
+def _auto_select_darwin_audio(ffmpeg_path: Path) -> str:
+    """Pick an AVFoundation audio device for loopback capture on macOS.
+
+    Returns the index of the first audio device, preferring loopback-style
+    names (BlackHole / Loopback / Virtual / Stereo Mix) so the stream always
+    carries sound even when no Stereo Mix device was configured. Returns ""
+    when no audio device exists.
+    """
+    devices = _list_darwin_audio_devices(ffmpeg_path)
+    for index, name in devices:
+        lowered = name.lower()
+        if any(
+            token in lowered
+            for token in ("blackhole", "loopback", "virtual", "stereo mix")
+        ):
+            return str(index)
+    return str(devices[0][0]) if devices else ""
+
+
 def runtime_sbs_to_rgb(frame_or_result: Any) -> np.ndarray:
     """Convert a packed SBS runtime tensor/array to contiguous RGB8 HWC."""
     frame = getattr(frame_or_result, "sbs", frame_or_result)
     if frame is None:
         raise ValueError("runtime result does not contain an SBS frame")
     image = frame.detach() if hasattr(frame, "detach") else frame
-    if bool(getattr(image, "is_cuda", False)):
+    # Accelerator tensors (CUDA, MPS, ...) must be copied to host memory
+    # before numpy conversion; an is_cuda-only check lets MPS frames through
+    # and numpy raises "can't convert mps:0 device type tensor to numpy".
+    if hasattr(image, "device") and getattr(image.device, "type", "cpu") != "cpu":
         image = image.cpu()
     if hasattr(image, "numpy"):
         image = image.numpy()
@@ -1066,6 +1158,13 @@ class FfmpegDirectSbsOutput:
         )
         if not self.mediamtx_config.is_file():
             raise FileNotFoundError(f"MediaMTX config not found: {self.mediamtx_config}")
+        if sys.platform == "darwin":
+            # MediaMTX cannot apply udpReadBufferSize on macOS ("read buffer
+            # size is unimplemented on the current operating system") and
+            # aborts at startup, killing every listener. Drop it to the OS
+            # default in a runtime-generated copy; Windows/Linux keep the
+            # enlarged buffer.
+            self.mediamtx_config = _darwin_safe_mediamtx_config(self.mediamtx_config)
         self.server_process: subprocess.Popen | None = None
         self.ffmpeg_process: subprocess.Popen | None = None
         self._ffmpeg_log_thread: threading.Thread | None = None
@@ -1088,6 +1187,8 @@ class FfmpegDirectSbsOutput:
         self._pending_audio_delay: float | None = None
         self._audio_delay_lock = threading.Lock()
         self._packet_loss_warning_emitted = False
+        self._darwin_audio_device: str | None = None
+        self._darwin_audio_probe_started = False
         if self.auto_calibration:
             logs_dir = self.base_dir / "logs"
             self._calibration_controller = StreamCalibrationController(
@@ -1601,6 +1702,12 @@ class FfmpegDirectSbsOutput:
 
     def _audio_input_args(self) -> list[str]:
         device = self.stereo_mix_device
+        if self.os_name == "Darwin":
+            # No configured device (or a "no device found" placeholder):
+            # auto-pick a loopback capture device so the stream always
+            # carries sound on macOS.
+            if not device or device.lower().startswith(("no ", "none", "null")):
+                device = _auto_select_darwin_audio(self.ffmpeg_path)
         if not device or device.lower().startswith(("no ", "none", "null")):
             return []
         if self.os_name == "Windows":
@@ -1647,18 +1754,75 @@ class FfmpegDirectSbsOutput:
             ]
         if self.os_name == "Darwin":
             audio_device = device
-            if audio_device.isdigit():
-                audio_device = f":{audio_device}"
-            elif not audio_device.startswith(":"):
-                audio_device = f":{audio_device}"
-            return [
+            # Device labels from the GUI carry a backend prefix
+            # ("soundcard:BlackHole 2ch", "wasapi:..."); AVFoundation matches
+            # on the bare device name and rejects ":soundcard:BlackHole 2ch".
+            for prefix in ("soundcard:", "wasapi:"):
+                if audio_device.casefold().startswith(prefix):
+                    audio_device = audio_device.split(":", 1)[1].strip()
+                    break
+            auto_selected = False
+            if not audio_device or audio_device == ":":
+                # No usable device (empty, bare "soundcard:" prefix, or a lone
+                # ":"): skip audio entirely instead of handing FFmpeg "-i :"
+                # which fails with "Error opening input file :." and kills the
+                # stream.
+                auto = _auto_select_darwin_audio(self.ffmpeg_path)
+                if not auto:
+                    return []
+                auto_selected = True
+                audio_device = auto
+            if not audio_device.isdigit():
+                # A configured device NAME (v2.5.0 settings parity) is
+                # resolved to its AVFoundation index so the persisted "Stereo
+                # Mix" device is captured even if the GUI list changes; a
+                # stale/unplugged name falls back to auto-selection instead
+                # of failing FFmpeg at startup.
+                resolved_index = None
+                for index, name in _list_darwin_audio_devices(self.ffmpeg_path):
+                    if name.casefold() == audio_device.casefold():
+                        resolved_index = str(index)
+                        break
+                if resolved_index is None:
+                    print(
+                        "[DirectSbsStream] WARNING: configured macOS Stereo Mix "
+                        f"device {audio_device!r} is not available; auto-selecting",
+                        flush=True,
+                    )
+                    resolved_index = _auto_select_darwin_audio(self.ffmpeg_path)
+                    auto_selected = True
+                if not resolved_index:
+                    return []
+                audio_device = resolved_index
+            audio_device = f":{audio_device}"
+            self._darwin_audio_device = audio_device
+            # v2.5.0 macOS parity: the AVFoundation audio input carries the
+            # same 256 MB ring buffer (rtbufsize) as the reference build.
+            args = [
                 "-itsoffset",
                 str(self.audio_delay),
                 "-f",
                 "avfoundation",
+                "-rtbufsize",
+                "256M",
                 "-i",
                 audio_device,
             ]
+            if auto_selected:
+                print(
+                    "[DirectSbsStream] WARNING: no Stereo Mix device configured; "
+                    f"auto-selected macOS audio device {audio_device!r}. If the "
+                    "stream has no sound, route system audio to that device or "
+                    "pick a Stereo Mix device in the GUI.",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[DirectSbsStream] macOS audio device: {device!r} -> "
+                    f"avfoundation {audio_device}",
+                    flush=True,
+                )
+            return args
         return []
 
     def _qsv_d3d11_surface_upload_enabled(self) -> bool:
@@ -1704,9 +1868,37 @@ class FfmpegDirectSbsOutput:
                 f"{width}x{height}",
                 "-framerate",
                 str(self.fps),
+                # Wall-clock timestamps: the app-paced pipe producer advances
+                # video PTS by 1/fps per frame regardless of delivery time,
+                # so every stall permanently shifts video PTS behind the
+                # real-time audio clock -> growing A/V offset -> the client
+                # constantly re-syncs (choppy sound). Timestamping at read
+                # time keeps video PTS on the same av_gettime() clock as the
+                # audio input (same pattern as the NVIDIA SRT path).
+                "-use_wallclock_as_timestamps",
+                "1",
+                # Threaded demux: the pipe read runs on a worker thread so a
+                # stalled/slow app producer can never block the demux loop
+                # and starve the real-time audio input (audio dropouts).
+                "-thread_queue_size",
+                "16",
                 "-i",
                 "pipe:0",
             ]
+        )
+        audio_input_args = (
+            [
+                # Same clock base as the video input (see above), so the
+                # muxer sees both streams on one timeline and never has to
+                # drop audio that runs ahead of a delayed video PTS.
+                "-thread_queue_size",
+                "512",
+                "-use_wallclock_as_timestamps",
+                "1",
+                *audio_args,
+            ]
+            if audio_args
+            else []
         )
         command = [
             str(self.ffmpeg_path),
@@ -1722,7 +1914,7 @@ class FfmpegDirectSbsOutput:
             "-analyzeduration",
             "0",
             *input_args,
-            *audio_args,
+            *audio_input_args,
             "-map",
             "0:v:0",
         ]
@@ -1919,11 +2111,15 @@ class FfmpegDirectSbsOutput:
                 ]
             )
         if audio_args:
-            if self.protocol == "WEBRTC":
+            # Both inputs share the av_gettime() wall-clock base, so the
+            # audio and video timelines are aligned by construction. async=1
+            # (the v2.5.0 magnitude) absorbs residual device-clock drift by
+            # inserting/dropping samples without letting the filter make
+            # large, audible adjustments.
+            command.extend(["-af", "aresample=async=1"])
+            if self.protocol == "WEBRTC" or self.os_name == "Darwin":
                 command.extend(
                     [
-                        "-af",
-                        "aresample=async=1000:first_pts=0",
                         "-c:a",
                         "libopus",
                         "-ar",
@@ -1935,6 +2131,8 @@ class FfmpegDirectSbsOutput:
                     ]
                 )
             else:
+                # Windows/Linux SRT/RTMP paths (NVIDIA/ROCm) keep AAC; the
+                # resample above still normalizes their audio timeline.
                 command.extend(["-c:a", "aac", "-ar", "48000", "-b:a", "128k"])
         if getattr(self, "_calibration_controller", None) is not None:
             # FFmpeg reports the actual encoded/muxed output rate, which is
@@ -1944,7 +2142,12 @@ class FfmpegDirectSbsOutput:
             command.extend(
                 [
                     "-force_key_frames",
-                    "expr:gte(t,n_forced*1)",
+                    # Frame-based (not t-based): the video input now carries
+                    # wall-clock PTS, so a time expression like
+                    # expr:gte(t,n_forced*1) would force every frame to be a
+                    # keyframe. n is the frame index, independent of the PTS
+                    # base; one keyframe per fps frames (1/s cadence).
+                    f"expr:eq(n%{self.fps}\\,0)",
                     "-muxdelay",
                     "0",
                     "-muxpreload",
@@ -2002,6 +2205,60 @@ class FfmpegDirectSbsOutput:
             )
         return command
 
+    def _probe_darwin_audio_silence(self) -> None:
+        """Warn once when the macOS audio device captures digital silence.
+
+        Runs a short volumedetect capture on the same AVFoundation device the
+        stream uses (CoreAudio allows concurrent capture clients). Purely
+        advisory: a silent result never fails or delays the stream. macOS
+        only; other platforms are no-ops.
+        """
+        if getattr(self, "os_name", None) != "Darwin":
+            return
+        device = getattr(self, "_darwin_audio_device", None)
+        if not device:
+            return
+        ffmpeg_path = getattr(self, "ffmpeg_path", None)
+        if not ffmpeg_path:
+            return
+        try:
+            result = subprocess.run(
+                [
+                    str(ffmpeg_path),
+                    "-hide_banner",
+                    "-f",
+                    "avfoundation",
+                    "-rtbufsize",
+                    "256M",
+                    "-i",
+                    device,
+                    "-t",
+                    "1",
+                    "-af",
+                    "volumedetect",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2.5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+        match = re.search(r"mean_volume:\s*(-?[0-9.]+)\s*dB", result.stderr or "")
+        if match is None:
+            return
+        mean_db = float(match.group(1))
+        if mean_db < -55.0:
+            print(
+                "[DirectSbsStream] WARNING: macOS audio device "
+                f"{device!r} appears silent (mean_volume={mean_db:.1f} dB). "
+                "Route system audio to that device, or select a different "
+                "Stereo Mix device in the GUI so the stream carries sound.",
+                flush=True,
+            )
+
     def _start_ffmpeg(self, width: int, height: int) -> None:
         # Audio: old main.py used dshow directly (ffmpeg -f dshow -i audio={device}) with no broken sound.
         # Previous wasapi UDP loopback (SoundcardLoopbackSender) caused fragmentation/discontinuity -> broken audio.
@@ -2054,6 +2311,25 @@ class FfmpegDirectSbsOutput:
                 f"FFmpeg exited during startup with code {self.ffmpeg_process.returncode}: {detail}"
             )
         self._frame_size = (width, height)
+        if (
+            self.os_name == "Darwin"
+            and not getattr(self, "_darwin_audio_probe_started", False)
+            and getattr(self, "_darwin_audio_device", None)
+        ):
+            # Advisory silence check on the captured device, once per stream
+            # lifecycle; runs off the pipeline thread so it never blocks
+            # frame submission.
+            self._darwin_audio_probe_started = True
+
+            def _delayed_probe() -> None:
+                time.sleep(0.5)
+                self._probe_darwin_audio_silence()
+
+            threading.Thread(
+                target=_delayed_probe,
+                name="DarwinAudioSilenceProbe",
+                daemon=True,
+            ).start()
         if self._active_rate_budget is not None:
             target_mbps, peak_mbps, buffer_mbps = self._active_rate_budget
             print(
@@ -2395,6 +2671,21 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
 
     def _start_native_mux(self) -> None:
         audio_args = self._audio_input_args()
+        audio_input_args = (
+            [
+                # Same clock base and demux decoupling as the FFmpeg path:
+                # wall-clock timestamps keep the muxed video PTS on the
+                # real-time audio clock, and the audio demux thread can never
+                # be starved by a stalled video pipe producer.
+                "-thread_queue_size",
+                "512",
+                "-use_wallclock_as_timestamps",
+                "1",
+                *audio_args,
+            ]
+            if audio_args
+            else []
+        )
         command = [
             str(self.ffmpeg_path),
             "-hide_banner",
@@ -2414,9 +2705,13 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
             "h264",
             "-r",
             str(self.fps),
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-thread_queue_size",
+            "16",
             "-i",
             "pipe:0",
-            *audio_args,
+            *audio_input_args,
             "-map",
             "0:v:0",
             "-c:v",
@@ -2424,11 +2719,12 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
         ]
         if audio_args:
             command.extend(["-map", "1:a:0"])
+            # Same normalized audio timeline as the FFmpeg path (async=1,
+            # the v2.5.0 magnitude) for every client protocol.
+            command.extend(["-af", "aresample=async=1"])
             if self.protocol == "WEBRTC":
                 command.extend(
                     [
-                        "-af",
-                        "aresample=async=1000:first_pts=0",
                         "-c:a",
                         "libopus",
                         "-ar",

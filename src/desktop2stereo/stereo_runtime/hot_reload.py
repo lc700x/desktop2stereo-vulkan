@@ -112,7 +112,13 @@ def _depth_backend_hot_reload(settings_dict: dict, config):
         return "onnx_cuda"
     if settings_dict.get("Depth Backend"):
         return _normalize_depth_backend(settings_dict["Depth Backend"])
-    return "migraphx_rocm" if is_rocm else "pytorch_cuda"
+    # No backend explicitly selected: "TensorRT: null" etc. are saved
+    # placeholders, not user choices. The runtime config defaults to "auto"
+    # (resolved per-platform, e.g. PyTorch MPS on macOS), so forcing the old
+    # "pytorch_cuda" fallback here would diverge from the runtime default and
+    # request a pipeline rebuild on every hot reload -- which kills the
+    # pipeline thread on the first frame. Return None (no change) instead.
+    return None
 
 
 def _add_runtime_quality_mode_if_changed(values: dict, settings_dict: dict, config) -> None:

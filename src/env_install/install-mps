@@ -66,6 +66,26 @@ if ! "$PYTHON_EXE" -m pip install -r "$SCRIPT_DIR/requirements.txt" --cache-dir 
 fi
 chmod a+x "$PROJECT_ROOT/run_mac" "$0"
 chmod -R 777 "$PROJECT_ROOT/desktop2stereo/streaming/rtmp"
+
+# Install the Vulkan loader (MoltenVK + vulkan-loader) required by the viewer
+echo
+echo "- Installing the Vulkan loader (MoltenVK)"
+if ! command -v brew &> /dev/null
+then
+    echo "Homebrew is not found in PATH. Please install it from https://brew.sh first."
+    read -p "Press enter to exit..."
+    exit 1
+fi
+if ! brew list --formula vulkan-loader &> /dev/null || ! brew list --formula molten-vk &> /dev/null; then
+    if ! brew install molten-vk vulkan-loader; then
+        echo "Failed to install the Vulkan loader (molten-vk, vulkan-loader)"
+        read -p "Press enter to exit..."
+        exit 1
+    fi
+else
+    echo "Vulkan loader already installed"
+fi
+
 echo "Python environment deployed successfully."
 read -p "You can close this terminal window to exit..."
 exit

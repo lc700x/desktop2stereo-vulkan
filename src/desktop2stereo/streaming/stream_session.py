@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 
 
@@ -52,6 +53,17 @@ def resolve_network_video_backend(
             backend="ffmpeg",
             requested=requested,
             reason="non-advanced mode fallback",
+        )
+
+    if sys.platform == "darwin":
+        # macOS has no NVIDIA/AMD/Intel vendor encoder and the bundled FFmpeg
+        # has no Vulkan video encoder (h264_vulkan); the FFmpeg backend probes
+        # VideoToolbox first, then libx264. Keep Windows/CUDA/ROCm auto-chain
+        # (vendor -> Vulkan -> OpenGL/FFmpeg) untouched.
+        return NetworkVideoBackendDecision(
+            backend="ffmpeg",
+            requested=requested,
+            reason="macOS auto uses FFmpeg (VideoToolbox/libx264); no vendor/Vulkan encoder",
         )
 
     vendor = (

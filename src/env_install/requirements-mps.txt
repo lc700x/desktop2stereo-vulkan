@@ -9,3 +9,6 @@ pyobjc-framework-Metal==12.2.1
 coremltools==9.0
 pyobjc-framework-CoreMedia==12.2.1
 pyobjc-framework-ScreenCaptureKit==12.2.1
+
+# clipboard for the GUI bug-report/stream-URL copy buttons
+pyperclip==1.11.0

@@ -49,6 +49,8 @@ class StereoRuntimeConfig:
     trt_workspace_gb: int = 4
     use_cuda_graph: bool = False
     profile_sync: bool = False
+    use_coreml: bool = False
+    recompile_coreml: bool = False
     parallel_inference: bool = False
     parallel_inference_workers: int = 1
     # Optional program-controlled OpenXR visual regression output directory.
@@ -303,6 +305,8 @@ def runtime_config_from_d2s_settings(
         color_tint=float(settings.get("Color Tint", 0.0)),
         debug_output=_to_bool(settings.get("Debug Stereo Output", False)),
         profile_sync=_to_bool(settings.get("Depth Profile Sync", settings.get("Profile Sync", False))),
+        use_coreml=_to_bool(settings.get("CoreML", False)),
+        recompile_coreml=_to_bool(settings.get("Recompile CoreML", False)),
         parallel_inference=parallel_workers > 1,
         parallel_inference_workers=parallel_workers,
         stereo_compute_backend=_normalize_stereo_compute_backend(
@@ -586,6 +590,8 @@ def depth_provider_config_from_runtime(config: StereoRuntimeConfig) -> "DepthPro
         force_rebuild=force_rebuild,
         use_cuda_graph=config.use_cuda_graph,
         profile_sync=config.profile_sync,
+        use_coreml=bool(getattr(config, "use_coreml", False)),
+        recompile_coreml=bool(getattr(config, "recompile_coreml", False)),
         execution_slot_count=config.parallel_inference_workers,
         depth_upsample=config.depth_upsample,
         depth_upsample_edge_strength=config.depth_upsample_edge_strength,

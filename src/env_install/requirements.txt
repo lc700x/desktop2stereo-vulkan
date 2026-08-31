@@ -14,6 +14,7 @@ onnx==1.22.0
 onnxscript==0.7.0
 mss==10.2.0
 pynput==1.8.2
+pyperclip==1.11.0
 wincam==1.0.14; sys_platform == "win32"
 windows-capture==2.0.0; sys_platform == "win32"
 python_xlib; sys_platform == "linux"

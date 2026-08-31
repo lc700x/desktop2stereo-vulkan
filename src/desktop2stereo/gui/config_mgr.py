@@ -452,9 +452,13 @@ class GUIConfigMixin:
             "Controller Model": self.ctrl_model_dd.value,
             "Environment Model": self.env_key,
         })
-        # Remove legacy persisted audio selections. The runtime resolves the
-        # current default output through SoundCard/WASAPI on every start.
-        self._config.pop("Stereo Mix", None)
+        # Remove legacy persisted audio selections on Windows/Linux: the
+        # runtime resolves the current default output through SoundCard/WASAPI
+        # on every start. On macOS the selected Stereo Mix device is kept
+        # (v2.5.0 parity) so the runtime captures the user's chosen device by
+        # name instead of auto-selecting a possibly silent loopback.
+        if OS_NAME != "Darwin":
+            self._config.pop("Stereo Mix", None)
         self.recompile_trt_cb.value = False
         self.recompile_migraphx_cb.value = False
         self.recompile_coreml_cb.value = False

@@ -254,6 +254,30 @@ def test_hot_reload_depth_provider_rebuild_fields_only_when_changed():
     assert changed.classify() is SnapshotChangeClass.PIPELINE_REBUILD
 
 
+def test_null_backend_placeholders_do_not_request_rebuild_against_auto_config():
+    # The runtime config defaults depth_backend to "auto" (resolved per
+    # platform, e.g. PyTorch MPS on macOS). settings.yaml saves
+    # "TensorRT: null"/"MIGraphX: null" placeholders; these must not force
+    # the legacy "pytorch_cuda" fallback, which would diverge from the
+    # runtime default and raise RuntimeSettingsPipelineRebuildRequired on the
+    # first hot reload, killing the pipeline thread.
+    config = make_config(model_id="Distill-Any-Depth-Small", depth_backend="auto")
+
+    snapshot = hot_reload_runtime_settings_snapshot(
+        {
+            "Depth Model": "Distill-Any-Depth-Small",
+            "TensorRT": None,
+            "MIGraphX": None,
+        },
+        config,
+        version=7,
+        timestamp=1.0,
+    )
+
+    assert snapshot.depth_backend is None
+    assert snapshot.classify() is not SnapshotChangeClass.PIPELINE_REBUILD
+
+
 def test_hot_reload_ignores_run_mode_as_runtime_quality_mode():
     config = make_config(mode="movie")
 

@@ -23,6 +23,8 @@ NEW_FFMPEG_DSHOW_OUTPUT = """
 
 
 def test_windows_soundcard_version_supports_pinned_numpy_binary_buffers() -> None:
+    if sys.platform != "win32":
+        pytest.skip("reads the Windows venv's site-packages layout (Lib/)")
     requirements = (
         Path(__file__).resolve().parents[1] / "src/env_install/requirements.txt"
     ).read_text(encoding="utf-8")
@@ -395,3 +397,109 @@ def test_soundcard_sender_keeps_ffmpeg_alive_with_silence_after_capture_failure(
         assert "continuing with silent audio" in capsys.readouterr().out
     finally:
         sender.close()
+
+
+def test_darwin_persists_explicit_stereo_mix_selection(monkeypatch) -> None:
+    from gui import handlers
+
+    target = _target()
+    target._config = {}
+    monkeypatch.setattr(handlers, "OS_NAME", "Darwin")
+
+    # A real device selection is persisted (v2.5.0 parity: the runtime then
+    # captures the chosen device by name instead of auto-selecting).
+    ev = types.SimpleNamespace(control=types.SimpleNamespace(value="Virtual Desktop Speakers"))
+    handlers.GUIHandlerMixin.on_audio_device_change(target, ev)
+    assert target._config.get("Stereo Mix") == "Virtual Desktop Speakers"
+
+    # Placeholder labels are never persisted.
+    for placeholder in (
+        "No Stereo Mix device found",
+        "sounddevice not available",
+        "No audio capture devices found",
+    ):
+        ev = types.SimpleNamespace(control=types.SimpleNamespace(value=placeholder))
+        target._config["Stereo Mix"] = "old"
+        handlers.GUIHandlerMixin.on_audio_device_change(target, ev)
+        assert "Stereo Mix" not in target._config
+
+
+def test_non_darwin_never_persists_stereo_mix(monkeypatch) -> None:
+    from gui import handlers
+
+    target = _target()
+    target._config = {}
+    monkeypatch.setattr(handlers, "OS_NAME", "Windows")
+
+    ev = types.SimpleNamespace(control=types.SimpleNamespace(value="Speakers"))
+    handlers.GUIHandlerMixin.on_audio_device_change(target, ev)
+
+    assert "Stereo Mix" not in target._config
+
+
+class _FakeDropdown:
+    def __init__(self):
+        self.options = []
+        self.value = ""
+        self._updates = 0
+
+    def update(self):
+        self._updates += 1
+
+
+def test_saved_stereo_mix_wins_over_first_discovered_device() -> None:
+    from gui import handlers
+
+    target = _target()
+    target._config = {"Stereo Mix": "Virtual Desktop Speakers"}
+    target.audio_devices = ["BlackHole 2ch", "Virtual Desktop Speakers"]
+
+    assert handlers.GUIHandlerMixin._saved_audio_device(target) == "Virtual Desktop Speakers"
+
+
+def test_saved_stereo_mix_matches_prefixed_label() -> None:
+    from gui import handlers
+
+    target = _target()
+    target._config = {"Stereo Mix": "soundcard:BlackHole 2ch"}
+    target.audio_devices = ["BlackHole 2ch", "Virtual Desktop Speakers"]
+
+    assert handlers.GUIHandlerMixin._saved_audio_device(target) == "BlackHole 2ch"
+
+
+def test_saved_stereo_mix_ignored_when_device_gone() -> None:
+    from gui import handlers
+
+    target = _target()
+    target._config = {"Stereo Mix": "Gone Device"}
+    target.audio_devices = ["BlackHole 2ch"]
+
+    assert handlers.GUIHandlerMixin._saved_audio_device(target) is None
+
+
+def test_audio_dropdown_prefers_saved_device() -> None:
+    from gui import handlers
+
+    target = _target()
+    target._config = {"Stereo Mix": "Virtual Desktop Speakers"}
+    target.audio_devices = ["BlackHole 2ch", "Virtual Desktop Speakers"]
+    target.audio_dd = _FakeDropdown()
+
+    handlers.GUIHandlerMixin._apply_audio_devices_to_dropdown(target)
+
+    assert target.audio_dd.value == "Virtual Desktop Speakers"
+    assert target.audio_dd.options == target.audio_devices
+    assert target.audio_dd._updates >= 1
+
+
+def test_auto_select_stereo_mix_keeps_saved_device() -> None:
+    from gui import handlers
+
+    target = _target()
+    target._config = {"Stereo Mix": "Virtual Desktop Speakers"}
+    target.audio_devices = ["BlackHole 2ch", "Virtual Desktop Speakers"]
+    target.audio_dd = _FakeDropdown()
+
+    handlers.GUIHandlerMixin.auto_select_stereo_mix(target)
+
+    assert target.audio_dd.value == "Virtual Desktop Speakers"

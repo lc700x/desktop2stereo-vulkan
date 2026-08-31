@@ -1390,6 +1390,10 @@ class GUIProcessMixin:
             child_env = os.environ.copy()
             child_env["DESKTOP2STEREO_LOCALE"] = self.locale
             child_env["PYTHONIOENCODING"] = "utf-8"
+            if OS_NAME == "Darwin":
+                from utils.vulkan_env import apply_macos_vulkan_env
+
+                apply_macos_vulkan_env(child_env)
             child_env["D2S_STOP_REQUEST_FILE"] = STOP_REQUEST_FILE
             calibration_requested = self._calibration_run_requested
             self._calibration_run_requested = False
@@ -1658,6 +1662,21 @@ class GUIProcessMixin:
                                 os.makedirs(LOG_DIR, exist_ok=True)
                                 with open(STOP_REQUEST_FILE, "w", encoding="utf-8") as f:
                                     f.write(str(saved_pid))
+                            elif OS_NAME == "Darwin":
+                                import signal
+                                os.makedirs(LOG_DIR, exist_ok=True)
+                                with open(STOP_REQUEST_FILE, "w", encoding="utf-8") as f:
+                                    f.write(str(saved_pid))
+                                # Signal only the runtime process, NOT its
+                                # whole group: MediaMTX and FFmpeg run in the
+                                # child's process group, so killpg(SIGINT)
+                                # shuts the RTSP server down first and the
+                                # FFmpeg publisher dies with "Broken pipe" /
+                                # "End of file" errors. The runtime handles
+                                # SIGINT itself and stops FFmpeg before
+                                # MediaMTX during teardown. Windows/Linux
+                                # keep their existing stop behavior.
+                                os.kill(saved_pid, signal.SIGINT)
                             else:
                                 import signal
                                 os.killpg(os.getpgid(saved_pid), signal.SIGINT)
@@ -2056,6 +2075,10 @@ class GUIProcessMixin:
             except ImportError:
                 if OS_NAME == "Windows":
                     subprocess.run("clip", input=text, text=True, shell=True)
+                elif OS_NAME == "Darwin":
+                    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
+                else:
+                    raise RuntimeError("pyperclip is required to copy the log")
             self.set_status(UI_MESSAGES[self.locale].get("Bug report copied to clipboard!", "Bug report copied to clipboard!"))
         except Exception as exc:
             logger.exception("Failed to build bug report")

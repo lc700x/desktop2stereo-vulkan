@@ -60,6 +60,10 @@ class PollingCaptureRunner:
                     )
                     if callable(pop_native_depth):
                         native_depth_profile = pop_native_depth()
+                    zero_copy = None
+                    take_zero_copy = getattr(self._source, "take_latest_zero_copy", None)
+                    if callable(take_zero_copy):
+                        zero_copy = take_zero_copy()
                     if shutdown_event.is_set():
                         break
                     on_frame(
@@ -69,6 +73,8 @@ class PollingCaptureRunner:
                             capture_start_time,
                             config=self.config,
                             copy_mode=FrameCopyMode.COPY,
+                            original_format=str(getattr(self._source, "frame_format", "") or ""),
+                            sck_zero_copy=zero_copy,
                             metadata={
                                 "backend": type(self._source).__name__,
                                 "zero_copy": False,

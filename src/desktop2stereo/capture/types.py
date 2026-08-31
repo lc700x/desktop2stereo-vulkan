@@ -48,6 +48,10 @@ class CapturedFrame:
     native_resource: Any | None = None
     # Optional CPU compatibility frame kept separate from the native output.
     cpu_compat_frame: Any | None = None
+    # Owned zero-copy capture frame (macOS ScreenCaptureKit): a
+    # CVPixelBuffer+CVMetalTexture pair handed capture -> runtime -> viewer
+    # along a single-owner chain; GC frees it on drop.
+    sck_zero_copy: Any | None = None
 
 
 def _frame_raw_type(frame: Any) -> str:
@@ -100,6 +104,7 @@ def capture_frame_from_raw(
     frame_raw_dtype: str | None = None,
     native_resource: Any | None = None,
     cpu_compat_frame: Any | None = None,
+    sck_zero_copy: Any | None = None,
 ) -> CapturedFrame:
     return CapturedFrame(
         frame=frame,
@@ -118,6 +123,7 @@ def capture_frame_from_raw(
         metadata=dict(metadata or {}),
         native_resource=native_resource,
         cpu_compat_frame=cpu_compat_frame,
+        sck_zero_copy=sck_zero_copy,
     )
 
 
