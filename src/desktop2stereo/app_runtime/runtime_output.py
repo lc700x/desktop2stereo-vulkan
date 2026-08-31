@@ -288,17 +288,15 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
             getattr(self.presenter, "_environment_screen_light_enabled", False)
             and getattr(self.presenter.config, "filament_glb_path", None)
         )
-        if self.backend_name not in {"cuda", "rocm", "hip"}:
+        if self.backend_name != "cuda":
+            # The GPU glow path (VulkanGlowSourceComputeBackend + HIP buffer
+            # importer) renders the whole view BLACK on AMD LLPC (confirmed:
+            # screen_light ~0.008 and a black glow layer darken the scene), on
+            # top of dropping the compositor present. Keep the ROCm glow on the
+            # cpu_fallback path for a visible OpenXR; v2.5's glow used a different
+            # GL-based approach that works on AMD and would need porting.
             self._set_glow_gpu_status(f"cpu_fallback backend={self.backend_name}")
             return {}
-        if self.backend_name in {"rocm", "hip"} and not getattr(
-            self, "_glow_rocm_path_logged", False
-        ):
-            self._glow_rocm_path_logged = True
-            print(
-                "[VulkanOutput] Glow ROCm diagnostic: computing GPU glow path",
-                flush=True,
-            )
         # The source image is produced by the Vulkan Glow worker.  Do not use
         # the removed Filament screen/Glow ABI as a capability gate: the
         # Projection Composer owns the eventual sampling pass.
@@ -384,17 +382,6 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                 )
                 metadata["glow_composer_source_ready"] = True
                 metadata["glow_composer_source_owner"] = "vulkan_projection_composer"
-            if self.backend_name in {"rocm", "hip"} and not getattr(
-                self, "_glow_rocm_rgb_logged", False
-            ):
-                self._glow_rocm_rgb_logged = True
-                print(
-                    "[VulkanOutput] Glow ROCm RGB: "
-                    f"screen_light={metadata.get('screen_light_linear_rgb')} "
-                    f"glow_image={'yes' if resource is not None else 'no'} "
-                    f"size={metadata.get('glow_source_size')}",
-                    flush=True,
-                )
             return metadata
         except Exception as exc:
             import traceback as _tb
