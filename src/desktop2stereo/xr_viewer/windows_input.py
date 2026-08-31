@@ -2,6 +2,8 @@
 
 import ctypes
 import sys
+import threading
+import time
 
 __all__ = [
     '_set_cursor_pos',
@@ -15,6 +17,9 @@ __all__ = [
     '_MOUSEEVENTF_LEFTUP',
     '_MOUSEEVENTF_RIGHTDOWN',
     '_MOUSEEVENTF_RIGHTUP',
+    '_start_physical_input_monitor',
+    '_physical_mouse_active',
+    '_physical_keyboard_active',
 ]
 
 # Windows input helpers (no-op on non-Windows)
@@ -84,6 +89,121 @@ if sys.platform == "win32":
         inp.mi.dwFlags = _MOUSEEVENTF_HWHEEL
         inp.mi.mouseData = ctypes.c_ulong(int(amount) & 0xFFFFFFFF)
         ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+    # ---- Physical-input priority monitor -------------------------------------
+    # Low-level hooks detect PHYSICAL mouse/keyboard activity only: events the
+    # app itself injects (SendInput) carry the LLMHF_INJECTED / LLKHF_INJECTED
+    # flag and are ignored, and the controller beam's SetCursorPos does not
+    # generate a hook event at all. The frame producer can then give the real
+    # mouse/keyboard priority over the controller beam and the virtual keyboard.
+    _LLMHF_INJECTED = 0x0001
+    _LLKHF_INJECTED = 0x0001
+    _WH_MOUSE_LL = 14
+    _WH_KEYBOARD_LL = 13
+    _WM_QUIT = 0x0012
+
+    class _POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    class _MSLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("pt", _POINT),
+            ("mouseData", ctypes.c_ulong),
+            ("flags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.c_ulonglong),
+        ]
+
+    class _KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", ctypes.c_ulong),
+            ("scanCode", ctypes.c_ulong),
+            ("flags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.c_ulonglong),
+        ]
+
+    _physical_lock = threading.Lock()
+    _last_physical_mouse = 0.0
+    _last_physical_keyboard = 0.0
+    _hook_thread = None
+    _hook_mouse = None
+    _hook_keyboard = None
+    _MouseProc = ctypes.WINFUNCTYPE(
+        ctypes.c_long, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+    )
+    _KeyboardProc = ctypes.WINFUNCTYPE(
+        ctypes.c_long, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+    )
+
+    @_MouseProc
+    def _physical_mouse_proc(nCode, wParam, lParam):
+        global _last_physical_mouse
+        if nCode >= 0 and lParam:
+            try:
+                data = ctypes.cast(lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+                if not (int(data.flags) & _LLMHF_INJECTED):
+                    with _physical_lock:
+                        _last_physical_mouse = time.monotonic()
+            except Exception:
+                pass
+        return ctypes.windll.user32.CallNextHookEx(
+            _hook_mouse, nCode, wParam, lParam
+        )
+
+    @_KeyboardProc
+    def _physical_keyboard_proc(nCode, wParam, lParam):
+        global _last_physical_keyboard
+        if nCode >= 0 and lParam:
+            try:
+                data = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                if not (int(data.flags) & _LLKHF_INJECTED):
+                    with _physical_lock:
+                        _last_physical_keyboard = time.monotonic()
+            except Exception:
+                pass
+        return ctypes.windll.user32.CallNextHookEx(
+            _hook_keyboard, nCode, wParam, lParam
+        )
+
+    def _physical_hook_loop():
+        global _hook_mouse, _hook_keyboard
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        module = kernel32.GetModuleHandleW(None)
+        _hook_mouse = user32.SetWindowsHookExW(
+            _WH_MOUSE_LL, _physical_mouse_proc, module, 0
+        )
+        _hook_keyboard = user32.SetWindowsHookExW(
+            _WH_KEYBOARD_LL, _physical_keyboard_proc, module, 0
+        )
+        msg = ctypes.wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        if _hook_mouse:
+            user32.UnhookWindowsHookEx(_hook_mouse)
+        if _hook_keyboard:
+            user32.UnhookWindowsHookEx(_hook_keyboard)
+
+    def _start_physical_input_monitor():
+        """Start the low-level physical input hooks (idempotent)."""
+        global _hook_thread
+        if _hook_thread is not None:
+            return
+        _hook_thread = threading.Thread(
+            target=_physical_hook_loop, name="d2s-physical-input", daemon=True
+        )
+        _hook_thread.start()
+
+    def _physical_mouse_active(timeout: float = 2.0) -> bool:
+        with _physical_lock:
+            return (time.monotonic() - _last_physical_mouse) < float(timeout)
+
+    def _physical_keyboard_active(timeout: float = 2.0) -> bool:
+        with _physical_lock:
+            return (time.monotonic() - _last_physical_keyboard) < float(timeout)
+
 else:
     def _set_cursor_pos(x, y): pass
     def _send_mouse_flags(flags): pass
@@ -96,3 +216,7 @@ else:
     _MOUSEEVENTF_RIGHTDOWN = 0x0008
     _MOUSEEVENTF_RIGHTUP   = 0x0010
     _KEYEVENTF_KEYUP       = 0x0002
+
+    def _start_physical_input_monitor(): pass
+    def _physical_mouse_active(timeout: float = 2.0) -> bool: return False
+    def _physical_keyboard_active(timeout: float = 2.0) -> bool: return False

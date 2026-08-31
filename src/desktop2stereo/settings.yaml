@@ -1,17 +1,17 @@
 Capture Mode: Monitor
-Monitor Index: 1
+Monitor Index: 2
 Monitor Identity:
-  stable_id: DISPLAY\TUP0270\5&3b49acb3&8&UID4357
-  name: DELL U2410
+  stable_id: DISPLAY\TUP0270\9&1ce1d36&1&UID1796
+  name: D270H
   manufacturer: TUP
   model: D270H
   serial: '808728147'
-  left: 0
+  left: -3840
   top: 0
-  width: 1920
-  height: 1200
+  width: 3840
+  height: 2160
 Window Title: ''
-Show FPS: true
+Show FPS: false
 Model List:
   Distill-Any-Depth-Small:
     resolutions:
@@ -518,20 +518,20 @@ Vulkan Projection RCAS Sharpness: 0.5
 Display Mode: Half-SBS
 FP16: true
 torch.compile: false
-TensorRT: true
+TensorRT: null
 Parallel Inference: false
 Parallel Inference Workers: 1
 Recompile TensorRT: false
 CoreML: null
 Recompile CoreML: false
-MIGraphX: null
+MIGraphX: true
 Recompile MIGraphX: false
 Recompile OpenVINO: false
 Computing Device: 0
-Language: CN
-Run Mode: MJPEG Streamer
+Language: EN
+Run Mode: OpenXR Link
 XR Headset Model: Pico 4 / 4 Ultra
-XR Preview Window: true
+XR Preview Window: false
 VSync: false
 Window Preview: false
 Target FPS: 0
@@ -556,28 +556,28 @@ Stream Key: live
 Audio Capture Backend: auto
 Video Encoder Backend: auto
 CRF: 23
-Audio Delay: -0.1
+Audio Delay: 0.0
 Controller Model: PICO
 Environment Model: Default
 NVIDIA Frame Generation: false
 Lossless Scaling Support: false
-Capture Tool: WindowsCaptureCUDA
+Capture Tool: WindowsCaptureROCm
 Display Fit Mode: contain
+Stream Display Fit Mode: contain
 Fill 16:9: true
 Fix Viewer Aspect: true
-Stereo Output: 1
+Stereo Output: 2
 Stereo Output Identity:
-  stable_id: DISPLAY\TUP0270\5&3b49acb3&8&UID4357
-  name: DELL U2410
+  stable_id: DISPLAY\TUP0270\9&1ce1d36&1&UID1796
+  name: D270H
   manufacturer: TUP
   model: D270H
   serial: '808728147'
-  left: 0
+  left: -3840
   top: 0
-  width: 1920
-  height: 1200
+  width: 3840
+  height: 2160
 Show Log Panel: true
-Input Display Resolution Tier: 1K
+Input Display Resolution Tier: 4K
 Synthetic View: quality_4k
 OpenVINO: null
-Stream Target FPS: 0

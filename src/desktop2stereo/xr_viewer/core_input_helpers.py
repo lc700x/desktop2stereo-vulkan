@@ -14,6 +14,7 @@ from .windows_input import (
     _send_hscroll,
     _send_key,
     _send_vscroll,
+    _physical_keyboard_active,
 )
 
 
@@ -112,6 +113,14 @@ class CoreInputHelpersMixin:
     def _handle_keyboard_input(self):
         """Send Windows keystrokes when a controller trigger fires on a keyboard key."""
         if not self._keyboard_visible:
+            self._kb_hover_l = None
+            self._kb_hover_r = None
+            self._release_locked_modifiers()
+            return
+        if _physical_keyboard_active():
+            # The hardware keyboard has priority over the virtual keyboard:
+            # while the user types on the physical keyboard, do not inject any
+            # virtual keystrokes and release any held virtual key.
             self._kb_hover_l = None
             self._kb_hover_r = None
             self._release_locked_modifiers()

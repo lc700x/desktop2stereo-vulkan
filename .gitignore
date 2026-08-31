@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 venv/
 python3/
+python3_cuda/
 build/
 dist/
 *.egg-info/
@@ -32,3 +33,5 @@ native/nvfruc_bridge/Optical_Flow_SDK_*.zip
 .tools/
 artifacts/
 AGENTS.md
+.tmp
+.serena

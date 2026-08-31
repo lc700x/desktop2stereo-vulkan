@@ -95,6 +95,9 @@ from .windows_input import (
     _send_mouse_flags,
     _send_key,
     _set_cursor_pos,
+    _start_physical_input_monitor,
+    _physical_mouse_active,
+    _physical_keyboard_active,
 )
 from .input import (
     _TOUCH_AVAILABLE,
@@ -1034,6 +1037,11 @@ class OpenXrVulkanPresenter(
         self._grip_mat_r = None
         self._frame_now = 0.0
         self._filament_animation_origin: float | None = None
+        # Physical mouse/keyboard get priority over the controller beam and the
+        # virtual keyboard: the low-level hooks (started once here) track only
+        # non-injected input, so moving the real mouse or typing on the hardware
+        # keyboard suppresses the beam's cursor emulation.
+        _start_physical_input_monitor()
         # Keep the controller lifecycle aligned with the legacy renderer:
         # movement refreshes a per-hand activity timestamp and both the model
         # and laser are hidden after the idle timeout.
@@ -3808,6 +3816,10 @@ class OpenXrVulkanPresenter(
                 laser_hit=hits[1],
             )
         touch_active = self._update_touch_contacts(inputs, hits)
+        # Physical mouse takes priority over the controller beam: while the real
+        # mouse was moved/clicked recently, the beam neither moves the OS cursor
+        # nor sends clicks (the injected input is released and ignored).
+        physical_mouse_active = bool(_physical_mouse_active())
         for name, hand, hit, down_flag, up_flag in (
             ("left", inputs[0], hits[0], _MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP),
             ("right", inputs[1], hits[1], _MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP),
@@ -3828,8 +3840,16 @@ class OpenXrVulkanPresenter(
                         self._touch_state["left"] == "down"
                         and self._touch_state["right"] == "down"
                     )
+                    and not physical_mouse_active
                 ):
                     _set_cursor_pos(*self._cursor_pixel_for_screen_uv(hit[0], hit[1]))
+                self._pointer_state[name] = "idle"
+                continue
+            if physical_mouse_active:
+                # The hardware mouse owns the cursor now; release any beam-held
+                # button and ignore the beam for this frame.
+                if state != "idle":
+                    _send_mouse_flags(up_flag)
                 self._pointer_state[name] = "idle"
                 continue
             if hit is None or keyboard_hit:
@@ -5279,6 +5299,43 @@ class OpenXrVulkanPresenter(
             queue_family_index=queue_family_index,
             queue_index=0,
         )
+        # AMD ROCm: pre-create and warm the torch glow source before the session
+        # presents, so the first live glow frame does not pay the ~85ms torch
+        # kernel JIT + first-transition cost. Opt-in via D2S_ROCm_TORCH_GLOW;
+        # the default glow path on ROCm is the stable cpu_fallback.
+        self._prewarmed_glow_backend = None
+        if os.environ.get("D2S_ROCm_TORCH_GLOW"):
+            try:
+                import torch
+
+                if getattr(torch.version, "hip", None):
+                    from stereo_runtime.rocm_torch_glow_source import (
+                        RocmTorchGlowSource,
+                    )
+
+                    prewarm_backend = RocmTorchGlowSource(self.vulkan)
+                    warm = torch.zeros(
+                        (1, 3, 2160, 3840), dtype=torch.float32, device="cuda"
+                    )
+                    prewarm_backend.submit(
+                        warm,
+                        mode="glow",
+                        screen_light_only=False,
+                        temporal_smoothing_seconds=1.0,
+                    )
+                    prewarm_backend.release_frame(0)
+                    self._prewarmed_glow_backend = prewarm_backend
+                    print(
+                        "[OpenXRViewer] ROCm torch glow pre-warmed",
+                        flush=True,
+                    )
+            except Exception as exc:
+                self._prewarmed_glow_backend = None
+                print(
+                    "[OpenXRViewer] ROCm torch glow pre-warm skipped: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
 
     def _create_session_and_swapchains(self) -> None:
         xr = self.xr
@@ -6870,6 +6927,11 @@ class OpenXrVulkanPresenter(
             and glow_state[0] == 3
             and all("glow_source" in draw for draw in projection_draws)
         )
+        if os.environ.get("D2S_OPENXR_DISABLE_GLOW_DRAW"):
+            # Diagnostic: isolate whether the composer's glow draw pass (sampling
+            # the glow image with the glow fragment pipeline) breaks the Virtual
+            # Desktop session; the screen-light reduction is kept.
+            surround_requested = False
         surround_active = False
         if surround_requested:
             # Match the legacy Filament scene split: Surround is room/background
@@ -6887,6 +6949,12 @@ class OpenXrVulkanPresenter(
                 self._last_vulkan_projection_glow_error = None
                 if self._on_breakdown_inc is not None:
                     self._on_breakdown_inc("openxr_vulkan_composer_glow", 1)
+                if os.environ.get("D2S_GLOW_DIAGNOSTIC"):
+                    print(
+                        "[OpenXRViewer] Glow draw: surround pass executed "
+                        f"mode={glow_state[0]} draws={len(projection_draws)}",
+                        flush=True,
+                    )
             except Exception as exc:
                 glow_error = (type(exc).__name__, str(exc))
                 if glow_error != self._last_vulkan_projection_glow_error:
@@ -6898,6 +6966,7 @@ class OpenXrVulkanPresenter(
                     )
         if (
             not surround_requested
+            and not os.environ.get("D2S_OPENXR_DISABLE_GLOW_DRAW")
             and all("glow_source" in draw for draw in projection_draws)
         ):
             # Formal ordering is controller/environment -> Glow -> SBS screen.
@@ -6912,6 +6981,12 @@ class OpenXrVulkanPresenter(
                 self._last_vulkan_projection_glow_error = None
                 if self._on_breakdown_inc is not None:
                     self._on_breakdown_inc("openxr_vulkan_composer_glow", 1)
+                if os.environ.get("D2S_GLOW_DIAGNOSTIC"):
+                    print(
+                        "[OpenXRViewer] Glow draw: glow/veil pass executed "
+                        f"mode={glow_state[0]} draws={len(projection_draws)}",
+                        flush=True,
+                    )
             except Exception as exc:
                 glow_error = (type(exc).__name__, str(exc))
                 if glow_error != self._last_vulkan_projection_glow_error:
@@ -10516,6 +10591,13 @@ class OpenXrVulkanPresenter(
                 spec for spec in specs if spec[0] != "controller_proxy_callout"
             ] + controller_callouts
         specs_ready = time.perf_counter()
+        if not os.environ.get("D2S_OPENXR_ENABLE_TOOL_QUADS"):
+            # Virtual Desktop's runtime fails MSDF tool-quad swapchain
+            # enumeration (RuntimeFailureError) which precedes session drops.
+            # The quads are cosmetic overlays (menu / cursor / callouts), never
+            # the screen or the glow layers. Re-enable with
+            # D2S_OPENXR_ENABLE_TOOL_QUADS=1.
+            return []
         layers = [self._upload_tool_quad(*spec) for spec in specs]
         if self._on_breakdown_add_time is not None:
             self._on_breakdown_add_time(

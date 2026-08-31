@@ -990,8 +990,21 @@ class VulkanContext:
             )
         return int(timeline)
 
-    def prepare_external_image_for_cuda(self, resource: Any) -> int:
-        """Establish a persistent GENERAL layout before CUDA writes external memory."""
+    def prepare_external_image_for_cuda(
+        self, resource: Any, *, wait: bool = True, defer: bool = False
+    ) -> int:
+        """Establish a persistent GENERAL layout before CUDA writes external memory.
+
+        ``wait=False`` records the layout transition but does not call
+        ``vkDeviceWaitIdle``; callers that register producer images while the
+        compositor is actively rendering use it to avoid stalling the whole
+        device mid-stream.
+
+        ``defer=True`` skips the GPU barrier submission entirely and only marks
+        the image GENERAL in the state tracker. Use it for storage-image sources
+        whose first producer access is a HIP copy + compute-read with its own
+        barrier.
+        """
 
         self._ensure_open()
         if getattr(resource, "context", self) is not self:
@@ -1008,6 +1021,17 @@ class VulkanContext:
                 "CUDA external image must be UNDEFINED or GENERAL during slot registration"
             )
         vk = self.vk
+        if defer:
+            self._image_states.update(
+                image_key,
+                ImageState(
+                    layout=vk.VK_IMAGE_LAYOUT_GENERAL,
+                    access_mask=vk.VK_ACCESS_MEMORY_WRITE_BIT,
+                    stage_mask=vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    queue_family_index=self.queue_family_index,
+                ),
+            )
+            return self._timeline_value
 
         def record(command_buffer: Any) -> None:
             barrier = vk.VkImageMemoryBarrier(
@@ -1046,12 +1070,15 @@ class VulkanContext:
         )
         # This is slot initialization only. Runtime frames synchronize through
         # the CUDA stream and never call vkDeviceWaitIdle.
-        self.wait_idle()
+        if wait:
+            self.wait_idle()
         return timeline_value
 
-    def prepare_external_image_for_producer(self, resource: Any) -> int:
+    def prepare_external_image_for_producer(
+        self, resource: Any, *, wait: bool = True, defer: bool = False
+    ) -> int:
         """Prepare an exportable image for any GPU producer backend."""
-        return self.prepare_external_image_for_cuda(resource)
+        return self.prepare_external_image_for_cuda(resource, wait=wait, defer=defer)
 
     def prepare_external_image_for_sampling(
         self,

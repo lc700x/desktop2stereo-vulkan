@@ -235,6 +235,19 @@ class RocmVulkanImageImporter:
             ctypes.c_void_p,
         ]
         lib.hipMemcpy2DToArrayAsync.restype = ctypes.c_int
+        sync_copy = getattr(lib, "hipMemcpy2DToArray", None)
+        if sync_copy is not None:
+            sync_copy.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_int,
+            ]
+            sync_copy.restype = ctypes.c_int
         lib.hipDestroyExternalMemory.argtypes = [ctypes.c_void_p]
         lib.hipDestroyExternalMemory.restype = ctypes.c_int
         lib.hipStreamSynchronize.argtypes = [ctypes.c_void_p]
@@ -289,7 +302,7 @@ class RocmVulkanImageImporter:
         if int(result) != 0:
             raise RocmVulkanInteropError(f"{operation} failed with HIP error {int(result)}")
 
-    def register_slot(self, target: VulkanExportableImage):
+    def register_slot(self, target: VulkanExportableImage, *, wait: bool = True, defer: bool = False):
         key = id(target)
         if key in self._slots:
             return target.resource
@@ -298,7 +311,7 @@ class RocmVulkanImageImporter:
             raise RocmVulkanInteropError(
                 "Vulkan context cannot establish an external HIP image layout"
             )
-        prepare(target.resource)
+        prepare(target.resource, wait=wait, defer=defer)
         handle = target.export_handle
         desc = _ExternalMemoryHandleDesc(
             type=(
@@ -349,7 +362,14 @@ class RocmVulkanImageImporter:
         target.close_export_handle()
         return target.resource
 
-    def copy_tensor(self, tensor: Any, target: VulkanExportableImage, *, stream=None):
+    def copy_tensor(
+        self,
+        tensor: Any,
+        target: VulkanExportableImage,
+        *,
+        stream=None,
+        synchronous: bool = False,
+    ):
         resource = self.register_slot(target)
         if getattr(tensor, "device", None) is None or str(tensor.device.type) != "cuda":
             raise RocmVulkanInteropError("ROCm Vulkan copy requires a HIP tensor")
@@ -368,6 +388,24 @@ class RocmVulkanImageImporter:
 
             stream = int(torch.cuda.current_stream(device=tensor.device).cuda_stream)
         slot = self._slots[id(target)]
+        if synchronous:
+            sync_copy = getattr(self._hip, "hipMemcpy2DToArray", None)
+            if sync_copy is None:
+                raise RocmVulkanInteropError("hipMemcpy2DToArray is unavailable")
+            self._check(
+                sync_copy(
+                    slot.array,
+                    0,
+                    0,
+                    ctypes.c_void_p(int(tensor.data_ptr())),
+                    target.width * 4,
+                    target.width * 4,
+                    target.height,
+                    self._HIP_MEMCPY_DEVICE_TO_DEVICE,
+                ),
+                "hipMemcpy2DToArray",
+            )
+            return resource
         self._check(
             self._hip.hipMemcpy2DToArrayAsync(
                 slot.array,

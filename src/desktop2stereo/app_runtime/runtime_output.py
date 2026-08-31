@@ -289,14 +289,18 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
             and getattr(self.presenter.config, "filament_glb_path", None)
         )
         if self.backend_name != "cuda":
-            # The GPU glow path (VulkanGlowSourceComputeBackend + HIP buffer
-            # importer) renders the whole view BLACK on AMD LLPC (confirmed:
-            # screen_light ~0.008 and a black glow layer darken the scene), on
-            # top of dropping the compositor present. Keep the ROCm glow on the
-            # cpu_fallback path for a visible OpenXR; v2.5's glow used a different
-            # GL-based approach that works on AMD and would need porting.
-            self._set_glow_gpu_status(f"cpu_fallback backend={self.backend_name}")
-            return {}
+            # AMD ROCm default: cpu_fallback glow (stable). The torch glow
+            # (D2S_ROCm_TORCH_GLOW=1) computes the glow on the HIP stream and
+            # uploads it through the same image import the eye path uses; on
+            # Virtual Desktop it is opt-in because the session may drop while
+            # the glow is active.
+            if os.environ.get("D2S_ROCm_TORCH_GLOW"):
+                self._set_glow_gpu_status(
+                    f"torch_compute_external_image backend={self.backend_name}"
+                )
+            else:
+                self._set_glow_gpu_status(f"cpu_fallback backend={self.backend_name}")
+                return {}
         # The source image is produced by the Vulkan Glow worker.  Do not use
         # the removed Filament screen/Glow ABI as a capability gate: the
         # Projection Composer owns the eventual sampling pass.
@@ -304,17 +308,38 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         gpu_glow_active = glow_active and glow_image_available
         try:
             if self._glow_gpu_backend is None:
-                from stereo_runtime.vulkan_glow_source import (
-                    VulkanGlowSourceComputeBackend,
-                )
+                if self.backend_name != "cuda":
+                    prewarmed = getattr(
+                        self.presenter, "_prewarmed_glow_backend", None
+                    )
+                    if prewarmed is not None:
+                        self._glow_gpu_backend = prewarmed
+                        self.presenter._prewarmed_glow_backend = None
+                    else:
+                        from stereo_runtime.rocm_torch_glow_source import (
+                            RocmTorchGlowSource,
+                        )
 
-                self._glow_gpu_backend = VulkanGlowSourceComputeBackend(
-                    self.presenter.vulkan
-                )
+                        self._glow_gpu_backend = RocmTorchGlowSource(
+                            self.presenter.vulkan
+                        )
+                else:
+                    from stereo_runtime.vulkan_glow_source import (
+                        VulkanGlowSourceComputeBackend,
+                    )
+
+                    self._glow_gpu_backend = VulkanGlowSourceComputeBackend(
+                        self.presenter.vulkan
+                    )
             if gpu_glow_active:
-                self._set_glow_gpu_status(
-                    "vulkan_compute_external_image async_queue=True"
-                )
+                if self.backend_name != "cuda":
+                    self._set_glow_gpu_status(
+                        "torch_compute_external_image async_queue=True"
+                    )
+                else:
+                    self._set_glow_gpu_status(
+                        "vulkan_compute_external_image async_queue=True"
+                    )
             else:
                 reason = (
                     "vulkan_projection_composer_source"
@@ -382,6 +407,18 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                 )
                 metadata["glow_composer_source_ready"] = True
                 metadata["glow_composer_source_owner"] = "vulkan_projection_composer"
+            if os.environ.get("D2S_GLOW_DIAGNOSTIC"):
+                now_diag = time.monotonic()
+                if now_diag - getattr(self, "_glow_diag_last_log", 0.0) >= 2.0:
+                    self._glow_diag_last_log = now_diag
+                    print(
+                        "[VulkanOutput] Glow diag: "
+                        f"status={self._glow_gpu_status} "
+                        f"screen_light={metadata.get('screen_light_linear_rgb')} "
+                        f"glow_size={metadata.get('glow_source_size')} "
+                        f"submit_ms={getattr(backend, '_last_submit_ms', None)}",
+                        flush=True,
+                    )
             return metadata
         except Exception as exc:
             import traceback as _tb

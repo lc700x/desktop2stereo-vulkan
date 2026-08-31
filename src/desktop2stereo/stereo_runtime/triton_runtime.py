@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import platform
+import warnings
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any
@@ -23,6 +24,10 @@ def _ensure_windows_cc() -> None:
     fails and every Triton kernel launch raises.  Triton ships its own TinyCC
     (``triton/runtime/tcc/tcc.exe``) with a bundled libc for exactly this case;
     selecting it keeps the ROCm Triton backend usable without MSVC.
+
+    The probe below is expected to fail on machines without MSVC (the app then
+    uses bundled TinyCC), so Triton's "Failed to find MSVC" UserWarning is
+    noise here and is suppressed for the probe.
     """
     if os.name != "nt" or os.environ.get("CC"):
         return
@@ -31,7 +36,14 @@ def _ensure_windows_cc() -> None:
 
         from triton.windows_utils import find_msvc
 
-        msvc_bin, _, _ = find_msvc(env_only=False)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Failed to find MSVC.*",
+                category=UserWarning,
+                module=r"triton\.windows_utils",
+            )
+            msvc_bin, _, _ = find_msvc(env_only=False)
         if msvc_bin:
             return  # real MSVC present; keep Triton's default compiler
         tcc = os.path.join(
