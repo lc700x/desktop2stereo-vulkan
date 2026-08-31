@@ -2170,29 +2170,101 @@ class GUIProcessMixin:
 
     VK_ESC = 0x1B
 
+    def _run_active(self) -> bool:
+        return bool(getattr(self, "_starting", False)) or (
+            getattr(self, "process", None) is not None
+            and getattr(self.process, "returncode", None) is None
+        )
+
     async def _esc_poll_task(self):
-        if OS_NAME != "Windows":
+        if OS_NAME == "Windows":
+            user32 = ctypes.windll.user32
+            try:
+                while not self._closed:
+                    await asyncio.sleep(0.2)
+                    if self._closed:
+                        break
+                    if user32.GetAsyncKeyState(self.VK_ESC) & 0x8000:
+                        if self._esc_down is None:
+                            self._esc_down = time.time()
+                        elif not self._esc_stopped and (time.time() - self._esc_down >= 3.0):
+                            self._esc_stopped = True
+                            self._esc_down = None
+                            self.set_status(UI_MESSAGES[self.locale]["esc_stop"])
+                            asyncio.ensure_future(self._async_stop())
+                    else:
+                        if self._esc_down is not None:
+                            self._esc_down = None
+                            self._esc_stopped = False
+            except asyncio.CancelledError:
+                pass
             return
-        user32 = ctypes.windll.user32
+        # macOS/Linux: Flet's page.on_keyboard_event needs page focus and is
+        # unreliable there, so monitor the ESC key globally with pynput (the
+        # same "works regardless of window focus" behavior as GetAsyncKeyState
+        # on Windows). Requires Accessibility permission on macOS; when pynput
+        # is unavailable the Flet _on_key path remains as a fallback.
+        try:
+            from pynput import keyboard as _pynput_keyboard
+        except Exception:
+            return
+        state = {"down": False, "down_at": None}
+
+        def on_press(key):
+            if key == _pynput_keyboard.Key.esc:
+                state["down"] = True
+                if state["down_at"] is None:
+                    state["down_at"] = time.time()
+
+        def on_release(key):
+            if key == _pynput_keyboard.Key.esc:
+                state["down"] = False
+                state["down_at"] = None
+
+        listener = _pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
+        try:
+            listener.start()
+        except Exception:
+            return  # e.g. no Accessibility permission; Flet _on_key fallback
+        if OS_NAME == "Darwin":
+            try:
+                from ApplicationServices import AXIsProcessTrusted
+
+                if not AXIsProcessTrusted():
+                    print(
+                        "[GUI] macOS Accessibility permission is not granted: "
+                        "hold-ESC-to-stop listens only while this window is "
+                        "focused. Grant Accessibility to the app in System "
+                        "Settings > Privacy & Security so ESC works globally.",
+                        flush=True,
+                    )
+            except Exception:
+                pass
         try:
             while not self._closed:
                 await asyncio.sleep(0.2)
-                if self._closed:
-                    break
-                if user32.GetAsyncKeyState(self.VK_ESC) & 0x8000:
-                    if self._esc_down is None:
-                        self._esc_down = time.time()
-                    elif not self._esc_stopped and (time.time() - self._esc_down >= 3.0):
-                        self._esc_stopped = True
-                        self._esc_down = None
-                        self.set_status(UI_MESSAGES[self.locale]["esc_stop"])
-                        asyncio.ensure_future(self._async_stop())
-                else:
+                if not state["down"]:
                     if self._esc_down is not None:
                         self._esc_down = None
                         self._esc_stopped = False
+                    continue
+                if not self._run_active():
+                    continue
+                if state["down_at"] is None:
+                    continue
+                if not self._esc_stopped and (time.time() - state["down_at"] >= 3.0):
+                    self._esc_stopped = True
+                    state["down"] = False
+                    state["down_at"] = None
+                    self.set_status(UI_MESSAGES[self.locale]["esc_stop"])
+                    asyncio.ensure_future(self._async_stop())
         except asyncio.CancelledError:
             pass
+        finally:
+            try:
+                listener.stop()
+            except Exception:
+                pass
 
     def _on_key(self, e: ft.KeyboardEvent):
         if e.key != "Esc" or self._esc_stopped or OS_NAME == "Windows":
