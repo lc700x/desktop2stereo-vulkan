@@ -10591,12 +10591,10 @@ class OpenXrVulkanPresenter(
                 spec for spec in specs if spec[0] != "controller_proxy_callout"
             ] + controller_callouts
         specs_ready = time.perf_counter()
-        if not os.environ.get("D2S_OPENXR_ENABLE_TOOL_QUADS"):
-            # Virtual Desktop's runtime fails MSDF tool-quad swapchain
-            # enumeration (RuntimeFailureError) which precedes session drops.
-            # The quads are cosmetic overlays (menu / cursor / callouts), never
-            # the screen or the glow layers. Re-enable with
-            # D2S_OPENXR_ENABLE_TOOL_QUADS=1.
+        if os.environ.get("D2S_OPENXR_DISABLE_TOOL_QUADS"):
+            # Diagnostic escape hatch: Virtual Desktop's runtime can fail MSDF
+            # tool-quad swapchain enumeration (RuntimeFailureError, caught) and
+            # the quad overlays (menu / cursor / callouts) are then skipped.
             return []
         layers = [self._upload_tool_quad(*spec) for spec in specs]
         if self._on_breakdown_add_time is not None:
