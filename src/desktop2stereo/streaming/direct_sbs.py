@@ -219,6 +219,32 @@ def _auto_select_darwin_audio(ffmpeg_path: Path) -> str:
     return str(devices[0][0]) if devices else ""
 
 
+def _auto_select_windows_audio(ffmpeg_path: Path) -> str:
+    """Pick a dshow audio capture device for loopback on Windows.
+
+    Prefers loopback-style names (Stereo Mix / virtual-audio-capturer / What
+    U Hear). Returns "" when no loopback-capable device exists so the caller
+    runs video-only instead of handing FFmpeg an empty ``-i audio=`` name
+    (which fails with ``Error opening input: I/O error`` and kills the
+    stream). This is the Windows counterpart of the macOS auto-selection.
+    Only loopback-style devices are returned on purpose: auto-selecting an
+    arbitrary microphone would broadcast the room instead of system audio.
+    """
+    try:
+        from streaming.audio import (
+            find_loopback_audio_devices,
+            query_ffmpeg_dshow_audio_devices,
+        )
+
+        devices = query_ffmpeg_dshow_audio_devices(ffmpeg_path) or []
+        if not devices:
+            return ""
+        loopback = find_loopback_audio_devices(devices)
+        return loopback[0] if loopback else ""
+    except Exception:
+        return ""
+
+
 def runtime_sbs_to_rgb(frame_or_result: Any) -> np.ndarray:
     """Convert a packed SBS runtime tensor/array to contiguous RGB8 HWC."""
     frame = getattr(frame_or_result, "sbs", frame_or_result)
@@ -1189,6 +1215,7 @@ class FfmpegDirectSbsOutput:
         self._packet_loss_warning_emitted = False
         self._darwin_audio_device: str | None = None
         self._darwin_audio_probe_started = False
+        self._audio_startup_retried = False
         if self.auto_calibration:
             logs_dir = self.base_dir / "logs"
             self._calibration_controller = StreamCalibrationController(
@@ -1716,6 +1743,15 @@ class FfmpegDirectSbsOutput:
                 # Old main.py used: -f dshow -rtbufsize 256M -i audio={device} with -fflags nobuffer
                 # Python wasapi UDP loopback (s16le udp://...) causes fragmentation/discontinuity -> broken sound
                 device_name = device.split(":", 1)[1].strip()
+                if not device_name:
+                    # The GUI stores an empty Stereo Mix device as the bare
+                    # "soundcard:" prefix. Auto-pick a working dshow capture
+                    # device (loopback preferred) so FFmpeg never receives an
+                    # empty "-i audio=" name, which fails with "Error opening
+                    # input: I/O error" and aborts the whole stream.
+                    device_name = _auto_select_windows_audio(self.ffmpeg_path)
+                    if not device_name:
+                        return []
                 return [
                     "-itsoffset",
                     str(self.audio_delay),
@@ -1727,13 +1763,18 @@ class FfmpegDirectSbsOutput:
                     f"audio={device_name}",
                 ]
             if device.casefold().startswith("wasapi:"):
+                wasapi_name = device.split(":", 1)[1].strip()
+                if not wasapi_name:
+                    # Same empty-device guard as the soundcard branch: skip
+                    # audio instead of passing an unusable "-i " argument.
+                    return []
                 return [
                     "-itsoffset",
                     str(self.audio_delay),
                     "-f",
                     "wasapi",
                     "-i",
-                    device.split(":", 1)[1].strip(),
+                    wasapi_name,
                 ]
             return [
                 "-itsoffset",
@@ -2307,6 +2348,34 @@ class FfmpegDirectSbsOutput:
         time.sleep(0.05)
         if self.ffmpeg_process.poll() is not None:
             detail = "; ".join(self._ffmpeg_stderr_tail[-3:]) or "no FFmpeg diagnostic"
+            if (
+                self.os_name == "Windows"
+                and self.stereo_mix_device
+                and not self._audio_startup_retried
+                and re.search(
+                    r"\[in#[0-9]+\].*error opening input|"
+                    r"(dshow|wasapi).*(i/o error|no such device|device not found)|"
+                    r"i/o error.*(dshow|wasapi|audio)",
+                    detail,
+                    re.IGNORECASE,
+                )
+            ):
+                # The configured audio capture device cannot be opened (missing
+                # "Stereo Mix" loopback, unplugged device, wrong name). FFmpeg
+                # dies at startup, so retry once with audio disabled instead of
+                # failing the whole stream; the video-only stream still starts.
+                print(
+                    f"[DirectSbsStream] audio input failed to open ({detail}); "
+                    "retrying without audio",
+                    flush=True,
+                )
+                self._audio_startup_retried = True
+                self.stereo_mix_device = ""
+                self._stop_process(self.ffmpeg_process)
+                self.ffmpeg_process = None
+                self._frame_size = None
+                self._start_ffmpeg(width, height)
+                return
             raise RuntimeError(
                 f"FFmpeg exited during startup with code {self.ffmpeg_process.returncode}: {detail}"
             )
@@ -2449,7 +2518,36 @@ class FfmpegDirectSbsOutput:
             return
         try:
             self._write_frame(frame)
-        except (BrokenPipeError, OSError, RuntimeError):
+        except (BrokenPipeError, OSError, RuntimeError) as exc:
+            # A dead FFmpeg whose last diagnostics point at the audio input
+            # (dshow/wasapi open failure) is restarted once without audio so
+            # the stream still starts video-only. This guards the case where
+            # the audio open fails after the short startup probe window.
+            if (
+                self.os_name == "Windows"
+                and self.stereo_mix_device
+                and not self._audio_startup_retried
+                and re.search(
+                    r"\[in#[0-9]+\].*error opening input|"
+                    r"(dshow|wasapi).*(i/o error|no such device|device not found)|"
+                    r"i/o error.*(dshow|wasapi|audio)",
+                    str(exc),
+                    re.IGNORECASE,
+                )
+            ):
+                print(
+                    f"[DirectSbsStream] audio input failed during startup "
+                    f"({exc}); retrying without audio",
+                    flush=True,
+                )
+                self._audio_startup_retried = True
+                self.stereo_mix_device = ""
+                self._stop_process(self.ffmpeg_process)
+                self.ffmpeg_process = None
+                self._frame_size = None
+                self._start_ffmpeg(*size)
+                self._write_frame(frame)
+                return
             if self.video_encoder not in {"h264_nvenc", "hevc_nvenc"}:
                 raise
             software_encoder = "libx265" if self.use_hevc else "libx264"
@@ -2609,7 +2707,17 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
             os_name=self.os_name,
         )
         if not report.available:
-            raise RuntimeError(report.detail)
+            # The native Vulkan encoder (h264_vulkan/hevc_vulkan) is not usable
+            # on this device (e.g. AMD LLPC). Fall back through the normal
+            # vendor -> software chain instead of crashing the stream with the
+            # raw FFmpeg probe error. Working NVIDIA/macOS paths are untouched:
+            # they succeed this probe and never reach the fallback.
+            print(
+                f"[VulkanStream] Vulkan encoder unavailable ({report.detail}); "
+                "falling back to the vendor/FFmpeg encoder chain",
+                flush=True,
+            )
+            return super()._select_video_encoder(width, height)
         print(
             f"[VulkanStream] Vulkan capability probe: encoder={report.encoder} "
             f"input={report.input_format} {width}x{height}",

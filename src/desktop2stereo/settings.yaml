@@ -1,12 +1,12 @@
 Capture Mode: Monitor
-Monitor Index: 2
+Monitor Index: 1
 Monitor Identity:
   stable_id: DISPLAY\TUP0270\9&1ce1d36&1&UID1796
   name: D270H
   manufacturer: TUP
   model: D270H
   serial: '808728147'
-  left: -3840
+  left: 0
   top: 0
   width: 3840
   height: 2160
@@ -529,7 +529,7 @@ Recompile MIGraphX: false
 Recompile OpenVINO: false
 Computing Device: 0
 Language: EN
-Run Mode: OpenXR Link
+Run Mode: RTMP Streamer
 XR Headset Model: Pico 4 / 4 Ultra
 XR Preview Window: false
 VSync: false
@@ -568,12 +568,12 @@ Fill 16:9: true
 Fix Viewer Aspect: true
 Stereo Output: 2
 Stereo Output Identity:
-  stable_id: DISPLAY\TUP0270\9&1ce1d36&1&UID1796
-  name: D270H
-  manufacturer: TUP
-  model: D270H
-  serial: '808728147'
-  left: -3840
+  stable_id: DISPLAY\MTT1337\1&15ecd195&d&UID256
+  name: VITURE
+  manufacturer: MTT
+  model: VITURE
+  serial: '2290649088'
+  left: 3840
   top: 0
   width: 3840
   height: 2160
@@ -581,3 +581,4 @@ Show Log Panel: true
 Input Display Resolution Tier: 4K
 Synthetic View: quality_4k
 OpenVINO: null
+Stream Target FPS: 0

@@ -44,3 +44,20 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
 - Keep paths relative/portable (no hard-coded absolute paths in app code); v2.5.0 `depth.py` derives ROCm paths from torch's location.
 - v2.5.0 `depth.py` `MIGraphXEngine` is the reference zero-copy design; current `providers/amd/migraphx.py` matches it.
 - Test artifacts live in `F:\desktop2stereo-vulkan\.tmp` (untracked).
+
+## RTMP Streamer on Windows ROCm (direct_sbs.py)
+- Root cause of "Nothing was written into output file": `VulkanDirectSbsOutput._select_video_encoder`
+  probed `h264_vulkan` on AMD LLPC, failed, and previously raised the raw FFmpeg probe stderr as
+  `RuntimeError(report.detail)`. Now falls back to the shared vendor chain
+  (`super()._select_video_encoder`) -> on this machine `h264_amf` is selected. NVIDIA/macOS are
+  untouched: their Vulkan probe succeeds and never enters the fallback.
+- Second bug (surfaced once video worked): `FFmpeg exited with code 4294967291: [in#1] Error opening
+  input: I/O error` at startup. Root cause: settings.yaml has no "Stereo Mix" key, so runtime_entry
+  resolves `selected_audio = "soundcard:"` (empty device name after the prefix); `_audio_input_args`
+  then built dshow `-i audio=` with an empty name -> FFmpeg aborts at input open.
+  Fix (Windows-only, in `_audio_input_args`): empty `soundcard:`/`wasapi:` name -> auto-pick a dshow
+  loopback device via `_auto_select_windows_audio` (Stereo Mix / virtual-audio-capturer / What U Hear
+  only; never a random microphone), else return [] -> video-only stream. Both `_start_ffmpeg` and
+  `submit_frame` additionally retry once with audio disabled when FFmpeg dies on the audio input.
+  No loopback device exists on this machine -> RTMP now starts video-only (verified: command contains
+  only `-i pipe:0`, no empty `audio=`).
