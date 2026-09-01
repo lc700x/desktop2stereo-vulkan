@@ -200,6 +200,48 @@ def _list_darwin_audio_devices(ffmpeg_path: Path) -> list[tuple[int, str]]:
     return devices
 
 
+def _windows_lan_ipv4s() -> list[str]:
+    """Return this PC's connected, non-virtual IPv4 addresses.
+
+    Used to restrict MediaMTX WebRTC ICE candidates to real NICs. MediaMTX
+    advertises every interface IP by default; WSL/Hyper-V vEthernet adapters
+    (e.g. 192.168.64.x) then appear as candidates that remote LAN clients
+    cannot reach, causing connections to drop every few seconds and audio to
+    never arrive. Querying Get-NetAdapter (Status=Up, Virtual=False) yields
+    exactly the reachable LAN addresses. Windows only; returns [] on failure
+    so callers keep the default (advertise all interfaces).
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and "
+                "$_.Virtual -eq $false } | ForEach-Object { "
+                "(Get-NetIPAddress -InterfaceIndex $_.ifIndex "
+                "-AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress }",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    ips = []
+    for line in (result.stdout or "").splitlines():
+        ip = line.strip()
+        if not ip or ip.startswith(("127.", "169.254.")):
+            continue
+        if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+            continue
+        ips.append(ip)
+    return ips
+
+
 def _auto_select_darwin_audio(ffmpeg_path: Path) -> str:
     """Pick an AVFoundation audio device for loopback capture on macOS.
 
@@ -1310,6 +1352,29 @@ class FfmpegDirectSbsOutput:
             env["MTX_HLSADDRESS"] = f":{self.port}"
         elif self.protocol == "WEBRTC":
             env["MTX_WEBRTCADDRESS"] = f":{self.port}"
+            if self.os_name == "Windows":
+                # MediaMTX advertises every interface IP as a WebRTC ICE
+                # candidate by default. On machines with a WSL/Hyper-V
+                # vEthernet (e.g. 192.168.64.x) that unreachable adapter is
+                # advertised too: remote LAN clients pick it, the connection
+                # drops every few seconds and audio never arrives. Restrict
+                # the advertised candidates to real NICs (Status=Up,
+                # Virtual=False) so clients negotiate a reachable path.
+                lan_ips = _windows_lan_ipv4s()
+                if lan_ips:
+                    env["MTX_WEBRTCIPSFROMINTERFACES"] = "no"
+                    env["MTX_WEBRTCADDITIONALHOSTS"] = ",".join(lan_ips)
+                    print(
+                        f"[DirectSbsStream] WebRTC ICE candidates restricted "
+                        f"to LAN IPs: {lan_ips}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[DirectSbsStream] WARNING: could not enumerate LAN "
+                        "IPs; WebRTC will advertise all interfaces",
+                        flush=True,
+                    )
         return env
 
     @staticmethod

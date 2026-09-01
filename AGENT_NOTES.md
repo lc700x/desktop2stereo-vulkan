@@ -190,3 +190,19 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   (H264, Opus), command shows "-f s16le -i udp://127.0.0.1:PORT" not dshow.
   Named speakers all open in loopback (Realtek 2nd output, D270H monitor,
   Realtek Digital, CABLE Input).
+
+- "no sound for real test" resolution (2026-09-01): two independent fixes.
+  (1) WASAPI-only audio (dshow throttles AMF video to 10 FPS) - committed
+  a5f0cf6. (2) WebRTC ICE candidate poisoning: MediaMTX advertises ALL
+  interface IPs as candidates, including the WSL/Hyper-V vEthernet
+  (192.168.64.1) which remote LAN clients cannot reach -> sessions drop
+  every 3-10s (reconnect loop) and audio never arrives. Verified in MediaMTX
+  logs: user client (192.168.1.99) sessions rotated candidates 192.168.64.1/
+  192.168.1.70 and died every 3-10s; after restricting candidates to real
+  NICs (MTX_WEBRTCIPSFROMINTERFACES=no + MTX_WEBRTCADDITIONALHOSTS=<lan ips>
+  from Get-NetAdapter Status=Up Virtual=False) the same client stayed
+  connected for the whole run and the user heard sound. The app sets these
+  env vars in _server_environment (Windows+WEBRTC only).
+  IMPORTANT for testing: the GUI must be fully restarted to load code
+  changes - a GUI started before a fix keeps running the old code (user's
+  22:18 GUI ran the pre-ICE-fix code).
