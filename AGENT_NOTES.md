@@ -80,3 +80,19 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
     Vulkan FFmpeg encoder creation failed") and hip_gl_interop=False, so the
     auto chain lands on the stable h264_amf host-upload path
     (gpu_to_cpu=True zero_copy=False) - same design as the glow CPU fallback.
+- Browser showed black frame for the AMD WebRTC stream even though MediaMTX
+  relayed all RTP (0 lost/0 discarded). Verified two causes in the RTSP SPS
+  (4D0433 = Main profile, level 5.1):
+  1. Profile mismatch: MediaMTX answers the WHEP offer with Constrained
+     Baseline (profile-level-id 42e01f) but AMF emitted Main (4D) NALs; the
+     browser negotiated CB then refused Main packets.
+  2. Level under-declared: level 5.1 caps 4K at ~30.3 fps (MaxMBPS 983040 /
+     32400 MB per frame) and the stream ran 4K@40 -> invalid SPS -> strict
+     browser decoders rejected it.
+  Fix in the AMF branch of _ffmpeg_command (WEBRTC + H.264 + Windows only):
+  force -profile:v constrained_baseline and the level required by
+  resolution/fps via _required_h264_level/_format_h264_level (5.2 for
+  4K@40, 4.0 for 1080p@30, 4.2 for 1080p@60). Verified SPS is now 424034
+  (CB, level 5.2) and FFmpeg decodes the RTSP feed at ~50 fps. HEVC AMF
+  keeps defaults; NVENC/QSV/VideoToolbox/libx264 and the NVIDIA/macOS
+  selection never enter the "_amf" branch.
