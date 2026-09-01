@@ -223,12 +223,16 @@ def _auto_select_windows_audio(ffmpeg_path: Path) -> str:
     """Pick a dshow audio capture device for loopback on Windows.
 
     Prefers loopback-style names (Stereo Mix / virtual-audio-capturer / What
-    U Hear). Returns "" when no loopback-capable device exists so the caller
-    runs video-only instead of handing FFmpeg an empty ``-i audio=`` name
-    (which fails with ``Error opening input: I/O error`` and kills the
-    stream). This is the Windows counterpart of the macOS auto-selection.
-    Only loopback-style devices are returned on purpose: auto-selecting an
-    arbitrary microphone would broadcast the room instead of system audio.
+    U Hear), then falls back to virtual-cable loopback devices (VB-Audio
+    "CABLE Output (VB-Audio Virtual Cable)", etc.) so a machine whose only
+    loopback is a virtual cable still carries sound. Returns "" when no
+    loopback-capable device exists so the caller runs video-only instead of
+    handing FFmpeg an empty ``-i audio=`` name (which fails with ``Error
+    opening input: I/O error`` and kills the stream). This is the Windows
+    counterpart of the macOS auto-selection. Only loopback-style devices are
+    returned on purpose: auto-selecting an arbitrary microphone would
+    broadcast the room instead of system audio, so any device whose name
+    marks it as a microphone is always excluded.
     """
     try:
         from streaming.audio import (
@@ -240,7 +244,33 @@ def _auto_select_windows_audio(ffmpeg_path: Path) -> str:
         if not devices:
             return ""
         loopback = find_loopback_audio_devices(devices)
-        return loopback[0] if loopback else ""
+        if loopback:
+            return loopback[0]
+        # Virtual-cable loopback fallback: VB-Audio Virtual Cable exposes
+        # itself as "CABLE Output (VB-Audio Virtual Cable)" / "CABLE Input
+        # (VB-Audio Virtual Cable)", which carries whatever is routed to the
+        # virtual cable (system audio). It does not match the classic Stereo
+        # Mix / virtual-audio-capturer name tokens above, so without this
+        # fallback such machines silently stream video-only.
+        mic_tokens = ("microphone", "麦克风", "mic ")
+        for name in devices:
+            normalized = name.casefold()
+            if any(token in normalized for token in mic_tokens):
+                continue
+            if any(
+                token in normalized
+                for token in (
+                    "virtual cable",
+                    "vb-audio",
+                    "vb-cable",
+                    "cable output",
+                    "cable input",
+                    "what u hear",
+                    "wave out mix",
+                )
+            ):
+                return name
+        return ""
     except Exception:
         return ""
 
@@ -1785,7 +1815,13 @@ class FfmpegDirectSbsOutput:
                     # input: I/O error" and aborts the whole stream.
                     device_name = _auto_select_windows_audio(self.ffmpeg_path)
                     if not device_name:
-                        return []
+                        # No dshow loopback device (no Stereo Mix / What U Hear
+                        # / virtual cable). Grab the default speaker directly
+                        # via the Python soundcard WASAPI loopback endpoint and
+                        # stream its PCM to FFmpeg over localhost UDP. This is
+                        # the only way to carry system audio when the sound
+                        # card exposes no capture-side loopback device.
+                        return self._start_wasapi_loopback_audio()
                 return [
                     "-itsoffset",
                     str(self.audio_delay),
@@ -1899,6 +1935,54 @@ class FfmpegDirectSbsOutput:
                 )
             return args
         return []
+
+    def _start_wasapi_loopback_audio(self) -> list[str]:
+        """Grab the default Windows speaker via WASAPI loopback into FFmpeg.
+
+        Used when no dshow capture-side loopback device exists (no Stereo Mix
+        / What U Hear / virtual cable): the Python soundcard library opens the
+        default render device in loopback mode and streams its PCM to FFmpeg
+        over localhost UDP. This is the only direct way to carry system audio
+        when the sound card exposes no capture loopback endpoint. Returns the
+        FFmpeg input args, or [] when no default speaker / loopback is
+        available (stream then runs video-only, matching previous behavior).
+        """
+        if self._soundcard_audio is not None:
+            return [
+                "-itsoffset",
+                str(self.audio_delay),
+                "-f",
+                "s16le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-i",
+                self._soundcard_audio.ffmpeg_url,
+            ]
+        try:
+            sender = SoundcardLoopbackSender(None)
+            sender.start()
+        except Exception as exc:
+            print(
+                f"[DirectSbsStream] WASAPI loopback unavailable ({type(exc).__name__}: {exc}); "
+                "streaming video-only",
+                flush=True,
+            )
+            return []
+        self._soundcard_audio = sender
+        return [
+            "-itsoffset",
+            str(self.audio_delay),
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-i",
+            sender.ffmpeg_url,
+        ]
 
     def _qsv_d3d11_surface_upload_enabled(self) -> bool:
         """Opt into FFmpeg's Windows D3D11/QSV surface upload boundary.
@@ -2456,6 +2540,9 @@ class FfmpegDirectSbsOutput:
                 )
                 self._audio_startup_retried = True
                 self.stereo_mix_device = ""
+                if self._soundcard_audio is not None:
+                    self._soundcard_audio.close()
+                    self._soundcard_audio = None
                 self._stop_process(self.ffmpeg_process)
                 self.ffmpeg_process = None
                 self._frame_size = None
@@ -2627,6 +2714,9 @@ class FfmpegDirectSbsOutput:
                 )
                 self._audio_startup_retried = True
                 self.stereo_mix_device = ""
+                if self._soundcard_audio is not None:
+                    self._soundcard_audio.close()
+                    self._soundcard_audio = None
                 self._stop_process(self.ffmpeg_process)
                 self.ffmpeg_process = None
                 self._frame_size = None
