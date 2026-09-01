@@ -751,7 +751,10 @@ def test_macos_rtmp_stream_audio_uses_opus_like_v250(monkeypatch) -> None:
     command = output._ffmpeg_command(3840, 1080)
 
     assert command[command.index("-c:a") + 1] == "libopus"
-    assert command[command.index("-af") + 1] == "aresample=async=1"
+    # macOS re-anchors audio to the video wall-clock base in the filter graph
+    # (asetpts=RTCTIME, delay folded in: -0.1s -> -100000us) instead of the
+    # audio demuxer wall-clock option, so audio keeps smooth device pacing.
+    assert command[command.index("-af") + 1] == "asetpts=RTCTIME-100000,aresample=async=1"
     assert command[command.index("-ar") + 1] == "48000"
     assert command[command.index("-ac") + 1] == "2"
     assert command[command.index("-b:a") + 1] == "96k"
@@ -761,13 +764,16 @@ def test_macos_rtmp_stream_audio_uses_opus_like_v250(monkeypatch) -> None:
     # input's "-i" follows "-rtbufsize" (the video input is rawvideo pipe:0).
     audio_i = command.index("-i", command.index("-rtbufsize"))
     assert command[audio_i + 1] == ":8"
-    # Professional A/V sync: both inputs share the av_gettime() wall-clock
-    # base (video PTS can never drift behind the real-time audio clock) and
-    # each input demuxes on its own thread (audio can't be starved by a
+    # Professional A/V sync: only the VIDEO input uses the demuxer wall-clock
+    # option (audio is re-anchored in the filter graph — see _audio_filter_graph)
+    # and each input demuxes on its own thread (audio can't be starved by a
     # stalled video pipe producer).
-    assert command.count("-use_wallclock_as_timestamps") == 2
+    assert command.count("-use_wallclock_as_timestamps") == 1
     assert command.count("-thread_queue_size") == 2
     assert command[command.index("-use_wallclock_as_timestamps") + 1] == "1"
+    # Immediate mux flushing keeps audio RTP delivery from batching into
+    # bursts when the app-paced video stalls.
+    assert "-flush_packets" in command
 
 
 def test_macos_webrtc_stream_audio_uses_opus_async1(monkeypatch) -> None:
@@ -790,7 +796,8 @@ def test_macos_webrtc_stream_audio_uses_opus_async1(monkeypatch) -> None:
     command = output._ffmpeg_command(3840, 1080)
 
     assert command[command.index("-c:a") + 1] == "libopus"
-    assert command[command.index("-af") + 1] == "aresample=async=1"
+    # Default audio_delay (-0.1s) folds into the RTCTIME anchor on macOS.
+    assert command[command.index("-af") + 1] == "asetpts=RTCTIME-100000,aresample=async=1"
     assert "aac" not in command
 
 

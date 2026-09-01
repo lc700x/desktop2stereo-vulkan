@@ -1837,9 +1837,16 @@ class FfmpegDirectSbsOutput:
         both produce an empty audio stream on this build). The v2.5.0
         ``-itsoffset`` audio delay is folded into the RTCTIME offset
         because asetpts overwrites the demuxer PTS that the offset shifted.
+
+        macOS uses the same re-anchoring: the AVFoundation device timestamps
+        are already real-time, so the demuxer wall-clock option is redundant
+        and re-times audio to the (jittery under CPU load) packet read time,
+        which the async resampler then has to correct audibly. Anchoring in
+        the filter graph keeps the audio on the wall-clock base with smooth,
+        device-derived pacing.
         """
         graph = "aresample=async=1"
-        if self._soundcard_audio is not None:
+        if self._soundcard_audio is not None or self.os_name == "Darwin":
             delay_us = int(round(float(self.audio_delay) * 1e6))
             graph = f"asetpts=RTCTIME{delay_us:+d},{graph}"
         return graph
@@ -2086,12 +2093,15 @@ class FfmpegDirectSbsOutput:
                 # option silences the whole audio chain on this FFmpeg
                 # build); its wall-clock re-anchoring happens in the audio
                 # filter graph instead (asetpts=RTCTIME, see
-                # _audio_filter_graph).
+                # _audio_filter_graph). macOS drops it too: AVFoundation
+                # timestamps are already real-time and re-timing them to the
+                # packet read time (jittery under CPU load) makes the async
+                # resampler compensate audibly.
                 "-thread_queue_size",
                 "512",
                 *(
                     []
-                    if self._soundcard_audio is not None
+                    if self._soundcard_audio is not None or self.os_name == "Darwin"
                     else ["-use_wallclock_as_timestamps", "1"]
                 ),
                 *audio_args,
@@ -2449,6 +2459,27 @@ class FfmpegDirectSbsOutput:
                     # Bound sparse-stream interleaving to 100 ms.
                     "-max_interleave_delta",
                     "100000",
+                ]
+            )
+            if self.os_name == "Darwin":
+                # Flush every muxed packet immediately instead of batching:
+                # with an app-paced video source and a real-time audio input,
+                # buffered writes deliver audio to MediaMTX in bursts, which
+                # shows up as jitter in the client's audio buffer. Same
+                # options the Windows path uses; macOS/Linux keep their
+                # existing behavior otherwise (Linux/ROCm untouched).
+                command.extend(
+                    [
+                        "-muxdelay",
+                        "0",
+                        "-muxpreload",
+                        "0",
+                        "-flush_packets",
+                        "1",
+                    ]
+                )
+            command.extend(
+                [
                     "-f",
                     "rtsp",
                     "-rtsp_transport",
@@ -3014,12 +3045,13 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
                 # be starved by a stalled video pipe producer. The WASAPI
                 # soundcard input skips the demuxer wall-clock option (it
                 # silences the chain on this FFmpeg build) and is re-anchored
-                # in the filter graph via asetpts=RTCTIME instead.
+                # in the filter graph via asetpts=RTCTIME instead. macOS
+                # skips it too (see _audio_filter_graph).
                 "-thread_queue_size",
                 "512",
                 *(
                     []
-                    if self._soundcard_audio is not None
+                    if self._soundcard_audio is not None or self.os_name == "Darwin"
                     else ["-use_wallclock_as_timestamps", "1"]
                 ),
                 *audio_args,
