@@ -1800,6 +1800,27 @@ class FfmpegDirectSbsOutput:
             flush=True,
         )
 
+    def _audio_filter_graph(self) -> str:
+        """Audio timeline filter for every FFmpeg/native muxer.
+
+        The Windows WASAPI loopback input (s16le over UDP) must NOT use
+        ``-use_wallclock_as_timestamps``: on this FFmpeg build that demuxer
+        option makes the audio chain emit zero packets (the stream then
+        declares an Opus track that never carries audio, so WebRTC clients
+        get video with no sound). Instead the raw s16le/UDP timeline is
+        re-anchored to the same wall-clock base as the video input with
+        ``asetpts=RTCTIME``. The order matters: asetpts must run BEFORE
+        aresample (measured: ``aresample,asetpts`` and plain ``asetpts``
+        both produce an empty audio stream on this build). The v2.5.0
+        ``-itsoffset`` audio delay is folded into the RTCTIME offset
+        because asetpts overwrites the demuxer PTS that the offset shifted.
+        """
+        graph = "aresample=async=1"
+        if self._soundcard_audio is not None:
+            delay_us = int(round(float(self.audio_delay) * 1e6))
+            graph = f"asetpts=RTCTIME{delay_us:+d},{graph}"
+        return graph
+
     def _audio_input_args(self) -> list[str]:
         device = self.stereo_mix_device
         if self.os_name == "Darwin":
@@ -2037,10 +2058,19 @@ class FfmpegDirectSbsOutput:
                 # Same clock base as the video input (see above), so the
                 # muxer sees both streams on one timeline and never has to
                 # drop audio that runs ahead of a delayed video PTS.
+                # The WASAPI soundcard input must NOT use
+                # -use_wallclock_as_timestamps (measured: that demuxer
+                # option silences the whole audio chain on this FFmpeg
+                # build); its wall-clock re-anchoring happens in the audio
+                # filter graph instead (asetpts=RTCTIME, see
+                # _audio_filter_graph).
                 "-thread_queue_size",
                 "512",
-                "-use_wallclock_as_timestamps",
-                "1",
+                *(
+                    []
+                    if self._soundcard_audio is not None
+                    else ["-use_wallclock_as_timestamps", "1"]
+                ),
                 *audio_args,
             ]
             if audio_args
@@ -2310,8 +2340,11 @@ class FfmpegDirectSbsOutput:
             # audio and video timelines are aligned by construction. async=1
             # (the v2.5.0 magnitude) absorbs residual device-clock drift by
             # inserting/dropping samples without letting the filter make
-            # large, audible adjustments.
-            command.extend(["-af", "aresample=async=1"])
+            # large, audible adjustments. The WASAPI soundcard path
+            # additionally re-anchors the raw s16le/UDP timeline to the wall
+            # clock (asetpts=RTCTIME) because -use_wallclock_as_timestamps
+            # on the audio demuxer would silence the stream entirely.
+            command.extend(["-af", self._audio_filter_graph()])
             if self.protocol == "WEBRTC" or self.os_name == "Darwin":
                 command.extend(
                     [
@@ -2955,11 +2988,17 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
                 # Same clock base and demux decoupling as the FFmpeg path:
                 # wall-clock timestamps keep the muxed video PTS on the
                 # real-time audio clock, and the audio demux thread can never
-                # be starved by a stalled video pipe producer.
+                # be starved by a stalled video pipe producer. The WASAPI
+                # soundcard input skips the demuxer wall-clock option (it
+                # silences the chain on this FFmpeg build) and is re-anchored
+                # in the filter graph via asetpts=RTCTIME instead.
                 "-thread_queue_size",
                 "512",
-                "-use_wallclock_as_timestamps",
-                "1",
+                *(
+                    []
+                    if self._soundcard_audio is not None
+                    else ["-use_wallclock_as_timestamps", "1"]
+                ),
                 *audio_args,
             ]
             if audio_args
@@ -2999,8 +3038,10 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
         if audio_args:
             command.extend(["-map", "1:a:0"])
             # Same normalized audio timeline as the FFmpeg path (async=1,
-            # the v2.5.0 magnitude) for every client protocol.
-            command.extend(["-af", "aresample=async=1"])
+            # the v2.5.0 magnitude) for every client protocol; the WASAPI
+            # soundcard path adds the asetpts=RTCTIME wall-clock re-anchor
+            # (see _audio_filter_graph).
+            command.extend(["-af", self._audio_filter_graph()])
             if self.protocol == "WEBRTC":
                 command.extend(
                     [

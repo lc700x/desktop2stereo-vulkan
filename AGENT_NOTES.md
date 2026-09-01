@@ -206,3 +206,27 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   IMPORTANT for testing: the GUI must be fully restarted to load code
   changes - a GUI started before a fix keeps running the old code (user's
   22:18 GUI ran the pre-ICE-fix code).
+
+- "Video OK but no sound" root cause (2026-09-01, found 23:1x): the Windows
+  WASAPI soundcard audio input used `-use_wallclock_as_timestamps 1` on the
+  s16le/UDP demuxer. On the bundled FFmpeg build this SILENCES THE WHOLE
+  AUDIO CHAIN: the Opus track is declared in the SDP but ZERO audio packets
+  are ever produced. Symptoms: MediaMTX shows "2 tracks (H264, Opus)", the
+  client subscribes to both, but the browser gets video only - inbound-rtp
+  audio absent, audio receiver track muted, RTSP audio-only pull hangs with
+  no astats report, local mp4 mux of the same chain = 0 bytes.
+  Isolated with a 6-variant bisect (file mux): demuxer wallclock kills
+  audio regardless of UDP-vs-file or aresample; no wallclock works.
+  Fix (committed): drop the demuxer wallclock option on the soundcard input
+  and re-anchor audio PTS to the wall clock in the FILTER graph instead:
+  `-af asetpts=RTCTIME<+delay_us>,aresample=async=1` (order matters! asetpts
+  must come BEFORE aresample; asetpts-after-aresample and asetpts-alone both
+  produce empty audio on this build). The v2.5.0 -itsoffset audio delay is
+  folded into the RTCTIME offset. Video input keeps use_wallclock_as_timestamps.
+  Verified end-to-end: app run + tone -> WHEP probe shows audio inbound-rtp
+  growing, receiver muted=false, WebAudio RMS 0.23-0.44; RTSP pull astats
+  RMS -12 dB. Control (plain 0-based audio + wallclock video) confirmed the
+  muxer then drops the audio (PTS gap), so the asetpts re-anchor is required.
+  MediaMTX built-in player page (/live/) defaults video.muted=true - clients
+  must unmute or open with ?muted=0; the page/reader.js otherwise handles
+  audio correctly (recvonly transceivers for video+audio).
