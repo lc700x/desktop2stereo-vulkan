@@ -848,6 +848,7 @@ class VulkanExportableImage:
         *,
         label: str,
         format: int | None = None,
+        tiling: int | None = None,
     ) -> None:
         if int(width) < 1 or int(height) < 1:
             raise ValueError("exportable image dimensions must be positive")
@@ -859,6 +860,27 @@ class VulkanExportableImage:
         self.height = int(height)
         self.label = str(label)
         self.format = int(format or self.vk.VK_FORMAT_R8G8B8A8_UNORM)
+        self.tiling = int(
+            tiling or self.vk.VK_IMAGE_TILING_OPTIMAL
+        )
+        # STORAGE_BIT needs the format's compute/storage linear feature set,
+        # which R8G8B8A8_UNORM linear images usually do NOT expose. The glow
+        # producer writes the linear pixels through the imported HIP pointer
+        # (no vkCmd path), so the image only needs SAMPLED (+ TRANSFER_SRC for
+        # diagnostics/readback). Linear tiling is what lets the HIP mapped
+        # buffer address the rows contiguously (zero-copy write).
+        if self.tiling == self.vk.VK_IMAGE_TILING_LINEAR:
+            self.usage = (
+                self.vk.VK_IMAGE_USAGE_SAMPLED_BIT
+                | self.vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+            )
+        else:
+            self.usage = (
+                self.vk.VK_IMAGE_USAGE_STORAGE_BIT
+                | self.vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                | self.vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                | self.vk.VK_IMAGE_USAGE_SAMPLED_BIT
+            )
         self.image = None
         self.memory = None
         self.allocation_size = 0
@@ -925,13 +947,8 @@ class VulkanExportableImage:
                 mipLevels=1,
                 arrayLayers=1,
                 samples=vk.VK_SAMPLE_COUNT_1_BIT,
-                tiling=vk.VK_IMAGE_TILING_OPTIMAL,
-                usage=(
-                    vk.VK_IMAGE_USAGE_STORAGE_BIT
-                    | vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                    | vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                    | vk.VK_IMAGE_USAGE_SAMPLED_BIT
-                ),
+                tiling=self.tiling,
+                usage=self.usage,
                 sharingMode=sharing_mode,
                 queueFamilyIndexCount=len(sharing_families) if len(sharing_families) > 1 else 0,
                 pQueueFamilyIndices=sharing_families if len(sharing_families) > 1 else None,
@@ -1008,6 +1025,26 @@ class VulkanExportableImage:
     @property
     def handle_type(self) -> int:
         return self._handle_type
+
+    def row_pitch(self) -> int:
+        """Return the linear-tiling row pitch in bytes (VkSubresourceLayout).
+
+        Only valid for images created with ``VK_IMAGE_TILING_LINEAR`` (the
+        zero-copy HIP glow write uses this pitch to address the rows).
+        """
+        vk = self.vk
+        layout = vk.VkSubresourceLayout()
+        vk.vkGetImageSubresourceLayout(
+            self.context.device,
+            self.image,
+            vk.VkImageSubresource(
+                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                mipLevel=0,
+                arrayLayer=0,
+            ),
+            layout,
+        )
+        return int(layout.rowPitch)
 
     def external_memory_contract(
         self,

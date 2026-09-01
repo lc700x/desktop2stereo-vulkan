@@ -5301,10 +5301,12 @@ class OpenXrVulkanPresenter(
         )
         # AMD ROCm: pre-create and warm the torch glow source before the session
         # presents, so the first live glow frame does not pay the ~85ms torch
-        # kernel JIT + first-transition cost. Opt-in via D2S_ROCm_TORCH_GLOW;
-        # the default glow path on ROCm is the stable cpu_fallback.
+        # kernel JIT + first-transition cost. The GPU torch glow is the ROCm
+        # default; D2S_ROCm_TORCH_GLOW=0 reverts to the stable cpu_fallback.
         self._prewarmed_glow_backend = None
-        if os.environ.get("D2S_ROCm_TORCH_GLOW"):
+        if os.environ.get("D2S_ROCm_TORCH_GLOW", "1").strip().lower() not in {
+            "0", "false", "off", "no", "disabled",
+        }:
             try:
                 import torch
 

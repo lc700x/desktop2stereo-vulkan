@@ -152,7 +152,10 @@ class RocmVulkanImageImporter:
                     "hipDestroyExternalSemaphore",
                 )
             ),
-            zero_copy=False,
+            zero_copy=bool(
+                getattr(self._hip, "hipExternalMemoryGetMappedBuffer", None)
+                and getattr(self._hip, "hipMemcpy2D", None)
+            ),
         )
 
     @staticmethod
@@ -288,6 +291,12 @@ class RocmVulkanImageImporter:
             (
                 "hipMemcpy",
                 [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int],
+                ctypes.c_int,
+            ),
+            (
+                "hipMemcpy2D",
+                [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+                 ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int],
                 ctypes.c_int,
             ),
         ):
@@ -435,6 +444,74 @@ class RocmVulkanImageImporter:
             "hipMemcpy2DToArrayAsync",
         )
         return resource
+
+    def image_pointer(self, target: VulkanExportableImage) -> int | None:
+        """Map a LINEAR exportable image's memory into HIP once (zero-copy).
+
+        Returns the device pointer to the Vulkan image memory or None when the
+        driver cannot map image memory as a buffer (callers then fall back to
+        the mipmapped-array copy path).
+        """
+        slot = self._buffer_slots.get(id(target))
+        if slot is None:
+            try:
+                self.register_buffer(target)
+            except Exception:
+                return None
+            slot = self._buffer_slots.get(id(target))
+        if slot is None:
+            return None
+        return int(getattr(slot.pointer, "value", 0) or 0) or None
+
+    def copy_tensor_to_image(
+        self,
+        tensor: Any,
+        target: VulkanExportableImage,
+        *,
+        stream=None,
+    ) -> None:
+        """Zero-copy D2D write of a contiguous HxWx4 uint8 tensor into the
+        image's mapped (linear) memory using the Vulkan row pitch.
+
+        The tensor is written device-to-device straight into the shared Vulkan
+        image memory (no staging, no mipmapped-array API). The synchronous
+        hipMemcpy2D completes before returning, so the caller only needs the
+        Vulkan GENERAL -> SHADER_READ_ONLY barrier afterwards.
+        """
+        if not self._hip.hipMemcpy2D:
+            raise RocmVulkanInteropError("hipMemcpy2D is unavailable")
+        pointer = self.image_pointer(target)
+        if pointer is None:
+            raise RocmVulkanInteropError(
+                "driver cannot map image memory as a HIP buffer"
+            )
+        if getattr(tensor, "device", None) is None or str(tensor.device.type) != "cuda":
+            raise RocmVulkanInteropError("ROCm Vulkan image write requires a HIP tensor")
+        if str(getattr(tensor, "dtype", "")) != "torch.uint8":
+            raise RocmVulkanInteropError("ROCm Vulkan image write requires torch.uint8 RGBA")
+        if getattr(tensor, "ndim", 0) != 3 or tuple(tensor.shape) != (
+            target.height,
+            target.width,
+            4,
+        ):
+            raise RocmVulkanInteropError(
+                "ROCm Vulkan image write requires HxWx4 tensor matching target"
+            )
+        if not bool(tensor.is_contiguous()):
+            raise RocmVulkanInteropError("ROCm Vulkan image write requires a contiguous tensor")
+        row_pitch = int(target.row_pitch())
+        self._check(
+            self._hip.hipMemcpy2D(
+                ctypes.c_void_p(pointer),
+                row_pitch,
+                ctypes.c_void_p(int(tensor.data_ptr())),
+                target.width * 4,
+                target.width * 4,
+                target.height,
+                self._HIP_MEMCPY_DEVICE_TO_DEVICE,
+            ),
+            "hipMemcpy2D(image)",
+        )
 
     def register_buffer(self, target: Any) -> None:
         """Import an exportable Vulkan storage buffer into HIP once."""

@@ -31,6 +31,19 @@ TARGET_WIDTH = 320
 TARGET_HEIGHT = 180
 
 
+def rocm_torch_glow_default_on() -> bool:
+    """ROCm glow policy: torch-computed glow is ON by default.
+
+    ``D2S_ROCm_TORCH_GLOW=0/false/off`` explicitly reverts to the stable
+    cpu_fallback path; any other value (or unset) keeps the GPU torch glow
+    with the automatic fallback machinery in runtime_output.
+    """
+    value = os.environ.get("D2S_ROCm_TORCH_GLOW")
+    if value is None:
+        return True
+    return str(value).strip().lower() not in {"0", "false", "off", "no", "disabled"}
+
+
 class RocmTorchGlowSource:
     """Compute glow + screen light in torch and publish an RGBA8 Vulkan image."""
 
@@ -47,6 +60,11 @@ class RocmTorchGlowSource:
                 TARGET_HEIGHT,
                 format=context.vk.VK_FORMAT_R8G8B8A8_UNORM,
                 label=f"torch-glow-{index}",
+                # LINEAR tiling lets the zero-copy HIP write address the
+                # memory rows contiguously through the imported buffer pointer
+                # (hipExternalMemoryGetMappedBuffer). OPTIMAL images cannot be
+                # written linearly and keep the mipmapped-array copy fallback.
+                tiling=context.vk.VK_IMAGE_TILING_LINEAR,
             )
             self.importer.register_slot(image, wait=False, defer=True)
             self.slots.append(image)
@@ -64,6 +82,8 @@ class RocmTorchGlowSource:
         self._closed = False
         self._frame_slots: dict[int, Any] = {}
         self._leases: dict[int, int] = {}
+        self._zero_copy_active: bool | None = None
+        self._zero_copy_logged = False
         # Background worker: every blocking glow step runs here, never on the
         # frame producer.
         self._pending: list[tuple[Any, Any, str, float]] = []
@@ -276,7 +296,29 @@ class RocmTorchGlowSource:
                     self.context.release_external_image_from_sampling(
                         slot.resource
                     )
-                self.importer.copy_tensor(rgba, slot, synchronous=True)
+                # Zero-copy: write the RGBA pixels device-to-device straight
+                # into the imported Vulkan image memory (mapped HIP buffer,
+                # linear tiling, pitched by the Vulkan row pitch). No staging,
+                # no mipmapped-array API. When the driver cannot map image
+                # memory as a buffer, the mipmapped-array copy (the CUDA-path
+                # equivalent) is used instead - both keep the identical visual.
+                try:
+                    self.importer.copy_tensor_to_image(rgba, slot)
+                    self._zero_copy_active = True
+                except Exception:
+                    self.importer.copy_tensor(rgba, slot, synchronous=True)
+                    self._zero_copy_active = False
+                if not self._zero_copy_logged:
+                    self._zero_copy_logged = True
+                    print(
+                        "[VulkanOutput] ROCm torch glow upload: "
+                        + (
+                            "zero_copy_hip_buffer"
+                            if self._zero_copy_active
+                            else "mipmapped_array_copy_fallback"
+                        ),
+                        flush=True,
+                    )
                 self.context.prepare_external_image_for_sampling(slot.resource)
                 with self._lock:
                     self._current_resource = slot.resource

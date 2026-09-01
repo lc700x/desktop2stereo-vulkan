@@ -289,12 +289,16 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
             and getattr(self.presenter.config, "filament_glb_path", None)
         )
         if self.backend_name != "cuda":
-            # AMD ROCm default: cpu_fallback glow (stable). The torch glow
-            # (D2S_ROCm_TORCH_GLOW=1) computes the glow on the HIP stream and
-            # uploads it through the same image import the eye path uses; on
-            # Virtual Desktop it is opt-in because the session may drop while
-            # the glow is active.
-            if os.environ.get("D2S_ROCm_TORCH_GLOW"):
+            # AMD ROCm default: torch-computed glow on the HIP stream (GPU
+            # path) with automatic fallback to cpu_fallback on failure. The
+            # CPU reference remains the safety net; D2S_ROCm_TORCH_GLOW=0
+            # explicitly reverts to it (Virtual Desktop sessions that cannot
+            # keep the glow active fall back automatically as well).
+            from stereo_runtime.rocm_torch_glow_source import (
+                rocm_torch_glow_default_on,
+            )
+
+            if rocm_torch_glow_default_on():
                 self._set_glow_gpu_status(
                     f"torch_compute_external_image backend={self.backend_name}"
                 )

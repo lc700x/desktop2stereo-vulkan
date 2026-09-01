@@ -254,3 +254,31 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   wallclock gap -> audio dropped). python3_cuda bundle has soundcard+numpy;
   both bundles share the same ffmpeg.exe. The AMD (RTCTIME) and macOS
   (avfoundation, no soundcard code) filter behavior is unchanged.
+
+- AMD ROCm OpenXR glow (2026-09-02): torch glow is now the ROCm DEFAULT
+  (D2S_ROCm_TORCH_GLOW unset/1 = GPU torch glow; 0/false/off = cpu_fallback),
+  with the upload upgraded to a zero-copy HIP/Vulkan path:
+  VulkanExportableImage gains a tiling kwarg (the ROCm torch glow slots use
+  VK_IMAGE_TILING_LINEAR with SAMPLED|TRANSFER_SRC usage - STORAGE requires
+  the linear format feature set and is dropped for linear), a row_pitch()
+  query (vkGetImageSubresourceLayout), and RocmVulkanImageImporter gains
+  image_pointer() (hipImportExternalMemory + hipExternalMemoryGetMappedBuffer
+  over the image memory) + copy_tensor_to_image() (synchronous
+  hipMemcpy2D with the Vulkan row pitch straight into the shared memory).
+  RocmTorchGlowSource prefers the zero-copy write and falls back to the
+  mipmapped-array hipMemcpy2DToArray path; one log line reports which
+  ("ROCm torch glow upload: zero_copy_hip_buffer" | "..._fallback").
+  NVIDIA (vulkan compute backend + cuda array copy) and macOS untouched.
+  Diagnosis findings on this machine: glow pipeline works end-to-end on
+  ROCm (prewarm, publish, "Glow draw: surround pass executed mode=3"),
+  the tool-quad overlays fail against VDXR (RuntimeFailureError in
+  enumerate_swapchain_images, CAUGHT - "quad layer render error; skipping
+  overlays"; D2S_OPENXR_DISABLE_TOOL_QUADS is the escape hatch), and the
+  Quest 3 proximity sensor (mProximityPositive) MUST read worn for VDXR to
+  deliver eye frames - software keep-awake (svc power stayon true,
+  stay_on_while_plugged_in=7, screen_off_timeout=2147483647) does NOT
+  override it; sensor is internal IR (between the lenses). Headless
+  --runtime reads settings.yaml directly (no D2S settings-path override);
+  capture display must exist (currently only a VITURE/MTT display present,
+  Dell U2410 disconnected -> Monitor Index/Identity had to be pointed at the
+  VITURE for the diagnosis; .tmp/settings.yaml.bak holds the previous file).
