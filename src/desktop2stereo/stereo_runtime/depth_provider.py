@@ -336,7 +336,29 @@ def _reachable_hf_endpoints(model_id: str) -> tuple[str, ...]:
     return tuple(reachable)
 
 
-def _load_hf_with_endpoint_fallback(load_fn: Callable[[str], Any], model_id: str):
+def _load_hf_with_endpoint_fallback(
+    load_fn: Callable[[str], Any],
+    model_id: str,
+    *,
+    local_first: Callable[[], Any] | None = None,
+):
+    """Load a HuggingFace model, preferring the local cache over the network.
+
+    ``_reachable_hf_endpoints`` raises when every mirror is unreachable (DNS
+    down, offline, VPN off). That must not gate startup when the weights are
+    already fully cached locally, so callers pass ``local_first`` to attempt
+    ``from_pretrained(..., local_files_only=True)`` before any network I/O.
+    Only when the local cache is incomplete does this fall through to the
+    endpoint probe + download path.
+    """
+    if local_first is not None:
+        try:
+            return local_first()
+        except Exception as exc:
+            _progress_print(
+                f"[Main] Local cache load failed ({type(exc).__name__}); "
+                "probing download endpoints"
+            )
     last_error = None
     for endpoint in _reachable_hf_endpoints(model_id):
         model_url = _hf_resolve_url(endpoint, model_id)
@@ -510,10 +532,30 @@ class DistillAnyDepthBase518:
             "local_files_only": self.local_files_only,
             "force_download": self.force_download,
         }
-        model = _load_hf_with_endpoint_fallback(
-            lambda model_id: AutoModelForDepthEstimation.from_pretrained(model_id, **kwargs),
-            DISTILL_ANY_DEPTH_BASE_MODEL_ID,
-        )
+        if self.local_files_only:
+            # Explicit offline mode: never touch the network.
+            model = AutoModelForDepthEstimation.from_pretrained(
+                DISTILL_ANY_DEPTH_BASE_MODEL_ID,
+                **kwargs,
+            )
+        else:
+            model = _load_hf_with_endpoint_fallback(
+                lambda model_id: AutoModelForDepthEstimation.from_pretrained(model_id, **kwargs),
+                DISTILL_ANY_DEPTH_BASE_MODEL_ID,
+                # Already-downloaded weights must load without network access
+                # (the endpoint probe hard-fails when offline/DNS is down).
+                local_first=(
+                    None
+                    if self.force_download
+                    else lambda: AutoModelForDepthEstimation.from_pretrained(
+                        DISTILL_ANY_DEPTH_BASE_MODEL_ID,
+                        cache_dir=str(self.cache_dir),
+                        dtype=self.dtype,
+                        weights_only=True,
+                        local_files_only=True,
+                    )
+                ),
+            )
 
         self._model = model.to(self.device).eval()
         return self._model
@@ -638,10 +680,29 @@ class GenericAutoDepthProvider:
             "local_files_only": self.local_files_only,
             "force_download": self.force_download,
         }
-        model = _load_hf_with_endpoint_fallback(
-            lambda model_id: AutoModelForDepthEstimation.from_pretrained(model_id, **kwargs),
-            self.model_id,
-        )
+        if self.local_files_only:
+            # Explicit offline mode: never touch the network.
+            model = AutoModelForDepthEstimation.from_pretrained(
+                self.model_id,
+                **kwargs,
+            )
+        else:
+            model = _load_hf_with_endpoint_fallback(
+                lambda model_id: AutoModelForDepthEstimation.from_pretrained(model_id, **kwargs),
+                self.model_id,
+                # Already-downloaded weights must load without network access.
+                local_first=(
+                    None
+                    if self.force_download
+                    else lambda: AutoModelForDepthEstimation.from_pretrained(
+                        self.model_id,
+                        cache_dir=str(self.cache_dir),
+                        dtype=self.dtype,
+                        weights_only=True,
+                        local_files_only=True,
+                    )
+                ),
+            )
         self._model = model.to(self.device).eval()
         return self._model
 
