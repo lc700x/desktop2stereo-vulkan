@@ -110,3 +110,23 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
 - Diagnostic tools built under .tmp: cdp_probe*.mjs (headless Chrome + CDP:
   video state, getStats codec/frames, real WHEP answer capture), rtsp_analyze*.py
   (interleaved RTP NAL/PT capture). Keep for future streaming debugging.
+- RTMP/WebRTC audio on Windows: the bundled FFmpeg has NO native wasapi input
+  (ffmpeg -devices shows only dshow/gdigrab/lavfi/vfwcap), so `-f wasapi` is
+  impossible and the GUI's wasapi: device labels cannot be captured by FFmpeg
+  directly. dshow can only see capture-side loopback devices (Stereo Mix /
+  What U Hear / virtual cables); on machines with none of those (e.g. only a
+  default speaker + VB-Cable), _auto_select_windows_audio returned "" and the
+  stream ran video-only.
+- Fix (direct_sbs.py, Windows-only): (1) _auto_select_windows_audio also
+  matches VB-Audio virtual-cable devices ("CABLE Output/Input (VB-Audio
+  Virtual Cable)", vb-audio, vb-cable, virtual cable, what u hear, wave out
+  mix) while excluding microphone-named devices; (2) when still no dshow
+  loopback exists, grab the default render device directly via the Python
+  soundcard WASAPI loopback and feed its 48k stereo PCM to FFmpeg over
+  localhost UDP (_start_wasapi_loopback_audio -> -f s16le -i udp://...).
+  This is the answer to "can the sound card grab audio directly?": yes via
+  WASAPI loopback (verified mean_volume -13.5 dB with a 440Hz tone), just not
+  through FFmpeg itself on this build.
+- Verified: MediaMTX "[path live] 2 tracks (H264, Opus)", WebRTC sessions read
+  2 tracks, browser getStats audio inbound-rtp 1000 pkts/0 lost/jitter 0.024/
+  totalSamplesReceived 943200 (48k decoded), video 760 frames decoded.
