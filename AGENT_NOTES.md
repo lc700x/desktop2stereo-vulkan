@@ -96,3 +96,17 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   (CB, level 5.2) and FFmpeg decodes the RTSP feed at ~50 fps. HEVC AMF
   keeps defaults; NVENC/QSV/VideoToolbox/libx264 and the NVIDIA/macOS
   selection never enter the "_amf" branch.
+- FINAL browser black-frame root cause (AMF): the Constrained Baseline +
+  level fix was necessary but not sufficient. Wire-level NAL capture
+  (interleaved RTSP reader) showed AMF -usage ultralowlatency emits only ONE
+  true IDR (NAL type 5) at stream start; -g and -force_key_frames turn into
+  non-IDR I-slices (open-GOP). Browser WebRTC H.264 depacketizer needs a real
+  IDR to start -> framesReceived stays 0 with 50k+ RTP packets flowing.
+  Verification (180 frames, NAL type-5 count): ultralowlatency=1, lowlatency=1,
+  webcam=6, transcoding=6. Fix: WEBRTC+H.264 AMF uses -usage webcam (low
+  latency, true IDRs); SRT/RTSP keep ultralowlatency; HEVC/NVIDIA/macOS
+  untouched. Verified: real 4K stream decodes in browser (framesDecoded 200,
+  readyState 4, videoWidth 3840).
+- Diagnostic tools built under .tmp: cdp_probe*.mjs (headless Chrome + CDP:
+  video state, getStats codec/frames, real WHEP answer capture), rtsp_analyze*.py
+  (interleaved RTP NAL/PT capture). Keep for future streaming debugging.
