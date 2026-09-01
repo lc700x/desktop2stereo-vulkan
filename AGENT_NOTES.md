@@ -130,3 +130,28 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
 - Verified: MediaMTX "[path live] 2 tracks (H264, Opus)", WebRTC sessions read
   2 tracks, browser getStats audio inbound-rtp 1000 pkts/0 lost/jitter 0.024/
   totalSamplesReceived 943200 (48k decoded), video 760 frames decoded.
+
+- REGRESSION FOLLOW-UP ("FPS becomes very low and no sound", fixed):
+  Root cause was the dshow VB-Audio virtual-cable input, NOT the AMF usage
+  mode. A/B in-app (same -usage webcam, only the audio input differs):
+    * dshow "CABLE Output (VB-Audio Virtual Cable)" -> ~10 FPS, submit_ms
+      ~90-130ms, and the cable captures digital silence when nothing is
+      routed to it (no sound).
+    * WASAPI default-speaker loopback (soundcard -> s16le udp://127.0.0.1) ->
+      60 FPS steady, submit_ms 2.4ms, 2 tracks (H264, Opus).
+  Standalone FFmpeg reproduces part of it: encode rate 167 FPS video-only vs
+  72 FPS with the dshow cable input; with real-time pacing + RTSP muxing the
+  muxer waits on the stalled/interleaved audio and the app's pipe write
+  blocks (submit_ms ~90ms -> ~10 FPS).
+  Also busted two earlier false leads: (a) "webcam caps at 27 FPS at 4K" was
+  a testsrc2 producer artifact - with rawvideo 4K input every usage encodes
+  ~75 FPS; (b) gops_per_idr / forced-idr / bf0 / sc_threshold cannot make
+  ultralowlatency emit periodic IDR (still 1 per stream).
+  Fix: _auto_select_windows_audio no longer falls back to virtual-cable
+  dshow devices; machines without a real Stereo Mix loopback now go straight
+  to the WASAPI default-speaker loopback (real system audio + full FPS).
+  Real loopback dshow devices (Stereo Mix / virtual-audio-capturer) are still
+  preferred when present. NVIDIA/macOS paths untouched. Diagnostics kept:
+  D2S_AMF_USAGE (usage override, default webcam for WEBRTC+H.264),
+  D2S_AMF_EXTRA (extra AMF args), D2S_FFMPEG_ECHO=1 (echo ffmpeg argv),
+  D2S_FFMPEG_STATS=1 (echo ffmpeg frame/fps stats).

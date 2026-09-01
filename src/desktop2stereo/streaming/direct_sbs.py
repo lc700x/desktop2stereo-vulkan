@@ -223,16 +223,22 @@ def _auto_select_windows_audio(ffmpeg_path: Path) -> str:
     """Pick a dshow audio capture device for loopback on Windows.
 
     Prefers loopback-style names (Stereo Mix / virtual-audio-capturer / What
-    U Hear), then falls back to virtual-cable loopback devices (VB-Audio
-    "CABLE Output (VB-Audio Virtual Cable)", etc.) so a machine whose only
-    loopback is a virtual cable still carries sound. Returns "" when no
-    loopback-capable device exists so the caller runs video-only instead of
-    handing FFmpeg an empty ``-i audio=`` name (which fails with ``Error
-    opening input: I/O error`` and kills the stream). This is the Windows
-    counterpart of the macOS auto-selection. Only loopback-style devices are
-    returned on purpose: auto-selecting an arbitrary microphone would
-    broadcast the room instead of system audio, so any device whose name
-    marks it as a microphone is always excluded.
+    U Hear). Returns "" when no loopback-capable device exists so the caller
+    uses the WASAPI default-speaker loopback (SoundcardLoopbackSender) or
+    runs video-only instead of handing FFmpeg an empty ``-i audio=`` name
+    (which fails with ``Error opening input: I/O error`` and kills the
+    stream). This is the Windows counterpart of the macOS auto-selection.
+
+    Virtual-cable devices (VB-Audio "CABLE Output (VB-Audio Virtual Cable)")
+    are deliberately NOT selected here: on machines where nothing is routed
+    to the cable they capture digital silence, and their dshow input
+    throttles the AMF video pipeline (measured: ~10 FPS in-app instead of
+    ~60 FPS; the standalone encode rate halves too). The WASAPI
+    default-speaker loopback covers exactly that case with real system audio
+    and no throughput loss. Only loopback-style devices are returned on
+    purpose: auto-selecting an arbitrary microphone would broadcast the room
+    instead of system audio, so any device whose name marks it as a
+    microphone is always excluded.
     """
     try:
         from streaming.audio import (
@@ -246,30 +252,6 @@ def _auto_select_windows_audio(ffmpeg_path: Path) -> str:
         loopback = find_loopback_audio_devices(devices)
         if loopback:
             return loopback[0]
-        # Virtual-cable loopback fallback: VB-Audio Virtual Cable exposes
-        # itself as "CABLE Output (VB-Audio Virtual Cable)" / "CABLE Input
-        # (VB-Audio Virtual Cable)", which carries whatever is routed to the
-        # virtual cable (system audio). It does not match the classic Stereo
-        # Mix / virtual-audio-capturer name tokens above, so without this
-        # fallback such machines silently stream video-only.
-        mic_tokens = ("microphone", "麦克风", "mic ")
-        for name in devices:
-            normalized = name.casefold()
-            if any(token in normalized for token in mic_tokens):
-                continue
-            if any(
-                token in normalized
-                for token in (
-                    "virtual cable",
-                    "vb-audio",
-                    "vb-cable",
-                    "cable output",
-                    "cable input",
-                    "what u hear",
-                    "wave out mix",
-                )
-            ):
-                return name
         return ""
     except Exception:
         return ""
@@ -2252,11 +2234,14 @@ class FfmpegDirectSbsOutput:
             # WebRTC+H.264 AMF path switches; SRT/RTSP headset paths keep
             # ultralowlatency, and NVIDIA/macOS never select "_amf".
             amf_usage = (
-                "webcam"
+                os.environ.get("D2S_AMF_USAGE", "webcam")
                 if self.protocol == "WEBRTC" and not self.use_hevc
                 else "ultralowlatency"
             )
             command.extend(["-usage", amf_usage, "-quality", "speed", "-rc", "vbr_peak"])
+            amf_extra = os.environ.get("D2S_AMF_EXTRA", "").strip()
+            if amf_extra:
+                command.extend(amf_extra.split())
             if (
                 self.protocol == "WEBRTC"
                 and not self.use_hevc
@@ -2494,6 +2479,8 @@ class FfmpegDirectSbsOutput:
             self.video_encoder = self._select_video_encoder(width, height)
             self._encoder_selected = True
         command = self._ffmpeg_command(width, height)
+        if str(os.environ.get("D2S_FFMPEG_ECHO", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+            print("[DirectSbsStream] FFmpeg cmd: " + " ".join(command), flush=True)
         creationflags = (
             getattr(subprocess, "CREATE_NO_WINDOW", 0)
             if self.os_name == "Windows"
@@ -2636,6 +2623,10 @@ class FfmpegDirectSbsOutput:
                     self._ffmpeg_bitrate_mbps = value * multiplier
                 self._ffmpeg_stderr_tail.append(line)
                 del self._ffmpeg_stderr_tail[:-20]
+                if str(os.environ.get("D2S_FFMPEG_STATS", "0")).strip().lower() in {"1", "true", "yes", "on"} and re.search(
+                    r"frame=\s*\d+|fps=\s*[\d.]+", line
+                ):
+                    print(f"[DirectSbsStream] FFmpeg: {line}", flush=True)
                 if any(token in line.casefold() for token in ("error", "failed", "invalid", "cannot")):
                     print(f"[DirectSbsStream] FFmpeg: {line}", flush=True)
         except (OSError, ValueError):
