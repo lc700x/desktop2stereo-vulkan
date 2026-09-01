@@ -2114,7 +2114,13 @@ class FfmpegDirectSbsOutput:
             else:
                 self._qsv_surface_mode = "host_upload"
         elif self.video_encoder.endswith("_amf"):
-            for option in ("-tune", "-rc", "-cq", "-zerolatency", "-forced-idr", "-strict_gop", "-spatial-aq", "-temporal-aq", "-aq-strength"):
+            # h264_amf/hevc_amf have no FFmpeg "preset" option (that is
+            # NVENC/QSV); the shared hardware branch adds "-preset fast" so it
+            # must be stripped here or AMF rejects it at option-apply time
+            # ("Error setting option preset to value fast" -> the stream dies
+            # right at encoder init). Only the AMF branch is touched; NVENC,
+            # QSV, VAAPI, VideoToolbox and libx264/265 keep their presets.
+            for option in ("-preset", "-tune", "-rc", "-cq", "-zerolatency", "-forced-idr", "-strict_gop", "-spatial-aq", "-temporal-aq", "-aq-strength"):
                 while option in command:
                     index = command.index(option)
                     del command[index:index + 2]
@@ -2187,8 +2193,13 @@ class FfmpegDirectSbsOutput:
                     # wall-clock PTS, so a time expression like
                     # expr:gte(t,n_forced*1) would force every frame to be a
                     # keyframe. n is the frame index, independent of the PTS
-                    # base; one keyframe per fps frames (1/s cadence).
-                    f"expr:eq(n%{self.fps}\\,0)",
+                    # base; one keyframe per fps frames (1/s cadence). Use
+                    # mod() (not the % operator, which the bundled FFmpeg's
+                    # force_key_frames evaluator rejects as "Missing ')' or
+                    # too many args") and no backslash-escaping (the command
+                    # is spawned as an argv list, so FFmpeg receives the
+                    # expression verbatim).
+                    f"expr:eq(mod(n,{self.fps}),0)",
                     "-muxdelay",
                     "0",
                     "-muxpreload",
