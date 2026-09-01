@@ -242,6 +242,29 @@ def _windows_lan_ipv4s() -> list[str]:
     return ips
 
 
+def _darwin_loopback_routing_hint(device: str) -> str:
+    """Return macOS loopback routing guidance for a virtual capture device.
+
+    macOS has no ffmpeg-native system-audio loopback (unlike Windows WASAPI
+    "Stereo Mix" or Linux PulseAudio monitors): system sound only reaches a
+    virtual input device (BlackHole, Soundflower, app loopbacks such as
+    Virtual Desktop Speakers) when the Mac's output is routed to it. Returns
+    "" for devices that are not loopback-style.
+    """
+    lowered = device.casefold()
+    if not any(
+        token in lowered
+        for token in ("blackhole", "loopback", "soundflower", "virtual")
+    ):
+        return ""
+    return (
+        "macOS has no native system-audio loopback: this virtual device only "
+        "captures what is routed to it. Set the Mac's output to BlackHole (or "
+        "a Multi-Output device of speakers + BlackHole) in System Settings > "
+        "Sound > Output, then start this stream again."
+    )
+
+
 def _auto_select_darwin_audio(ffmpeg_path: Path) -> str:
     """Pick an AVFoundation audio device for loopback capture on macOS.
 
@@ -1925,11 +1948,11 @@ class FfmpegDirectSbsOutput:
                 audio_device,
             ]
             if auto_selected:
+                hint = _darwin_loopback_routing_hint(audio_device)
                 print(
                     "[DirectSbsStream] WARNING: no Stereo Mix device configured; "
-                    f"auto-selected macOS audio device {audio_device!r}. If the "
-                    "stream has no sound, route system audio to that device or "
-                    "pick a Stereo Mix device in the GUI.",
+                    f"auto-selected macOS audio device {audio_device!r}. "
+                    + (hint if hint else "Pick a Stereo Mix device in the GUI."),
                     flush=True,
                 )
             else:
@@ -2484,11 +2507,11 @@ class FfmpegDirectSbsOutput:
             return
         mean_db = float(match.group(1))
         if mean_db < -55.0:
+            hint = _darwin_loopback_routing_hint(device)
             print(
                 "[DirectSbsStream] WARNING: macOS audio device "
                 f"{device!r} appears silent (mean_volume={mean_db:.1f} dB). "
-                "Route system audio to that device, or select a different "
-                "Stereo Mix device in the GUI so the stream carries sound.",
+                + (hint if hint else "Select a different Stereo Mix device in the GUI."),
                 flush=True,
             )
 

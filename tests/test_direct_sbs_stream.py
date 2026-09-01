@@ -391,6 +391,7 @@ def test_vulkan_native_mux_uses_wallclock_sync_and_async1(monkeypatch):
     output.ffmpeg_path = Path("ffmpeg")
     output.stereo_mix_device = "soundcard:Stereo Mix"
     output.audio_delay = 0.0
+    output._soundcard_audio = None
     monkeypatch.setattr(VulkanDirectSbsOutput, "_native_output_url", lambda self: "rtsp://127.0.0.1:8554/live")
     monkeypatch.setattr(VulkanDirectSbsOutput, "_audio_input_args", lambda self: ["-itsoffset", "0.0", "-f", "dshow", "-i", "audio=Stereo Mix"])
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -665,25 +666,34 @@ def test_hardware_encoder_failure_falls_back_to_software(monkeypatch):
     assert output._encoder_selection_reason == "software fallback"
 
 
-def test_windows_soundcard_audio_args_unchanged_for_nvidia_rocm():
-    # NVIDIA/ROCm run on Windows with the "soundcard:" loopback path; the
-    # macOS audio parity work must not alter these exact dshow args.
+def test_windows_soundcard_audio_uses_wasapi_loopback_sender(monkeypatch) -> None:
+    # NVIDIA/ROCm run on Windows with the "soundcard:" speaker label; it is
+    # captured through the python soundcard WASAPI loopback (UDP s16le), not
+    # dshow. The macOS avfoundation parity work must not alter this path.
     output = object.__new__(FfmpegDirectSbsOutput)
     output.os_name = "Windows"
     output.stereo_mix_device = "soundcard:Stereo Mix (Realtek(R) Audio)"
     output.audio_delay = -0.15
+    output._soundcard_audio = None
+    sender = SimpleNamespace(
+        ffmpeg_url="udp://127.0.0.1:54321", start=lambda: None
+    )
+    monkeypatch.setattr(direct_sbs, "SoundcardLoopbackSender", lambda name: sender)
 
-    assert output._audio_input_args() == [
+    args = output._audio_input_args()
+
+    assert args == [
         "-itsoffset", "-0.15",
-        "-f", "dshow",
-        "-rtbufsize", "256M",
-        "-i", "audio=Stereo Mix (Realtek(R) Audio)",
+        "-f", "s16le", "-ar", "48000", "-ac", "2",
+        "-i", "udp://127.0.0.1:54321",
     ]
+    assert output._soundcard_audio is sender
 
 
 def test_windows_rtmp_audio_keeps_aac_for_nvidia_rocm():
     # Windows/Linux RTMP (the SRT ingest used by NVIDIA/ROCm) keeps AAC; only
-    # the macOS RTSP/Opus path was aligned with v2.5.0.
+    # the macOS RTSP/Opus path was aligned with v2.5.0. A bare dshow-style
+    # device label exercises the non-loopback Windows input.
     output = FfmpegDirectSbsOutput(
         base_dir=str(APP_ROOT),
         protocol="RTMP",
@@ -692,7 +702,7 @@ def test_windows_rtmp_audio_keeps_aac_for_nvidia_rocm():
         fps=30,
         crf=20,
         os_name="Windows",
-        stereo_mix_device="soundcard:Stereo Mix",
+        stereo_mix_device="virtual-audio-capturer",
     )
 
     command = output._ffmpeg_command(3840, 1080)
@@ -1059,7 +1069,7 @@ def test_dynamic_rate_budget_covers_rtmp_and_webrtc_but_not_rtsp():
     assert command[command.index("-g") + 1] == "50"
     # Frame-based keyframe cadence: time expressions (gte(t,...)) break once
     # the input carries wall-clock PTS (t would force every frame).
-    assert command[command.index("-force_key_frames") + 1] == "expr:eq(n%50\\,0)"
+    assert command[command.index("-force_key_frames") + 1] == "expr:eq(mod(n,50),0)"
     assert command[command.index("-pkt_size") + 1] == "1452"
     assert command[-1] == "rtsp://127.0.0.1:8554/live?pkt_size=1452"
 
@@ -1391,3 +1401,10 @@ def test_pynv_output_uses_rtsp_for_webrtc_and_soundcard_loopback(monkeypatch):
         ("start", None),
         ("close", None),
     ]
+
+
+def test_darwin_loopback_routing_hint_only_for_virtual_devices() -> None:
+    assert "BlackHole" in direct_sbs._darwin_loopback_routing_hint(":1 BlackHole 2ch")
+    assert "BlackHole" in direct_sbs._darwin_loopback_routing_hint(":8 Virtual Desktop Speakers")
+    assert direct_sbs._darwin_loopback_routing_hint(":2 iMac Microphone") == ""
+    assert direct_sbs._darwin_loopback_routing_hint("") == ""
