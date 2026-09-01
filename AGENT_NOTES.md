@@ -155,3 +155,24 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   D2S_AMF_USAGE (usage override, default webcam for WEBRTC+H.264),
   D2S_AMF_EXTRA (extra AMF args), D2S_FFMPEG_ECHO=1 (echo ffmpeg argv),
   D2S_FFMPEG_STATS=1 (echo ffmpeg frame/fps stats).
+
+- "still no sound" follow-up (2026-09-01): full chain VERIFIED AUDIBLE end-to-end.
+  Method: play 440Hz tone to the PC default speaker (soundcard player), run the
+  app, connect NON-HEADLESS Chrome via WHEP, capture the video element's audio
+  with WebAudio (AnalyserNode RMS). Result vs app: webaudio_rms 0.185-0.34 (loud
+  tone), audio inbound-rtp 950 pkts / 897k samples / 0 concealment. So the
+  capture->UDP->FFmpeg->Opus->RTSP->MediaMTX->WebRTC chain carries the PC's
+  default-speaker audio correctly.
+  CRITICAL MEASUREMENT TRAP: headless Chrome reports totalAudioEnergy=0 and
+  audioLevel=0 (and often no audio inbound-rtp / muted track) for REAL audio,
+  because headless mode has no audio output device. Always verify audio with
+  NON-headless Chrome + WebAudio RMS (cdp_probe12.mjs), not headless getStats.
+  Also: MediaMTX RTSP readers get 404 in the app context (only WebRTC/WHEP is
+  meant to be consumed); the RTSP pull works against a manually-started
+  MediaMTX with the same yml - so 404 there is not an audio failure.
+  User-facing implication: the stream carries whatever plays on the Windows
+  DEFAULT playback device (the one in "WASAPI loopback active: speaker=...").
+  If the stream is silent: (a) nothing is playing to that device (check the
+  new "WASAPI capture status: packets=N silent=M peak=..." log line every 5s),
+  or (b) the viewer is muted/volume 0. GUI Stereo Mix dropdown lets the user
+  pick a different loopback speaker to capture.
