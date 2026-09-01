@@ -1207,18 +1207,19 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 "shutdown_event": shutdown_event,
                 "config": local_viewer_config,
             }
+
+            def _packer_on_stat(name: str, value: float) -> None:
+                # Durations aggregate as times; counters as increments.
+                if name == "packer_ms":
+                    # add_time appends _ms; store as packer_ms directly.
+                    callbacks.breakdown_add_time("packer", value / 1000.0)
+                else:
+                    callbacks.breakdown_inc(name, int(value))
+
             if OS_NAME == "Darwin":
                 from viewer.host_frame_packer import (
                     maybe_install_local_viewer_packer,
                 )
-
-                def _packer_on_stat(name: str, value: float) -> None:
-                    # Durations aggregate as times; counters as increments.
-                    if name == "packer_ms":
-                        # add_time appends _ms; store as packer_ms directly.
-                        callbacks.breakdown_add_time("packer", value / 1000.0)
-                    else:
-                        callbacks.breakdown_inc(name, int(value))
 
                 _maybe_install_local_viewer_packer = (
                     maybe_install_local_viewer_packer

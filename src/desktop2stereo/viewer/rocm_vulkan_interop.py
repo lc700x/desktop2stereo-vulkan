@@ -311,7 +311,21 @@ class RocmVulkanImageImporter:
             raise RocmVulkanInteropError(
                 "Vulkan context cannot establish an external HIP image layout"
             )
-        prepare(target.resource, wait=wait, defer=defer)
+        # The OpenXR VulkanContext accepts wait/defer; the Local Viewer interop
+        # context does not. Pass only the kwargs the method actually supports so
+        # both backends keep working.
+        try:
+            import inspect
+
+            parameters = inspect.signature(prepare).parameters
+        except Exception:  # pragma: no cover - unknown signature
+            parameters = {}
+        prepare_kwargs = {}
+        if "wait" in parameters:
+            prepare_kwargs["wait"] = wait
+        if "defer" in parameters:
+            prepare_kwargs["defer"] = defer
+        prepare(target.resource, **prepare_kwargs)
         handle = target.export_handle
         desc = _ExternalMemoryHandleDesc(
             type=(
