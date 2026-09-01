@@ -245,6 +245,40 @@ def _auto_select_windows_audio(ffmpeg_path: Path) -> str:
         return ""
 
 
+def _required_h264_level(width: int, height: int, fps: int) -> float:
+    """Return the smallest H.264 level supporting width x height @ fps.
+
+    The encoder's auto-selected level only accounts for resolution, not the
+    frame rate: AMF picks level 5.1 for 4K, but level 5.1 caps 4K at ~30 fps
+    (MaxMBPS 983,040 / 32,400 MB per frame). At 4K@40 that SPS is invalid, so
+    browser WebRTC decoders reject the stream (black frame) even though RTP
+    flows. Compute the level from the actual MB/s load instead:
+    MaxMBPS per level (H.264 Table A-1) -> smallest level whose budget fits.
+    """
+    macroblocks_per_frame = max(1, math.ceil(width / 16)) * max(
+        1, math.ceil(height / 16)
+    )
+    required_mbps = macroblocks_per_frame * max(1, int(fps))
+    # (level, MaxMBPS) pairs from the H.264 spec.
+    level_budgets = [
+        (1.0, 1485), (1.1, 3000), (1.2, 6000), (1.3, 11880),
+        (2.0, 11880), (2.1, 19800), (2.2, 20250),
+        (3.0, 40500), (3.1, 108000), (3.2, 216000),
+        (4.0, 245760), (4.1, 245760), (4.2, 522240),
+        (5.0, 589824), (5.1, 983040), (5.2, 2073600),
+        (6.0, 4177920), (6.1, 8355840), (6.2, 16711680),
+    ]
+    for level, budget in level_budgets:
+        if required_mbps <= budget:
+            return level
+    return 6.2
+
+
+def _format_h264_level(level: float) -> str:
+    """Format a numeric H.264 level (e.g. 5.2) as FFmpeg expects ("5.2")."""
+    return f"{level:g}"
+
+
 def runtime_sbs_to_rgb(frame_or_result: Any) -> np.ndarray:
     """Convert a packed SBS runtime tensor/array to contiguous RGB8 HWC."""
     frame = getattr(frame_or_result, "sbs", frame_or_result)
@@ -2125,6 +2159,32 @@ class FfmpegDirectSbsOutput:
                     index = command.index(option)
                     del command[index:index + 2]
             command.extend(["-usage", "ultralowlatency", "-quality", "speed", "-rc", "vbr_peak"])
+            if (
+                self.protocol == "WEBRTC"
+                and not self.use_hevc
+                and self.os_name == "Windows"
+            ):
+                # Browser WebRTC H.264 decoders (Chrome/Edge/Firefox) reject
+                # Main-profile streams and enforce the SPS level against the
+                # frame rate. AMF auto-selects level 5.1 for 4K, which only
+                # supports 4K@~30 fps, so a 4K@40 stream carries an invalid
+                # SPS and the browser shows a black frame even though RTP
+                # flows (verified: MediaMTX answered the WHEP offer with
+                # profile-level-id 42e01f Constrained Baseline while AMF
+                # emitted Main 4D0433). Force Constrained Baseline + the
+                # level actually required by resolution/fps (e.g. 5.2 for
+                # 4K@40) so the SPS matches the negotiated profile and the
+                # decoder accepts the stream. H.264 only; HEVC AMF keeps its
+                # defaults. NVIDIA/macOS paths never select "_amf".
+                required_level = _required_h264_level(width, height, self.fps)
+                command.extend(
+                    [
+                        "-profile:v",
+                        "constrained_baseline",
+                        "-level:v",
+                        _format_h264_level(required_level),
+                    ]
+                )
 
         if calibration_stream:
             # Normal playback remains quality-oriented VBR. Calibration uses
