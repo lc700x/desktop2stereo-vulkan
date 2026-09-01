@@ -176,3 +176,17 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   new "WASAPI capture status: packets=N silent=M peak=..." log line every 5s),
   or (b) the viewer is muted/volume 0. GUI Stereo Mix dropdown lets the user
   pick a different loopback speaker to capture.
+
+- "sound works but FPS 10 again" (2026-09-01): root cause = ANY dshow audio
+  input throttles the AMF video pipeline, not just the VB-Cable. When the
+  Realtek driver flakily exposes a dshow "Stereo Mix" capture device,
+  _auto_select_windows_audio picked it -> real sound (Stereo Mix loops the
+  Realtek output) but ~10 FPS (submit_ms ~90-145ms), exactly like the
+  CABLE-Output case. Fixed by routing ALL Windows GUI audio sources
+  ("soundcard:" and "wasapi:" labels, named or bare) through the Python
+  soundcard WASAPI loopback sender; dshow is no longer used for prefixed
+  labels. _auto_select_windows_audio removed (dead). Verified: WASAPI active,
+  capture peaks 0.28-0.41, 60+ FPS steady (submit_ms 2.4ms), 2 tracks
+  (H264, Opus), command shows "-f s16le -i udp://127.0.0.1:PORT" not dshow.
+  Named speakers all open in loopback (Realtek 2nd output, D270H monitor,
+  Realtek Digital, CABLE Input).

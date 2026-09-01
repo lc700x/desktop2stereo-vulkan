@@ -219,44 +219,6 @@ def _auto_select_darwin_audio(ffmpeg_path: Path) -> str:
     return str(devices[0][0]) if devices else ""
 
 
-def _auto_select_windows_audio(ffmpeg_path: Path) -> str:
-    """Pick a dshow audio capture device for loopback on Windows.
-
-    Prefers loopback-style names (Stereo Mix / virtual-audio-capturer / What
-    U Hear). Returns "" when no loopback-capable device exists so the caller
-    uses the WASAPI default-speaker loopback (SoundcardLoopbackSender) or
-    runs video-only instead of handing FFmpeg an empty ``-i audio=`` name
-    (which fails with ``Error opening input: I/O error`` and kills the
-    stream). This is the Windows counterpart of the macOS auto-selection.
-
-    Virtual-cable devices (VB-Audio "CABLE Output (VB-Audio Virtual Cable)")
-    are deliberately NOT selected here: on machines where nothing is routed
-    to the cable they capture digital silence, and their dshow input
-    throttles the AMF video pipeline (measured: ~10 FPS in-app instead of
-    ~60 FPS; the standalone encode rate halves too). The WASAPI
-    default-speaker loopback covers exactly that case with real system audio
-    and no throughput loss. Only loopback-style devices are returned on
-    purpose: auto-selecting an arbitrary microphone would broadcast the room
-    instead of system audio, so any device whose name marks it as a
-    microphone is always excluded.
-    """
-    try:
-        from streaming.audio import (
-            find_loopback_audio_devices,
-            query_ffmpeg_dshow_audio_devices,
-        )
-
-        devices = query_ffmpeg_dshow_audio_devices(ffmpeg_path) or []
-        if not devices:
-            return ""
-        loopback = find_loopback_audio_devices(devices)
-        if loopback:
-            return loopback[0]
-        return ""
-    except Exception:
-        return ""
-
-
 def _required_h264_level(width: int, height: int, fps: int) -> float:
     """Return the smallest H.264 level supporting width x height @ fps.
 
@@ -1785,49 +1747,24 @@ class FfmpegDirectSbsOutput:
             return []
         if self.os_name == "Windows":
             if device.casefold().startswith("soundcard:"):
-                # Fix broken audio: revert to old stable dshow path (gfxcapture+ffmpeg handles loopback directly)
-                # Old main.py used: -f dshow -rtbufsize 256M -i audio={device} with -fflags nobuffer
-                # Python wasapi UDP loopback (s16le udp://...) causes fragmentation/discontinuity -> broken sound
+                # The "soundcard:" prefix means a WASAPI loopback speaker from
+                # the soundcard library (the GUI Stereo Mix dropdown lists
+                # these). It must be captured through the Python WASAPI
+                # loopback sender - NOT dshow: dshow cannot see render-side
+                # devices, and a dshow audio input throttles the AMF video
+                # pipeline (measured ~10 FPS in-app with -usage webcam, and
+                # the standalone encode rate halves) because the muxer waits
+                # on the audio stream. WASAPI loopback keeps 60 FPS and
+                # carries real system audio.
                 device_name = device.split(":", 1)[1].strip()
-                if not device_name:
-                    # The GUI stores an empty Stereo Mix device as the bare
-                    # "soundcard:" prefix. Auto-pick a working dshow capture
-                    # device (loopback preferred) so FFmpeg never receives an
-                    # empty "-i audio=" name, which fails with "Error opening
-                    # input: I/O error" and aborts the whole stream.
-                    device_name = _auto_select_windows_audio(self.ffmpeg_path)
-                    if not device_name:
-                        # No dshow loopback device (no Stereo Mix / What U Hear
-                        # / virtual cable). Grab the default speaker directly
-                        # via the Python soundcard WASAPI loopback endpoint and
-                        # stream its PCM to FFmpeg over localhost UDP. This is
-                        # the only way to carry system audio when the sound
-                        # card exposes no capture-side loopback device.
-                        return self._start_wasapi_loopback_audio()
-                return [
-                    "-itsoffset",
-                    str(self.audio_delay),
-                    "-f",
-                    "dshow",
-                    "-rtbufsize",
-                    "256M",
-                    "-i",
-                    f"audio={device_name}",
-                ]
+                return self._start_wasapi_loopback_audio(device_name or None)
             if device.casefold().startswith("wasapi:"):
+                # FFmpeg's bundled build has no native wasapi input, so a
+                # "wasapi:" label cannot be captured by FFmpeg directly;
+                # capture that speaker through the soundcard WASAPI loopback
+                # instead (same fast path as "soundcard:").
                 wasapi_name = device.split(":", 1)[1].strip()
-                if not wasapi_name:
-                    # Same empty-device guard as the soundcard branch: skip
-                    # audio instead of passing an unusable "-i " argument.
-                    return []
-                return [
-                    "-itsoffset",
-                    str(self.audio_delay),
-                    "-f",
-                    "wasapi",
-                    "-i",
-                    wasapi_name,
-                ]
+                return self._start_wasapi_loopback_audio(wasapi_name or None)
             return [
                 "-itsoffset",
                 str(self.audio_delay),
@@ -1918,16 +1855,18 @@ class FfmpegDirectSbsOutput:
             return args
         return []
 
-    def _start_wasapi_loopback_audio(self) -> list[str]:
-        """Grab the default Windows speaker via WASAPI loopback into FFmpeg.
+    def _start_wasapi_loopback_audio(self, device_name: str | None = None) -> list[str]:
+        """Grab a Windows speaker via WASAPI loopback into FFmpeg.
 
-        Used when no dshow capture-side loopback device exists (no Stereo Mix
-        / What U Hear / virtual cable): the Python soundcard library opens the
-        default render device in loopback mode and streams its PCM to FFmpeg
-        over localhost UDP. This is the only direct way to carry system audio
-        when the sound card exposes no capture loopback endpoint. Returns the
-        FFmpeg input args, or [] when no default speaker / loopback is
-        available (stream then runs video-only, matching previous behavior).
+        Used for every Windows GUI audio source: the soundcard library opens
+        the requested speaker (or the default speaker when ``device_name`` is
+        None) in loopback mode and streams its PCM to FFmpeg over localhost
+        UDP. This is the only reliable way to carry system audio - dshow
+        cannot see render-side devices, the bundled FFmpeg has no native
+        wasapi input, and a dshow audio input throttles the AMF video
+        pipeline (~10 FPS in-app). Returns the FFmpeg input args, or [] when
+        no speaker / loopback is available (stream then runs video-only,
+        matching previous behavior).
         """
         if self._soundcard_audio is not None:
             return [
@@ -1943,11 +1882,12 @@ class FfmpegDirectSbsOutput:
                 self._soundcard_audio.ffmpeg_url,
             ]
         try:
-            sender = SoundcardLoopbackSender(None)
+            sender = SoundcardLoopbackSender(device_name)
             sender.start()
         except Exception as exc:
             print(
-                f"[DirectSbsStream] WASAPI loopback unavailable ({type(exc).__name__}: {exc}); "
+                f"[DirectSbsStream] WASAPI loopback unavailable "
+                f"(speaker={device_name!r}, {type(exc).__name__}: {exc}); "
                 "streaming video-only",
                 flush=True,
             )
