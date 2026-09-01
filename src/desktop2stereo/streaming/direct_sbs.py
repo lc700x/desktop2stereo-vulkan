@@ -2158,7 +2158,21 @@ class FfmpegDirectSbsOutput:
                 while option in command:
                     index = command.index(option)
                     del command[index:index + 2]
-            command.extend(["-usage", "ultralowlatency", "-quality", "speed", "-rc", "vbr_peak"])
+            # AMF's "ultralowlatency" usage only emits ONE real IDR at stream
+            # start: -g / -force_key_frames turn into non-IDR I-slices, so a
+            # browser WebRTC H.264 depacketizer joining mid-stream never sees
+            # a keyframe and shows black forever (framesReceived stays 0 even
+            # though all RTP flows - verified via MediaMTX WHEP getStats).
+            # "webcam" usage keeps low latency but honors the GOP with true
+            # IDR frames, which is what WebRTC browsers require. Only the
+            # WebRTC+H.264 AMF path switches; SRT/RTSP headset paths keep
+            # ultralowlatency, and NVIDIA/macOS never select "_amf".
+            amf_usage = (
+                "webcam"
+                if self.protocol == "WEBRTC" and not self.use_hevc
+                else "ultralowlatency"
+            )
+            command.extend(["-usage", amf_usage, "-quality", "speed", "-rc", "vbr_peak"])
             if (
                 self.protocol == "WEBRTC"
                 and not self.use_hevc
