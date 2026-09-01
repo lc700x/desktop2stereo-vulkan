@@ -330,10 +330,22 @@ class PyNvSrtVideoOutput:
         command.extend(["-c:v", "copy", "-fps_mode", "cfr"])
         if audio_url:
             if audio_codec == "libopus":
+                # Same timeline strategy as the shared FFmpeg path (the
+                # Windows soundcard fix): the s16le/UDP audio input must not
+                # use the demuxer -use_wallclock_as_timestamps option (it
+                # silences the whole audio chain on the bundled FFmpeg build),
+                # so the audio PTS are re-anchored to the same wall-clock base
+                # as the video input with asetpts=RTCTIME. Order matters:
+                # asetpts must run BEFORE aresample (asetpts after aresample
+                # and asetpts alone both yield an empty audio stream). The
+                # -itsoffset audio delay is folded into the RTCTIME offset
+                # because asetpts overwrites the demuxer PTS that the offset
+                # shifted.
+                delay_us = int(round(float(audio_delay) * 1e6))
                 command.extend(
                     [
                         "-af",
-                        "aresample=async=1000:first_pts=0",
+                        f"asetpts=RTCTIME{delay_us:+d},aresample=async=1",
                         "-c:a",
                         "libopus",
                         "-ar",

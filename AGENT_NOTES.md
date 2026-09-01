@@ -230,3 +230,27 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   MediaMTX built-in player page (/live/) defaults video.muted=true - clients
   must unmute or open with ?muted=0; the page/reader.js otherwise handles
   audio correctly (recvonly transceivers for video+audio).
+
+- Sound "jittering" root cause (2026-09-01/02): the WASAPI sender delivered
+  each ~85 ms capture block as a ~0 ms burst of 17 datagrams followed by an
+  ~85 ms gap (recorder.record returns one blocksize chunk per wakeup; the
+  old code sent all datagrams back-to-back). FFmpeg's asetpts=RTCTIME stamps
+  at processing time, so the burst compressed ~85 ms of audio into ~0 ms of
+  timestamps -> client plays audio in fast bursts with gaps (jitter).
+  Fix in wasapi_audio.py: dedicated paced sender thread draining the capture
+  buffer at exactly one 240-frame datagram per 5 ms (udp_frames/samplerate),
+  decoupled from the blocking capture loop. Also raise the Windows process
+  timer resolution (winmm timeBeginPeriod(1)) and use time.perf_counter
+  (QPC) for the send deadline: time.monotonic/Event.wait tick at ~15.6 ms on
+  Windows and would quantize the 5 ms cadence into 3-packet bursts (measured
+  artifact-free cadence now: min 2.6ms, median 5.1ms, p95 6.1ms, max 9ms,
+  zero bursts, zero >50ms gaps; 199.8 pkt/s).
+  IMPORTANT measurement trap: time.monotonic() on Windows ticks at ~15.6 ms;
+  measuring UDP arrival deltas with it produces fake "0ms bursts + 16ms
+  gaps". Always use time.perf_counter() for inter-packet timing.
+  NVIDIA PyNvSrtVideoOutput (nvidia_encoder.py) audio filter migrated to the
+  same chain as the AMD/shared path: asetpts=RTCTIME<+delay_us>,aresample=
+  async=1 (was aresample=async=1000:first_pts=0 which has the 0-based-vs-
+  wallclock gap -> audio dropped). python3_cuda bundle has soundcard+numpy;
+  both bundles share the same ffmpeg.exe. The AMD (RTCTIME) and macOS
+  (avfoundation, no soundcard code) filter behavior is unchanged.

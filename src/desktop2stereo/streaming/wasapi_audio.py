@@ -10,6 +10,27 @@ from typing import Any
 import numpy as np
 
 
+def _raise_windows_timer_resolution() -> None:
+    """Raise the process timer to 1 ms so 5 ms UDP pacing actually sleeps.
+
+    Windows timers (time.monotonic/Event.wait/time.sleep) tick at ~15.6 ms by
+    default; without timeBeginPeriod(1) a 5 ms datagram cadence quantizes into
+    ~3-packet bursts every ~15.6 ms, which re-introduces the bursty PCM
+    arrival pattern this module exists to avoid. Media applications routinely
+    raise the resolution; it costs a little idle power.
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
+
+_raise_windows_timer_resolution()
+
+
 def query_soundcard_loopback_devices() -> list[str] | None:
     """Return loopback speakers with the Windows default speaker first."""
     try:
@@ -80,6 +101,9 @@ class SoundcardLoopbackSender:
         self._startup_error: Exception | None = None
         self._runtime_error: Exception | None = None
         self._thread: threading.Thread | None = None
+        self._send_thread: threading.Thread | None = None
+        self._send_buffer = bytearray()
+        self._send_lock = threading.Lock()
 
     def _resolve_loopback(self, device_name: str | None) -> Any:
         requested = str(device_name or "").strip()
@@ -112,6 +136,13 @@ class SoundcardLoopbackSender:
             return
         self._thread = threading.Thread(target=self._run, name="WasapiLoopback", daemon=True)
         self._thread.start()
+        # Dedicated paced sender: one datagram every udp_frames/samplerate
+        # (5 ms), fully decoupled from the blocking capture loop, so the
+        # localhost PCM stream is smooth instead of block-bursty.
+        self._send_thread = threading.Thread(
+            target=self._send_loop, name="WasapiLoopbackSend", daemon=True
+        )
+        self._send_thread.start()
         if not self._startup_done.wait(max(0.1, float(timeout))):
             self.close()
             raise RuntimeError("Windows loopback capture produced no PCM data")
@@ -166,12 +197,17 @@ class SoundcardLoopbackSender:
                             flush=True,
                         )
                     pcm_bytes = (pcm * 32767.0).astype(np.int16).tobytes()
-                    packet_bytes = self.udp_frames * self.channels * 2
-                    for offset in range(0, len(pcm_bytes), packet_bytes):
-                        self._socket.sendto(
-                            pcm_bytes[offset : offset + packet_bytes],
-                            ("127.0.0.1", self.port),
-                        )
+                    # Hand the block to the paced sender thread. It is NOT
+                    # sent from here: the soundcard recorder wakes up once per
+                    # blocksize chunk (~85 ms), and sending the whole chunk
+                    # back-to-back would deliver ~85 ms of PCM as a ~0 ms
+                    # burst followed by a gap. Consumers that stamp packets at
+                    # processing time (FFmpeg's asetpts=RTCTIME on the
+                    # soundcard input) would then see a compressed audio
+                    # timeline and the client would play the sound in fast
+                    # bursts with gaps (jitter).
+                    with self._send_lock:
+                        self._send_buffer.extend(pcm_bytes)
                     self._packet_count += 1
                     # Keep periodic PCM level counters out of normal logs.
                     # Startup and discontinuity diagnostics remain visible.
@@ -204,6 +240,36 @@ class SoundcardLoopbackSender:
             )
             self._send_silence_until_stopped()
 
+    def _send_loop(self) -> None:
+        """Drain the capture buffer at a steady one-datagram-per-interval pace."""
+        packet_bytes = self.udp_frames * self.channels * 2
+        silence_packet = bytes(packet_bytes)
+        send_interval = self.udp_frames / float(self.samplerate)
+        # perf_counter is QPC-based (always high resolution); monotonic is
+        # tick-based and would quantize the cadence to ~15.6 ms steps.
+        deadline = time.perf_counter()
+        while not self._stop.is_set():
+            deadline += send_interval
+            chunk = None
+            with self._send_lock:
+                if len(self._send_buffer) >= packet_bytes:
+                    chunk = bytes(self._send_buffer[:packet_bytes])
+                    del self._send_buffer[:packet_bytes]
+            if chunk is None:
+                # Keep the localhost PCM stream continuous. A silent gap
+                # makes FFmpeg's audio input queue go empty, and a read on an
+                # empty threaded input queue blocks the whole transcode loop
+                # (video included) until the next packet arrives; a long gap
+                # can stall the publish past MediaMTX's read timeout.
+                chunk = silence_packet
+            try:
+                self._socket.sendto(chunk, ("127.0.0.1", self.port))
+            except OSError:
+                if not self._stop.is_set():
+                    raise
+                return
+            self._stop.wait(max(0.0, deadline - time.perf_counter()))
+
     def _send_silence_until_stopped(self) -> None:
         """Keep FFmpeg's mapped audio input alive after a capture interruption."""
         frames_per_packet = 1024
@@ -232,4 +298,6 @@ class SoundcardLoopbackSender:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
+        if self._send_thread is not None:
+            self._send_thread.join(timeout=1.0)
         self._socket.close()
