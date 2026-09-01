@@ -131,6 +131,8 @@ class SoundcardLoopbackSender:
 
     def _run(self) -> None:
         produced_pcm = False
+        status_interval = max(1, int(os.environ.get("D2S_WASAPI_STATUS_SECS", "5")))
+        last_status = time.monotonic()
         try:
             with self._loopback.recorder(
                 samplerate=self.samplerate,
@@ -157,6 +159,12 @@ class SoundcardLoopbackSender:
                     peak = float(np.max(np.abs(pcm))) if pcm.size else 0.0
                     if peak < 1e-5:
                         self._silent_packet_count += 1
+                    elif self._silent_packet_count == self._packet_count:
+                        print(
+                            "[DirectSbsStream] WASAPI capture is live: "
+                            f"first non-silent block (peak={peak:.4f})",
+                            flush=True,
+                        )
                     pcm_bytes = (pcm * 32767.0).astype(np.int16).tobytes()
                     packet_bytes = self.udp_frames * self.channels * 2
                     for offset in range(0, len(pcm_bytes), packet_bytes):
@@ -169,6 +177,17 @@ class SoundcardLoopbackSender:
                     # Startup and discontinuity diagnostics remain visible.
                     produced_pcm = True
                     self._startup_done.set()
+                    now = time.monotonic()
+                    if now - last_status >= status_interval:
+                        last_status = now
+                        print(
+                            "[DirectSbsStream] WASAPI capture status: "
+                            f"speaker={self.device_name!r} packets={self._packet_count} "
+                            f"silent={self._silent_packet_count} "
+                            f"peak={peak:.4f} "
+                            f"discontinuities={self._discontinuity_count}",
+                            flush=True,
+                        )
         except Exception as exc:
             if self._stop.is_set():
                 return
