@@ -61,3 +61,22 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   `submit_frame` additionally retry once with audio disabled when FFmpeg dies on the audio input.
   No loopback device exists on this machine -> RTMP now starts video-only (verified: command contains
   only `-i pipe:0`, no empty `audio=`).
+- RTMP smoke test on this machine (main.py --runtime --runtime-seconds 30, WEBRTC):
+  h264_amf publishes "live" (1 track H264) to MediaMTX for the full window with
+  no audio errors. Two more pre-existing encoder-option bugs were fixed after
+  the audio fix unmasked them:
+  1. h264_amf has no FFmpeg "preset" option -> the shared hardware branch's
+     "-preset fast" made AMF die at option-apply time; strip "-preset" in the
+     AMF-only cleanup branch (NVENC/QSV/VAAPI/VideoToolbox/libx264 untouched).
+  2. Windows force_key_frames used "expr:eq(n%fps\,0)": the % modulo operator
+     is rejected by this bundled FFmpeg's force_key_frames evaluator for EVERY
+     encoder (libx264 included: "Missing ')' or too many args"), and the "\," 
+     escaping is wrong for argv-list spawning. Use "expr:eq(mod(n,fps),0)"
+     unescaped (verified exits 0 for h264_amf and libx264). The block is
+     Windows-only, so macOS is untouched; NVIDIA native paths (PyNv NVENC and
+     the Vulkan native mux) build their own commands without force_key_frames
+     and never select AMF, so they stay byte-identical.
+  - AMD LLPC still cannot create the native Vulkan FFmpeg encoder ("native
+    Vulkan FFmpeg encoder creation failed") and hip_gl_interop=False, so the
+    auto chain lands on the stable h264_amf host-upload path
+    (gpu_to_cpu=True zero_copy=False) - same design as the glow CPU fallback.
