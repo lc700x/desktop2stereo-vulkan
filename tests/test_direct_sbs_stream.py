@@ -1312,6 +1312,34 @@ def test_windows_webrtc_stream_audio_uses_opus():
     assert command[command.index("-ac") + 1] == "2"
     assert command[command.index("-b:a") + 1] == "96k"
     assert command[command.index("-max_interleave_delta") + 1] == "100000"
+    assert "-fec" not in command
+    assert "-packet_loss" not in command
+
+
+def test_macos_webrtc_uses_higher_quality_opus_without_fec(
+    monkeypatch,
+):
+    output = FfmpegDirectSbsOutput(
+        base_dir=str(APP_ROOT),
+        protocol="WebRTC",
+        port=1122,
+        stream_key="live",
+        fps=30,
+        crf=20,
+        os_name="Darwin",
+        stereo_mix_device="soundcard:Virtual Desktop Speakers",
+    )
+    monkeypatch.setattr(
+        direct_sbs,
+        "_list_darwin_audio_devices",
+        lambda _ffmpeg: [(9, "Virtual Desktop Speakers")],
+    )
+    command = output._ffmpeg_command(1920, 1080)
+
+    assert command[command.index("-application") + 1] == "audio"
+    assert command[command.index("-b:a") + 1] == "128k"
+    assert "-packet_loss" not in command
+    assert "-fec" not in command
     assert "aac" not in command
 
 

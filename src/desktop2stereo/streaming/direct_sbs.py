@@ -2466,6 +2466,9 @@ class FfmpegDirectSbsOutput:
             # the stream entirely.
             command.extend(["-af", self._audio_filter_graph()])
             if self.protocol == "WEBRTC" or self.os_name == "Darwin":
+                macos_webrtc_audio = (
+                    self.os_name == "Darwin" and self.protocol == "WEBRTC"
+                )
                 command.extend(
                     [
                         "-c:a",
@@ -2475,9 +2478,14 @@ class FfmpegDirectSbsOutput:
                         "-ac",
                         "2",
                         "-b:a",
-                        "96k",
+                        "128k" if macos_webrtc_audio else "96k",
                     ]
                 )
+                if macos_webrtc_audio:
+                    # At the measured LAN loss rate, in-band FEC reduced
+                    # fidelity without helping recovery. Use more Opus
+                    # bandwidth for clean stereo audio instead.
+                    command.extend(["-application", "audio"])
             else:
                 # Windows/Linux SRT/RTMP paths (NVIDIA/ROCm) keep AAC; the
                 # resample above still normalizes their audio timeline.
