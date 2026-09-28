@@ -217,8 +217,8 @@ class StreamCalibrationController:
         state_path: str | Path,
         profile_path: str | Path,
         hevc: bool = False,
-        stage_seconds: float = 15.0,
-        stability_seconds: float = 30.0,
+        stage_seconds: float = 8.0,
+        stability_seconds: float = 15.0,
         settle_seconds: float = 2.0,
         fingerprint: dict[str, str] | None = None,
         clock=time.monotonic,
@@ -464,11 +464,11 @@ class StreamCalibrationController:
             if decoded_fps <= 0.0:
                 # A bitrate switch/reconnect can produce stats before the
                 # headset has decoded and displayed a frame. Do not start
-                # or advance the 15-second probe window in that state.
+                # or advance the probe window in that state.
                 self._status = "waiting_receiver"
                 if self._measurement_started is not None:
                     # A display interruption invalidates the current window;
-                    # the next decoded frame starts a fresh 15-second probe.
+                    # the next decoded frame starts a fresh probe window.
                     self._stage_started = None
                     self._measurement_started = None
                     self._receiver_reports.clear()
@@ -539,7 +539,7 @@ class StreamCalibrationController:
                 lower = self._active_tier.target_mbps
                 if upper - lower <= 1:
                     # Binary search converged to 1 Mbps. Keep the highest
-                    # stable candidate running for the 30-second confirmation.
+                    # stable candidate running for the longer confirmation.
                     self._confirming_stability = True
                     self._reset_stage_locked("confirming")
                     return
@@ -550,7 +550,15 @@ class StreamCalibrationController:
                     flush=True,
                 )
             else:
-                next_target = self._active_tier.target_mbps + 5
+                # Exponential bracketing finds the network ceiling in fewer
+                # reconnects than fixed 5 Mbps increments. Test the ceiling
+                # itself before switching to binary search.
+                current_target = self._active_tier.target_mbps
+                next_target = (
+                    self._bitrate_limit + 1
+                    if current_target >= self._bitrate_limit
+                    else min(current_target * 2, self._bitrate_limit)
+                )
         else:
             reasons = metrics.get("failure_reasons", [])
             network_reasons = {
@@ -569,7 +577,7 @@ class StreamCalibrationController:
                         f"[StreamCalibration] No bitrate change: "
                         f"non-network failure reasons={','.join(reasons) or 'unknown'} "
                         f"lost={metrics.get('packets_lost', 0)}; "
-                        "starting 30-second confirmation",
+                        f"starting {self.stability_seconds:g}-second confirmation",
                         flush=True,
                     )
                     self._decreasing_bitrate = True
