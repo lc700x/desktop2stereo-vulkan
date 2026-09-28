@@ -93,6 +93,34 @@ def supports_network_calibration(run_mode: str, protocol: str) -> bool:
     )
 
 
+def resolve_stream_audio_device(settings: dict, *, os_name: str) -> str:
+    """Resolve the configured audio source for an advanced stream.
+
+    Windows/Linux no longer persist a device name because the GUI must follow
+    the current system output.  On Windows, an empty ``auto``/``soundcard``
+    selection therefore needs an explicit marker so the output creates the
+    default-speaker WASAPI loopback sender instead of silently becoming video-
+    only.  Other platforms retain their existing device handling.
+    """
+    audio_backend = str(
+        settings.get("Audio Capture Backend", "auto") or "auto"
+    ).strip().casefold()
+    selected_audio = str(settings.get("Stereo Mix", "") or "").strip()
+    if (
+        selected_audio
+        and audio_backend in {"auto", "soundcard"}
+        and not selected_audio.casefold().startswith(("soundcard:", "wasapi:"))
+    ):
+        selected_audio = f"soundcard:{selected_audio}"
+    if (
+        str(os_name or "").strip() == "Windows"
+        and not selected_audio
+        and audio_backend in {"auto", "soundcard"}
+    ):
+        return "soundcard:"
+    return selected_audio
+
+
 @dataclass(frozen=True)
 class NetworkStreamSessionConfig:
     """Transport settings shared by vendor and advanced video backends."""

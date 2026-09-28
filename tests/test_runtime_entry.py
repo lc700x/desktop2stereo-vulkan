@@ -96,6 +96,7 @@ def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode(monkey
     from streaming.stream_session import (
         NetworkStreamSessionConfig,
         is_network_stream_mode,
+        resolve_stream_audio_device,
         resolve_network_video_backend,
         supports_network_calibration,
     )
@@ -111,6 +112,19 @@ def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode(monkey
     )
     assert config.port == 1122
     assert config.fps == 30
+    assert resolve_stream_audio_device(
+        {"Audio Capture Backend": "auto"}, os_name="Windows"
+    ) == "soundcard:"
+    assert resolve_stream_audio_device(
+        {"Audio Capture Backend": "auto"}, os_name="Darwin"
+    ) == ""
+    assert resolve_stream_audio_device(
+        {"Audio Capture Backend": "auto", "Stereo Mix": "BlackHole 2ch"},
+        os_name="Darwin",
+    ) == "soundcard:BlackHole 2ch"
+    assert resolve_stream_audio_device(
+        {"Audio Capture Backend": "none"}, os_name="Windows"
+    ) == ""
 
     # Advanced Auto keeps a distinct lazy chain so vendor-native GPU encoding
     # is attempted before Vulkan. Explicit Vulkan remains unchanged.

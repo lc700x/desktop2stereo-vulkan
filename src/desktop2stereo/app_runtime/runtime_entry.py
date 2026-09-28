@@ -50,6 +50,7 @@ from streaming.stream_session import (
     CALIBRATABLE_STREAM_MODES,
     NetworkStreamSessionConfig,
     is_network_stream_mode,
+    resolve_stream_audio_device,
     resolve_network_video_backend,
     supports_network_calibration,
 )
@@ -1039,14 +1040,10 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 stream_input_size = None
 
             if configured_run_mode in CALIBRATABLE_STREAM_MODES:
-                audio_backend = str(
-                    settings.get("Audio Capture Backend", "auto") or "auto"
-                ).strip().casefold()
-                selected_audio = str(settings.get("Stereo Mix", "") or "").strip()
-                if selected_audio and audio_backend in {"auto", "soundcard"} and not selected_audio.casefold().startswith(
-                    ("soundcard:", "wasapi:")
-                ):
-                    selected_audio = f"soundcard:{selected_audio}"
+                selected_audio = resolve_stream_audio_device(
+                    settings,
+                    os_name=OS_NAME,
+                )
                 stream_config = replace(
                     NetworkStreamSessionConfig.from_settings(settings, fps=int(FPS)),
                     stereo_mix_device=selected_audio,
