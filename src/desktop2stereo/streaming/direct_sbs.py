@@ -268,19 +268,20 @@ def _darwin_loopback_routing_hint(device: str) -> str:
 def _auto_select_darwin_audio(ffmpeg_path: Path) -> str:
     """Pick an AVFoundation audio device for loopback capture on macOS.
 
-    Returns the index of the first audio device, preferring loopback-style
-    names (BlackHole / Loopback / Virtual / Stereo Mix) so the stream always
-    carries sound even when no Stereo Mix device was configured. Returns ""
-    when no audio device exists.
+    Prefer the Desktop2Stereo virtual speaker when present, then other
+    loopback-style names. This keeps a synced settings file from selecting a
+    different silent virtual input merely because it appears first.
     """
     devices = _list_darwin_audio_devices(ffmpeg_path)
-    for index, name in devices:
-        lowered = name.lower()
-        if any(
-            token in lowered
-            for token in ("blackhole", "loopback", "virtual", "stereo mix")
-        ):
-            return str(index)
+    preferred_tokens = (
+        ("virtual desktop speakers",),
+        ("blackhole", "loopback", "soundflower", "stereo mix", "virtual"),
+    )
+    for tokens in preferred_tokens:
+        for index, name in devices:
+            lowered = name.casefold()
+            if any(token in lowered for token in tokens):
+                return str(index)
     return str(devices[0][0]) if devices else ""
 
 
@@ -1923,18 +1924,18 @@ class FfmpegDirectSbsOutput:
         ``-itsoffset`` audio delay is folded into the RTCTIME offset
         because asetpts overwrites the demuxer PTS that the offset shifted.
 
-        macOS AVFoundation exposes an absolute microsecond timestamp. Normalize
-        it to the input start and the audio time base before applying the
-        configured delay. Passing RTCTIME directly as PTS makes FFmpeg treat
-        the microsecond value as stream ticks; the muxer then duplicates video
-        for minutes to catch up, eventually blocking the rawvideo pipe.
+        macOS keeps the configured delay and async resampling, but uses a
+        relative audio clock. The bundled FFmpeg build can emit no packets
+        when the absolute AVFoundation RTCTIME value is normalized in this
+        filter graph. Resetting to the first audio PTS keeps the stream
+        monotonic without changing Windows/Linux timing behavior.
         """
         graph = "aresample=async=1"
         if self.os_name == "Darwin":
             delay_us = int(round(float(self.audio_delay) * 1e6))
             graph = (
-                "asetpts=(RTCTIME-STARTT"
-                f"{delay_us:+d})/(1000000*TB),{graph}"
+                "asetpts=PTS-STARTPTS"
+                f"{delay_us:+d}/(1000000*TB),{graph}"
             )
         elif self._soundcard_audio is not None:
             delay_us = int(round(float(self.audio_delay) * 1e6))
@@ -1943,19 +1944,9 @@ class FfmpegDirectSbsOutput:
 
     def _audio_input_args(self) -> list[str]:
         device = self.stereo_mix_device
-        if self.os_name == "Darwin":
-            # An unconfigured audio source must not open a live AVFoundation
-            # input: its clock can block the video muxer for hundreds of ms.
-            # Audio remains available when the user explicitly selects a
-            # device (for example ``soundcard:BlackHole 2ch``).
-            normalized = device.casefold().strip()
-            if (
-                not normalized
-                or normalized in {"soundcard:", "wasapi:", ":"}
-                or normalized.startswith(("no ", "none", "null"))
-            ):
-                return []
-        if not device or device.lower().startswith(("no ", "none", "null")):
+        if self.os_name != "Darwin" and (
+            not device or device.lower().startswith(("no ", "none", "null"))
+        ):
             return []
         if self.os_name == "Windows":
             if device.casefold().startswith("soundcard:"):

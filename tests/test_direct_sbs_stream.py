@@ -206,31 +206,37 @@ def test_darwin_audio_input_args_strip_backend_prefix(monkeypatch) -> None:
     target.stereo_mix_device = "soundcard:Gone Device"
     assert target._audio_input_args()[-2:] == ["-i", ":1"]
 
-    # Empty / bare-prefix / lone-colon / "no device" values must not start a
-    # live AVFoundation input: that input can block the video muxer. Explicit
-    # device names still use the configured audio path above.
+    # Empty / bare-prefix / lone-colon / "no device" values auto-select the
+    # available macOS loopback device instead of silently dropping audio.
     for bad in ("", "soundcard:", "wasapi:", ":", "No Stereo Mix device found"):
         target.stereo_mix_device = bad
         args = target._audio_input_args()
-        assert args == [], f"device {bad!r} must remain video-only"
+        assert args[-2:] == ["-i", ":1"], f"device {bad!r} did not auto-select"
 
 
-def test_darwin_unconfigured_audio_stays_video_only(monkeypatch) -> None:
+def test_darwin_unconfigured_audio_auto_selects_loopback(monkeypatch) -> None:
     target = object.__new__(FfmpegDirectSbsOutput)
     target.os_name = "Darwin"
     target.audio_delay = 0.0
     target.ffmpeg_path = Path("/usr/bin/ffmpeg")
     target.stereo_mix_device = ""
 
+    monkeypatch.setattr(direct_sbs, "_auto_select_darwin_audio", lambda _ffmpeg: "1")
+
+    assert target._audio_input_args()[-2:] == ["-i", ":1"]
+
+
+def test_darwin_auto_select_prefers_virtual_desktop_speakers(monkeypatch) -> None:
     monkeypatch.setattr(
         direct_sbs,
-        "_auto_select_darwin_audio",
-        lambda _ffmpeg: (_ for _ in ()).throw(
-            AssertionError("unconfigured audio must not start a device probe")
-        ),
+        "_list_darwin_audio_devices",
+        lambda _ffmpeg: [
+            (1, "BlackHole 2ch"),
+            (8, "Virtual Desktop Speakers"),
+        ],
     )
 
-    assert target._audio_input_args() == []
+    assert direct_sbs._auto_select_darwin_audio(Path("ffmpeg")) == "8"
 
 
 def test_darwin_frame_submit_replaces_stale_frame_without_blocking() -> None:
@@ -928,10 +934,10 @@ def test_macos_rtmp_stream_audio_uses_opus_like_v250(monkeypatch) -> None:
     command = output._ffmpeg_command(3840, 1080)
 
     assert command[command.index("-c:a") + 1] == "libopus"
-    # macOS normalizes AVFoundation's absolute microsecond timestamp to the
-    # stream time base and folds in the -0.1s audio delay.
+    # macOS uses a relative audio clock so the bundled FFmpeg emits packets;
+    # the configured delay is folded into the filter graph.
     assert command[command.index("-af") + 1] == (
-        "asetpts=(RTCTIME-STARTT-100000)/(1000000*TB),aresample=async=1"
+        "asetpts=PTS-STARTPTS-100000/(1000000*TB),aresample=async=1"
     )
     assert command[command.index("-ar") + 1] == "48000"
     assert command[command.index("-ac") + 1] == "2"
@@ -974,9 +980,9 @@ def test_macos_webrtc_stream_audio_uses_opus_async1(monkeypatch) -> None:
     command = output._ffmpeg_command(3840, 1080)
 
     assert command[command.index("-c:a") + 1] == "libopus"
-    # Default audio_delay (-0.1s) folds into the normalized macOS timestamp.
+    # Default audio_delay (-0.1s) folds into the relative macOS timestamp.
     assert command[command.index("-af") + 1] == (
-        "asetpts=(RTCTIME-STARTT-100000)/(1000000*TB),aresample=async=1"
+        "asetpts=PTS-STARTPTS-100000/(1000000*TB),aresample=async=1"
     )
     assert "aac" not in command
 
