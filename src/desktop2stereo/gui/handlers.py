@@ -16,6 +16,7 @@ from streaming.audio import (
     query_ffmpeg_dshow_audio_devices,
     query_ffmpeg_wasapi_audio_devices,
 )
+from streaming.stream_calibration import automatic_peak_bitrate_mbps
 from streaming.wasapi_audio import query_soundcard_loopback_devices
 from utils.run_mode import target_fps_setting_key
 from utils.xr_headset_presets import display_to_xr_headset, xr_headset_options, xr_headset_to_display
@@ -712,6 +713,33 @@ class GUIHandlerMixin:
             button.visible = not manual
         self._safe_update(row, button)
 
+    def _set_stream_bitrate_controls(self, target_mbps, peak_mbps=None):
+        try:
+            target = int(round(float(target_mbps)))
+        except (TypeError, ValueError):
+            target = 30
+        target = max(5, min(35, target))
+        if peak_mbps is None:
+            peak = automatic_peak_bitrate_mbps(target, maximum_mbps=35)
+        else:
+            try:
+                peak = max(target, int(round(float(peak_mbps))))
+            except (TypeError, ValueError):
+                peak = automatic_peak_bitrate_mbps(target, maximum_mbps=35)
+        self.stream_target_bitrate_slider.value = target
+        self.stream_target_bitrate_value.value = f"{target} Mbps"
+        self.stream_peak_bitrate_value.value = f"{peak} Mbps"
+        return target, peak
+
+    def _on_stream_target_bitrate_change(self, event):
+        target, peak = self._set_stream_bitrate_controls(event.control.value)
+        self._config["Stream Target Bitrate Mbps"] = target
+        self._config["Stream Peak Bitrate Mbps"] = peak
+        self._safe_update(
+            self.stream_target_bitrate_value,
+            self.stream_peak_bitrate_value,
+        )
+
     def _auto_select_stereo_monitor(self):
         mon_count = self._get_monitor_count()
         if mon_count <= 1:
@@ -962,7 +990,7 @@ class GUIHandlerMixin:
             "Stream Target Bitrate:", "Target Bitrate (Mbps):"
         )
         self.stream_peak_bitrate_label.value = t.get(
-            "Stream Peak Bitrate:", "Peak Bitrate (Mbps):"
+            "Stream Peak Bitrate:", "Peak (auto):"
         )
         self.audio_label.value = t["Stereo Mix"]
         self.crf_label.value = t["CRF"]
@@ -1050,8 +1078,8 @@ class GUIHandlerMixin:
             (self.video_backend_dd, "tooltip_video_backend"),
             (self.stream_calibration_mode_dd, "tooltip_stream_calibration_mode"),
             (self.stream_calibration_btn, "tooltip_stream_calibration_start"),
-            (self.stream_target_bitrate_tf, "tooltip_stream_target_bitrate"),
-            (self.stream_peak_bitrate_tf, "tooltip_stream_peak_bitrate"),
+            (self.stream_target_bitrate_slider, "tooltip_stream_target_bitrate"),
+            (self.stream_peak_bitrate_value, "tooltip_stream_peak_bitrate"),
         ]:
             _set_tooltip(ctrl, t.get(key, UI_MESSAGES["EN"].get(key, key)))
         self._refresh_stream_calibration_status()
@@ -1127,19 +1155,17 @@ class GUIHandlerMixin:
         if e is not None and getattr(e, "control", None) is not None:
             self.stream_calibration_mode_dd.value = e.control.value
         if not self._stream_calibration_auto_enabled():
-            try:
-                target = int(self.stream_target_bitrate_tf.value or 0)
-            except (TypeError, ValueError):
-                target = 0
-            try:
-                peak = int(self.stream_peak_bitrate_tf.value or 0)
-            except (TypeError, ValueError):
-                peak = 0
-            if not 5 <= target <= 35:
-                target = 30
-                self.stream_target_bitrate_tf.value = str(target)
-            if not target <= peak <= 35:
-                self.stream_peak_bitrate_tf.value = str(35)
+            configured_target = self._parse_int(
+                self._config.get("Stream Target Bitrate Mbps", 0), 0
+            )
+            target_value = (
+                configured_target if 5 <= configured_target <= 35 else 30
+            )
+            target, peak = self._set_stream_bitrate_controls(
+                target_value
+            )
+            self._config["Stream Target Bitrate Mbps"] = target
+            self._config["Stream Peak Bitrate Mbps"] = peak
         self._config["Use Stream Calibration"] = self._stream_calibration_auto_enabled()
         self._sync_manual_bitrate_visibility()
         self._collect_config()

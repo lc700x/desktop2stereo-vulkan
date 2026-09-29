@@ -25,7 +25,10 @@ from streaming.runtime_manager import ensure_runtime
 from streaming.nvidia_encoder import PyNvSrtVideoOutput, PyNvVideoCodecEncoder
 from streaming.native_rtsp_output import NativeRtspAvOutput
 from streaming.nvenc_cudaarray_bridge import NvencCudaArrayEncoder
-from streaming.stream_calibration import StreamCalibrationController
+from streaming.stream_calibration import (
+    StreamCalibrationController,
+    automatic_peak_bitrate_mbps,
+)
 from streaming.wasapi_audio import SoundcardLoopbackSender
 from streaming.vulkan_capabilities import probe_vulkan_video
 from streaming.vulkan_bridge import VulkanNativeBridge
@@ -1665,9 +1668,9 @@ class FfmpegDirectSbsOutput:
             pixels_per_second * bits_per_pixel * quality_factor / 1_000_000
         )
         target_mbps = max(4, min(target_limit, target_mbps))
-        peak_mbps = max(
+        peak_mbps = automatic_peak_bitrate_mbps(
             target_mbps,
-            min(peak_limit, int(math.ceil(target_mbps * 1.15))),
+            maximum_mbps=peak_limit,
         )
         return target_mbps, peak_mbps, peak_mbps
 

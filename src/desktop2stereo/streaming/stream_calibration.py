@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import statistics
 import threading
 import time
@@ -112,6 +113,19 @@ def minimum_bitrate_for_resolution(input_width: int, input_height: int) -> int:
     if pixels <= 3_686_400:  # 1440p / 2K
         return 10
     return 20  # 4K and above
+
+
+def automatic_peak_bitrate_mbps(
+    target_mbps: int,
+    *,
+    maximum_mbps: int | None = None,
+) -> int:
+    """Return the encoder's 15% peak headroom, optionally capped."""
+    target = max(1, int(target_mbps))
+    peak = max(target, math.ceil(target * 1.15))
+    if maximum_mbps is not None:
+        peak = min(peak, max(target, int(maximum_mbps)))
+    return peak
 
 
 def calibration_tiers(

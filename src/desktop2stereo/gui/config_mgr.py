@@ -5,6 +5,7 @@ from utils import OS_NAME, DEFAULT_PORT, read_yaml
 from utils.display_info import display_identity_record, resolve_display_capture_index
 from utils.run_mode import normalize_run_mode, target_fps_setting_key
 from utils.xr_headset_presets import display_to_xr_headset, xr_headset_to_display
+from streaming.stream_calibration import automatic_peak_bitrate_mbps
 from .config import (
     DEFAULTS, DEFAULT_FAMILIES, DEFAULT_MODEL_LIST, FAMILY_TO_SIZES,
     environment_display_label, parse_model_name, save_yaml, GUI_MODEL_CATALOG,
@@ -280,12 +281,14 @@ class GUIConfigMixin:
         target_bitrate = self._parse_int(cfg.get("Stream Target Bitrate Mbps", 30), 30)
         peak_bitrate = self._parse_int(cfg.get("Stream Peak Bitrate Mbps", 35), 35)
         manual_bitrate_mode = not bool(cfg.get("Use Stream Calibration", True))
-        if manual_bitrate_mode and not 5 <= target_bitrate <= 35:
-            target_bitrate = 30
-        if manual_bitrate_mode and not target_bitrate <= peak_bitrate <= 35:
-            peak_bitrate = 35
-        self.stream_target_bitrate_tf.value = str(target_bitrate)
-        self.stream_peak_bitrate_tf.value = str(max(target_bitrate, peak_bitrate))
+        if manual_bitrate_mode:
+            if not 5 <= target_bitrate <= 35:
+                target_bitrate = 30
+            peak_bitrate = automatic_peak_bitrate_mbps(
+                target_bitrate,
+                maximum_mbps=35,
+            )
+        self._set_stream_bitrate_controls(target_bitrate, peak_bitrate)
         self.stream_key_tf.value = cfg.get("Stream Key", DEFAULTS["Stream Key"])
         # Audio output is selected at runtime from the current system default;
         # never restore a previously saved device choice.
@@ -360,6 +363,22 @@ class GUIConfigMixin:
         self._config.pop("Debug Mode", None)
         fps_key = target_fps_setting_key(self.run_mode_key)
         self._config[fps_key] = self._target_fps_from_display(self.target_fps_dd.value)
+        if self._stream_calibration_auto_enabled():
+            stream_target_bitrate = self._parse_int(
+                self._config.get("Stream Target Bitrate Mbps", 30), 30
+            )
+            stream_peak_bitrate = self._parse_int(
+                self._config.get("Stream Peak Bitrate Mbps", 35), 35
+            )
+        else:
+            stream_target_bitrate = max(
+                5,
+                min(35, int(round(float(self.stream_target_bitrate_slider.value)))),
+            )
+            stream_peak_bitrate = automatic_peak_bitrate_mbps(
+                stream_target_bitrate,
+                maximum_mbps=35,
+            )
 
         self._config.update({
             "Capture Mode": self.capture_mode_key,
@@ -441,14 +460,8 @@ class GUIConfigMixin:
             "Streamer Port": self._parse_int(self.stream_port_tf.value, DEFAULTS["Streamer Port"]),
             "Stream Quality": self._parse_int(self.stream_quality_dd.value, DEFAULTS["Stream Quality"]),
             "Use Stream Calibration": self._stream_calibration_auto_enabled(),
-            "Stream Target Bitrate Mbps": self._parse_int(
-                self.stream_target_bitrate_tf.value,
-                self._parse_int(self._config.get("Stream Target Bitrate Mbps", 30), 30),
-            ),
-            "Stream Peak Bitrate Mbps": self._parse_int(
-                self.stream_peak_bitrate_tf.value,
-                self._parse_int(self._config.get("Stream Peak Bitrate Mbps", 35), 35),
-            ),
+            "Stream Target Bitrate Mbps": stream_target_bitrate,
+            "Stream Peak Bitrate Mbps": stream_peak_bitrate,
             "Stream Calibration Port": self._parse_int(
                 min(65535, self._parse_int(self.stream_port_tf.value, DEFAULT_PORT) + 1),
                 min(65535, self._parse_int(self.stream_port_tf.value, DEFAULT_PORT) + 1),

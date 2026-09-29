@@ -1110,26 +1110,40 @@ class GUIBuilderMixin:
             spacing=1,
         )
         self.stream_target_bitrate_label = ft.Text(
-            "Target Bitrate (Mbps):", size=FONT_SIZE, width=S(150)
+            "Target Bitrate (Mbps):", size=FONT_SIZE, width=S(170)
         )
-        self.stream_target_bitrate_tf = CompactTextField(
-            value="30", width=S(80), filter=r"[0-9]", max_length=3
+        self.stream_target_bitrate_slider = ft.Slider(
+            min=5,
+            max=35,
+            divisions=30,
+            value=30,
+            label="{value}",
+            width=S(220),
+            height=S(34),
+            on_change=self._on_stream_target_bitrate_change,
+        )
+        self.stream_target_bitrate_value = ft.Text(
+            "30 Mbps", size=FONT_SIZE, width=S(66),
+            text_align=ft.TextAlign.RIGHT, no_wrap=True,
         )
         self.stream_peak_bitrate_label = ft.Text(
-            "Peak Bitrate (Mbps):", size=FONT_SIZE, width=S(125)
+            "Peak (auto):", size=FONT_SIZE, width=S(105)
         )
-        self.stream_peak_bitrate_tf = CompactTextField(
-            value="35", width=S(80), filter=r"[0-9]", max_length=3
+        self.stream_peak_bitrate_value = ft.Text(
+            "35 Mbps", size=FONT_SIZE, width=S(66),
+            text_align=ft.TextAlign.RIGHT, no_wrap=True,
         )
         self.stream_bitrate_row = ft.Row(
             [
                 self.stream_target_bitrate_label,
-                self.stream_target_bitrate_tf,
+                self.stream_target_bitrate_slider,
+                self.stream_target_bitrate_value,
                 ft.Container(width=S(10)),
                 self.stream_peak_bitrate_label,
-                self.stream_peak_bitrate_tf,
+                self.stream_peak_bitrate_value,
             ],
             spacing=1,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
             visible=False,
         )
         self.crf_label = ft.Text("CRF:", size=FONT_SIZE, width=S(150))

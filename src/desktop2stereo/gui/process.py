@@ -730,6 +730,21 @@ class GUIProcessMixin:
     def _stream_calibration_profile_is_current(self) -> bool:
         return self._stream_calibration_profile_status() == "current"
 
+    def _stream_calibration_failure_is_current(self, profile) -> bool:
+        try:
+            with open(STREAM_CALIBRATION_STATE_FILE, "r", encoding="utf-8") as file:
+                state = json.load(file)
+            result = state.get("result") or {}
+            created_at = profile.get("created_at")
+            return bool(
+                created_at is not None
+                and state.get("status") == "complete"
+                and result.get("stability", "stable") != "stable"
+                and result.get("created_at") == created_at
+            )
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
     def _persist_current_stream_calibration_profile(self) -> None:
         """Restore a completed profile if shutdown raced GUI result handling."""
         if getattr(self, "stream_calibration_mode_dd", None) is None:
@@ -778,12 +793,7 @@ class GUIProcessMixin:
         crf_control = getattr(self, "crf_tf", None)
         if crf_control is not None:
             crf_control.value = str(crf)
-        target_bitrate_control = getattr(self, "stream_target_bitrate_tf", None)
-        if target_bitrate_control is not None:
-            target_bitrate_control.value = str(target)
-        peak_bitrate_control = getattr(self, "stream_peak_bitrate_tf", None)
-        if peak_bitrate_control is not None:
-            peak_bitrate_control.value = str(peak)
+        self._set_stream_bitrate_controls(target, peak)
         ok, error = save_yaml(os.path.join(BASE_DIR, "settings.yaml"), self._config)
         if not ok:
             logger.warning("[StreamCalibration] Failed to restore saved profile: %s", error)
@@ -881,6 +891,16 @@ class GUIProcessMixin:
                 profile = json.load(file)
             clear_result()
             if profile.get("stability", "stable") != "stable":
+                if not self._stream_calibration_failure_is_current(profile):
+                    clear_warning()
+                    clear_result()
+                    control.value = UI_MESSAGES[self.locale].get(
+                        "Not calibrated", "Not calibrated"
+                    )
+                    control.color = ft.Colors.GREY
+                    self._safe_update(control)
+                    refit_visible_rows()
+                    return
                 control.value = UI_MESSAGES[self.locale].get("Not calibrated", "Not calibrated")
                 control.color = ft.Colors.ORANGE
                 clear_warning()
@@ -979,6 +999,7 @@ class GUIProcessMixin:
             os.remove(STREAM_CALIBRATION_STATE_FILE)
         except FileNotFoundError:
             pass
+        self._refresh_stream_calibration_status()
         self._calibration_previous_target_value = self.target_fps_dd.value
         self.target_fps_dd.value = self._target_fps_to_display(0)
         self._calibration_active = True
@@ -1264,12 +1285,7 @@ class GUIProcessMixin:
         crf_control = getattr(self, "crf_tf", None)
         if crf_control is not None:
             crf_control.value = str(crf)
-        target_bitrate_control = getattr(self, "stream_target_bitrate_tf", None)
-        if target_bitrate_control is not None:
-            target_bitrate_control.value = str(target)
-        peak_bitrate_control = getattr(self, "stream_peak_bitrate_tf", None)
-        if peak_bitrate_control is not None:
-            peak_bitrate_control.value = str(peak)
+        self._set_stream_bitrate_controls(target, peak)
         self._collect_config()
         ok, error = save_yaml(os.path.join(BASE_DIR, "settings.yaml"), self._config)
         if not ok:
@@ -1354,14 +1370,12 @@ class GUIProcessMixin:
             return False, UI_MESSAGES[self.locale]["err_crf"]
         if self.run_mode_key == "RTMP Streamer" and not self._stream_calibration_auto_enabled():
             try:
-                target_bitrate = int(self.stream_target_bitrate_tf.value or 0)
-                peak_bitrate = int(self.stream_peak_bitrate_tf.value or 0)
+                target_bitrate = int(
+                    round(float(self.stream_target_bitrate_slider.value))
+                )
             except (TypeError, ValueError):
                 return False, UI_MESSAGES[self.locale]["err_stream_bitrate"]
-            if not (
-                5 <= target_bitrate <= 35
-                and target_bitrate <= peak_bitrate <= 35
-            ):
+            if not 5 <= target_bitrate <= 35:
                 return False, UI_MESSAGES[self.locale]["err_stream_bitrate"]
         try:
             delay_val = float(self.audio_delay_tf.value) if self.audio_delay_tf.value else DEFAULTS["Audio Delay"]
