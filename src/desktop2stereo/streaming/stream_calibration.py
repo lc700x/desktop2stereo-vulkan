@@ -285,9 +285,15 @@ class StreamCalibrationController:
     def _estimate_stage_count(self) -> int:
         """Estimate the largest number of probe windows for the progress bar."""
         initial = int(self._tiers[0].target_mbps)
-        lower_bound = max(1, min(7, initial // 2))
+        lower_bound = min(
+            minimum_bitrate_for_resolution(*self._input_resolution),
+            initial,
+        )
         limit = int(self._bitrate_limit)
-        estimate = 1 + self._binary_search_steps(initial - lower_bound) + 1
+        search_steps = self._binary_search_steps(initial - lower_bound)
+        if 0 < initial - lower_bound <= _BITRATE_SEARCH_RESOLUTION_MBPS:
+            search_steps = max(1, search_steps)
+        estimate = 1 + search_steps + 1
         previous = initial
         bracket_count = 1
         while previous < limit:
@@ -652,22 +658,31 @@ class StreamCalibrationController:
             lower = (
                 self._best_tier.target_mbps
                 if self._best_tier is not None
-                else max(1, min(7, self._active_tier.target_mbps // 2))
+                else min(
+                    minimum_bitrate_for_resolution(*self._input_resolution),
+                    int(self._tiers[0].target_mbps),
+                )
             )
             upper = self._search_upper_mbps
+            if upper <= lower and self._best_tier is None:
+                self._complete_locked(self._active_tier, metrics, "limited")
+                return
             if upper - lower <= _BITRATE_SEARCH_RESOLUTION_MBPS:
                 if self._best_tier is None:
-                    self._complete_locked(self._active_tier, metrics, "limited")
+                    # The resolution's minimum viable bitrate has not been
+                    # tested yet; do that before reporting a network limit.
+                    next_target = lower
+                else:
+                    selected = self._best_tier
+                    if selected != self._active_tier:
+                        self._active_tier = selected
+                        self._pending_tier = selected
+                    self._confirming_stability = True
+                    self._reset_stage_locked("confirming")
+                    self._write_state_locked(extra={"last_metrics": metrics})
                     return
-                selected = self._best_tier
-                if selected != self._active_tier:
-                    self._active_tier = selected
-                    self._pending_tier = selected
-                self._confirming_stability = True
-                self._reset_stage_locked("confirming")
-                self._write_state_locked(extra={"last_metrics": metrics})
-                return
-            next_target = (lower + upper) // 2
+            else:
+                next_target = (lower + upper) // 2
             print(
                 f"[StreamCalibration] Receiver instability detected "
                 f"({','.join(reason for reason in reasons if reason in network_reasons)}); "
@@ -676,7 +691,7 @@ class StreamCalibrationController:
                 f"drop_ratio={metrics.get('drop_ratio', 0)} "
                 f"freeze={metrics.get('freeze_count', 0)} "
                 f"jitter={metrics.get('jitter_buffer_ms', 0)}ms; "
-                f"binary range stable={lower}M unstable={upper}M; "
+                f"search range lower={lower}M upper={upper}M; "
                 f"testing {next_target}M",
                 flush=True,
             )
@@ -688,7 +703,11 @@ class StreamCalibrationController:
                 flush=True,
             )
 
-        if next_target < 8:
+        minimum_target = min(
+            minimum_bitrate_for_resolution(*self._input_resolution),
+            int(self._tiers[0].target_mbps),
+        )
+        if next_target < minimum_target:
             selected = self._best_tier or self._active_tier
             self._complete_locked(
                 selected,
