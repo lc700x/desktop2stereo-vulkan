@@ -100,6 +100,20 @@ def recommended_crf_for_bitrate(target_mbps: int | float) -> int:
     return 30
 
 
+def minimum_bitrate_for_resolution(input_width: int, input_height: int) -> int:
+    """Return a conservative integer floor for a stable stream profile."""
+    pixels = max(1, int(input_width)) * max(1, int(input_height))
+    if pixels <= 600_000:  # 480p and below
+        return 2
+    if pixels <= 921_600:  # 720p
+        return 3
+    if pixels <= 2_073_600:  # 1080p
+        return 6
+    if pixels <= 3_686_400:  # 1440p / 2K
+        return 10
+    return 20  # 4K and above
+
+
 def calibration_tiers(
     maximum_fps: int,
     *,
@@ -724,6 +738,15 @@ class StreamCalibrationController:
         self._status = "complete"
         network_max_mbps = max(1, int(selected.target_mbps))
         safe_target_mbps = max(1, int(network_max_mbps * _SAFE_TARGET_RATIO))
+        if stability == "stable":
+            resolution_floor = minimum_bitrate_for_resolution(
+                *self._input_resolution
+            )
+            safe_target_mbps = max(
+                safe_target_mbps,
+                min(resolution_floor, network_max_mbps),
+            )
+        safe_target_mbps = min(safe_target_mbps, network_max_mbps)
         safe_peak_mbps = max(
             safe_target_mbps,
             int(network_max_mbps * _SAFE_PEAK_RATIO),

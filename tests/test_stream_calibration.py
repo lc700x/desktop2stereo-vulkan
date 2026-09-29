@@ -11,6 +11,7 @@ from streaming.stream_calibration import (
     evaluate_calibration_window,
     build_calibration_fingerprint,
     calibration_fingerprint_matches,
+    minimum_bitrate_for_resolution,
     recommended_crf_for_bitrate,
 )
 
@@ -304,6 +305,41 @@ def test_calibration_tier_starts_in_resolution_appropriate_range(
     )[0]
 
     assert minimum <= tier.target_mbps <= maximum
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "expected"),
+    [
+        (640, 480, 2),
+        (1280, 720, 3),
+        (1920, 1080, 6),
+        (2560, 1440, 10),
+        (3840, 2160, 20),
+    ],
+)
+def test_stable_profile_floor_follows_resolution(width, height, expected):
+    assert minimum_bitrate_for_resolution(width, height) == expected
+
+
+def test_stable_1080p_profile_allows_a_6_mbps_floor(tmp_path):
+    controller = StreamCalibrationController(
+        bind_port=12000,
+        stream_port=1122,
+        stream_key="live",
+        maximum_fps=30,
+        state_path=tmp_path / "state.json",
+        profile_path=tmp_path / "profile.json",
+    )
+    controller.configure_input_resolution(1920, 1080)
+    controller._complete_locked(
+        CalibrationTier(fps=30, target_mbps=7, peak_mbps=8),
+        {},
+        "stable",
+    )
+
+    profile = json.loads((tmp_path / "profile.json").read_text(encoding="utf-8"))
+    assert profile["network_max_mbps"] == 7
+    assert profile["target_mbps"] == 6
 
 
 def test_calibration_window_rejects_a_probe_that_did_not_reach_target_rate():
