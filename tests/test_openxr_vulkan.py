@@ -6383,6 +6383,69 @@ def test_settings_menu_render_scale_step_schedules_one_rebuild() -> None:
     assert calls[-1][0] == "persist_openxr_render_scale"
 
 
+def test_rocm_automatic_render_scale_is_capped_without_changing_manual_or_cuda(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        OpenXrVulkanPresenter,
+        "_is_rocm_backend",
+        staticmethod(lambda: True),
+    )
+    rocm_startup_auto = OpenXrVulkanPresenter(
+        OpenXrVulkanConfig(
+            render_scale=1.24,
+            render_scale_auto=True,
+            headset_model="Meta Quest 2",
+        )
+    )
+    assert rocm_startup_auto._openxr_render_scale == pytest.approx(1.0)
+
+    rocm_auto = OpenXrVulkanPresenter(
+        OpenXrVulkanConfig(
+            render_scale=0.8,
+            render_scale_auto=True,
+            headset_model="Meta Quest 2",
+        )
+    )
+    assert rocm_auto._openxr_render_scale == pytest.approx(0.8)
+    rebuild_scales = []
+    rocm_auto._release_projection_render_targets = lambda: None
+    rocm_auto._create_projection_swapchains_for_scale = (
+        lambda scale: rebuild_scales.append(scale)
+    )
+    rocm_auto._initialize_filament_bridges = lambda: None
+    rocm_auto._projection_eye_extents = lambda: ()
+    rocm_auto._pending_openxr_render_scale = 1.24
+
+    rocm_auto._apply_pending_openxr_render_scale()
+
+    assert rebuild_scales == [pytest.approx(1.0)]
+    assert rocm_auto._openxr_render_scale == pytest.approx(1.0)
+
+    rocm_manual = OpenXrVulkanPresenter(
+        OpenXrVulkanConfig(
+            render_scale=1.24,
+            render_scale_auto=False,
+            headset_model="Meta Quest 2",
+        )
+    )
+    assert rocm_manual._openxr_render_scale == pytest.approx(1.24)
+
+    monkeypatch.setattr(
+        OpenXrVulkanPresenter,
+        "_is_rocm_backend",
+        staticmethod(lambda: False),
+    )
+    cuda_auto = OpenXrVulkanPresenter(
+        OpenXrVulkanConfig(
+            render_scale=1.24,
+            render_scale_auto=True,
+            headset_model="Meta Quest 2",
+        )
+    )
+    assert cuda_auto._openxr_render_scale == pytest.approx(1.24)
+
+
 def test_visible_settings_menu_disables_screen_edge_ray_attraction() -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._settings_menu.visible = True

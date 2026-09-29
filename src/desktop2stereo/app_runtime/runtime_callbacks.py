@@ -214,13 +214,16 @@ class RuntimeCallbacks:
 
                 settings_path = os.path.join(self.context.base_dir, "settings.yaml")
                 settings = read_yaml(settings_path)
+                requested = values.get("value")
+                if requested is None:
+                    requested = resolve_xr_headset_preset(
+                        settings.get("XR Headset Model")
+                    ).recommended_render_scale
                 numeric = max(
                     OPENXR_RENDER_SCALE_MIN,
                     min(
                         OPENXR_RENDER_SCALE_MAX,
-                        resolve_xr_headset_preset(
-                            settings.get("XR Headset Model")
-                        ).recommended_render_scale,
+                        float(requested),
                     ),
                 )
                 settings["XR Render Mode"] = "auto"

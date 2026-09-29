@@ -239,6 +239,29 @@ def test_settings_menu_persists_dedicated_openxr_render_scale(
     assert "XR Render: 1.75" in settings_path.read_text(encoding="utf-8")
 
 
+def test_settings_menu_persists_effective_automatic_openxr_render_scale(
+    tmp_path,
+) -> None:
+    callbacks = _callbacks(0.6)
+    callbacks.context.base_dir = str(tmp_path)
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(
+        "XR Headset Model: Meta Quest 2\nOpenXR Render Scale: 1.24\n",
+        encoding="utf-8",
+    )
+
+    assert callbacks.on_openxr_controller_shortcut(
+        "persist_openxr_render_auto", value=1.0
+    ) is True
+
+    from stereo_runtime.hot_reload import read_yaml
+
+    settings = read_yaml(str(settings_path))
+    assert settings["XR Render Mode"] == "auto"
+    assert settings["XR Render"] == pytest.approx(1.0)
+    assert settings["OpenXR Render Scale"] == pytest.approx(1.0)
+
+
 def test_settings_menu_persists_and_resets_openxr_screen_state(tmp_path) -> None:
     callbacks = _callbacks(0.6)
     callbacks.context.base_dir = str(tmp_path)

@@ -1209,11 +1209,21 @@ class OpenXrVulkanPresenter(
         self._settings_menu_grab_hand: int | None = None
         self._settings_menu_grab_relative: np.ndarray | None = None
         self._settings_menu_grip_down = [False, False]
+        self._openxr_render_scale_auto = bool(self.config.render_scale_auto)
         self._openxr_render_scale = max(
             OPENXR_RENDER_SCALE_MIN,
             min(OPENXR_RENDER_SCALE_MAX, float(self.config.render_scale)),
         )
-        self._openxr_render_scale_auto = bool(self.config.render_scale_auto)
+        if self._openxr_render_scale_auto and self._rocm_backend:
+            automatic_scale = self._recommended_openxr_render_scale()
+            if self._openxr_render_scale > automatic_scale:
+                print(
+                    "[OpenXRViewer] ROCm automatic render scale capped: "
+                    f"configured={self._openxr_render_scale:.2f}x "
+                    f"effective={automatic_scale:.2f}x",
+                    flush=True,
+                )
+                self._openxr_render_scale = automatic_scale
         self._openxr_runtime_capped = False
         self._pending_openxr_render_scale: float | None = None
         self._view_configuration_views: tuple[Any, ...] = ()
@@ -5042,13 +5052,7 @@ class OpenXrVulkanPresenter(
             return
         if key == "openxr:render_auto":
             self._openxr_render_scale_auto = True
-            value = max(
-                OPENXR_RENDER_SCALE_MIN,
-                min(
-                    OPENXR_RENDER_SCALE_MAX,
-                    float(self._headset_preset.recommended_render_scale),
-                ),
-            )
+            value = self._recommended_openxr_render_scale()
             self._settings_menu_values["openxr_render_auto"] = True
             self._settings_menu_values["openxr_render_scale"] = value
             self._pending_openxr_render_scale = value
@@ -6491,6 +6495,8 @@ class OpenXrVulkanPresenter(
             OPENXR_RENDER_SCALE_MIN,
             min(OPENXR_RENDER_SCALE_MAX, float(requested)),
         )
+        if self._openxr_render_scale_auto and self._rocm_backend:
+            requested = min(requested, self._recommended_openxr_render_scale())
         self._pending_openxr_render_scale = None
         if abs(requested - self._openxr_render_scale) < 1e-6:
             return
@@ -7746,6 +7752,21 @@ class OpenXrVulkanPresenter(
             return bool(getattr(torch.version, "hip", None))
         except Exception:
             return False
+
+    def _recommended_openxr_render_scale(self) -> float:
+        """Resolve headset auto scale, limiting ROCm to runtime recommendation."""
+        scale = max(
+            OPENXR_RENDER_SCALE_MIN,
+            min(
+                OPENXR_RENDER_SCALE_MAX,
+                float(self._headset_preset.recommended_render_scale),
+            ),
+        )
+        # OpenXR's recommended per-eye extent is the 1.0x baseline. The
+        # current ROCm projection loop misses its frame-time target, so avoid
+        # optional supersampling in Auto mode while keeping manual tuning and
+        # the CUDA path untouched.
+        return min(scale, 1.0) if self._rocm_backend else scale
 
     def _activate_rocm_openxr_stable_path(self) -> None:
         """Apply the validated AMD/VDXR overlay isolation after XR starts."""
