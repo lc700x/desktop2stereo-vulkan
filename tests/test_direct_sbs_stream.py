@@ -1232,6 +1232,18 @@ def test_calibrated_bitrate_overrides_dynamic_rate_budget():
     assert output._dynamic_stream_rate_budget(3840, 2160) == (24, 28, 28)
 
 
+@pytest.mark.parametrize("os_name", ["Windows", "Linux", "Darwin"])
+def test_manual_bitrate_budget_is_shared_across_platforms(os_name):
+    # The rate policy is shared and does not need a platform encoder binary.
+    output = object.__new__(FfmpegDirectSbsOutput)
+    output.os_name = os_name
+    output.protocol = "WEBRTC"
+    output.target_bitrate_mbps = 25
+    output.peak_bitrate_mbps = 35
+
+    assert output._dynamic_stream_rate_budget(3840, 2160) == (25, 35, 35)
+
+
 def test_dynamic_rate_budget_covers_rtmp_and_webrtc_but_not_rtsp():
     output = FfmpegDirectSbsOutput(
         base_dir=str(APP_ROOT),
