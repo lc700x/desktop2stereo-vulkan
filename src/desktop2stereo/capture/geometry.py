@@ -1,6 +1,31 @@
 from __future__ import annotations
 
 
+def match_mss_monitor_to_rect(monitor_index, monitors, display_rects, tolerance=2.0):
+    """Return the display-rect position matching a 1-based MSS monitor index."""
+    try:
+        index = int(monitor_index)
+        monitor = monitors[index] if 0 < index < len(monitors) else None
+        target = tuple(
+            float(monitor[key]) for key in ("left", "top", "width", "height")
+        ) if monitor is not None else None
+    except (TypeError, ValueError, KeyError):
+        return None
+    if target is None:
+        return None
+
+    for position, rect in enumerate(display_rects):
+        try:
+            if len(rect) == 4 and all(
+                abs(float(actual) - expected) <= tolerance
+                for actual, expected in zip(rect, target)
+            ):
+                return position
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def monitor_contains(mon, rect):
     left, top, w, h = rect
     right, bottom = left + w, top + h

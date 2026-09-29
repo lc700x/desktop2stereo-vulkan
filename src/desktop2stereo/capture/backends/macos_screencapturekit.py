@@ -16,6 +16,7 @@ from CoreMedia import (
     CMSampleBufferGetSampleAttachmentsArray,
 )
 from AppKit import NSScreen
+from ..geometry import match_mss_monitor_to_rect
 
 # Optional Metal zero-copy path (Milestone 2)
 try:
@@ -459,9 +460,34 @@ class DesktopGrabber:
             )
 
         if self.capture_mode == "Monitor":
-            idx = max(0, min(monitor_index - 1, len(displays) - 1))
-            self._display = displays[idx]
+            import mss
+
+            requested_index = int(monitor_index)
+            with mss.mss() as capture:
+                monitors = capture.monitors
+            display_rects = []
+            for display in displays:
+                frame = display.frame()
+                display_rects.append((
+                    frame.origin.x,
+                    frame.origin.y,
+                    frame.size.width,
+                    frame.size.height,
+                ))
+            display_position = match_mss_monitor_to_rect(
+                requested_index, monitors, display_rects
+            )
+            if display_position is None:
+                raise RuntimeError(
+                    f"MSS monitor {requested_index} could not be matched to a "
+                    "ScreenCaptureKit display by bounds"
+                )
+            self._display = displays[display_position]
             df = self._display.frame()
+            print(
+                f"[ScreenCaptureKit] MSS monitor {requested_index} -> "
+                f"display ID {self._display.displayID()}"
+            )
             self.left = int(df.origin.x)
             self.top = int(df.origin.y)
             self.width = self._display.width()
