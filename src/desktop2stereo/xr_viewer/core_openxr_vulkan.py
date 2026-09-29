@@ -1359,8 +1359,8 @@ class OpenXrVulkanPresenter(
 
     @property
     def output_ready(self) -> bool:
-        """Report readiness after the presenter-owned Filament Engine is ready."""
-        return self._initialized
+        """Report readiness only while OpenXR can accept runtime output."""
+        return self._initialized and self.session_running and self._accept_output
 
     def inference_backpressure_active(self) -> bool:
         """Whether an extra inference would compete with queued XR presentation."""

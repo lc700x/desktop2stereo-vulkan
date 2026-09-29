@@ -4474,6 +4474,20 @@ def test_presenter_wait_enters_hard_idle_after_configured_timeout(capsys) -> Non
     assert states[-1] == "active"
 
 
+def test_presenter_output_ready_tracks_openxr_acceptance_gate() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._initialized = True
+    presenter.session_running = True
+
+    assert not presenter.output_ready
+
+    presenter._notify_headset_active()
+    assert presenter.output_ready
+
+    presenter._notify_headset_waiting()
+    assert not presenter.output_ready
+
+
 def test_presenter_rejects_output_while_headset_is_waiting() -> None:
     from types import SimpleNamespace
 
