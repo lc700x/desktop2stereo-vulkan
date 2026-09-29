@@ -40,6 +40,8 @@ from utils.run_mode import target_fps_setting_key
 from streaming.stream_calibration import (
     build_calibration_fingerprint,
     calibration_fingerprint_matches,
+    limited_profile_meets_resolution_floor,
+    minimum_bitrate_for_resolution,
     recommended_crf_for_bitrate,
 )
 from streaming.stream_session import supports_network_calibration
@@ -717,7 +719,10 @@ class GUIProcessMixin:
                 profile = json.load(file)
             if not calibration_fingerprint_matches(profile.get("fingerprint"), self._config):
                 return "stale"
-            if profile.get("stability", "stable") != "stable":
+            if (
+                profile.get("stability", "stable") != "stable"
+                and not self._limited_stream_profile_is_usable(profile)
+            ):
                 return "missing"
             valid = all(
                 int(profile.get(key, 0) or 0) > 0
@@ -726,6 +731,46 @@ class GUIProcessMixin:
             return "current" if valid else "missing"
         except (OSError, ValueError, TypeError, AttributeError):
             return "missing"
+
+    def _limited_stream_profile_is_usable(self, profile) -> bool:
+        try:
+            minimum = int(profile.get("minimum_bitrate_mbps", 0) or 0)
+        except (TypeError, ValueError, AttributeError):
+            minimum = 0
+        if minimum <= 0:
+            resolution = profile.get("input_resolution")
+            if isinstance(resolution, dict):
+                width, height = resolution.get("width"), resolution.get("height")
+            elif isinstance(resolution, (tuple, list)) and len(resolution) == 2:
+                width, height = resolution
+            else:
+                width = height = None
+            if not width or not height:
+                config = getattr(self, "_config", {}) or {}
+                identity = config.get("Monitor Identity")
+                if isinstance(identity, str):
+                    try:
+                        identity = json.loads(identity)
+                    except ValueError:
+                        identity = None
+                if not isinstance(identity, dict):
+                    identity = (profile.get("fingerprint") or {}).get(
+                        "Monitor Identity"
+                    )
+                    if isinstance(identity, str):
+                        try:
+                            identity = json.loads(identity)
+                        except ValueError:
+                            identity = None
+                if isinstance(identity, dict):
+                    width, height = identity.get("width"), identity.get("height")
+            try:
+                if not width or not height:
+                    return False
+                minimum = minimum_bitrate_for_resolution(int(width), int(height))
+            except (TypeError, ValueError):
+                return False
+        return limited_profile_meets_resolution_floor(profile, minimum)
 
     def _stream_calibration_profile_is_current(self) -> bool:
         return self._stream_calibration_profile_status() == "current"
@@ -754,7 +799,10 @@ class GUIProcessMixin:
         try:
             with open(STREAM_CALIBRATION_PROFILE_FILE, "r", encoding="utf-8") as file:
                 profile = json.load(file)
-            if profile.get("stability", "stable") != "stable":
+            if (
+                profile.get("stability", "stable") != "stable"
+                and not self._limited_stream_profile_is_usable(profile)
+            ):
                 return
             if not calibration_fingerprint_matches(profile.get("fingerprint"), self._config):
                 return
@@ -845,6 +893,7 @@ class GUIProcessMixin:
             measured=None,
             network_max=None,
             stable=True,
+            sufficient=False,
         ):
             network_bitrate = (
                 int(round(float(network_max or 0.0)))
@@ -852,8 +901,15 @@ class GUIProcessMixin:
                 or target
             )
             if result is not None:
+                result_key = (
+                    "calibration_result_stable"
+                    if stable
+                    else "calibration_result_sufficient_limited"
+                    if sufficient
+                    else "calibration_result_limited"
+                )
                 result.value = UI_MESSAGES[self.locale].get(
-                    "calibration_result_stable" if stable else "calibration_result_limited",
+                    result_key,
                     "Stable network limit: {network_max} Mbps, safe bitrate: "
                     "{safe_target} Mbps, {fps} FPS.",
                 ).format(
@@ -861,7 +917,9 @@ class GUIProcessMixin:
                     network_max=network_bitrate,
                     safe_target=target,
                 )
-                result.color = ft.Colors.GREEN if stable else ft.Colors.ORANGE
+                result.color = (
+                    ft.Colors.GREEN if stable or sufficient else ft.Colors.ORANGE
+                )
                 result.visible = True
             if result_row is not None:
                 result_row.visible = True
@@ -890,7 +948,11 @@ class GUIProcessMixin:
             with open(STREAM_CALIBRATION_PROFILE_FILE, "r", encoding="utf-8") as file:
                 profile = json.load(file)
             clear_result()
-            if profile.get("stability", "stable") != "stable":
+            is_limited = profile.get("stability", "stable") != "stable"
+            limited_usable = (
+                is_limited and self._limited_stream_profile_is_usable(profile)
+            )
+            if is_limited and not limited_usable:
                 if not self._stream_calibration_failure_is_current(profile):
                     clear_warning()
                     clear_result()
@@ -926,7 +988,8 @@ class GUIProcessMixin:
                 int(profile.get("peak_mbps", 0)),
                 profile.get("measured_bitrate_mbps"),
                 profile.get("network_max_mbps"),
-                stable=True,
+                stable=not is_limited,
+                sufficient=limited_usable,
             )
             control.value = UI_MESSAGES[self.locale].get(
                 "calibration_profile_summary", "{fps} FPS · {target} Mbps"
@@ -934,7 +997,7 @@ class GUIProcessMixin:
                 fps=int(profile.get("fps", 0)),
                 target=int(profile.get("target_mbps", 0)),
             )
-            control.color = ft.Colors.GREEN
+            control.color = ft.Colors.ORANGE if is_limited else ft.Colors.GREEN
         except (OSError, ValueError, TypeError):
             saved = getattr(self, "_config", {}) or {}
             saved_fps = int(saved.get("Stream Target FPS", 0) or 0)
@@ -1250,7 +1313,14 @@ class GUIProcessMixin:
         except (OSError, ValueError, TypeError, KeyError) as exc:
             self.set_status(f"Calibration result error: {exc}")
             return
-        if profile.get("stability", "stable") != "stable":
+        limited_usable = (
+            profile.get("stability", "stable") != "stable"
+            and self._limited_stream_profile_is_usable(profile)
+        )
+        if (
+            profile.get("stability", "stable") != "stable"
+            and not limited_usable
+        ):
             await self._async_stop()
             self._restore_precalibration_target()
             message = UI_MESSAGES[self.locale].get(
@@ -1301,13 +1371,19 @@ class GUIProcessMixin:
                 on_click=self._close_stream_calibration_dialog,
             )]
             self._calibration_dialog_progress.value = 1.0
+            result_key = (
+                "calibration_result_sufficient_limited"
+                if limited_usable
+                else "calibration_result"
+            )
             self._calibration_dialog_detail.value = UI_MESSAGES[self.locale].get(
-                "calibration_result",
+                result_key,
                 "Stable network limit: {network_max} Mbps · safe bitrate: "
                 "{target} Mbps · peak {peak} Mbps · {fps} FPS",
             ).format(
                 fps=fps,
                 target=target,
+                safe_target=target,
                 peak=peak,
                 network_max=network_max,
             )

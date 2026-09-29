@@ -224,6 +224,63 @@ def test_calibration_stops_runtime_before_showing_result(monkeypatch, tmp_path):
     )
 
 
+def test_limited_7mbps_profile_applies_safe_1080p_rate(monkeypatch, tmp_path):
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(
+        json.dumps({
+            "fps": 30,
+            "target_mbps": 5,
+            "peak_mbps": 6,
+            "network_max_mbps": 7,
+            "stability": "limited",
+            "metrics": {"failure_reasons": ["insufficient_probe_bitrate"]},
+        }),
+        encoding="utf-8",
+    )
+    events = []
+
+    class Harness(gui_process.GUIProcessMixin):
+        async def _async_stop(self):
+            events.append("stop")
+
+        def _restore_precalibration_target(self):
+            events.append("restore")
+
+        def _set_stream_bitrate_controls(self, target, peak):
+            events.append(("controls", target, peak))
+
+        def _refresh_stream_calibration_status(self):
+            events.append("refresh")
+
+        def _collect_config(self):
+            pass
+
+        def set_status(self, message, key=None):
+            events.append(message)
+
+        def _safe_update(self, *controls):
+            pass
+
+    gui = Harness()
+    gui.locale = "EN"
+    gui._config = {"Monitor Identity": {"width": 1920, "height": 1080}}
+    gui.target_fps_dd = SimpleNamespace(value="0")
+    gui.stream_calibration_mode_dd = SimpleNamespace(value="")
+    gui._calibration_previous_target_value = "Auto"
+    gui._calibration_active = True
+    gui._calibration_dialog = None
+
+    monkeypatch.setattr(gui_process, "STREAM_CALIBRATION_PROFILE_FILE", str(profile_path))
+    monkeypatch.setattr(gui_process, "BASE_DIR", str(tmp_path))
+    monkeypatch.setattr(gui_process, "save_yaml", lambda *args: (True, ""))
+
+    asyncio.run(gui._apply_stream_calibration_profile())
+
+    assert "restore" not in events
+    assert gui._config["Stream Target Bitrate Mbps"] == 5
+    assert "Calibration applied: 30 FPS, 5 Mbps" in events
+
+
 def test_page_close_applies_completed_calibration_before_stopping(monkeypatch, tmp_path):
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps({"status": "complete"}), encoding="utf-8")
@@ -486,9 +543,12 @@ def test_limited_calibration_profile_is_not_treated_as_current(monkeypatch, tmp_
 
 def test_limited_calibration_result_is_visible_below_transport_profile(monkeypatch, tmp_path):
     profile_path = tmp_path / "profile.json"
+    state_path = tmp_path / "state.json"
     settings = {"Streamer Port": 1122}
+    created_at = 123.0
     profile_path.write_text(
         json.dumps({
+            "created_at": created_at,
             "fps": 30,
             "target_mbps": 24,
             "peak_mbps": 30,
@@ -496,6 +556,13 @@ def test_limited_calibration_result_is_visible_below_transport_profile(monkeypat
             "network_max_mbps": 30,
             "stability": "limited",
             "fingerprint": gui_process.build_calibration_fingerprint(settings),
+        }),
+        encoding="utf-8",
+    )
+    state_path.write_text(
+        json.dumps({
+            "status": "complete",
+            "result": {"created_at": created_at, "stability": "limited"},
         }),
         encoding="utf-8",
     )
@@ -513,6 +580,7 @@ def test_limited_calibration_result_is_visible_below_transport_profile(monkeypat
     gui.stream_calibration_result = SimpleNamespace(value="", color=None, visible=False)
     gui.stream_calibration_result_row = SimpleNamespace(visible=False)
     monkeypatch.setattr(gui_process, "STREAM_CALIBRATION_PROFILE_FILE", str(profile_path))
+    monkeypatch.setattr(gui_process, "STREAM_CALIBRATION_STATE_FILE", str(state_path))
 
     gui._refresh_stream_calibration_status()
 
@@ -520,6 +588,57 @@ def test_limited_calibration_result_is_visible_below_transport_profile(monkeypat
     assert gui.stream_calibration_result_row.visible is True
     assert "网络校准在 30 Mbps 未通过" in gui.stream_calibration_result.value
     assert "降低分辨率后重新校准" in gui.stream_calibration_result.value
+
+
+def test_limited_7mbps_profile_is_shown_as_sufficient_for_1080p(
+    monkeypatch, tmp_path
+):
+    profile_path = tmp_path / "profile.json"
+    settings = {
+        "Streamer Port": 1122,
+        "Monitor Identity": {"width": 1920, "height": 1080},
+    }
+    profile_path.write_text(
+        json.dumps({
+            "fps": 30,
+            "target_mbps": 5,
+            "peak_mbps": 6,
+            "network_max_mbps": 7,
+            "stability": "limited",
+            "input_resolution": [1920, 1080],
+            "minimum_bitrate_mbps": 5,
+            "metrics": {"failure_reasons": ["insufficient_probe_bitrate"]},
+            "fingerprint": gui_process.build_calibration_fingerprint(settings),
+        }),
+        encoding="utf-8",
+    )
+
+    class Harness(gui_process.GUIProcessMixin):
+        def _safe_update(self, *controls):
+            pass
+
+        def _persist_current_stream_calibration_profile(self):
+            pass
+
+    gui = Harness()
+    gui.locale = "EN"
+    gui._config = settings
+    gui.stream_calibration_mode_dd = SimpleNamespace(value="Auto Calibration")
+    gui.stream_calibration_status = SimpleNamespace(value="", color=None)
+    gui.stream_calibration_warning = SimpleNamespace(value="", visible=False)
+    gui.stream_calibration_warning_row = SimpleNamespace(visible=False)
+    gui.stream_calibration_result = SimpleNamespace(value="", color=None, visible=False)
+    gui.stream_calibration_result_row = SimpleNamespace(visible=False)
+    monkeypatch.setattr(gui_process, "STREAM_CALIBRATION_PROFILE_FILE", str(profile_path))
+
+    assert gui._stream_calibration_profile_status() == "current"
+    gui._refresh_stream_calibration_status()
+
+    assert gui.stream_calibration_status.value == "30 FPS · 5 Mbps"
+    assert gui.stream_calibration_warning.visible is False
+    assert gui.stream_calibration_result.visible is True
+    assert "Safe bitrate 5 Mbps meets this resolution" in gui.stream_calibration_result.value
+    assert "lower the resolution" not in gui.stream_calibration_result.value
 
 
 def test_stable_calibration_result_shows_network_limit_and_safe_rates(

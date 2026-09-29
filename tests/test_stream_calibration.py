@@ -12,6 +12,7 @@ from streaming.stream_calibration import (
     build_calibration_fingerprint,
     calibration_fingerprint_matches,
     minimum_bitrate_for_resolution,
+    limited_profile_meets_resolution_floor,
     recommended_crf_for_bitrate,
 )
 
@@ -312,7 +313,7 @@ def test_calibration_tier_starts_in_resolution_appropriate_range(
     [
         (640, 480, 2),
         (1280, 720, 3),
-        (1920, 1080, 6),
+        (1920, 1080, 5),
         (2560, 1440, 10),
         (3840, 2160, 20),
     ],
@@ -321,7 +322,7 @@ def test_stable_profile_floor_follows_resolution(width, height, expected):
     assert minimum_bitrate_for_resolution(width, height) == expected
 
 
-def test_stable_1080p_profile_allows_a_6_mbps_floor(tmp_path):
+def test_stable_1080p_profile_allows_a_5_mbps_floor(tmp_path):
     controller = StreamCalibrationController(
         bind_port=12000,
         stream_port=1122,
@@ -339,7 +340,24 @@ def test_stable_1080p_profile_allows_a_6_mbps_floor(tmp_path):
 
     profile = json.loads((tmp_path / "profile.json").read_text(encoding="utf-8"))
     assert profile["network_max_mbps"] == 7
-    assert profile["target_mbps"] == 6
+    assert profile["target_mbps"] == 5
+    assert profile["input_resolution"] == [1920, 1080]
+    assert profile["minimum_bitrate_mbps"] == 5
+
+
+def test_limited_7mbps_profile_meets_the_1080p_floor_only_for_probe_load_failure():
+    profile = {
+        "stability": "limited",
+        "target_mbps": 5,
+        "network_max_mbps": 7,
+        "metrics": {"failure_reasons": ["insufficient_probe_bitrate"]},
+    }
+
+    assert limited_profile_meets_resolution_floor(profile, 5)
+    assert not limited_profile_meets_resolution_floor(dict(profile, target_mbps=4), 5)
+    assert not limited_profile_meets_resolution_floor(
+        dict(profile, metrics={"failure_reasons": ["packet_loss"]}), 5
+    )
 
 
 def test_calibration_window_rejects_a_probe_that_did_not_reach_target_rate():

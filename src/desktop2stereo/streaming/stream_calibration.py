@@ -109,10 +109,29 @@ def minimum_bitrate_for_resolution(input_width: int, input_height: int) -> int:
     if pixels <= 921_600:  # 720p
         return 3
     if pixels <= 2_073_600:  # 1080p
-        return 6
+        return 5
     if pixels <= 3_686_400:  # 1440p / 2K
         return 10
     return 20  # 4K and above
+
+
+def limited_profile_meets_resolution_floor(
+    profile: dict[str, Any], minimum_mbps: int
+) -> bool:
+    """Accept a safe limited profile only when the ceiling meets its floor."""
+    metrics = profile.get("metrics") or {}
+    reasons = set(metrics.get("failure_reasons") or ())
+    if profile.get("stability") != "limited" or reasons != {
+        "insufficient_probe_bitrate"
+    }:
+        return False
+    try:
+        minimum = max(1, int(minimum_mbps))
+        target = int(profile.get("target_mbps", 0) or 0)
+        network_max = int(profile.get("network_max_mbps", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return target >= minimum and network_max >= minimum
 
 
 def automatic_peak_bitrate_mbps(
@@ -788,6 +807,10 @@ class StreamCalibrationController:
             "version": 4,
             "created_at": time.time(),
             "stream_key": self.stream_key,
+            "input_resolution": list(self._input_resolution),
+            "minimum_bitrate_mbps": minimum_bitrate_for_resolution(
+                *self._input_resolution
+            ),
             "fps": selected.fps,
             "target_mbps": safe_target_mbps,
             "peak_mbps": safe_peak_mbps,
