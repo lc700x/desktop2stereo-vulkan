@@ -3206,6 +3206,12 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
 
     def _ffmpeg_command(self, width: int, height: int) -> list[str]:
         """Keep the validated host-upload command for explicit fallback/diagnostics."""
+        # Automatic WebRTC calibration publishes an independent lavfi test
+        # stream.  It must use the shared FFmpeg command unchanged: applying
+        # the Vulkan filter/device rewrite to that probe can make FFmpeg exit
+        # before publishing RTSP, which leaves MediaMTX with no WHEP stream.
+        if getattr(self, "_calibration_controller", None) is not None:
+            return FfmpegDirectSbsOutput._ffmpeg_command(self, width, height)
         command = super()._ffmpeg_command(width, height)
         encoder = getattr(self, "video_encoder", "h264_vulkan")
         command[1:1] = [

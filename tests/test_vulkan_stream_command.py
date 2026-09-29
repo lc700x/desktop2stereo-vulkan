@@ -26,6 +26,22 @@ def test_vulkan_filter_options_are_before_output_url(monkeypatch, tmp_path: Path
     assert command[command.index("-vf") + 1] == "format=nv12,hwupload"
 
 
+def test_vulkan_calibration_uses_shared_ffmpeg_command(monkeypatch) -> None:
+    output = object.__new__(VulkanDirectSbsOutput)
+    output._calibration_controller = object()
+    base = ["ffmpeg", "-f", "lavfi", "-i", "testsrc2", "rtsp://127.0.0.1/live"]
+    monkeypatch.setattr(
+        "streaming.direct_sbs.FfmpegDirectSbsOutput._ffmpeg_command",
+        lambda _self, _width, _height: list(base),
+    )
+
+    command = VulkanDirectSbsOutput._ffmpeg_command(output, 3840, 2160)
+
+    assert command == base
+    assert "-init_hw_device" not in command
+    assert "-vf" not in command
+
+
 def test_native_vulkan_publish_url_uses_local_rtsp_packet_size() -> None:
     output = object.__new__(VulkanDirectSbsOutput)
     output.protocol = "WEBRTC"
