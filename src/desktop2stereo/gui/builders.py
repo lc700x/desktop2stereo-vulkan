@@ -1065,6 +1065,7 @@ class GUIBuilderMixin:
             options=["Auto Calibration", "Manual"],
             value="Auto Calibration",
             width=S(130),
+            on_select=self._on_stream_calibration_mode_change,
         )
         self.stream_calibration_btn = ft.Button(
             content=ft.Text("Calibrate", size=FONT_SIZE),
@@ -1108,6 +1109,29 @@ class GUIBuilderMixin:
             ],
             spacing=1,
         )
+        self.stream_target_bitrate_label = ft.Text(
+            "Target Bitrate (Mbps):", size=FONT_SIZE, width=S(150)
+        )
+        self.stream_target_bitrate_tf = CompactTextField(
+            value="30", width=S(80), filter=r"[0-9]", max_length=3
+        )
+        self.stream_peak_bitrate_label = ft.Text(
+            "Peak Bitrate (Mbps):", size=FONT_SIZE, width=S(125)
+        )
+        self.stream_peak_bitrate_tf = CompactTextField(
+            value="35", width=S(80), filter=r"[0-9]", max_length=3
+        )
+        self.stream_bitrate_row = ft.Row(
+            [
+                self.stream_target_bitrate_label,
+                self.stream_target_bitrate_tf,
+                ft.Container(width=S(10)),
+                self.stream_peak_bitrate_label,
+                self.stream_peak_bitrate_tf,
+            ],
+            spacing=1,
+            visible=False,
+        )
         self.crf_label = ft.Text("CRF:", size=FONT_SIZE, width=S(150))
         self.crf_tf = CompactTextField(value=str(DEFAULTS["CRF"]), width=S(130), filter=r"[0-9]", max_length=2)
         self.audio_delay_label = ft.Text("Audio Delay (s):", size=FONT_SIZE, width=S(130))
@@ -1133,6 +1157,7 @@ class GUIBuilderMixin:
             self.stream_calibration_warning_row,
             self.stream_calibration_result_row,
             self.stream_calibration_recalibrate_hint_row,
+            self.stream_bitrate_row,
         ]
         self.stream_container = ft.Container(
             ft.Column([], spacing=S(6)), visible=False,
@@ -1156,7 +1181,7 @@ class GUIBuilderMixin:
         return {
             "Local Viewer": [], "3D Monitor": [], "OpenXR Link": [],
             "MJPEG Streamer": [0, 5],
-            "RTMP Streamer": [0, 1, 2, 3, 5, 6, 7, 8],
+            "RTMP Streamer": [0, 1, 2, 3, 5, 6, 7, 8, 10],
         }
 
     # ── data population ──

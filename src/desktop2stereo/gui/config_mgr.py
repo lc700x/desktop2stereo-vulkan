@@ -277,6 +277,15 @@ class GUIConfigMixin:
             if bool(cfg.get("Use Stream Calibration", True))
             else UI_MESSAGES[self.locale].get("Manual", "Manual")
         )
+        target_bitrate = self._parse_int(cfg.get("Stream Target Bitrate Mbps", 30), 30)
+        peak_bitrate = self._parse_int(cfg.get("Stream Peak Bitrate Mbps", 35), 35)
+        manual_bitrate_mode = not bool(cfg.get("Use Stream Calibration", True))
+        if manual_bitrate_mode and not 5 <= target_bitrate <= 35:
+            target_bitrate = 30
+        if manual_bitrate_mode and not target_bitrate <= peak_bitrate <= 35:
+            peak_bitrate = 35
+        self.stream_target_bitrate_tf.value = str(target_bitrate)
+        self.stream_peak_bitrate_tf.value = str(max(target_bitrate, peak_bitrate))
         self.stream_key_tf.value = cfg.get("Stream Key", DEFAULTS["Stream Key"])
         # Audio output is selected at runtime from the current system default;
         # never restore a previously saved device choice.
@@ -433,10 +442,12 @@ class GUIConfigMixin:
             "Stream Quality": self._parse_int(self.stream_quality_dd.value, DEFAULTS["Stream Quality"]),
             "Use Stream Calibration": self._stream_calibration_auto_enabled(),
             "Stream Target Bitrate Mbps": self._parse_int(
-                self._config.get("Stream Target Bitrate Mbps", 0), 0
+                self.stream_target_bitrate_tf.value,
+                self._parse_int(self._config.get("Stream Target Bitrate Mbps", 30), 30),
             ),
             "Stream Peak Bitrate Mbps": self._parse_int(
-                self._config.get("Stream Peak Bitrate Mbps", 0), 0
+                self.stream_peak_bitrate_tf.value,
+                self._parse_int(self._config.get("Stream Peak Bitrate Mbps", 35), 35),
             ),
             "Stream Calibration Port": self._parse_int(
                 min(65535, self._parse_int(self.stream_port_tf.value, DEFAULT_PORT) + 1),

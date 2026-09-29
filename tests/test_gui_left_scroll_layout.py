@@ -243,9 +243,33 @@ def test_advanced_streaming_exposes_shared_calibration_rows() -> None:
     end = source.index("\n    # ── data population ──", start)
     row_map = source[start:end]
 
-    assert '"RTMP Streamer": [0, 1, 2, 3, 5, 6, 7, 8]' in row_map
+    assert '"RTMP Streamer": [0, 1, 2, 3, 5, 6, 7, 8, 10]' in row_map
     assert '"MJPEG Streamer": [0, 5]' in row_map
     assert '"GPU Streamer"' not in row_map
+
+
+def test_manual_stream_bitrate_controls_are_bilingual_and_runtime_bound() -> None:
+    builders = BUILDERS_SOURCE.read_text(encoding="utf-8")
+    handlers = HANDLERS_SOURCE.read_text(encoding="utf-8")
+    process = (APP_ROOT / "gui" / "process.py").read_text(encoding="utf-8")
+    runtime = (APP_ROOT / "app_runtime" / "runtime_entry.py").read_text(encoding="utf-8")
+    localization = (APP_ROOT / "gui" / "localization.py").read_text(encoding="utf-8")
+
+    assert "self.stream_target_bitrate_tf = CompactTextField" in builders
+    assert "self.stream_peak_bitrate_tf = CompactTextField" in builders
+    assert "on_select=self._on_stream_calibration_mode_change" in builders
+    assert '"Stream Target Bitrate:":' in localization
+    assert '"Stream Peak Bitrate:":' in localization
+    assert '"tooltip_stream_target_bitrate":' in localization
+    assert '"tooltip_stream_peak_bitrate":' in localization
+    assert '(self.stream_target_bitrate_tf, "tooltip_stream_target_bitrate")' in handlers
+    assert '(self.stream_peak_bitrate_tf, "tooltip_stream_peak_bitrate")' in handlers
+    config_mgr = (APP_ROOT / "gui" / "config_mgr.py").read_text(encoding="utf-8")
+    assert '"Stream Target Bitrate Mbps": self._parse_int(' in config_mgr
+    assert "self.stream_target_bitrate_tf.value" in config_mgr
+    assert 'target_bitrate_mbps=stream_config.target_bitrate_mbps' in runtime
+    assert 'peak_bitrate_mbps=stream_config.peak_bitrate_mbps' in runtime
+    assert "5 <= target_bitrate <= 35" in process
 
 
 def test_compact_display_field_adapts_between_minimum_and_maximum_widths() -> None:
@@ -339,6 +363,8 @@ def test_every_stream_parameter_control_has_an_explanatory_tooltip() -> None:
         "video_backend_dd": "tooltip_video_backend",
         "stream_calibration_mode_dd": "tooltip_stream_calibration_mode",
         "stream_calibration_btn": "tooltip_stream_calibration_start",
+        "stream_target_bitrate_tf": "tooltip_stream_target_bitrate",
+        "stream_peak_bitrate_tf": "tooltip_stream_peak_bitrate",
     }
 
     for control, tooltip_key in tooltip_bindings.items():

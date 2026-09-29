@@ -677,6 +677,7 @@ class GUIHandlerMixin:
         row_map = self._get_streamer_row_map()
         row_indices = row_map.get(mode, []) if is_streamer and self.stream_settings_cb.value else []
         self._show_streamer_rows(*row_indices)
+        self._sync_manual_bitrate_visibility()
         self.update_stereo_monitor_menu()
         self._fit_window_to_content()
         if mode == "Local Viewer":
@@ -694,6 +695,22 @@ class GUIHandlerMixin:
         self.update_stream_url()
         self._fit_window_to_content()
         self.page.update()
+
+    def _sync_manual_bitrate_visibility(self):
+        """Keep manual bitrate controls limited to advanced streaming mode."""
+        row = getattr(self, "stream_bitrate_row", None)
+        button = getattr(self, "stream_calibration_btn", None)
+        if row is None:
+            return
+        manual = (
+            self.run_mode_key == "RTMP Streamer"
+            and bool(getattr(self, "stream_settings_cb", None).value)
+            and not self._stream_calibration_auto_enabled()
+        )
+        row.visible = manual
+        if button is not None:
+            button.visible = not manual
+        self._safe_update(row, button)
 
     def _auto_select_stereo_monitor(self):
         mon_count = self._get_monitor_count()
@@ -941,6 +958,12 @@ class GUIHandlerMixin:
         self.stream_calibration_btn.content.value = t.get(
             "Calibrate", "Calibrate"
         )
+        self.stream_target_bitrate_label.value = t.get(
+            "Stream Target Bitrate:", "Target Bitrate (Mbps):"
+        )
+        self.stream_peak_bitrate_label.value = t.get(
+            "Stream Peak Bitrate:", "Peak Bitrate (Mbps):"
+        )
         self.audio_label.value = t["Stereo Mix"]
         self.crf_label.value = t["CRF"]
         self.audio_delay_label.value = t["Audio Delay"]
@@ -1027,9 +1050,12 @@ class GUIHandlerMixin:
             (self.video_backend_dd, "tooltip_video_backend"),
             (self.stream_calibration_mode_dd, "tooltip_stream_calibration_mode"),
             (self.stream_calibration_btn, "tooltip_stream_calibration_start"),
+            (self.stream_target_bitrate_tf, "tooltip_stream_target_bitrate"),
+            (self.stream_peak_bitrate_tf, "tooltip_stream_peak_bitrate"),
         ]:
             _set_tooltip(ctrl, t.get(key, UI_MESSAGES["EN"].get(key, key)))
         self._refresh_stream_calibration_status()
+        self._sync_manual_bitrate_visibility()
         self._auto_align_labels(force=True)
 
     def _safe_update(self, *controls):
@@ -1095,6 +1121,30 @@ class GUIHandlerMixin:
         self._config["Stream Protocol"] = self.stream_protocol_key
         self.update_stream_url()
         self._fit_window_to_content()
+
+    def _on_stream_calibration_mode_change(self, e):
+        """Apply the profile mode immediately and expose manual rate controls."""
+        if e is not None and getattr(e, "control", None) is not None:
+            self.stream_calibration_mode_dd.value = e.control.value
+        if not self._stream_calibration_auto_enabled():
+            try:
+                target = int(self.stream_target_bitrate_tf.value or 0)
+            except (TypeError, ValueError):
+                target = 0
+            try:
+                peak = int(self.stream_peak_bitrate_tf.value or 0)
+            except (TypeError, ValueError):
+                peak = 0
+            if not 5 <= target <= 35:
+                target = 30
+                self.stream_target_bitrate_tf.value = str(target)
+            if not target <= peak <= 35:
+                self.stream_peak_bitrate_tf.value = str(35)
+        self._config["Use Stream Calibration"] = self._stream_calibration_auto_enabled()
+        self._sync_manual_bitrate_visibility()
+        self._collect_config()
+        self._fit_window_to_content(update=True, resize_window=True)
+        self.page.update()
 
     def on_audio_device_change(self, e):
         # Persist an explicit Stereo Mix selection on macOS only (v2.5.0

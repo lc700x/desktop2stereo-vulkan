@@ -1065,16 +1065,12 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     display_mode=stream_config.display_mode,
                     fit_mode=stream_fit_mode,
                     input_size=stream_input_size,
-                    target_bitrate_mbps=(
-                        stream_config.target_bitrate_mbps
-                        if bool(settings.get("Use Stream Calibration", True))
-                        else 0
-                    ),
-                    peak_bitrate_mbps=(
-                        stream_config.peak_bitrate_mbps
-                        if bool(settings.get("Use Stream Calibration", True))
-                        else 0
-                    ),
+                    # Auto calibration and manual mode share the same encoder
+                    # path.  The calibration controller temporarily replaces
+                    # these values during its probe; manual mode must retain
+                    # the values selected in the GUI instead of clearing them.
+                    target_bitrate_mbps=stream_config.target_bitrate_mbps,
+                    peak_bitrate_mbps=stream_config.peak_bitrate_mbps,
                     auto_calibration=(
                         supports_network_calibration(
                             configured_run_mode,

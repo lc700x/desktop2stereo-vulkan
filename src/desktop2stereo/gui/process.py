@@ -697,7 +697,16 @@ class GUIProcessMixin:
 
     def _stream_calibration_auto_enabled(self) -> bool:
         value = str(getattr(self.stream_calibration_mode_dd, "value", "") or "")
-        return value.casefold().startswith("auto") or value.startswith("自动")
+        auto_label = str(
+            UI_MESSAGES.get(getattr(self, "locale", "EN"), UI_MESSAGES["EN"]).get(
+                "Auto Calibration", "Auto Calibration"
+            )
+        )
+        return (
+            value.casefold().startswith("auto")
+            or value == auto_label
+            or value.startswith("自动")
+        )
 
     def _stream_calibration_profile_status(self) -> str:
         """Return current, missing, or stale for the saved calibration profile."""
@@ -769,6 +778,12 @@ class GUIProcessMixin:
         crf_control = getattr(self, "crf_tf", None)
         if crf_control is not None:
             crf_control.value = str(crf)
+        target_bitrate_control = getattr(self, "stream_target_bitrate_tf", None)
+        if target_bitrate_control is not None:
+            target_bitrate_control.value = str(target)
+        peak_bitrate_control = getattr(self, "stream_peak_bitrate_tf", None)
+        if peak_bitrate_control is not None:
+            peak_bitrate_control.value = str(peak)
         ok, error = save_yaml(os.path.join(BASE_DIR, "settings.yaml"), self._config)
         if not ok:
             logger.warning("[StreamCalibration] Failed to restore saved profile: %s", error)
@@ -1249,6 +1264,12 @@ class GUIProcessMixin:
         crf_control = getattr(self, "crf_tf", None)
         if crf_control is not None:
             crf_control.value = str(crf)
+        target_bitrate_control = getattr(self, "stream_target_bitrate_tf", None)
+        if target_bitrate_control is not None:
+            target_bitrate_control.value = str(target)
+        peak_bitrate_control = getattr(self, "stream_peak_bitrate_tf", None)
+        if peak_bitrate_control is not None:
+            peak_bitrate_control.value = str(peak)
         self._collect_config()
         ok, error = save_yaml(os.path.join(BASE_DIR, "settings.yaml"), self._config)
         if not ok:
@@ -1331,6 +1352,17 @@ class GUIProcessMixin:
                 return False, UI_MESSAGES[self.locale]["err_crf"]
         except ValueError:
             return False, UI_MESSAGES[self.locale]["err_crf"]
+        if self.run_mode_key == "RTMP Streamer" and not self._stream_calibration_auto_enabled():
+            try:
+                target_bitrate = int(self.stream_target_bitrate_tf.value or 0)
+                peak_bitrate = int(self.stream_peak_bitrate_tf.value or 0)
+            except (TypeError, ValueError):
+                return False, UI_MESSAGES[self.locale]["err_stream_bitrate"]
+            if not (
+                5 <= target_bitrate <= 35
+                and target_bitrate <= peak_bitrate <= 35
+            ):
+                return False, UI_MESSAGES[self.locale]["err_stream_bitrate"]
         try:
             delay_val = float(self.audio_delay_tf.value) if self.audio_delay_tf.value else DEFAULTS["Audio Delay"]
             if not (-10 <= delay_val <= 10):
