@@ -102,8 +102,9 @@ def test_default_probe_window_allows_headset_to_stabilize(tmp_path):
         profile_path=tmp_path / "profile.json",
     )
 
-    assert controller.stage_seconds == 8.0
-    assert controller.stability_seconds == 15.0
+    assert controller.stage_seconds == 5.0
+    assert controller.stability_seconds == 8.0
+    assert controller.state()["overall_progress"] == 0.0
 
 
 def test_probe_timer_starts_on_first_decoded_frame_after_bitrate_switch(tmp_path):
@@ -115,7 +116,7 @@ def test_probe_timer_starts_on_first_decoded_frame_after_bitrate_switch(tmp_path
         maximum_fps=30,
         state_path=tmp_path / "state.json",
         profile_path=tmp_path / "profile.json",
-        stage_seconds=8.0,
+        stage_seconds=5.0,
         settle_seconds=2.0,
         clock=lambda: now[0],
     )
@@ -131,10 +132,10 @@ def test_probe_timer_starts_on_first_decoded_frame_after_bitrate_switch(tmp_path
     assert controller.state()["status"] == "testing"
     assert controller.state()["stage_progress"] == 0.0
 
-    now[0] = 116.9
+    now[0] = 113.9
     controller.add_receiver_report(_receiver_report(30.0))
     assert controller.state()["status"] == "testing"
-    now[0] = 117.0
+    now[0] = 114.0
     controller.add_receiver_report(_receiver_report(30.0))
     assert controller.state()["status"] != "testing"
 
@@ -181,6 +182,8 @@ def test_controller_advances_then_rolls_back_to_highest_stable_tier(tmp_path):
     controller.add_receiver_report(_receiver_report(29.5, bitrate_mbps=100.0))
 
     assert controller.take_pending_tier().target_mbps == 60
+    first_progress = controller.state()["overall_progress"]
+    assert first_progress > 0.0
     controller.observe_sender({"submitted_fps": 29.8})
     for _ in range(5):
         controller.add_receiver_report(_receiver_report(29.5, bitrate_mbps=100.0))
@@ -188,6 +191,7 @@ def test_controller_advances_then_rolls_back_to_highest_stable_tier(tmp_path):
     controller.add_receiver_report(_receiver_report(29.5, bitrate_mbps=100.0))
 
     assert controller.take_pending_tier().target_mbps == 80
+    assert controller.state()["overall_progress"] > first_progress
     controller.observe_sender({"submitted_fps": 29.8})
     for _ in range(5):
         controller.add_receiver_report(
@@ -198,7 +202,7 @@ def test_controller_advances_then_rolls_back_to_highest_stable_tier(tmp_path):
         _receiver_report(29.5, bitrate_mbps=100.0, packets_lost=1)
     )
 
-    for expected_target in (70, 75, 77, 78, 79):
+    for expected_target in (70, 75, 77):
         assert controller.take_pending_tier().target_mbps == expected_target
         controller.observe_sender({"submitted_fps": 29.8})
         for _ in range(5):
@@ -208,8 +212,9 @@ def test_controller_advances_then_rolls_back_to_highest_stable_tier(tmp_path):
         now[0] += 2.1
         controller.add_receiver_report(_receiver_report(29.5, bitrate_mbps=100.0))
 
-    # The search bracketed the unstable ceiling at 80 Mbps and converged on
-    # 79 Mbps; confirm that candidate using the longer stability window.
+    # The search bracketed the unstable ceiling at 80 Mbps and converged within
+    # the 4 Mbps search resolution; confirm that candidate using the longer
+    # stability window.
     assert controller.take_pending_tier() is None
     controller.observe_sender({"submitted_fps": 29.8})
     for _ in range(5):
@@ -220,9 +225,9 @@ def test_controller_advances_then_rolls_back_to_highest_stable_tier(tmp_path):
     assert controller.take_pending_tier() is None
     profile = json.loads((tmp_path / "profile.json").read_text(encoding="utf-8"))
     assert profile["fps"] == 30
-    assert profile["network_max_mbps"] == 79
-    assert profile["target_mbps"] == 63
-    assert profile["peak_mbps"] == 71
+    assert profile["network_max_mbps"] == 77
+    assert profile["target_mbps"] == 61
+    assert profile["peak_mbps"] == 69
     assert profile["measured_bitrate_mbps"] == 100.0
     assert controller.state()["status"] == "complete"
 
@@ -248,7 +253,7 @@ def test_controller_stops_at_first_unstable_bitrate_probe(tmp_path):
     now[0] = 2.1
     controller.add_receiver_report(_receiver_report(20.0, dropped_frames=2, packets_lost=1))
 
-    for expected_target in (18, 24, 27, 28, 29):
+    for expected_target in (18, 24, 27):
         assert controller.take_pending_tier().target_mbps == expected_target
         controller.observe_sender({"submitted_fps": 29.8})
         for _ in range(5):
@@ -264,9 +269,9 @@ def test_controller_stops_at_first_unstable_bitrate_probe(tmp_path):
     controller.add_receiver_report(_receiver_report(29.5))
     assert controller.state()["status"] == "complete"
     profile = json.loads((tmp_path / "profile.json").read_text(encoding="utf-8"))
-    assert profile["network_max_mbps"] == original.target_mbps - 1
-    assert profile["target_mbps"] == 23
-    assert profile["peak_mbps"] == 26
+    assert profile["network_max_mbps"] == 27
+    assert profile["target_mbps"] == 21
+    assert profile["peak_mbps"] == 24
 
 
 def test_calibration_tier_uses_selected_input_resolution():

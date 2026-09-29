@@ -1154,10 +1154,7 @@ class GUIProcessMixin:
                     continue
                 status = str(state.get("status", "waiting_receiver"))
                 tier = state.get("tier") or {}
-                progress = float(state.get("stage_progress", 0.0) or 0.0)
-                overall = (
-                    float(state.get("tier_index", 0)) + progress
-                ) / max(1.0, float(state.get("tier_count", 1)))
+                overall = float(state.get("overall_progress", 0.0) or 0.0)
                 if getattr(self, "_calibration_dialog_progress", None) is not None:
                     self._calibration_dialog_progress.value = min(1.0, overall)
                     stage_key = {

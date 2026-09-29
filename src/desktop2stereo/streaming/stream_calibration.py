@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 _MIN_PROBE_LOAD_RATIO = 0.85
 _SAFE_TARGET_RATIO = 0.80
 _SAFE_PEAK_RATIO = 0.90
+_BITRATE_SEARCH_RESOLUTION_MBPS = 4
 
 
 @dataclass(frozen=True)
@@ -217,8 +218,8 @@ class StreamCalibrationController:
         state_path: str | Path,
         profile_path: str | Path,
         hevc: bool = False,
-        stage_seconds: float = 8.0,
-        stability_seconds: float = 15.0,
+        stage_seconds: float = 5.0,
+        stability_seconds: float = 8.0,
         settle_seconds: float = 2.0,
         fingerprint: dict[str, str] | None = None,
         clock=time.monotonic,
@@ -241,6 +242,8 @@ class StreamCalibrationController:
         self._tier_index = 0
         self._pending_tier: CalibrationTier | None = self._tiers[0]
         self._active_tier = self._tiers[0]
+        self._completed_stage_count = 0
+        self._progress_total = self._estimate_stage_count()
         self._best_tier: CalibrationTier | None = None
         self._stable_tiers: dict[int, CalibrationTier] = {}
         self._search_upper_mbps: int | None = None
@@ -259,6 +262,31 @@ class StreamCalibrationController:
         self._server_thread: threading.Thread | None = None
         self._status = "waiting_receiver"
         self._write_state()
+
+    @staticmethod
+    def _binary_search_steps(span: int) -> int:
+        span = max(0, int(span))
+        return max(0, (span - 1).bit_length()) if span else 0
+
+    def _estimate_stage_count(self) -> int:
+        """Estimate the largest number of probe windows for the progress bar."""
+        initial = int(self._tiers[0].target_mbps)
+        lower_bound = 7
+        limit = int(self._bitrate_limit)
+        estimate = 1 + self._binary_search_steps(initial - lower_bound) + 1
+        previous = initial
+        bracket_count = 1
+        while previous < limit:
+            candidate = min(previous * 2, limit)
+            bracket_count += 1
+            estimate = max(
+                estimate,
+                bracket_count
+                + self._binary_search_steps(candidate - previous)
+                + 1,
+            )
+            previous = candidate
+        return max(1, estimate)
 
     @property
     def calibration_url(self) -> str:
@@ -434,6 +462,8 @@ class StreamCalibrationController:
             )
             self._tier_index = 0
             self._active_tier = self._tiers[0]
+            self._completed_stage_count = 0
+            self._progress_total = self._estimate_stage_count()
             self._pending_tier = self._active_tier
             self._best_tier = None
             self._stable_tiers.clear()
@@ -512,6 +542,7 @@ class StreamCalibrationController:
             },
         )
         self._last_metrics = dict(metrics)
+        self._completed_stage_count += 1
         if not passed:
             print(
                 f"[StreamCalibration] Probe failed target={self._active_tier.target_mbps}M "
@@ -537,8 +568,9 @@ class StreamCalibrationController:
                     return
                 upper = int(self._search_upper_mbps or self._bitrate_limit + 1)
                 lower = self._active_tier.target_mbps
-                if upper - lower <= 1:
-                    # Binary search converged to 1 Mbps. Keep the highest
+                if upper - lower <= _BITRATE_SEARCH_RESOLUTION_MBPS:
+                    # Binary search converged to the configured resolution.
+                    # Keep the highest
                     # stable candidate running for the longer confirmation.
                     self._confirming_stability = True
                     self._reset_stage_locked("confirming")
@@ -609,7 +641,7 @@ class StreamCalibrationController:
                 else 7
             )
             upper = self._search_upper_mbps
-            if upper - lower <= 1:
+            if upper - lower <= _BITRATE_SEARCH_RESOLUTION_MBPS:
                 if self._best_tier is None:
                     self._complete_locked(self._active_tier, metrics, "limited")
                     return
@@ -735,7 +767,9 @@ class StreamCalibrationController:
             if self._confirming_stability
             else self.stage_seconds
         )
-        if self._stage_started is None:
+        if self._status == "complete":
+            progress = 1.0
+        elif self._stage_started is None:
             progress = 0.0
         elif self._measurement_started is None:
             progress = min(
@@ -749,12 +783,26 @@ class StreamCalibrationController:
                 (self._clock() - self._measurement_started)
                 / max(0.001, stage_seconds),
             )
+        overall_progress = (
+            1.0
+            if self._status == "complete"
+            else min(
+                1.0,
+                (
+                    self._completed_stage_count + progress
+                )
+                / max(1, self._progress_total),
+            )
+        )
         payload = {
             "status": self._status,
             "tier_index": self._tier_index,
             "tier_count": len(self._tiers),
             "tier": asdict(self._active_tier),
             "stage_progress": progress,
+            "overall_progress": overall_progress,
+            "completed_stages": self._completed_stage_count,
+            "estimated_stages": self._progress_total,
             "receiver_connected": bool(self._latest_receiver_report),
             "receiver_samples": len(self._receiver_reports),
             "receiver_latest": dict(self._latest_receiver_report),
