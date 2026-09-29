@@ -113,7 +113,7 @@ def calibration_tiers(
     fps = 30
     bits_per_pixel = 0.075 if hevc else 0.12
     target = max(
-        8,
+        2,
         round(
             max(1, int(input_width))
             * max(1, int(input_height))
@@ -271,7 +271,7 @@ class StreamCalibrationController:
     def _estimate_stage_count(self) -> int:
         """Estimate the largest number of probe windows for the progress bar."""
         initial = int(self._tiers[0].target_mbps)
-        lower_bound = 7
+        lower_bound = max(1, min(7, initial // 2))
         limit = int(self._bitrate_limit)
         estimate = 1 + self._binary_search_steps(initial - lower_bound) + 1
         previous = initial
@@ -638,7 +638,7 @@ class StreamCalibrationController:
             lower = (
                 self._best_tier.target_mbps
                 if self._best_tier is not None
-                else 7
+                else max(1, min(7, self._active_tier.target_mbps // 2))
             )
             upper = self._search_upper_mbps
             if upper - lower <= _BITRATE_SEARCH_RESOLUTION_MBPS:

@@ -285,6 +285,27 @@ def test_calibration_tier_uses_selected_input_resolution():
     assert tier.target_mbps == 13
 
 
+@pytest.mark.parametrize(
+    ("width", "height", "minimum", "maximum"),
+    [
+        (640, 480, 2, 3),
+        (1280, 720, 3, 5),
+        (1920, 1080, 5, 8),
+        (3840, 2160, 20, 35),
+    ],
+)
+def test_calibration_tier_starts_in_resolution_appropriate_range(
+    width, height, minimum, maximum
+):
+    tier = calibration_tiers(
+        60,
+        input_width=width,
+        input_height=height,
+    )[0]
+
+    assert minimum <= tier.target_mbps <= maximum
+
+
 def test_calibration_window_rejects_a_probe_that_did_not_reach_target_rate():
     tier = CalibrationTier(fps=30, target_mbps=30, peak_mbps=34)
     reports = [_receiver_report(29.5, bitrate_mbps=8.0) for _ in range(8)]
