@@ -4378,6 +4378,127 @@ def test_presenter_skips_end_frame_after_vulkan_device_loss() -> None:
     assert calls == ["begin"]
 
 
+def test_presenter_keeps_latest_output_during_non_renderable_xr_tick() -> None:
+    frame = object()
+    ended_frames = []
+    dropped_frames = []
+
+    class FakeXr:
+        FrameEndInfo = staticmethod(lambda **kwargs: kwargs)
+
+        def wait_frame(self, _session):
+            return SimpleNamespace(should_render=False, predicted_display_time=123)
+
+        def begin_frame(self, _session):
+            pass
+
+        def end_frame(self, _session, info):
+            ended_frames.append(info)
+
+    presenter = OpenXrVulkanPresenter()
+    presenter._initialized = True
+    presenter.session_running = True
+    presenter.session = object()
+    presenter.vulkan = SimpleNamespace(device_lost=False)
+    presenter.xr = FakeXr()
+    presenter._accept_output = True
+    presenter._pending_output = frame
+    presenter._drop_output_frames = lambda: dropped_frames.append(True)
+    presenter._drain_presenter_commands = lambda: None
+    presenter.poll_events = lambda: None
+    presenter._apply_pending_openxr_render_scale = lambda: None
+    presenter._pump_desktop_settings_actions = lambda: None
+    presenter._publish_desktop_settings_snapshot = lambda: None
+    presenter._sync_controller_inputs = lambda *_args: None
+    presenter._update_aim_poses = lambda *_args: None
+    presenter._update_grip_poses = lambda *_args: None
+    presenter._smooth_controller_poses = lambda: None
+    presenter._controller_input = lambda *_args: {}
+    presenter._handle_settings_menu_input = lambda: False
+    presenter._handle_keyboard_input = lambda: None
+    presenter._handle_vulkan_pointer_input = lambda: None
+    presenter._handle_controller_shortcuts = lambda: None
+    presenter._handle_controller_guide_input = lambda *_args: None
+    presenter._persist_screen_state_if_changed = lambda: None
+    presenter._record_xr_presented_frame = lambda: None
+
+    assert presenter.run_frame() is True
+
+    assert presenter._accept_output is True
+    assert presenter._pending_output is frame
+    assert dropped_frames == []
+    assert presenter.frame_count == 1
+    assert ended_frames == [
+        {
+            "display_time": 123,
+            "environment_blend_mode": presenter._environment_blend_mode,
+            "layer_count": 0,
+            "layers": None,
+        }
+    ]
+
+
+def test_projection_submit_stereo_records_both_eyes_in_one_graphics_submission() -> None:
+    calls = []
+
+    class FakeContext:
+        def submit_on(self, queue, record, **kwargs):
+            calls.append(("submit", queue, kwargs["wait_semaphore"]))
+            record("command-buffer")
+            kwargs["on_submit_profile"]({"submit_ms": 0.1})
+            return 17
+
+    screen_pass = object.__new__(VulkanProjectionScreenPass)
+    screen_pass.context = FakeContext()
+    screen_pass._prepare_draw = lambda source, target, **kwargs: {
+        "source": source,
+        "target": target,
+        "eye_index": kwargs["eye_index"],
+    }
+    screen_pass._record_draw = lambda command_buffer, draw: calls.append(
+        ("record", command_buffer, draw["eye_index"], draw["source"])
+    )
+    screen_pass._complete_draw = lambda draw, timeline: calls.append(
+        ("complete", draw["eye_index"], timeline)
+    )
+
+    timeline = screen_pass.submit_stereo(
+        [
+            {
+                "source": "left-frame",
+                "target": "left-target",
+                "array_layer": 0,
+                "eye_index": 0,
+                "frame_slot": 0,
+                "push_constants": b"left",
+                "clear_color": (0.0, 0.0, 0.0, 1.0),
+                "wait_semaphore": "left-ready",
+            },
+            {
+                "source": "right-frame",
+                "target": "right-target",
+                "array_layer": 0,
+                "eye_index": 1,
+                "frame_slot": 0,
+                "push_constants": b"right",
+                "clear_color": (0.0, 0.0, 0.0, 1.0),
+                "wait_semaphore": "right-ready",
+            },
+        ],
+        wait_for_timeline=9,
+    )
+
+    assert timeline == 17
+    assert calls == [
+        ("submit", "graphics", ["left-ready", "right-ready"]),
+        ("record", "command-buffer", 0, "left-frame"),
+        ("record", "command-buffer", 1, "right-frame"),
+        ("complete", 0, 17),
+        ("complete", 1, 17),
+    ]
+    assert screen_pass._last_submit_timeline == 17
+
+
 def test_presenter_recovers_from_invalid_openxr_composition_rect(capsys) -> None:
     calls = []
 

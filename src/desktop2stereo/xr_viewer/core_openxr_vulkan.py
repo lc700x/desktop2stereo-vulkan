@@ -1873,8 +1873,9 @@ class OpenXrVulkanPresenter(
             )
         if frame_state.should_render:
             self._notify_headset_active()
-        else:
-            self._notify_headset_waiting()
+        # shouldRender is a per-frame runtime hint, not a headset disconnect.
+        # Preserve the latest stereo output for the next renderable XR tick;
+        # session/form-factor loss is handled by the explicit waiting paths.
         controls_started = time.perf_counter()
         try:
             if self._on_breakdown_inc is not None:
