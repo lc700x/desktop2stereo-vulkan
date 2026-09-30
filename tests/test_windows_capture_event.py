@@ -39,23 +39,6 @@ class CloneBuffer:
         return "cloned-buffer"
 
 
-class MutableGpuBuffer:
-    device = "cuda:0"
-
-    def __init__(self, value):
-        self.value = value
-        self.clone_count = 0
-
-    def clone(self):
-        self.clone_count += 1
-        return MutableGpuBuffer(self.value)
-
-
-class CopyOnlyBuffer:
-    def copy(self):
-        return "cpu-copy"
-
-
 class NativeTexture:
     resource_kind = "d3d11_texture"
     format = "BGRA8"
@@ -345,7 +328,6 @@ def test_windows_capture_cuda_can_force_frame_copy(monkeypatch):
 
 def test_windows_capture_runner_marks_rocm_direct_device(monkeypatch):
     module = _install_capture_module(monkeypatch, "wc_rocm")
-    monkeypatch.setenv("D2S_WGC_COPY_FRAME_BUFFER", "0")
     monkeypatch.setattr(windows_capture_event, "_setup_dpi_awareness", lambda: None)
     monkeypatch.setattr(windows_capture_event.WindowsCaptureEventRunner, "_start_keyboard_worker", lambda self, event: None)
 
@@ -372,125 +354,11 @@ def test_windows_capture_runner_marks_rocm_direct_device(monkeypatch):
     shutdown_event.clear()
     capture.handlers[0](FakeFrame(clone_buffer), FakeControl())
 
-    assert clone_buffer.cloned is True
-    assert received[-1].frame == "cloned-buffer"
-    assert received[-1].copy_mode is FrameCopyMode.CLONE
+    assert clone_buffer.cloned is False
+    assert received[-1].frame is clone_buffer
+    assert received[-1].copy_mode is FrameCopyMode.GPU_TENSOR
     assert received[-1].frame_raw_device == "rocm"
-    assert received[-1].metadata["capture_gpu"] is True
-    assert received[-1].metadata["gpu_to_cpu"] is False
-    assert received[-1].metadata["gpu_copy_count"] == 1
-    assert received[-1].metadata["zero_copy"] is False
-
-
-def test_windows_capture_rocm_frame_is_owned_before_queue_and_replay(monkeypatch):
-    module = _install_capture_module(monkeypatch, "wc_rocm")
-    monkeypatch.setenv("D2S_WGC_COPY_FRAME_BUFFER", "0")
-    monkeypatch.setattr(windows_capture_event, "_setup_dpi_awareness", lambda: None)
-    monkeypatch.setattr(
-        windows_capture_event.WindowsCaptureEventRunner,
-        "_start_keyboard_worker",
-        lambda self, event: None,
-    )
-    runner = windows_capture_event.WindowsCaptureEventRunner(
-        CaptureConfig(
-            os_name="Windows",
-            capture_tool="WindowsCaptureROCm",
-            capture_mode="Monitor",
-            monitor_index=2,
-            output_resolution=(1920, 1080),
-        )
-    )
-    received = []
-    shutdown_event = threading.Event()
-    runner.run(
-        shutdown_event=shutdown_event,
-        on_frame=received.append,
-        on_error=lambda exc: shutdown_event.set(),
-    )
-
-    shutdown_event.clear()
-    source = MutableGpuBuffer(1)
-    module.WindowsCapture.last_instance.handlers[0](FakeFrame(source), FakeControl())
-    captured = received[-1]
-    source.value = 2
-    replayed = runner._replay_frame_if_due(captured.timestamp + 0.02)
-
-    assert source.clone_count == 1
-    assert captured.frame is not source
-    assert captured.frame.value == 1
-    assert replayed.frame.value == 1
-    assert captured.copy_mode is FrameCopyMode.CLONE
-    assert captured.metadata["gpu_copy_count"] == 1
-    assert captured.metadata["gpu_to_cpu"] is False
-
-
-def test_windows_capture_rocm_requires_gpu_clone_without_cpu_fallback():
-    with pytest.raises(RuntimeError, match="CPU fallback is disabled"):
-        windows_capture_event._copy_frame_buffer(CopyOnlyBuffer(), "WindowsCaptureROCm")
-
-
-def test_windows_capture_rocm_serializes_fresh_and_replayed_frame_emission():
-    runner = windows_capture_event.WindowsCaptureEventRunner(
-        CaptureConfig(
-            capture_tool="WindowsCaptureROCm",
-            capture_mode="Monitor",
-            monitor_index=1,
-            fps=20,
-        )
-    )
-    old_frame = CapturedFrame(
-        frame="old",
-        target_height=1080,
-        timestamp=10.0,
-        capture_tool="WindowsCaptureROCm",
-    )
-    fresh_frame = CapturedFrame(
-        frame="fresh",
-        target_height=1080,
-        timestamp=10.06,
-        capture_tool="WindowsCaptureROCm",
-    )
-    runner._remember_emitted_frame(old_frame, 10.0)
-
-    emitted = []
-    replay_entered_callback = threading.Event()
-    release_replay_callback = threading.Event()
-    capture_started = threading.Event()
-    capture_finished = threading.Event()
-
-    def on_frame(frame):
-        emitted.append(frame)
-        if frame.metadata.get("replayed_static_frame"):
-            replay_entered_callback.set()
-            assert release_replay_callback.wait(timeout=2.0)
-
-    replay_thread = threading.Thread(
-        target=lambda: runner._emit_static_replay_if_due(10.05, on_frame),
-        daemon=True,
-    )
-    replay_thread.start()
-    assert replay_entered_callback.wait(timeout=2.0)
-
-    def emit_fresh_frame():
-        capture_started.set()
-        runner._emit_captured_frame(fresh_frame, 10.06, on_frame)
-        capture_finished.set()
-
-    capture_thread = threading.Thread(target=emit_fresh_frame, daemon=True)
-    capture_thread.start()
-    assert capture_started.wait(timeout=2.0)
-    assert not capture_finished.wait(timeout=0.05)
-    release_replay_callback.set()
-    replay_thread.join(timeout=2.0)
-    capture_thread.join(timeout=2.0)
-
-    assert not replay_thread.is_alive()
-    assert not capture_thread.is_alive()
-    assert [frame.frame for frame in emitted] == ["old", "fresh"]
-
-    assert runner._emit_static_replay_if_due(10.11, on_frame) is True
-    assert emitted[-1].frame == "fresh"
-    assert emitted[-1].metadata["replayed_static_frame"] is True
+    assert received[-1].metadata["zero_copy"] is True
 
 
 def test_windows_capture_cuda_source_fps_log_defaults_off(capsys):

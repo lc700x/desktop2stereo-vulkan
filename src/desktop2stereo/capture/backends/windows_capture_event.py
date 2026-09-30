@@ -108,36 +108,9 @@ def _event_capture_device(capture_tool):
 
 def _copy_frame_buffer(frame_buffer, capture_tool):
     device = _event_capture_device(capture_tool)
-    if device == "rocm":
-        clone = getattr(frame_buffer, "clone", None)
-        if not callable(clone):
-            raise RuntimeError(
-                "WindowsCaptureROCm requires a cloneable GPU frame buffer; "
-                "CPU fallback is disabled"
-            )
-        try:
-            owned_frame = clone()
-        except Exception as exc:
-            raise RuntimeError(
-                "WindowsCaptureROCm failed to copy the GPU frame buffer; "
-                "CPU fallback is disabled"
-            ) from exc
-        if owned_frame is frame_buffer:
-            raise RuntimeError(
-                "WindowsCaptureROCm returned the borrowed frame buffer from clone(); "
-                "an owned GPU frame is required"
-            )
-        source_device = getattr(frame_buffer, "device", None)
-        owned_device = getattr(owned_frame, "device", None)
-        if source_device is not None and owned_device is not None and owned_device != source_device:
-            raise RuntimeError(
-                "WindowsCaptureROCm clone changed frame device "
-                f"from {source_device} to {owned_device}; CPU fallback is disabled"
-            )
-        return owned_frame, FrameCopyMode.CLONE, device
-    if device == "cuda" and not _env_bool("D2S_WGC_COPY_FRAME_BUFFER"):
+    if device in ("cuda", "rocm") and not _env_bool("D2S_WGC_COPY_FRAME_BUFFER"):
         return frame_buffer, FrameCopyMode.GPU_TENSOR, device
-    prefer_clone = device == "cuda"
+    prefer_clone = device in ("cuda", "rocm")
     if prefer_clone and hasattr(frame_buffer, "clone"):
         return frame_buffer.clone(), FrameCopyMode.CLONE, device
     if hasattr(frame_buffer, "copy"):
@@ -204,7 +177,6 @@ class WindowsCaptureEventRunner:
         self._software_pacing_fps = 0
         self._software_limited_frames = 0
         self._replay_lock = threading.Lock()
-        self._rocm_emission_lock = threading.Lock()
         self._replay_frame = None
         self._last_frame_emit_ts = 0.0
         self._replay_thread = None
@@ -268,15 +240,6 @@ class WindowsCaptureEventRunner:
             self._replay_frame = captured_frame
             self._last_frame_emit_ts = float(now)
 
-    def _emit_captured_frame(self, captured_frame, now: float, on_frame) -> None:
-        if self.capture_tool == "WindowsCaptureROCm":
-            with self._rocm_emission_lock:
-                self._remember_emitted_frame(captured_frame, now)
-                on_frame(captured_frame)
-            return
-        self._remember_emitted_frame(captured_frame, now)
-        on_frame(captured_frame)
-
     def _replay_frame_if_due(self, now: float):
         with self._replay_lock:
             captured_frame = self._replay_frame
@@ -289,20 +252,6 @@ class WindowsCaptureEventRunner:
             metadata = dict(captured_frame.metadata)
             metadata["replayed_static_frame"] = True
             return replace(captured_frame, timestamp=float(now), metadata=metadata)
-
-    def _emit_static_replay_if_due(self, now: float, on_frame) -> bool:
-        if self.capture_tool == "WindowsCaptureROCm":
-            with self._rocm_emission_lock:
-                replay_frame = self._replay_frame_if_due(now)
-                if replay_frame is None:
-                    return False
-                on_frame(replay_frame)
-                return True
-        replay_frame = self._replay_frame_if_due(now)
-        if replay_frame is None:
-            return False
-        on_frame(replay_frame)
-        return True
 
     def _start_static_replay_worker(
         self,
@@ -321,7 +270,9 @@ class WindowsCaptureEventRunner:
                     is_paused is not None and is_paused()
                 ):
                     continue
-                self._emit_static_replay_if_due(time.perf_counter(), on_frame)
+                replay_frame = self._replay_frame_if_due(time.perf_counter())
+                if replay_frame is not None:
+                    on_frame(replay_frame)
 
         self._replay_thread = threading.Thread(
             target=replay_worker,
@@ -522,11 +473,6 @@ class WindowsCaptureEventRunner:
                 output_frame = native_resource if native_output else raw
                 output_copy_mode = FrameCopyMode.NONE if native_output else copy_mode
                 output_device = "d3d11" if native_output else frame_raw_device
-                rocm_owned_gpu_copy = bool(
-                    self.capture_tool == "WindowsCaptureROCm"
-                    and copy_mode is FrameCopyMode.CLONE
-                    and not native_output
-                )
                 captured_frame = capture_frame_from_raw(
                     output_frame,
                     self.config.output_resolution,
@@ -545,12 +491,11 @@ class WindowsCaptureEventRunner:
                         "native_resource_output": native_output,
                         "capture_gpu": bool(
                             copy_mode is FrameCopyMode.GPU_TENSOR
-                            or rocm_owned_gpu_copy
                             or native_output
                         ),
                         **resource_contract,
                         "gpu_to_cpu": native_to_cpu,
-                        "gpu_copy_count": 1 if native_to_cpu or rocm_owned_gpu_copy else 0,
+                        "gpu_copy_count": 1 if native_to_cpu else 0,
                         "compatibility_copy_mode": (
                             copy_mode.value if native_to_cpu else None
                         ),
@@ -567,7 +512,8 @@ class WindowsCaptureEventRunner:
                         ),
                     },
                 )
-                self._emit_captured_frame(captured_frame, capture_start_time, on_frame)
+                self._remember_emitted_frame(captured_frame, capture_start_time)
+                on_frame(captured_frame)
                 handler_end_time = time.perf_counter()
                 self._record_capture_timing(
                     copy_seconds=enqueue_start_time - copy_start_time,
