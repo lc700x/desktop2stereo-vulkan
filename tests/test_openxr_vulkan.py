@@ -44,7 +44,6 @@ from xr_viewer.core_openxr_vulkan import (
     OpenXrVulkanUnavailableError,
     _EyeSwapchain,
     _xr_view_pose_to_model_mat4,
-    _format_openxr_frame_id_runs,
     _layout_msdf_osd_runs,
     _build_msdf_help_panel,
     _scaled_dimension,
@@ -2116,13 +2115,6 @@ def test_sbs_capture_options_are_explicit_and_delayed(monkeypatch, tmp_path) -> 
     assert options["sample_count"] == 300
     assert options["image_count"] == 6
     assert options["eye_width"] == 640
-
-
-def test_openxr_frame_trace_compacts_repeated_source_frames() -> None:
-    assert _format_openxr_frame_id_runs([31, 31, 32, 34, 34, -1]) == (
-        "31x2,32x1,34x2,-1x1"
-    )
-    assert _format_openxr_frame_id_runs([]) == "none"
 
 
 def test_sbs_capture_converts_bgra_and_bottom_left_origin() -> None:
