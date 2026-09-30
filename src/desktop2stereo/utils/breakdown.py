@@ -467,6 +467,7 @@ class FPSBreakdown:
             f"xr_loop={rate('openxr_loop'):.1f} "
             f"xr_input_fps={rate('openxr_input_sample'):.1f} "
             f"xr_present_fps={rate('openxr_presented_frame'):.1f} "
+            f"xr_end_fps={rate('openxr_end_frame'):.1f} "
             f"xr_should={rate('openxr_should_render'):.1f} "
             f"xr_no_render={rate('openxr_no_render'):.1f} "
             f"xr_no_fresh={rate('openxr_no_fresh'):.1f} "

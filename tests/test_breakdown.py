@@ -35,6 +35,23 @@ def test_fps_breakdown_honors_explicit_log_limit(monkeypatch, capsys):
     assert capsys.readouterr().out.count("[FPSBreakdown]") == 2
 
 
+def test_fps_breakdown_separates_rendered_xr_frames_from_end_frames(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("D2S_FPS_BREAKDOWN_INTERVAL", "1")
+    breakdown = FPSBreakdown(enabled=True, target_fps=90)
+    start = breakdown.last_log
+    breakdown.inc("openxr_end_frame", 90)
+    breakdown.inc("openxr_presented_frame", 30)
+    breakdown.inc("openxr_should_render", 30)
+
+    breakdown.log(now=start + 1.0)
+
+    output = capsys.readouterr().out
+    assert "xr_present_fps=30.0" in output
+    assert "xr_end_fps=90.0" in output
+
+
 def test_fps_breakdown_reports_normalized_hole_fill_mode(capsys):
     breakdown = FPSBreakdown(enabled=True, target_fps=60)
     start = breakdown.last_log

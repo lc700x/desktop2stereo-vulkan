@@ -1013,10 +1013,22 @@ def test_tool_overlay_snapshots_present_fps_before_invalidating_quad_texture(
     presenter._tool_overlay_xr_frame_ts.extend((10.0, 10.1))
     monkeypatch.setattr("xr_viewer.core_openxr_vulkan.time.perf_counter", lambda: 10.2)
 
-    presenter._record_xr_presented_frame()
+    presenter._record_xr_presented_frame(has_layers=True)
 
     assert presenter._tool_overlay_xr_fps == 60.0
     assert presenter._tool_overlay_pending_xr_fps == pytest.approx(10.0)
+
+
+def test_empty_openxr_end_frame_does_not_count_as_presented() -> None:
+    increments = []
+    presenter = OpenXrVulkanPresenter(
+        on_breakdown_inc=lambda name, amount: increments.append((name, amount))
+    )
+
+    presenter._record_xr_presented_frame(has_layers=False)
+
+    assert increments == [("openxr_end_frame", 1)]
+    assert not presenter._tool_overlay_xr_frame_ts
 
 
 def test_tool_overlay_does_not_report_runtime_producer_fps_as_presented_sbs() -> None:
@@ -4449,7 +4461,7 @@ def test_presenter_keeps_latest_output_during_non_renderable_xr_tick() -> None:
     presenter._handle_controller_shortcuts = lambda: None
     presenter._handle_controller_guide_input = lambda *_args: None
     presenter._persist_screen_state_if_changed = lambda: None
-    presenter._record_xr_presented_frame = lambda: None
+    presenter._record_xr_presented_frame = lambda **_kwargs: None
 
     assert presenter.run_frame() is True
 
