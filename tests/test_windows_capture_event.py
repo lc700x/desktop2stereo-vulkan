@@ -280,6 +280,22 @@ def test_windows_capture_replays_last_frame_at_runtime_target_fps():
     assert runner._replay_frame_if_due(10.15) is not None
 
 
+def test_rocm_replay_waits_for_capture_stall_before_replaying():
+    runner = windows_capture_event.WindowsCaptureEventRunner(
+        CaptureConfig(capture_tool="WindowsCaptureROCm", fps=60)
+    )
+    captured_frame = windows_capture_event.capture_frame_from_raw(
+        "frame", 1080, 10.0, config=runner.config
+    )
+
+    runner._remember_emitted_frame(captured_frame, 10.0)
+
+    assert runner._replay_frame_if_due(10.032) is None
+    replayed = runner._replay_frame_if_due(10.034)
+    assert replayed is not None
+    assert replayed.metadata["replayed_static_frame"] is True
+
+
 def test_rocm_replay_cannot_be_published_after_a_new_capture(monkeypatch):
     runner = windows_capture_event.WindowsCaptureEventRunner(
         CaptureConfig(capture_tool="WindowsCaptureROCm", fps=60)

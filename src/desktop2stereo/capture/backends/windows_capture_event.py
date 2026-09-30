@@ -181,6 +181,7 @@ class WindowsCaptureEventRunner:
             threading.Lock() if self.capture_tool == "WindowsCaptureROCm" else None
         )
         self._replay_frame = None
+        self._last_capture_ts = 0.0
         self._last_frame_emit_ts = 0.0
         self._replay_thread = None
 
@@ -241,6 +242,7 @@ class WindowsCaptureEventRunner:
     def _remember_emitted_frame(self, captured_frame, now: float) -> None:
         with self._replay_lock:
             self._replay_frame = captured_frame
+            self._last_capture_ts = float(now)
             self._last_frame_emit_ts = float(now)
 
     def _publish_captured_frame(self, captured_frame, now: float, on_frame) -> None:
@@ -254,6 +256,11 @@ class WindowsCaptureEventRunner:
             if captured_frame is None:
                 return None
             interval = 1.0 / float(self._target_fps())
+            minimum_capture_stall = interval * (
+                2.0 if self.capture_tool == "WindowsCaptureROCm" else 1.0
+            )
+            if float(now) - self._last_capture_ts + 1e-9 < minimum_capture_stall:
+                return None
             if float(now) - self._last_frame_emit_ts + 1e-9 < interval:
                 return None
             self._last_frame_emit_ts = float(now)
