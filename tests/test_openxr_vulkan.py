@@ -1610,6 +1610,35 @@ def test_projection_composer_base_pass_defers_controller_layers() -> None:
     assert "bridge.begin_frame()" in source
 
 
+def test_deferred_filament_eye_end_is_rocm_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("D2S_ROCM_OPENXR_DEFER_FILAMENT_EYES", raising=False)
+    presenter = OpenXrVulkanPresenter()
+    bridge = SimpleNamespace(
+        stereo_batch_submit_abi_available=True,
+        end_frame_deferred=lambda: None,
+        get_finished_drawing_semaphore=lambda: object(),
+    )
+
+    presenter._rocm_backend = False
+    assert not presenter._rocm_deferred_filament_eye_end_enabled(
+        bridge, finished_available=True
+    )
+
+    monkeypatch.setenv("D2S_ROCM_OPENXR_DEFER_FILAMENT_EYES", "1")
+    presenter._rocm_backend = True
+    assert presenter._rocm_deferred_filament_eye_end_enabled(
+        bridge, finished_available=True
+    )
+    assert not presenter._rocm_deferred_filament_eye_end_enabled(
+        bridge, finished_available=False
+    )
+
+    bridge.stereo_batch_submit_abi_available = False
+    assert not presenter._rocm_deferred_filament_eye_end_enabled(
+        bridge, finished_available=True
+    )
+
+
 def test_projection_quality_chain_disabled_forces_lod0_sampling() -> None:
     source = inspect.getsource(OpenXrVulkanPresenter._apply_vulkan_projection_sampling)
 

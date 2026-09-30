@@ -808,6 +808,7 @@ class OpenXrVulkanPresenter(
             and not _env_flag("D2S_ROCM_ENABLE_OPENXR_OVERLAYS", default=False)
         )
         self._rocm_openxr_runtime_active = False
+        self._rocm_deferred_filament_logged = False
         # The quality/mip chain is fully GPU-rendered, but its transient
         # image/template reuse is not reliable on the NVIDIA + VDXR path:
         # RTX 20-series can lose the OpenXR session after a few frames even
@@ -9772,9 +9773,16 @@ class OpenXrVulkanPresenter(
             getattr(bridge, "finished_drawing_semaphore_abi_available", False)
         )
         semaphores: list[Any] = []
-        # Keep the established safe per-eye end-frame behavior until the
-        # Composer/Filament shared queue contract has been validated.
-        deferred = False
+        deferred = self._rocm_deferred_filament_eye_end_enabled(
+            bridge, finished_available=finished_available
+        )
+        if deferred and not self._rocm_deferred_filament_logged:
+            print(
+                "[OpenXRViewer] ROCm deferred Filament eye submits enabled; "
+                "Vulkan waits on per-eye completion semaphores",
+                flush=True,
+            )
+            self._rocm_deferred_filament_logged = True
         for eye_index, (eye, image_index) in enumerate(acquired_images):
             state_started = time.perf_counter()
             bridge.set_active_eye(eye_index)
@@ -9815,6 +9823,19 @@ class OpenXrVulkanPresenter(
                 if callable(adopt_depth):
                     adopt_depth(self._filament_depth_attachments[eye_index].resource)
         return semaphores
+
+    def _rocm_deferred_filament_eye_end_enabled(
+        self, bridge: Any, *, finished_available: bool
+    ) -> bool:
+        """Opt in to async eye submission only on semaphore-safe ROCm composition."""
+        return bool(
+            self._rocm_backend
+            and _env_flag("D2S_ROCM_OPENXR_DEFER_FILAMENT_EYES", default=False)
+            and finished_available
+            and bool(getattr(bridge, "stereo_batch_submit_abi_available", False))
+            and callable(getattr(bridge, "end_frame_deferred", None))
+            and callable(getattr(bridge, "get_finished_drawing_semaphore", None))
+        )
 
     def _render_filament_controller_overlay(
         self,
