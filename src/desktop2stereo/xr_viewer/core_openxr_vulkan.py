@@ -1751,14 +1751,6 @@ class OpenXrVulkanPresenter(
                     ctypes.byref(event),
                     ctypes.POINTER(xr.EventDataSessionStateChanged),
                 ).contents
-                if changed.state != self.session_state:
-                    state_name = str(
-                        getattr(changed.state, "name", changed.state)
-                    ).upper()
-                    print(
-                        f"[OpenXRViewer] Session state: {state_name}",
-                        flush=True,
-                    )
                 self.session_state = changed.state
                 if changed.state == xr.SessionState.READY and not self.session_running:
                     xr.begin_session(
@@ -2111,7 +2103,7 @@ class OpenXrVulkanPresenter(
                     layer_pointers,
                     fallback_layer_pointers=primary_layer_pointers,
                 )
-                self._record_xr_presented_frame(has_layers=bool(layer_pointers))
+                self._record_xr_presented_frame()
                 if self._on_breakdown_add_time is not None:
                     self._on_breakdown_add_time(
                         "openxr_end_frame", time.perf_counter() - end_started
@@ -11239,14 +11231,10 @@ class OpenXrVulkanPresenter(
             self._tool_overlay_sbs_window_started = now
             self._tool_overlay_sbs_window_frames = 0
 
-    def _record_xr_presented_frame(self, *, has_layers: bool) -> None:
+    def _record_xr_presented_frame(self) -> None:
         timestamp = time.perf_counter()
         if self._on_breakdown_inc is not None:
-            self._on_breakdown_inc("openxr_end_frame", 1)
-            if has_layers:
-                self._on_breakdown_inc("openxr_presented_frame", 1)
-        if not has_layers:
-            return
+            self._on_breakdown_inc("openxr_presented_frame", 1)
         self._tool_overlay_xr_frame_ts.append(timestamp)
         count = len(self._tool_overlay_xr_frame_ts)
         if count < 2:
