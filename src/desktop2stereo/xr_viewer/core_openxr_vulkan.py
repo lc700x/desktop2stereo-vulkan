@@ -170,6 +170,23 @@ def _env_number(name: str, default: float, *, minimum: float) -> float:
     return max(float(minimum), value)
 
 
+def _format_openxr_frame_id_runs(frame_ids: list[int]) -> str:
+    if not frame_ids:
+        return "none"
+    runs: list[str] = []
+    current = frame_ids[0]
+    count = 1
+    for frame_id in frame_ids[1:]:
+        if frame_id == current:
+            count += 1
+            continue
+        runs.append(f"{current}x{count}")
+        current = frame_id
+        count = 1
+    runs.append(f"{current}x{count}")
+    return ",".join(runs)
+
+
 def _sbs_capture_options() -> dict[str, Any] | None:
     output_dir = str(os.environ.get("D2S_SBS_CAPTURE_DIR", "")).strip()
     if not output_dir:
@@ -1115,6 +1132,13 @@ class OpenXrVulkanPresenter(
         self._grip_mat_l = None
         self._grip_mat_r = None
         self._frame_now = 0.0
+        self._frame_pacing_trace_enabled = _env_flag(
+            "D2S_OPENXR_FRAME_PACING_TRACE"
+        )
+        self._frame_pacing_trace_started_at = time.perf_counter()
+        self._frame_pacing_trace_last_tick: float | None = None
+        self._frame_pacing_trace_last_predicted_ns: int | None = None
+        self._frame_pacing_trace_samples: list[tuple[int, float, float, float, float, float, bool]] = []
         self._filament_animation_origin: float | None = None
         # Physical mouse/keyboard get priority over the controller beam and the
         # virtual keyboard: the low-level hooks (started once here) track only
@@ -1817,8 +1841,62 @@ class OpenXrVulkanPresenter(
             except Exception:
                 pass
 
+    def _record_openxr_frame_pacing_trace(
+        self,
+        *,
+        now: float,
+        frame_id: int,
+        tick_ms: float,
+        predicted_period_ms: float,
+        frame_ms: float,
+        projection_ms: float,
+        age_ms: float,
+        replayed: bool,
+    ) -> None:
+        if not self._frame_pacing_trace_enabled:
+            return
+        if not self._frame_pacing_trace_samples:
+            self._frame_pacing_trace_started_at = now
+        self._frame_pacing_trace_samples.append(
+            (frame_id, tick_ms, predicted_period_ms, frame_ms, projection_ms, age_ms, replayed)
+        )
+        elapsed = now - self._frame_pacing_trace_started_at
+        if elapsed < 2.0:
+            return
+
+        samples = self._frame_pacing_trace_samples
+        periods = [sample[2] for sample in samples if sample[2] > 0]
+        period_ms = sum(periods) / len(periods) if periods else 0.0
+        frame_ids = [sample[0] for sample in samples]
+        source_updates = sum(
+            current[0] >= 0 and current[0] != previous[0]
+            for previous, current in zip(samples, samples[1:])
+        )
+        late_frames = sum(
+            period_ms > 0 and sample[3] > period_ms * 1.5 for sample in samples
+        )
+        print(
+            "[OpenXRFrameTrace] "
+            f"window={elapsed:.2f}s ticks={len(samples)} updates={source_updates} "
+            f"period={period_ms:.2f}ms tick_max={max((s[1] for s in samples), default=0.0):.2f}ms "
+            f"frame_max={max(s[3] for s in samples):.2f}ms "
+            f"projection_max={max(s[4] for s in samples):.2f}ms late={late_frames} "
+            f"age_max={max((s[5] for s in samples if s[5] >= 0), default=0.0):.2f}ms "
+            f"replayed={sum(s[6] for s in samples)} "
+            f"ids={_format_openxr_frame_id_runs(frame_ids)}",
+            flush=True,
+        )
+        self._frame_pacing_trace_started_at = now
+        self._frame_pacing_trace_samples = []
+
     def run_frame(self) -> bool:
         frame_started = time.perf_counter()
+        trace_tick_ms = 0.0
+        if self._frame_pacing_trace_enabled:
+            previous_tick = self._frame_pacing_trace_last_tick
+            if previous_tick is not None:
+                trace_tick_ms = (frame_started - previous_tick) * 1000.0
+            self._frame_pacing_trace_last_tick = frame_started
         self._ensure_initialized()
         events_started = time.perf_counter()
         self.poll_events()
@@ -1844,6 +1922,13 @@ class OpenXrVulkanPresenter(
         self._publish_desktop_settings_snapshot()
         wait_started = time.perf_counter()
         frame_state = xr.wait_frame(self.session)
+        predicted_period_ms = 0.0
+        if self._frame_pacing_trace_enabled:
+            predicted_ns = int(frame_state.predicted_display_time)
+            previous_predicted_ns = self._frame_pacing_trace_last_predicted_ns
+            if previous_predicted_ns is not None and predicted_ns > previous_predicted_ns:
+                predicted_period_ms = (predicted_ns - previous_predicted_ns) / 1_000_000.0
+            self._frame_pacing_trace_last_predicted_ns = predicted_ns
         if self._on_breakdown_add_time is not None:
             self._on_breakdown_add_time(
                 "openxr_wait_frame", time.perf_counter() - wait_started
@@ -1926,6 +2011,9 @@ class OpenXrVulkanPresenter(
         layer_structures: list[Any] = []
         layer_pointers: list[Any] = []
         primary_layer_pointers: list[Any] = []
+        output_frame = None
+        layer = None
+        trace_projection_ms = 0.0
         try:
             if frame_state.should_render:
                 locate_started = time.perf_counter()
@@ -2022,6 +2110,9 @@ class OpenXrVulkanPresenter(
                         # every XR tick; only inference input may be reused.
                         projection_started = time.perf_counter()
                         layer = self._render_projection_layer(views, output_frame)
+                        trace_projection_ms = (
+                            time.perf_counter() - projection_started
+                        ) * 1000.0
                         if self._on_breakdown_add_time is not None:
                             self._on_breakdown_add_time(
                                 "openxr_projection_layer",
@@ -2108,9 +2199,36 @@ class OpenXrVulkanPresenter(
                         "openxr_end_frame", time.perf_counter() - end_started
                     )
         self.frame_count += 1
+        frame_elapsed = time.perf_counter() - frame_started
         if self._on_breakdown_add_time is not None:
             self._on_breakdown_add_time(
-                "openxr_frame_total", time.perf_counter() - frame_started
+                "openxr_frame_total", frame_elapsed
+            )
+        if self._frame_pacing_trace_enabled:
+            with self._output_lock:
+                trace_frame = (
+                    output_frame
+                    if isinstance(output_frame, VulkanStereoOutputFrame)
+                    else self._displayed_output
+                )
+            frame_id = int(trace_frame.frame_id) if trace_frame is not None else -1
+            frame_age_ms = (
+                max(0.0, (time.perf_counter() - float(trace_frame.timestamp)) * 1000.0)
+                if trace_frame is not None
+                else -1.0
+            )
+            self._record_openxr_frame_pacing_trace(
+                now=time.perf_counter(),
+                frame_id=frame_id,
+                tick_ms=trace_tick_ms,
+                predicted_period_ms=predicted_period_ms,
+                frame_ms=frame_elapsed * 1000.0,
+                projection_ms=trace_projection_ms,
+                age_ms=frame_age_ms,
+                replayed=bool(
+                    trace_frame is not None
+                    and trace_frame.metadata.get("replayed_static_frame", False)
+                ),
             )
         return not self.exit_requested
 
