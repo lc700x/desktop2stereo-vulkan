@@ -1,5 +1,6 @@
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -277,6 +278,88 @@ def test_windows_capture_replays_last_frame_at_runtime_target_fps():
     target["fps"] = 10
     assert runner._replay_frame_if_due(10.149) is None
     assert runner._replay_frame_if_due(10.15) is not None
+
+
+def test_rocm_replay_cannot_be_published_after_a_new_capture(monkeypatch):
+    runner = windows_capture_event.WindowsCaptureEventRunner(
+        CaptureConfig(capture_tool="WindowsCaptureROCm", fps=60)
+    )
+    old_frame = windows_capture_event.capture_frame_from_raw(
+        "old", 1080, 1.0, config=runner.config
+    )
+    new_frame = windows_capture_event.capture_frame_from_raw(
+        "new", 1080, 2.0, config=runner.config
+    )
+    runner._remember_emitted_frame(old_frame, time.perf_counter() - 1.0)
+
+    replay_selected = threading.Event()
+    release_replay = threading.Event()
+    capture_waiting = threading.Event()
+    published = []
+    original_replay = runner._replay_frame_if_due
+
+    def pause_after_selecting_replay(now):
+        replay_frame = original_replay(now)
+        replay_selected.set()
+        assert release_replay.wait(timeout=2.0)
+        return replay_frame
+
+    class ObservedLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "fresh-capture":
+                capture_waiting.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self._lock.release()
+
+    monkeypatch.setattr(runner, "_replay_frame_if_due", pause_after_selecting_replay)
+    runner._frame_publish_lock = ObservedLock()
+
+    def on_frame(frame):
+        published.append(
+            (frame.frame, bool(frame.metadata.get("replayed_static_frame")))
+        )
+
+    replay_thread = threading.Thread(
+        target=runner._publish_replay_frame_if_due,
+        args=(on_frame,),
+        name="static-replay",
+    )
+    replay_thread.start()
+    assert replay_selected.wait(timeout=2.0)
+
+    capture_thread = threading.Thread(
+        target=runner._publish_captured_frame,
+        args=(new_frame, 2.0, on_frame),
+        name="fresh-capture",
+    )
+    capture_thread.start()
+    assert capture_waiting.wait(timeout=2.0)
+
+    release_replay.set()
+    replay_thread.join(timeout=2.0)
+    capture_thread.join(timeout=2.0)
+
+    assert not replay_thread.is_alive()
+    assert not capture_thread.is_alive()
+    assert published == [("old", True), ("new", False)]
+
+
+def test_frame_publication_lock_is_rocm_only():
+    rocm = windows_capture_event.WindowsCaptureEventRunner(
+        CaptureConfig(capture_tool="WindowsCaptureROCm")
+    )
+    cuda = windows_capture_event.WindowsCaptureEventRunner(
+        CaptureConfig(capture_tool="WindowsCaptureCUDA")
+    )
+
+    assert rocm._frame_publish_lock is not None
+    assert cuda._frame_publish_lock is None
 
 
 def test_windows_capture_cuda_limiter_runs_before_gpu_buffer_delivery(monkeypatch):

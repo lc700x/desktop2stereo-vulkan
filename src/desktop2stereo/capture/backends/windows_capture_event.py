@@ -177,6 +177,9 @@ class WindowsCaptureEventRunner:
         self._software_pacing_fps = 0
         self._software_limited_frames = 0
         self._replay_lock = threading.Lock()
+        self._frame_publish_lock = (
+            threading.Lock() if self.capture_tool == "WindowsCaptureROCm" else None
+        )
         self._replay_frame = None
         self._last_frame_emit_ts = 0.0
         self._replay_thread = None
@@ -240,6 +243,11 @@ class WindowsCaptureEventRunner:
             self._replay_frame = captured_frame
             self._last_frame_emit_ts = float(now)
 
+    def _publish_captured_frame(self, captured_frame, now: float, on_frame) -> None:
+        with self._frame_publish_lock:
+            self._remember_emitted_frame(captured_frame, now)
+            on_frame(captured_frame)
+
     def _replay_frame_if_due(self, now: float):
         with self._replay_lock:
             captured_frame = self._replay_frame
@@ -252,6 +260,12 @@ class WindowsCaptureEventRunner:
             metadata = dict(captured_frame.metadata)
             metadata["replayed_static_frame"] = True
             return replace(captured_frame, timestamp=float(now), metadata=metadata)
+
+    def _publish_replay_frame_if_due(self, on_frame) -> None:
+        with self._frame_publish_lock:
+            replay_frame = self._replay_frame_if_due(time.perf_counter())
+            if replay_frame is not None:
+                on_frame(replay_frame)
 
     def _start_static_replay_worker(
         self,
@@ -270,9 +284,12 @@ class WindowsCaptureEventRunner:
                     is_paused is not None and is_paused()
                 ):
                     continue
-                replay_frame = self._replay_frame_if_due(time.perf_counter())
-                if replay_frame is not None:
-                    on_frame(replay_frame)
+                if self._frame_publish_lock is None:
+                    replay_frame = self._replay_frame_if_due(time.perf_counter())
+                    if replay_frame is not None:
+                        on_frame(replay_frame)
+                else:
+                    self._publish_replay_frame_if_due(on_frame)
 
         self._replay_thread = threading.Thread(
             target=replay_worker,
@@ -512,8 +529,13 @@ class WindowsCaptureEventRunner:
                         ),
                     },
                 )
-                self._remember_emitted_frame(captured_frame, capture_start_time)
-                on_frame(captured_frame)
+                if self._frame_publish_lock is None:
+                    self._remember_emitted_frame(captured_frame, capture_start_time)
+                    on_frame(captured_frame)
+                else:
+                    self._publish_captured_frame(
+                        captured_frame, capture_start_time, on_frame
+                    )
                 handler_end_time = time.perf_counter()
                 self._record_capture_timing(
                     copy_seconds=enqueue_start_time - copy_start_time,
