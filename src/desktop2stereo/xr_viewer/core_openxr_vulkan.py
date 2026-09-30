@@ -5474,12 +5474,15 @@ class OpenXrVulkanPresenter(
 
     def run_until(self, shutdown_event: Any) -> int:
         """Run the XR frame loop until the application shutdown event is set."""
-        self._presenter_thread_id = threading.get_ident()
         self._shutdown_event = shutdown_event
         retry_count = 0
         runtime_recovery_delay = 0.0
         try:
             while not shutdown_event.is_set() and not self.exit_requested:
+                # close() clears the owner during headset-unavailable retries.
+                # Rebind it before each initialization so worker output stays
+                # queued for this thread after a late headset connection.
+                self._presenter_thread_id = threading.get_ident()
                 try:
                     if not self._initialized:
                         try:

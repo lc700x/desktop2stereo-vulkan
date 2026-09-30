@@ -4589,23 +4589,46 @@ def test_presenter_waits_for_headset_and_retries_initialization(capsys) -> None:
     ))
     shutdown = threading.Event()
     calls = []
+    owner_ids = []
+    converted = []
 
     def initialize():
         calls.append("initialize")
         if calls.count("initialize") == 1:
             raise type("FormFactorUnavailableError", (RuntimeError,), {})()
+        presenter._initialized = True
+        presenter.session_running = True
+        presenter._accept_output = True
 
     def run_frame():
         calls.append("frame")
+        owner_ids.append(presenter._presenter_thread_id)
+        worker = threading.Thread(
+            target=lambda: presenter.submit_runtime_result("new-frame", 1.0)
+        )
+        worker.start()
+        worker.join()
         shutdown.set()
         return True
 
     presenter.initialize = initialize
     presenter.run_frame = run_frame
-    presenter.close = lambda: calls.append("close")
+    presenter._submit_runtime_result_on_presenter = lambda *_args: converted.append(True)
+
+    def close():
+        calls.append("close")
+        presenter._presenter_thread_id = None
+        presenter._initialized = False
+
+    presenter.close = close
 
     assert presenter.run_until(shutdown) == 0
     assert calls == ["initialize", "close", "initialize", "frame", "close"]
+    assert owner_ids == [threading.get_ident()]
+    assert converted == []
+    assert presenter._presenter_commands.get_nowait() == (
+        "submit_runtime_result", ("new-frame", 1.0)
+    )
     assert "Vulkan/Filament initialization deferred" in capsys.readouterr().out
 
 
