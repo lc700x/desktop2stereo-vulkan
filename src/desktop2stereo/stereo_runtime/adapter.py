@@ -203,10 +203,9 @@ def runtime_config_from_d2s_settings(
     depth_backend: DepthBackend
     import torch
 
-    # TensorRT is NVIDIA-only.  On AMD ROCm the stale "TensorRT" setting
-    # (defaulted on by the GUI for CUDA machines) must not select the
-    # tensorrt_native backend, otherwise the frame loop fails importing
-    # tensorrt.  ROCm defaults to the AMD-native MIGraphX path instead.
+    # TensorRT is NVIDIA-only. On AMD ROCm, ignore stale TensorRT settings;
+    # MIGraphX is opt-in, and the supported GPU-native PyTorch provider is the
+    # default when its checkbox is off.
     is_rocm = bool(getattr(torch.version, "hip", None))
     if settings.get("MIGraphX", False):
         depth_backend = "migraphx_rocm"
@@ -217,7 +216,7 @@ def runtime_config_from_d2s_settings(
     elif settings.get("Depth Backend"):
         depth_backend = _normalize_depth_backend(settings["Depth Backend"])
     elif is_rocm:
-        depth_backend = "migraphx_rocm"
+        depth_backend = "pytorch_rocm"
     else:
         depth_backend = "auto"
 
