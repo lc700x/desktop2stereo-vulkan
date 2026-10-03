@@ -1281,7 +1281,7 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
     if backend in {"migraphx_rocm", "rocm_migraphx", "migraphx"}:
         from .providers.amd import create_migraphx_rocm_provider
 
-        return create_migraphx_rocm_provider(
+        provider = create_migraphx_rocm_provider(
             model_id=cfg.model_id,
             model_name=cfg.model_name,
             device=device,
@@ -1298,6 +1298,8 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
             depth_upsample=cfg.depth_upsample,
             depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
         )
+        provider.profile_sync = bool(cfg.profile_sync)
+        return provider
 
     if backend in {"pytorch_rocm", "rocm", "amd_rocm"}:
         from .providers.amd import create_pytorch_rocm_provider

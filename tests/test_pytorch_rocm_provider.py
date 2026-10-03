@@ -2,6 +2,9 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 from stereo_runtime.depth_provider import DepthProviderConfig, create_depth_provider
 from stereo_runtime.providers.amd import (
     GenericTorchRocmDepthProvider,
@@ -9,6 +12,75 @@ from stereo_runtime.providers.amd import (
     TorchRocmDepthProvider,
 )
 import stereo_runtime.providers.amd.migraphx as migraphx_provider
+
+
+@pytest.mark.parametrize("profile_sync", [False, True])
+def test_migraphx_factory_preserves_profile_sync(monkeypatch, profile_sync):
+    provider = SimpleNamespace()
+    monkeypatch.setattr(
+        "stereo_runtime.providers.amd.create_migraphx_rocm_provider", lambda **kwargs: provider
+    )
+    result = create_depth_provider(DepthProviderConfig(backend="migraphx_rocm", profile_sync=profile_sync))
+    assert result is provider
+    assert result.profile_sync is profile_sync
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_migraphx_profile_does_not_synchronize_normal_inference(monkeypatch, tmp_path, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("GPU timing requires a CUDA/ROCm device")
+    provider = MIGraphXDepthProvider(device=device, onnx_path=tmp_path / "model_fp16_2x3.onnx")
+    predicted = torch.arange(6, dtype=torch.float32, device=device).reshape(1, 2, 3)
+
+    class Engine:
+        input_image_size = (2, 3)
+
+        def __call__(self, tensor):
+            return predicted
+
+    monkeypatch.setattr(provider, "load", lambda: Engine())
+    # An already-submitted model output is enough to exercise preprocessing,
+    # postprocessing and stream timing without model downloads or MIGraphX.
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: pytest.fail("device-wide synchronization"))
+    result = provider.predict_profile(torch.zeros(1, 3, 8, 12, device=device))
+    assert result.depth.shape == (1, 1, 8, 12)
+    if device == "cuda":
+        torch.cuda.current_stream().synchronize()
+        events = result.cuda_timing_events
+        assert {"depth_pre_start", "depth_pre_end", "depth_model_start", "depth_model_end",
+                "depth_post_start", "depth_post_end"} <= events.keys()
+        assert events["depth_pre_start"].elapsed_time(events["depth_post_end"]) >= 0
+    else:
+        assert result.cuda_timing_events == {}
+    assert torch.isfinite(result.depth).all()
+    assert result.depth.min() == 0
+    assert result.depth.max() == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="explicit profiling requires CUDA/ROCm")
+def test_migraphx_explicit_profile_sync_still_waits(monkeypatch, tmp_path):
+    provider = MIGraphXDepthProvider(device="cuda", onnx_path=tmp_path / "model_fp16_2x3.onnx")
+    provider.profile_sync = True
+    predicted = torch.arange(6, dtype=torch.float32, device="cuda").reshape(1, 2, 3)
+
+    class Engine:
+        input_image_size = (2, 3)
+
+        def __call__(self, tensor):
+            return predicted
+
+    monkeypatch.setattr(provider, "load", lambda: Engine())
+    synchronize = torch.cuda.synchronize
+    calls = []
+
+    def sync(device):
+        calls.append(device)
+        synchronize(device)
+
+    monkeypatch.setattr(torch.cuda, "synchronize", sync)
+    result = provider.predict_profile(torch.zeros(1, 3, 8, 12, device="cuda"))
+    assert calls == [provider.device] * 5
+    assert result.depth.shape == (1, 1, 8, 12)
 
 
 def test_create_pytorch_rocm_provider_marks_backend():

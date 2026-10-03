@@ -149,6 +149,7 @@ class MIGraphXDepthProvider:
         self.device = torch.device(device)
         # cuDNN autotuning is disabled for the ROCm depth path (per project policy).
         torch.backends.cudnn.benchmark = False
+        self.profile_sync = False
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         self.onnx_path = Path(onnx_path) if onnx_path is not None else None
         self.graph_path = Path(graph_path) if graph_path is not None else None
@@ -212,28 +213,48 @@ class MIGraphXDepthProvider:
         import time
 
         def sync() -> None:
-            if self.device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.synchronize()
+            if self.profile_sync and self.device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
 
+        cuda_events: dict[str, Any] = {}
+
+        def record(name: str) -> None:
+            if self.device.type != "cuda":
+                return
+            try:
+                event = torch.cuda.Event(blocking=False, enable_timing=True)
+                event.record(torch.cuda.current_stream(self.device))
+                cuda_events[name] = event
+            except Exception:
+                pass
+
+        engine = self.load()
         sync()
+        record("depth_pre_start")
         start = time.perf_counter()
         rgb = ensure_bchw(rgb, name="rgb").to(self.device).float().clamp(0, 1)
         _, _, height, width = rgb.shape
-        engine = self.load()
         input_size = engine.input_image_size or self.preprocessor.input_size(height, width)
         tensor = self.preprocessor.prepare(rgb, height=input_size[0], width=input_size[1]).contiguous()
         sync()
+        record("depth_pre_end")
         preprocess_ms = (time.perf_counter() - start) * 1000.0
 
         sync()
+        record("depth_model_start")
         start = time.perf_counter()
         with torch.inference_mode():
             predicted = engine(tensor)
         sync()
+        record("depth_model_end")
         model_ms = (time.perf_counter() - start) * 1000.0
 
         start = time.perf_counter()
+        record("depth_post_start")
+        record("depth_norm_start")
         depth = _postprocess_generic_depth(predicted, self.model_id)
+        record("depth_norm_end")
+        record("depth_upsample_start")
         depth = upsample_depth(
             depth,
             height,
@@ -243,8 +264,13 @@ class MIGraphXDepthProvider:
             edge_strength=self.depth_upsample_edge_strength,
         )
         sync()
+        record("depth_upsample_end")
+        record("depth_post_end")
         postprocess_ms = (time.perf_counter() - start) * 1000.0
-        return DepthProfileResult(depth, preprocess_ms, model_ms, postprocess_ms)
+        # GPU timings are resolved by the pipeline after its existing ready
+        # event completes. Profiling must not drain capture/presentation work
+        # on every stage; normal inference remains ordered on the HIP stream.
+        return DepthProfileResult(depth, preprocess_ms, model_ms, postprocess_ms, cuda_timing_events=cuda_events)
 
 
 def create_migraphx_rocm_provider(
