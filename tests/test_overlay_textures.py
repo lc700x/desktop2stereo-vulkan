@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from PIL import Image, ImageDraw
 
 from gui.localization import MESSAGE_CATALOGS, gettext_for, normalize_locale
 from xr_viewer.overlay_textures import (
+    _fit_overlay_font,
     build_controller_callout_rgba,
     build_settings_menu_rgba,
     build_screen_adjust_osd_rgba,
@@ -36,11 +38,14 @@ def test_openxr_settings_menu_text_uses_every_gui_locale_catalog():
         assert {"Stop", "Stopping...", "Stopped"} <= catalog.keys()
 
 
-def test_openxr_uses_bundled_inter_for_latin_text():
-    font = load_overlay_font(18, bold=True)
+def test_settings_menu_uses_inter_without_changing_other_overlay_fonts():
+    draw = ImageDraw.Draw(Image.new("RGBA", (256, 64)))
+    font = _fit_overlay_font(draw, "Quest", 18, 256, prefer_cjk=False, bold=True)
 
     assert font.path.endswith("InterVariable.ttf")
-    assert load_overlay_font(18, bold=True) is font
+    assert _fit_overlay_font(draw, "Quest", 18, 256, prefer_cjk=False, bold=True) is font
+    other_font = load_overlay_font(18, bold=True)
+    assert not str(getattr(other_font, "path", "")).endswith("InterVariable.ttf")
 
 
 def test_menu_cursor_position_is_not_rasterized_into_the_full_panel_texture():

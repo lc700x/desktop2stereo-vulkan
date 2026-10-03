@@ -109,14 +109,14 @@ def build_msdf_text_osd_rgba(
 
 
 @lru_cache(maxsize=64)
-def _load_overlay_font_cached(size, font_type, prefer_cjk, bold):
+def _load_overlay_font_cached(size, font_type, prefer_cjk, bold, prefer_inter=False):
     candidates = []
     if prefer_cjk:
         candidates.append(
             r"C:\Windows\Fonts\msyhbd.ttc" if bold
             else r"C:\Windows\Fonts\msyh.ttc"
         )
-    elif _INTER_FONT_PATH.is_file():
+    elif prefer_inter and _INTER_FONT_PATH.is_file():
         candidates.append(str(_INTER_FONT_PATH))
     if bold:
         candidates.extend((
@@ -150,10 +150,10 @@ def load_overlay_font(size, font_type=None, *, prefer_cjk=False, bold=False):
 
 def _fit_overlay_font(draw, text, size, max_width, *, prefer_cjk=True, bold=False, minimum=14):
     for font_size in range(int(size), int(minimum) - 1, -1):
-        font = load_overlay_font(font_size, prefer_cjk=prefer_cjk, bold=bold)
+        font = _load_overlay_font_cached(font_size, None, bool(prefer_cjk), bool(bold), True)
         if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
             return font
-    return load_overlay_font(minimum, prefer_cjk=prefer_cjk, bold=bold)
+    return _load_overlay_font_cached(int(minimum), None, bool(prefer_cjk), bool(bold), True)
 
 
 def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, lang="EN"):
