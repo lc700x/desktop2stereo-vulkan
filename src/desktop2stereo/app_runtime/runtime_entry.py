@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from capture import capture_frame_to_rgb, prepare_rgb_for_stereo_runtime
 from capture.adaptive_rate import AdaptiveCaptureRate, adaptive_capture_enabled_for_mode
@@ -451,6 +452,15 @@ def _consume_stop_request(
     except OSError:
         pass
     return True
+
+
+def _openxr_runtime_exit_code(presenter: Any | None) -> int:
+    """Prefer an explicit user stop over a racing OpenXR device-loss result."""
+    return 77 if (
+        presenter is not None
+        and getattr(presenter, "fatal_device_loss", False)
+        and not getattr(presenter, "_runtime_stop_requested", False)
+    ) else 0
 
 
 def _watch_stop_request(
@@ -933,7 +943,6 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
     main_thread_job = None
     nvfruc_stage = None
     nvfruc_thread = None
-    fatal_openxr_device_loss = False
     presentation_q = context.runtime_q
     if context.nvfruc_frame_generation:
         nvfruc_stage = NvFrucStage(
@@ -1523,10 +1532,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             # run_until owns Filament/Vulkan teardown on the Presenter thread.
             # Do not let the main thread race that teardown after a timeout.
             presenter_thread.join()
-        fatal_openxr_device_loss = bool(
-            presenter is not None
-            and getattr(presenter, "fatal_device_loss", False)
-        )
+        runtime_exit_code = _openxr_runtime_exit_code(presenter)
         if local_viewer_thread is not None:
             local_viewer_thread.join(timeout=2.0)
         if presenter is not None:
@@ -1536,4 +1542,4 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             close()
     # rc=77 is handled by the GUI with a bounded fresh-process relaunch.  A
     # dead Vulkan device cannot be repaired by in-process OpenXR reconnects.
-    return 77 if fatal_openxr_device_loss else 0
+    return runtime_exit_code

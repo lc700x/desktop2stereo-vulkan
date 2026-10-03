@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+import queue
+import threading
 
 
 def _control(
@@ -57,13 +59,13 @@ def test_floating_icon_geometry_supports_negative_monitor_coordinates():
 def test_flet_panel_is_centered_on_the_selected_input_monitor():
     from xr_viewer.desktop_settings_menu import _flet_panel_position_for_monitor
 
-    assert _flet_panel_position_for_monitor((3840, 0, 1920, 1200)) == (4480, 275)
+    assert _flet_panel_position_for_monitor((3840, 0, 1920, 1200)) == (4420, 275)
 
 
 def test_flet_panel_position_preserves_negative_monitor_coordinates():
     from xr_viewer.desktop_settings_menu import _flet_panel_position_for_monitor
 
-    assert _flet_panel_position_for_monitor((-1920, -100, 1920, 1080)) == (-1280, 115)
+    assert _flet_panel_position_for_monitor((-1920, -100, 1920, 1080)) == (-1340, 115)
 
 
 def test_snapshot_layout_signature_ignores_live_value_changes():
@@ -77,6 +79,27 @@ def test_snapshot_layout_signature_ignores_live_value_changes():
     second = {"tab": "picture", "controls": controls, "values": {"color_brightness": 1.4}}
 
     assert _snapshot_layout_signature(first) == _snapshot_layout_signature(second)
+
+
+def test_snapshot_layout_signature_tracks_discrete_selection_changes():
+    from xr_viewer.desktop_settings_menu import _snapshot_layout_signature
+
+    controls = (
+        _control("openxr:render_auto", label="Headset optimized"),
+        _control("openxr_render_scale", label="Render Resolution", kind="slider"),
+    )
+    manual = {
+        "tab": "picture",
+        "controls": controls,
+        "values": {"openxr_render_auto": False, "openxr_render_scale": 1.0},
+    }
+    automatic = {
+        "tab": "picture",
+        "controls": controls,
+        "values": {"openxr_render_auto": True, "openxr_render_scale": 1.0},
+    }
+
+    assert _snapshot_layout_signature(manual) != _snapshot_layout_signature(automatic)
 
 
 def test_snapshot_layout_signature_tracks_language_changes():
@@ -105,8 +128,14 @@ def test_flet_static_openxr_labels_have_english_and_chinese_translations():
         "Desktop2Stereo OpenXR Settings",
         "Physical mouse controls are synchronized with the in-headset menu.",
         "Waiting for OpenXR settings...",
+        "Reset picture",
+        "Reset depth",
+        "Reset placement",
     )
     assert all(gettext_for("EN", message) == message for message in messages)
+    assert gettext_for("CN", "Reset picture") == "\u91cd\u7f6e\u753b\u9762"
+    assert gettext_for("CN", "Reset depth") == "\u91cd\u7f6e\u666f\u6df1"
+    assert gettext_for("CN", "Reset placement") == "\u91cd\u7f6e\u5c4f\u5e55\u4f4d\u7f6e"
     assert gettext_for("CN", "OpenXR Settings") == "OpenXR 设置"
     assert gettext_for("CN", "Desktop2Stereo OpenXR Settings") == "Desktop2Stereo OpenXR 设置"
     assert gettext_for("CN", messages[2]) == "物理鼠标控制与头显内菜单同步。"
@@ -140,6 +169,36 @@ def test_flet_formats_symmetric_crop_values_for_the_shared_snapshot():
 
     assert _format_value(12.0, 1.0, "screen:crop_width") == "12% each"
     assert _format_value(7.0, 1.0, "screen:crop_height") == "7% each"
+
+
+def test_flet_selectors_reflect_shared_menu_values():
+    from xr_viewer.desktop_settings_menu import (
+        _control_is_selected,
+        _toggle_value_for,
+    )
+
+    values = {
+        "screen:section": "crop",
+        "screen:curve_half_angle": 0.72,
+        "depth_strength": 0.25,
+        "cross_eyed": True,
+        "room:screen_reflection_enabled": True,
+        "screen:dynamic_crop": False,
+        "glow:mode": "veil",
+        "room:model": "3d_b",
+        "room:seat_index": 2,
+    }
+
+    assert _control_is_selected("screen:section:crop", values)
+    assert _control_is_selected("screen:type:deep", values)
+    assert _control_is_selected("glow:veil", values)
+    assert _control_is_selected("room:model:3d_b", values)
+    assert _control_is_selected("room:seat:back", values)
+    assert not _control_is_selected("screen:type:flat", values)
+    assert _toggle_value_for("depth:toggle_stereo", values)
+    assert _toggle_value_for("depth:toggle_cross_eyed", values)
+    assert _toggle_value_for("room:toggle_screen_reflection", values)
+    assert not _toggle_value_for("screen:dynamic_crop", values)
 
 
 def test_openxr_option_labels_have_chinese_translations():
@@ -202,10 +261,103 @@ def test_clicking_icon_toggles_the_flet_panel_once():
     assert calls == ["toggle"]
 
 
+def test_flet_settings_child_closes_when_runtime_parent_exits():
+    from xr_viewer.desktop_settings_menu import _quit_flet_when_parent_exits
+
+    parent_exited = threading.Event()
+    command_queue = queue.Queue()
+
+    class ParentProcess:
+        def join(self):
+            parent_exited.wait(timeout=1.0)
+
+    worker = threading.Thread(
+        target=_quit_flet_when_parent_exits,
+        args=(ParentProcess(), command_queue),
+        daemon=True,
+    )
+    worker.start()
+    assert command_queue.empty()
+    parent_exited.set()
+
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert command_queue.get_nowait() == "__quit__"
+
+
+def test_settings_stop_waits_for_flet_process_to_exit():
+    from xr_viewer.desktop_settings_menu import DesktopOpenXrSettingsWindow
+
+    class StoppedProcess:
+        pid = 123
+
+        def __init__(self):
+            self.join_calls = []
+            self.terminated = False
+
+        def join(self, timeout=None):
+            self.join_calls.append(timeout)
+
+        def is_alive(self):
+            return False
+
+        def terminate(self):
+            self.terminated = True
+
+    window = DesktopOpenXrSettingsWindow()
+    process = StoppedProcess()
+    window._flet_process = process
+
+    window.stop()
+
+    assert process.join_calls == [2.0]
+    assert not process.terminated
+
+
+def test_settings_stop_kills_flet_process_tree_after_timeout(monkeypatch):
+    from types import SimpleNamespace
+    import xr_viewer.desktop_settings_menu as settings_menu
+
+    class SlowProcess:
+        pid = 321
+
+        def __init__(self):
+            self.alive = True
+            self.join_calls = []
+            self.terminated = False
+
+        def join(self, timeout=None):
+            self.join_calls.append(timeout)
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+    process = SlowProcess()
+    commands = []
+
+    def run_taskkill(args, **kwargs):
+        commands.append((args, kwargs))
+        process.alive = False
+
+    monkeypatch.setattr(settings_menu, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(settings_menu.subprocess, "run", run_taskkill)
+
+    settings_menu._stop_flet_process(process)
+
+    assert commands[0][0] == ["taskkill", "/f", "/t", "/pid", "321"]
+    assert commands[0][1]["timeout"] == 2.0
+    assert process.join_calls == [2.0, 1.0]
+    assert not process.terminated
+
+
 def test_physical_mouse_control_uses_the_existing_openxr_action_queue():
     from xr_viewer.desktop_settings_menu import DesktopOpenXrSettingsWindow
 
     window = DesktopOpenXrSettingsWindow()
     window.actions.put(("depth_strength", 0.75))
 
-    assert window.actions.get_nowait() == ("depth_strength", 0.75)
+    assert window.actions.get(timeout=1.0) == ("depth_strength", 0.75)

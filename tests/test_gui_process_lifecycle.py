@@ -693,6 +693,7 @@ def test_backend_status_payload_is_rendered_as_read_only_telemetry():
     class Harness(gui_process.GUIProcessMixin):
         backend_status_text = control
         _backend_status_bar = bar
+        locale = "CN"
 
         def _safe_update(self, *controls):
             updates.extend(controls)
@@ -712,5 +713,62 @@ def test_backend_status_payload_is_rendered_as_read_only_telemetry():
     assert bar.visible is True
     assert "深度=pytorch_cuda" in control.value
     assert "GPU复制=1" in control.value
-    assert "TensorRT unavailable" in control.value
+    assert "TensorRT 不可用" in control.value
     assert updates == [control, bar]
+    gui.locale = "EN"
+    gui._refresh_backend_status_display()
+    assert "Depth=pytorch_cuda" in control.value
+    assert "TensorRT unavailable" in control.value
+
+
+def test_requested_stop_button_stays_localized_as_stop():
+    gui = gui_process.GUIProcessMixin()
+    gui.locale = "CN"
+    gui._starting = True
+    gui._user_stop_requested = True
+    gui.process = SimpleNamespace(returncode=None)
+
+    assert gui._stop_button_text() == gui_process.UI_MESSAGES["CN"]["Stop"]
+
+    gui.locale = "EN"
+    assert gui._stop_button_text() == gui_process.UI_MESSAGES["EN"]["Stop"]
+
+    gui.process = None
+    gui._starting = False
+    assert gui._stop_button_text() == gui_process.UI_MESSAGES["EN"]["Stop"]
+
+
+def test_intentional_gui_stop_suppresses_openxr_fatal_auto_relaunch(monkeypatch):
+    statuses = []
+
+    class FakeProcess:
+        pid = 4321
+        returncode = None
+
+        async def wait(self):
+            self.returncode = 77
+
+    class Harness(gui_process.GUIProcessMixin):
+        def _diag(self, *_args, **_kwargs):
+            pass
+
+        def set_status(self, message, key=None):
+            statuses.append((message, key))
+
+        def _set_running_ui(self, running):
+            statuses.append(("running", running))
+
+    proc = FakeProcess()
+    gui = Harness()
+    gui.process = proc
+    gui._starting = True
+    gui._user_stop_requested = True
+    gui._calibration_active = False
+    gui.locale = "EN"
+    monkeypatch.setattr(gui_process, "_set_console_quick_edit", lambda *_args: None)
+
+    asyncio.run(gui._monitor_process_task())
+
+    assert gui.process is None
+    assert (gui_process.UI_MESSAGES["EN"]["Stopped"], "Stopped") in statuses
+    assert not any("Auto Restart" in str(message) for message, *_rest in statuses)

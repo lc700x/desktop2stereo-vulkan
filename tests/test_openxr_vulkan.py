@@ -56,6 +56,7 @@ from xr_viewer.core_openxr_vulkan import (
 )
 from xr_viewer.controller_models import controller_button_local_position
 from xr_viewer.overlay_textures import build_controller_callout_rgba, build_keyboard_rgba
+from xr_viewer.settings_menu import MenuControl, SETTINGS_MENU_WORLD_SIZE
 from xr_viewer.msdf_font_atlas import MsdfFontAtlas
 from viewer.controller_help import get_controller_help_rows
 from viewer.vulkan_msdf_quad import VulkanMsdfQuadRequest
@@ -821,7 +822,7 @@ def test_controller_callout_uses_projection_layer_not_quad_layer() -> None:
 
     assert "return self._render_tool_quad_layers(output_frame)" in source
     assert "bridge.set_controller_guide_texture(self._controller_callout_rgba)" in source
-    assert "bridge.set_controller_guide(guide_matrix, visible=True)" in source
+    assert "bridge.set_controller_guide(guide_matrix, visible=visible)" in source
     assert 'specs.append(("controller_callouts"' not in source
     assert "if self._screen_operation_guide_visible:" in source
     assert "build_help_rgba(environment_mode=environment_mode, lang=language)" in source
@@ -945,8 +946,9 @@ def test_keyboard_modifier_clicks_toggle_real_key_state_for_combinations(monkeyp
     assert events[-1] == (0x11, core_input_helpers._KEYEVENTF_KEYUP)
 
 
-def test_tool_overlay_metrics_snapshot_latency_with_fps_window() -> None:
+def test_tool_overlay_metrics_snapshot_latency_with_fps_window(monkeypatch) -> None:
     presenter = OpenXrVulkanPresenter(on_capture_fps=lambda: 23.7)
+    monkeypatch.setattr("xr_viewer.core_openxr_vulkan.time.perf_counter", lambda: presenter._frame_now)
     presenter._frame_now = 10.0
 
     frame = type("Frame", (), {"frame_id": 1, "timestamp": 10.0})()
@@ -969,6 +971,18 @@ def test_tool_overlay_metrics_snapshot_latency_with_fps_window() -> None:
     assert presenter._tool_overlay_capture_fps == pytest.approx(23.7)
     assert presenter._tool_overlay_latency_ms == pytest.approx(50.0)
     assert presenter._tool_overlay_depth_strength == pytest.approx(1.75)
+
+
+def test_tool_overlay_latency_includes_work_since_xr_frame_timestamp(monkeypatch) -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._frame_now = 10.25
+    monkeypatch.setattr("xr_viewer.core_openxr_vulkan.time.perf_counter", lambda: 10.27)
+    frame = SimpleNamespace(frame_id=1, timestamp=10.20, metadata={})
+
+    presenter._update_tool_overlay_metrics(frame)
+
+    assert presenter._tool_overlay_pending_latency_ms == pytest.approx(70.0)
+    assert presenter._tool_overlay_latency_ms == 0.0
 
 
 def test_tool_overlay_sbs_fps_counts_unique_producer_frames() -> None:
@@ -1228,6 +1242,257 @@ def test_filament_controller_guide_tracks_geometry_and_visibility() -> None:
     presenter._update_filament_controller_guide(bridge)
     _, visible = bridge.calls[-1]
     assert visible is False
+
+
+def test_filament_controller_guide_does_not_require_controller_model() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._vulkan_controller_proxy_enabled = False
+    presenter._controller_brand = None
+    presenter._overlay_language = lambda: "EN"
+    presenter._controller_guide_geometry = lambda: (
+        (0.0, 0.0, -0.2), (0.34, 0.255), np.eye(3)
+    )
+
+    class Bridge:
+        controller_abi_available = True
+        controller_guide_abi_available = True
+
+        def __init__(self):
+            self.textures = []
+            self.poses = []
+
+        def set_controller_guide_texture(self, rgba):
+            self.textures.append(rgba.copy())
+
+        def set_controller_guide(self, matrix, *, visible):
+            self.poses.append((matrix.copy(), visible))
+
+    bridge = Bridge()
+    presenter._update_filament_controllers(bridge)
+
+    assert len(bridge.textures) == 1
+    assert bridge.poses[-1][1] is True
+
+
+def test_controller_guide_geometry_handles_vertical_head_direction() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._head_position_w = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
+    presenter._grip_mat_r = np.eye(4, dtype=np.float64)
+    presenter._controller_brand = None
+
+    geometry = presenter._controller_guide_geometry()
+
+    assert geometry is not None
+    _position, _size, basis = geometry
+    assert np.all(np.isfinite(basis))
+    assert basis.T @ basis == pytest.approx(np.eye(3), abs=1e-6)
+
+
+def test_controller_guide_texture_follows_live_locale() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._overlay_language = lambda: "EN"
+    presenter._controller_guide_geometry = lambda: (
+        (0.0, 0.0, 0.0), (0.34, 0.255), np.eye(3)
+    )
+
+    class Bridge:
+        controller_guide_abi_available = True
+
+        def __init__(self):
+            self.textures = []
+            self.poses = []
+
+        def set_controller_guide_texture(self, rgba):
+            self.textures.append(rgba.copy())
+
+        def set_controller_guide(self, matrix, *, visible):
+            self.poses.append((matrix.copy(), visible))
+
+    bridge = Bridge()
+    presenter._update_filament_controller_guide(bridge)
+    presenter._overlay_language = lambda: "CN"
+    presenter._update_filament_controller_guide(bridge)
+
+    assert len(bridge.textures) == 2
+    assert presenter._controller_guide_texture_locale == "CN"
+    assert all(visible for _matrix, visible in bridge.poses)
+
+
+def test_rocm_controller_guide_uses_quad_fallback_only_without_guide_abi(monkeypatch) -> None:
+    monkeypatch.delenv("D2S_OPENXR_DISABLE_TOOL_QUADS", raising=False)
+    presenter = OpenXrVulkanPresenter()
+    presenter._rocm_backend = True
+    presenter._rocm_openxr_runtime_active = True
+    presenter._vulkan_controller_proxy_enabled = False
+    presenter._controller_brand = None
+    presenter.filament_bridge = SimpleNamespace(controller_guide_abi_available=False)
+    presenter.filament_bridge.set_controller_guide = lambda *_args, **_kwargs: None
+    presenter._vulkan_msdf_quad_renderer = object()
+
+    presenter._configure_controller_guide_quad_fallback()
+    assert presenter._controller_guide_quad_fallback is True
+
+    presenter.filament_bridge.controller_guide_abi_available = True
+    presenter._controller_guide_quad_fallback = False
+    presenter._configure_controller_guide_quad_fallback()
+    assert presenter._controller_guide_quad_fallback is False
+
+
+def test_rocm_vdxr_renders_controller_callout_without_controller_model(monkeypatch) -> None:
+    monkeypatch.delenv("D2S_OPENXR_DISABLE_TOOL_QUADS", raising=False)
+    monkeypatch.delenv("D2S_ROCM_ENABLE_OPENXR_OVERLAYS", raising=False)
+    presenter = OpenXrVulkanPresenter()
+    presenter.xr = presenter.session = presenter.vulkan = object()
+    presenter._rocm_backend = True
+    presenter._rocm_openxr_runtime_active = True
+    presenter._controller_guide_quad_fallback = True
+    presenter._vulkan_msdf_quad_renderer = object()
+    presenter._filament_screen = (
+        (0.0, 0.0, -2.0), 2.4, 1.35, (0.0, 0.0, 0.0)
+    )
+    presenter._head_position_w = np.asarray((0.0, 0.0, 0.0))
+    presenter._controller_brand = None
+    presenter._overlay_language = lambda: "CN"
+    presenter._controller_guide_geometry = lambda: (
+        (0.0, 0.0, -1.0), (0.34, 0.255), np.eye(3)
+    )
+    presenter._cursor_overlay_specs = lambda *_args: []
+    presenter._upload_tool_quad = lambda *args: args
+
+    layers = presenter._render_tool_quad_layers()
+    callout = next(layer for layer in layers if layer[0] == "controller_proxy_callout")
+
+    assert callout[3] == pytest.approx((0.34, 0.255))
+    assert int(np.max(callout[1][..., 3])) == 255
+    assert presenter._tool_quad_texture_keys["controller_proxy_callout"] == (
+        "controller_proxy_callout", "CN"
+    )
+
+
+def test_rocm_vdxr_precreates_only_required_guide_quads(monkeypatch) -> None:
+    monkeypatch.delenv("D2S_OPENXR_DISABLE_TOOL_QUADS", raising=False)
+    monkeypatch.delenv("D2S_ROCM_ENABLE_OPENXR_OVERLAYS", raising=False)
+
+    class SwapchainCreateInfo:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+
+    class UsageFlags:
+        COLOR_ATTACHMENT_BIT = 1
+        SAMPLED_BIT = 2
+        TRANSFER_DST_BIT = 4
+
+    class FakeXr:
+        def __init__(self):
+            self.created = []
+
+        def create_swapchain(self, _session, info):
+            self.created.append((info.width, info.height))
+            return object()
+
+        def enumerate_swapchain_images(self, _swapchain, _image_type):
+            return []
+
+        def destroy_swapchain(self, _swapchain):
+            pass
+
+    FakeXr.SwapchainCreateInfo = SwapchainCreateInfo
+    FakeXr.SwapchainUsageFlags = UsageFlags
+    FakeXr.SwapchainImageVulkan2KHR = object
+
+    presenter = OpenXrVulkanPresenter()
+    presenter.xr = FakeXr()
+    presenter.session = object()
+    presenter.vulkan = object()
+    presenter._rocm_backend = True
+    presenter._rocm_openxr_runtime_active = True
+    presenter._tool_quad_format = lambda: 43
+    presenter._tool_quad_pool_size = lambda: (256, 256)
+    presenter._register_swapchain_images = lambda *_args: []
+
+    presenter._precreate_tool_quad_swapchains()
+
+    assert presenter.xr.created == [(2048, 768)]
+    assert set(presenter._overlay_quad_entries) == {"hand_help"}
+
+
+def test_explicit_openxr_overlay_isolation_precreates_no_guide_quads(monkeypatch) -> None:
+    monkeypatch.setenv("D2S_OPENXR_DISABLE_TOOL_QUADS", "1")
+    presenter = OpenXrVulkanPresenter()
+
+    class FakeXr:
+        def create_swapchain(self, *_args):
+            raise AssertionError("explicit isolation must not create quads")
+
+    presenter.xr = FakeXr()
+    presenter.session = object()
+    presenter.vulkan = object()
+
+    presenter._precreate_tool_quad_swapchains()
+
+    assert presenter._overlay_quad_entries == {}
+
+
+def test_rocm_guide_quads_survive_default_vdxr_isolation_only(monkeypatch) -> None:
+    monkeypatch.delenv("D2S_OPENXR_DISABLE_TOOL_QUADS", raising=False)
+    monkeypatch.delenv("D2S_ROCM_ENABLE_OPENXR_OVERLAYS", raising=False)
+    presenter = OpenXrVulkanPresenter()
+    presenter._rocm_backend = True
+    presenter._rocm_openxr_runtime_active = True
+    specs = [
+        ("settings_menu",),
+        ("controller_proxy_callout",),
+        ("hand_help",),
+        ("laser_cursor",),
+    ]
+
+    assert [spec[0] for spec in presenter._filter_tool_quad_specs_for_runtime(specs)] == [
+        "controller_proxy_callout",
+        "hand_help",
+    ]
+
+    monkeypatch.setenv("D2S_OPENXR_DISABLE_TOOL_QUADS", "1")
+    monkeypatch.setenv("D2S_ROCM_ENABLE_OPENXR_OVERLAYS", "1")
+    assert presenter._tool_quads_disabled() is True
+    assert presenter._filter_tool_quad_specs_for_runtime(specs) == []
+
+
+def test_settings_menu_stop_requests_shared_shutdown_once_and_beats_device_loss() -> None:
+    presenter = OpenXrVulkanPresenter()
+    shutdown = threading.Event()
+    presenter._shutdown_event = shutdown
+    control = MenuControl("runtime:stop", "Stop", (0.0, 0.0, 1.0, 1.0))
+
+    presenter._apply_settings_menu_control(control, (0.5, 0.5))
+    presenter._apply_settings_menu_control(control, (0.5, 0.5))
+
+    assert shutdown.is_set()
+    assert presenter._runtime_stop_requested is True
+    assert presenter.fatal_device_loss is False
+    assert presenter._settings_menu.stopping is True
+    assert presenter._accept_output is False
+    stop = next(
+        item for item in presenter._settings_menu.controls()
+        if item.key == "runtime:stop"
+    )
+    assert stop.label == "Stop"
+    assert stop.enabled is False
+
+    presenter._request_fatal_device_loss()
+    assert presenter.fatal_device_loss is False
+    assert shutdown.is_set()
+
+
+def test_right_stick_scroll_sign_changes_only_vertical_axis() -> None:
+    presenter = OpenXrVulkanPresenter()
+    calls = []
+    presenter._accum_scroll = lambda x, y, dt: calls.append((x, y, dt))
+
+    presenter._dispatch_controller_shortcut(
+        "scroll_axes", horizontal=0.25, vertical=0.75, dt=0.01
+    )
+
+    assert calls == [(0.25, -0.75, 0.01)]
 
 
 def test_presenter_defaults_to_composer_only_screen_path(monkeypatch) -> None:
@@ -4301,7 +4566,7 @@ def test_runtime_failure_waits_for_openxr_runtime_release_before_reconnect() -> 
     assert waits == [6.0]
 
 
-def test_presenter_close_destroys_bound_vulkan_before_openxr() -> None:
+def test_presenter_close_destroys_openxr_before_bound_vulkan() -> None:
     calls = []
 
     class FakeVulkan:
@@ -4322,7 +4587,7 @@ def test_presenter_close_destroys_bound_vulkan_before_openxr() -> None:
 
     presenter.close()
 
-    assert calls == ["vulkan", "openxr"]
+    assert calls == ["openxr", "vulkan"]
 
 
 def test_rocm_prewarm_closes_before_presenter_vulkan_device() -> None:
@@ -4798,13 +5063,60 @@ def test_presenter_latches_fatal_device_loss_from_output_conversion() -> None:
     assert presenter._accept_output is False
 
 
-def test_presenter_close_stops_worker_output_before_teardown() -> None:
+def test_presenter_close_stops_worker_output_before_teardown(monkeypatch) -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._accept_output = True
     presenter.session_running = True
+    action_spaces = [object() for _ in range(4)]
+    instance = object()
+    xr_events = []
+
+    class FakeXr:
+        def destroy_space(self, space):
+            xr_events.append(("destroy_space", space))
+
+        def end_session(self, session):
+            xr_events.append(("end_session", session))
+
+        def destroy_session(self, session):
+            xr_events.append(("destroy_session", session))
+
+        def destroy_instance(self, instance):
+            xr_events.append(("destroy_instance", instance))
+
+    class FakeVulkan:
+        device_lost = False
+        device = None
+
+        def wait_idle(self):
+            pass
+
+        def close(self):
+            xr_events.append(("close_vulkan", None))
+
+    presenter.xr = FakeXr()
+    presenter.session = object()
+    presenter.instance = instance
+    presenter.vulkan = FakeVulkan()
+    presenter._aim_space_l, presenter._aim_space_r = action_spaces[:2]
+    presenter._grip_space_l, presenter._grip_space_r = action_spaces[2:]
+    session = presenter.session
+    monkeypatch.setattr(presenter, "_persist_screen_state", lambda **_kwargs: None)
+
     presenter.close()
 
     assert presenter._accept_output is False
+    assert xr_events == [
+        *(('destroy_space', space) for space in action_spaces),
+        ("end_session", session),
+        ("destroy_session", session),
+        ("destroy_instance", instance),
+        ("close_vulkan", None),
+    ]
+    assert all(
+        getattr(presenter, attr) is None
+        for attr in ("_aim_space_l", "_aim_space_r", "_grip_space_l", "_grip_space_r")
+    )
 
 
 def test_filament_bridge_binds_each_openxr_eye(monkeypatch) -> None:
@@ -5973,6 +6285,24 @@ def test_settings_menu_uses_one_both_eye_cached_tool_quad() -> None:
     assert presenter._settings_menu_pose[0] == pytest.approx((0.0, 1.48, -1.1))
 
 
+def test_settings_menu_cursor_motion_does_not_dirty_the_cached_panel_texture():
+    presenter = OpenXrVulkanPresenter()
+    presenter._settings_menu.visible = True
+    presenter._settings_menu.dirty = False
+    presenter._settings_menu_pose = ((0.0, 0.0, -1.0), (0.0, 0.0, 0.0, 1.0))
+    pointer = [(0.4, 0.9), (0.6, 0.9)]
+    presenter._controller_input = lambda _hand: {"trigger": 0.0, "grip": 0.0}
+    presenter._settings_menu_ray_hit = lambda hand: pointer[hand]
+
+    presenter._handle_settings_menu_input()
+    assert presenter._settings_menu.dirty is False
+    pointer[:] = [(0.5, 0.9), (0.7, 0.9)]
+    presenter._handle_settings_menu_input()
+
+    assert presenter._settings_menu_cursor_uv == pytest.approx((0.5, 0.9))
+    assert presenter._settings_menu.dirty is False
+
+
 def test_settings_menu_grip_drag_preserves_controller_relative_pose() -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._settings_menu_pose = ((0.0, 1.0, -1.0), (0.0, 0.0, 0.0, 1.0))
@@ -5983,6 +6313,179 @@ def test_settings_menu_grip_drag_preserves_controller_relative_pose() -> None:
     presenter._grip_mat_l[:3, 3] = (0.25, 0.1, -0.2)
     presenter._handle_settings_menu_grip_drag(inputs, ((0.5, 0.5), None))
     assert presenter._settings_menu_pose[0] == pytest.approx((0.25, 1.1, -1.2))
+
+
+def test_settings_menu_grab_keeps_the_initial_local_uv_anchor_during_motion():
+    presenter = OpenXrVulkanPresenter()
+    presenter._settings_menu_pose = ((0.0, 0.0, -1.0), (0.0, 0.0, 0.0, 1.0))
+    presenter._settings_menu.visible = True
+    presenter._grip_mat_l = np.eye(4, dtype=np.float64)
+    initial_uv = (0.23, 0.71)
+    inputs = ({"grip": 1.0}, {"grip": 0.0})
+    presenter._handle_settings_menu_grip_drag(inputs, (initial_uv, None))
+
+    presenter._grip_mat_l[:3, 3] = (0.2, 0.1, -0.1)
+    presenter._handle_settings_menu_grip_drag(inputs, ((0.8, 0.2), None))
+    matrix = presenter._settings_menu_matrix()
+    expected_local = np.asarray(
+        ((initial_uv[0] - 0.5) * SETTINGS_MENU_WORLD_SIZE[0],
+         (0.5 - initial_uv[1]) * SETTINGS_MENU_WORLD_SIZE[1], 0.0),
+        dtype=np.float64,
+    )
+
+    assert presenter._settings_menu_grab_local_uv == pytest.approx(initial_uv)
+    assert presenter._settings_menu_grab_anchor_w == pytest.approx(
+        matrix[:3, 3] + matrix[:3, :3] @ expected_local
+    )
+
+
+def test_settings_menu_cursor_ring_uses_the_screen_cursor_quad_pose_and_scale():
+    presenter = OpenXrVulkanPresenter()
+    presenter._settings_menu.visible = True
+    presenter._settings_menu_pose = ((0.0, 0.0, -2.0), (0.0, 0.0, 0.0, 1.0))
+    presenter._settings_menu_cursor_hits = ((0.25, 0.75), None)
+
+    specs = presenter._settings_menu_cursor_overlay_specs(
+        np.zeros((64, 64, 4), dtype=np.uint8), np.asarray((0.0, 0.0, 0.0))
+    )
+
+    assert len(specs) == 1
+    key, _rgba, position, size, rotation = specs[0]
+    assert key == "laser_cursor_0"
+    assert position == pytest.approx((-0.2375, -0.1925, -1.997))
+    assert size[0] == pytest.approx(size[1])
+    assert size[0] == pytest.approx(0.024, abs=0.001)
+    assert rotation == pytest.approx((0.0, 0.0, 0.0, 1.0))
+
+
+def test_settings_menu_grab_ray_tracks_the_fixed_anchor_for_both_laser_backends():
+    presenter = OpenXrVulkanPresenter()
+    presenter._settings_menu_grab_hand = 1
+    presenter._settings_menu_grab_anchor_w = np.asarray((0.0, 1.0, -1.0))
+    origin = np.asarray((1.0, 1.0, 0.0))
+    fallback = np.asarray((0.0, 0.0, -1.0))
+
+    anchored = presenter._settings_menu_grab_ray_direction(1, origin, fallback)
+    other_hand = presenter._settings_menu_grab_ray_direction(0, origin, fallback)
+
+    assert anchored == pytest.approx((-1.0 / math.sqrt(2.0), 0.0, -1.0 / math.sqrt(2.0)))
+    assert other_hand is fallback
+
+
+def _start_settings_menu_grab_for_test(*, frame_dt=1.0 / 90.0):
+    presenter = OpenXrVulkanPresenter()
+    presenter._settings_menu_pose = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    presenter._settings_menu.visible = True
+    presenter._grip_mat_l = np.eye(4, dtype=np.float64)
+    presenter._last_frame_dt = frame_dt
+    presenter._handle_settings_menu_grip_drag(
+        ({"grip": 1.0}, {"grip": 0.0}), ((0.5, 0.5), None)
+    )
+    return presenter
+
+
+@pytest.mark.parametrize("frame_dt", (1.0 / 30.0, 1.0 / 60.0, 1.0 / 90.0))
+def test_settings_menu_grip_drag_scales_translation_filter_to_frame_time(frame_dt):
+    presenter = _start_settings_menu_grab_for_test(frame_dt=frame_dt)
+    presenter._grip_mat_l[:3, 3] = (0.01, 0.0, 0.0)
+
+    presenter._handle_settings_menu_grip_drag(
+        ({"grip": 1.0}, {"grip": 0.0}), ((0.5, 0.5), None)
+    )
+
+    follow = 0.3 + 0.01 / 0.04
+    alpha = 1.0 - (1.0 - follow) ** (frame_dt * 90.0)
+    assert presenter._settings_menu_pose[0] == pytest.approx((0.01 * alpha, 0.0, 0.0))
+
+
+@pytest.mark.parametrize("frame_dt", (1.0 / 30.0, 1.0 / 60.0, 1.0 / 90.0))
+def test_settings_menu_grip_drag_scales_rotation_filter_to_frame_time(frame_dt):
+    presenter = _start_settings_menu_grab_for_test(frame_dt=frame_dt)
+    angle = 0.02
+    presenter._grip_mat_l[:3, :3] = presenter._quat_to_mat3(
+        np.asarray((0.0, math.sin(angle / 2.0), 0.0, math.cos(angle / 2.0)))
+    )
+
+    presenter._handle_settings_menu_grip_drag(
+        ({"grip": 1.0}, {"grip": 0.0}), ((0.5, 0.5), None)
+    )
+
+    follow = 0.3 + angle / 0.04
+    alpha = 1.0 - (1.0 - follow) ** (frame_dt * 90.0)
+    orientation = np.asarray(presenter._settings_menu_pose[1])
+    actual_angle = 2.0 * math.acos(min(1.0, abs(float(orientation[3]))))
+    assert actual_angle == pytest.approx(angle * alpha, abs=1e-7)
+
+
+def test_settings_menu_grip_drag_suppresses_small_rotation_and_preserves_fast_motion():
+    presenter = _start_settings_menu_grab_for_test()
+    jitter_angle = 0.004
+    presenter._grip_mat_l[:3, :3] = presenter._quat_to_mat3(
+        np.asarray((0.0, math.sin(jitter_angle / 2.0), 0.0, math.cos(jitter_angle / 2.0)))
+    )
+    inputs = ({"grip": 1.0}, {"grip": 0.0})
+    hits = ((0.5, 0.5), None)
+
+    presenter._handle_settings_menu_grip_drag(inputs, hits)
+    assert presenter._settings_menu_pose[1] == pytest.approx((0.0, 0.0, 0.0, 1.0))
+
+    fast_angle = 0.2
+    presenter._grip_mat_l[:3, :3] = presenter._quat_to_mat3(
+        np.asarray((0.0, math.sin(fast_angle / 2.0), 0.0, math.cos(fast_angle / 2.0)))
+    )
+    presenter._handle_settings_menu_grip_drag(inputs, hits)
+    assert presenter._settings_menu_pose[1] == pytest.approx(
+        (0.0, math.sin(fast_angle / 2.0), 0.0, math.cos(fast_angle / 2.0))
+    )
+
+
+def test_settings_menu_grip_drag_uses_shortest_rotation_across_quaternion_sign_flip():
+    presenter = _start_settings_menu_grab_for_test()
+    inputs = ({"grip": 1.0}, {"grip": 0.0})
+    hits = ((0.5, 0.5), None)
+
+    presenter._grip_mat_l[:3, :3] = presenter._quat_to_mat3(
+        np.asarray((0.0, math.sin(3.13 / 2.0), 0.0, math.cos(3.13 / 2.0)))
+    )
+    presenter._handle_settings_menu_grip_drag(inputs, hits)
+    presenter._grip_mat_l[:3, :3] = presenter._quat_to_mat3(
+        np.asarray((0.0, math.sin(-3.13 / 2.0), 0.0, math.cos(-3.13 / 2.0)))
+    )
+    presenter._handle_settings_menu_grip_drag(inputs, hits)
+
+    qy, qw = presenter._settings_menu_pose[1][1], presenter._settings_menu_pose[1][3]
+    assert abs(qy) > 0.99
+    assert abs(qw) < 0.01
+
+
+def test_settings_menu_grip_drag_resets_on_tracking_loss_and_requires_release():
+    presenter = _start_settings_menu_grab_for_test()
+    assert presenter._settings_menu_grab_hand == 0
+
+    presenter._grip_mat_l = None
+    presenter._handle_settings_menu_grip_drag(
+        ({"grip": 1.0}, {"grip": 0.0}), (None, None)
+    )
+    assert presenter._settings_menu_grab_hand is None
+    assert presenter._settings_menu_grab_relative is None
+    assert presenter._settings_menu_grab_filtered_pose is None
+    assert presenter._settings_menu_grab_local_uv is None
+    assert presenter._settings_menu_grab_anchor_w is None
+
+    presenter._grip_mat_l = np.eye(4, dtype=np.float64)
+    presenter._handle_settings_menu_grip_drag(
+        ({"grip": 1.0}, {"grip": 0.0}), ((0.5, 0.5), None)
+    )
+    assert presenter._settings_menu_grab_hand is None
+
+    presenter._handle_settings_menu_grip_drag(
+        ({"grip": 0.0}, {"grip": 0.0}), (None, None)
+    )
+    presenter._handle_settings_menu_grip_drag(
+        ({"grip": 1.0}, {"grip": 0.0}), ((0.5, 0.5), None)
+    )
+    assert presenter._settings_menu_grab_hand == 0
+    assert presenter._settings_menu_grab_filtered_pose is not None
 
 
 def test_settings_menu_render_scale_defers_rebuild_until_slider_release() -> None:
@@ -6527,7 +7030,8 @@ def test_settings_menu_screen_rotation_and_reset_restore_profile_pose() -> None:
     assert presenter._filament_screen[3] == pytest.approx((10.0, 20.0, 120.0))
 
     presenter._apply_settings_menu_control(
-        controls["section:reset_defaults"], (0.0, 0.0)
+        MenuControl("section:reset_defaults", "", (0.0, 0.0, 0.0, 0.0)),
+        (0.0, 0.0),
     )
     assert presenter._filament_screen == (
         initial[0], initial[1], initial[2], (10.0, 20.0, 120.0)

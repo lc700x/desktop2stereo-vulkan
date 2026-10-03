@@ -1,4 +1,7 @@
 import gettext
+import re
+from functools import lru_cache
+from string import Formatter
 from types import MappingProxyType
 
 
@@ -126,9 +129,25 @@ MESSAGE_CATALOGS = {
         "Screen crop": "Screen crop",
         "Screen shape": "Screen shape",
         "Screen rotation": "Screen rotation",
+        "Screen placement": "Screen placement",
+        "Crop settings": "Crop settings",
+        "Crop range": "Crop range",
+        "Render quality": "Render quality",
+        "Color adjustment": "Color adjustment",
+        "Stereo mode": "Stereo mode",
+        "Glow mode": "Glow mode",
+        "Environment": "Environment",
+        "Seat position": "Seat position",
+        "Reset picture": "Reset picture",
+        "Reset depth": "Reset depth",
+        "Reset placement": "Reset placement",
+        "Rotate -90": "Rotate -90",
+        "Rotate +90": "Rotate +90",
         "One section at a time": "One section at a time",
         "OpenXR Settings": "OpenXR Settings",
         "Desktop2Stereo OpenXR Settings": "Desktop2Stereo OpenXR Settings",
+        "B button": "B button",
+        "Hold: show operation guide": "Hold: show operation guide",
         "Physical mouse controls are synchronized with the in-headset menu.": "Physical mouse controls are synchronized with the in-headset menu.",
         "Waiting for OpenXR settings...": "Waiting for OpenXR settings...",
         "Advanced Stereo": "Advanced Stereo",
@@ -517,9 +536,25 @@ MESSAGE_CATALOGS = {
         "Screen crop": "屏幕裁剪",
         "Screen shape": "屏幕形状",
         "Screen rotation": "屏幕旋转",
+        "Screen placement": "屏幕位置",
+        "Crop settings": "裁剪设置",
+        "Crop range": "裁剪范围",
+        "Render quality": "渲染质量",
+        "Color adjustment": "色彩调整",
+        "Stereo mode": "立体模式",
+        "Glow mode": "辉光模式",
+        "Environment": "环境",
+        "Seat position": "座位位置",
+        "Reset picture": "重置画面",
+        "Reset depth": "重置景深",
+        "Reset placement": "重置屏幕位置",
+        "Rotate -90": "左转 90 度",
+        "Rotate +90": "右转 90 度",
         "One section at a time": "一次调整一个分区",
         "OpenXR Settings": "OpenXR 设置",
         "Desktop2Stereo OpenXR Settings": "Desktop2Stereo OpenXR 设置",
+        "B button": "B 键",
+        "Hold: show operation guide": "长按：显示操作说明",
         "Physical mouse controls are synchronized with the in-headset menu.": "物理鼠标控制与头显内菜单同步。",
         "Waiting for OpenXR settings...": "正在等待 OpenXR 设置...",
         "Advanced Stereo": "显示高级立体参数",
@@ -809,9 +844,112 @@ LOCALE_ALIASES = MappingProxyType({
     "ZH-HANS": "CN",
 })
 
+_STATUS_MESSAGES = {
+    "Stopping...": "\u6b63\u5728\u505c\u6b62...",
+    "unknown": "未知",
+    "none": "无",
+    "Progress": "进度",
+    "Download": "下载",
+    "download": "下载",
+    "ETA": "预计剩余时间",
+    "{count} steps": "{count} 步",
+    "{rate} steps/s": "{rate} 步/秒",
+    "Loading model for ONNX export: {model}": "正在加载 ONNX 导出模型：{model}",
+    "Probing ONNX export dtype: {dtype}": "正在检测 ONNX 导出数据类型：{dtype}",
+    "Reloading model for ONNX export: {dtype}": "正在重新加载 ONNX 导出模型：{dtype}",
+    "Exporting ONNX: {file}": "正在导出 ONNX：{file}",
+    "Parsing ONNX for TensorRT: {file}": "正在为 TensorRT 解析 ONNX：{file}",
+    "Building TensorRT engine: {file}": "正在构建 TensorRT 引擎：{file}",
+    "vulkan_unavailable": "Vulkan 不可用",
+    "not_resolved": "尚未确定",
+    "coremltools_unavailable": "coremltools 不可用",
+    ("The input display is running at {refresh_hz} Hz, below the dynamic capture target of {capture_target} FPS; "
+     "increase the input display refresh rate or lower the capture target manually."):
+        "输入显示器当前仅 {refresh_hz} Hz，低于动态捕获目标 {capture_target} FPS；请提高输入显示器刷新率，或手动降低捕获帧率。",
+    ("The SBS output display is running at {refresh_hz} Hz, below the measured {sbs_fps} FPS "
+     "or the recommended 60 Hz minimum; increase its refresh rate in Windows or the GPU control panel."):
+        "SBS 输出显示器当前仅 {refresh_hz} Hz，低于实测 {sbs_fps} FPS 或建议最低 60 Hz；请在 Windows 显示设置或显卡控制面板中提高刷新率。",
+    "TensorRT unavailable": "TensorRT 不可用",
+    "migraphx is not installed": "未安装 MIGraphX",
+    "torch.version.hip is not available": "torch.version.hip 不可用",
+    "torch.backends.mps is not available": "torch.backends.mps 不可用",
+    "torch.xpu is not available": "torch.xpu 不可用",
+    "No Stereo Mix device found": "未找到立体声混音设备",
+    "No audio capture devices found": "未找到音频捕获设备",
+    "No audio sources found": "未找到音频源",
+    "sounddevice not available": "sounddevice 不可用",
+    "pacmd not available": "pacmd 不可用",
+    "Error: {error}": "错误：{error}",
+    "Calibration result error: {error}": "校准结果错误：{error}",
+    "Vulkan native GPU image path active": "Vulkan 原生 GPU 图像路径已启用",
+    "Native vendor GPU streaming active": "显卡原生 GPU 推流已启用",
+    "Vulkan unavailable; using OpenGL fallback": "Vulkan 不可用；回退至 OpenGL",
+    "Native vendor GPU unavailable; trying Vulkan": "显卡原生 GPU 路径不可用；正在尝试 Vulkan",
+    "Vulkan unavailable; using stable advanced FFmpeg path": "Vulkan 不可用；使用稳定的高级 FFmpeg 路径",
+    ("Downloading depth model weights: {model}. The first download may take several minutes; "
+     "see the progress bar above."):
+        "正在下载深度模型权重：{model}。首次下载可能需要几分钟，进度请看上方进度条。",
+    "Depth model weights downloaded; preparing the next step.": "深度模型权重下载完成，正在准备下一步。",
+    "Exporting ONNX: {file}. This may take a while; see the progress bar above.":
+        "正在导出 ONNX：{file}。这个步骤可能需要一段时间，进度请看上方进度条。",
+    "ONNX export complete: {file}.": "ONNX 导出完成：{file}。",
+    "Compiling TensorRT engine: {file}. This may take a long time; see the progress bar above.":
+        "正在编译 TensorRT 引擎：{file}。这个步骤耗时较长，请耐心等待，进度请看上方进度条。",
+    "TensorRT engine compilation complete: {file}.": "TensorRT 引擎编译完成：{file}。",
+    "calibration_sender_metrics": "{fps} FPS · {bitrate} Mbps · 发送 {submitted} FPS · 样本 {samples}",
+}
+MESSAGE_CATALOGS["EN"].update({key: key for key in _STATUS_MESSAGES})
+MESSAGE_CATALOGS["CN"].update(_STATUS_MESSAGES)
+MESSAGE_CATALOGS["EN"]["calibration_sender_metrics"] = (
+    "{fps} FPS · {bitrate} Mbps · send {submitted} FPS · samples {samples}"
+)
+for _catalog in MESSAGE_CATALOGS.values():
+    for _label in ("Selected input monitor:", "Selected input window:", "Failed to load settings.yaml:"):
+        _catalog[_label + " {detail}"] = _catalog[_label] + " {detail}"
+    _catalog["Opening URL in browser: {url}"] = _catalog["Opening URL in browser"] + ": {url}"
+
 SUPPORTED_LOCALES = tuple(MESSAGE_CATALOGS.keys())
 UI_MESSAGES = MESSAGE_CATALOGS
 UI_TEXTS = UI_MESSAGES
+
+
+@lru_cache(maxsize=1)
+def _status_templates():
+    templates = []
+    for catalog in MESSAGE_CATALOGS.values():
+        for key, template in catalog.items():
+            parts = list(Formatter().parse(template))
+            fields = [field for _, field, _, _ in parts if field is not None]
+            if not fields:
+                continue
+            pattern = "".join(re.escape(literal) + ("(.+?)" if field is not None else "")
+                              for literal, field, _, _ in parts)
+            templates.append((sum(len(literal) for literal, _, _, _ in parts), key, re.compile(pattern), fields))
+    # Prefer specific messages over generic wrappers such as "Error: {}".
+    return sorted(templates, key=lambda item: item[0], reverse=True)
+
+
+def translate_status(message, locale=DEFAULT_LOCALE):
+    """Translate known status text while preserving filenames and diagnostic arguments."""
+    text = str(message or "")
+    target = get_messages(locale)
+    if text in target:
+        return target[text]
+    for catalog in MESSAGE_CATALOGS.values():
+        for key, value in catalog.items():
+            if text == value:
+                return target.get(key, text)
+    for _, key, pattern, fields in _status_templates():
+        match = pattern.fullmatch(text)
+        if match is None:
+            continue
+        values = dict(zip(fields, match.groups()))
+        positional = iter(match.groups())
+        return "".join(
+            literal + (next(positional) if field == "" else values[field]) if field is not None else literal
+            for literal, field, _, _ in Formatter().parse(target.get(key, text))
+        )
+    return text
 
 
 class CatalogTranslation(gettext.NullTranslations):

@@ -33,7 +33,7 @@ from .paths import (
     STREAM_CALIBRATION_STATE_FILE,
 )
 from .capture_sources import get_primary_monitor_index, list_windows
-from .localization import UI_MESSAGES
+from .localization import UI_MESSAGES, translate_status
 from .log_handler import GuiLogHandler
 from utils.logging_setup import _NoisyThirdPartyDebugFilter
 from utils.run_mode import target_fps_setting_key
@@ -514,11 +514,16 @@ class GUIProcessMixin:
     """Mixin providing process lifecycle, ESC monitoring, and status for Desktop2StereoGUI."""
 
     def set_status(self, msg, key=None):
-        self.status_text.value = msg
-        if key is not None:
-            self._status_key = key
+        self._status_message = msg
+        self._status_key = key
+        self.status_text.value = translate_status(msg, self.locale)
         if msg:
-            status_logger.info(msg)
+            status_logger.info(self.status_text.value)
+        self._safe_update(self.status_text)
+
+    def _refresh_status_display(self):
+        message = getattr(self, "_status_message", self.status_text.value)
+        self.status_text.value = translate_status(message, self.locale)
         self._safe_update(self.status_text)
 
     def _set_backend_status(self, payload):
@@ -542,17 +547,17 @@ class GUIProcessMixin:
             self._safe_update(control)
             return
         t = UI_MESSAGES.get(self.locale, UI_MESSAGES["EN"])
-        depth = payload.get("depth_backend") or "unknown"
-        stereo = payload.get("stereo_backend") or "unknown"
+        depth = translate_status(payload.get("depth_backend") or "unknown", self.locale)
+        stereo = translate_status(payload.get("stereo_backend") or "unknown", self.locale)
         fallback = t.get("Status Yes", "Yes") if payload.get("fallback") else t.get("Status No", "No")
         gpu_to_cpu = t.get("Status Yes", "Yes") if payload.get("gpu_to_cpu") else t.get("Status No", "No")
         zero_copy = t.get("Status Yes", "Yes") if payload.get("zero_copy") else t.get("Status No", "No")
         copies = payload.get("gpu_copy_count", 0)
-        resource_kind = payload.get("resource_kind") or "unknown"
-        resource_format = payload.get("resource_format") or "unknown"
+        resource_kind = translate_status(payload.get("resource_kind") or "unknown", self.locale)
+        resource_format = translate_status(payload.get("resource_format") or "unknown", self.locale)
         directml_mode = payload.get("directml_resource_mode")
         reasons = payload.get("fallback_reasons") or []
-        reason_text = "; ".join(str(item) for item in reasons if item)
+        reason_text = "; ".join(translate_status(item, self.locale) for item in reasons if item)
         if len(reason_text) > 220:
             reason_text = reason_text[:217] + "..."
         # Get localized labels
@@ -594,6 +599,11 @@ class GUIProcessMixin:
         if self.stop_btn.disabled:
             self.stop_btn.disabled = False
             changed_controls.append(self.stop_btn)
+        stop_text = self._stop_button_text()
+        stop_content = getattr(self.stop_btn, "content", None)
+        if stop_content is not None and stop_content.value != stop_text:
+            stop_content.value = stop_text
+            changed_controls.append(self.stop_btn)
         calibration_button = getattr(self, "stream_calibration_btn", None)
         if (
             calibration_button is not None
@@ -602,6 +612,21 @@ class GUIProcessMixin:
             calibration_button.disabled = running
             changed_controls.append(calibration_button)
         self._safe_update(*changed_controls)
+
+    def _stop_button_text(self):
+        locale = getattr(self, "locale", "EN")
+        catalog = UI_MESSAGES.get(locale, UI_MESSAGES["EN"])
+        return catalog["Stop"]
+
+    def _refresh_stop_button_label(self):
+        stop_btn = getattr(self, "stop_btn", None)
+        content = getattr(stop_btn, "content", None)
+        if content is None:
+            return
+        text = self._stop_button_text()
+        if content.value != text:
+            content.value = text
+            self._safe_update(stop_btn)
 
     def _show_display_refresh_warning(self, payload: dict) -> None:
         if getattr(self, "_display_refresh_warning_dialog", None) is not None:
@@ -1267,11 +1292,11 @@ class GUIProcessMixin:
                         stage_key, status
                     ).format(fps=int(tier.get("fps", 0) or 0))
                     sender = state.get("sender") or {}
-                    sender_detail = (
-                        f"{int(tier.get('fps', 0) or 0)} FPS · "
-                        f"{int(tier.get('target_mbps', 0) or 0)} Mbps · "
-                        f"send {float(sender.get('submitted_fps', 0.0) or 0.0):.1f} FPS · "
-                        f"samples {int(state.get('receiver_samples', 0) or 0)}"
+                    sender_detail = UI_MESSAGES[self.locale]["calibration_sender_metrics"].format(
+                        fps=int(tier.get("fps", 0) or 0),
+                        bitrate=int(tier.get("target_mbps", 0) or 0),
+                        submitted=f"{float(sender.get('submitted_fps', 0.0) or 0.0):.1f}",
+                        samples=int(state.get("receiver_samples", 0) or 0),
                     )
                     receiver = state.get("receiver_latest") or {}
                     receiver_detail = UI_MESSAGES[self.locale].get(
@@ -1503,6 +1528,7 @@ class GUIProcessMixin:
         self._cancel_starting = False
         self._esc_stopped = False
         self._stopping = False
+        self._user_stop_requested = False
         # A manual Start resets the OpenXR fatal auto-relaunch budget.
         self._auto_relaunch_count = 0
         # Re-attach the file handler (append mode) for this run's log output;
@@ -1743,7 +1769,10 @@ class GUIProcessMixin:
                     self._restore_precalibration_target()
                     self._close_stream_calibration_dialog()
             code = proc.returncode if proc else None
-            if code == 77:
+            user_stop_requested = bool(
+                getattr(self, "_user_stop_requested", False)
+            )
+            if code == 77 and not user_stop_requested:
                 # Terminal OpenXR failure (device loss / exhausted reconnects):
                 # VDXR cannot re-create an instance in-process, so relaunch the
                 # runtime in a fresh process (bounded to avoid a crash loop).
@@ -1780,7 +1809,7 @@ class GUIProcessMixin:
                     )
                     _set_console_quick_edit(True)
                     self._set_running_ui(False)
-            elif code and code != 0:
+            elif code and code != 0 and not user_stop_requested:
                 self._diag(f"child exited rc={code}; see {LOG_FILE} for details", error=True)
                 self.set_status(UI_MESSAGES[self.locale]["exited_with_code"].format(code))
                 _set_console_quick_edit(True)
@@ -1800,6 +1829,9 @@ class GUIProcessMixin:
         )
         if not running:
             return
+        self._user_stop_requested = True
+        self._refresh_stop_button_label()
+        self.set_status(UI_MESSAGES[self.locale]["Stopping..."], key="Stopping...")
         future = asyncio.run_coroutine_threadsafe(self._async_stop(), self._loop)
         future.add_done_callback(lambda f: f.exception() if f.exception() else None)
 
@@ -1852,6 +1884,8 @@ class GUIProcessMixin:
                 pass
 
     async def _async_stop(self):
+        self._user_stop_requested = True
+        self._refresh_stop_button_label()
         if self._stopping:
             if self._closed and self.process and self.process.returncode is None:
                 proc = self.process
@@ -1859,6 +1893,7 @@ class GUIProcessMixin:
                 await self._kill_process_tree(proc, proc.pid)
             return
         self._stopping = True
+        self._refresh_stop_button_label()
         self._esc_stopped = True
         self._esc_down = None
         self._cancel_starting = True
@@ -2117,12 +2152,14 @@ class GUIProcessMixin:
         panel = getattr(self, "download_progress_panel", None)
         if panel is None:
             return
+        self._download_progress_payload = data
+        locale = getattr(self, "locale", "EN")
         percent = data.get("percent")
-        desc = str(data.get("desc") or "Download")
-        completed = data.get("downloaded") or ""
-        total = data.get("size") or ""
-        speed = data.get("speed") or ""
-        eta = data.get("eta") or ""
+        desc = translate_status(data.get("desc") or "Download", locale)
+        completed = translate_status(data.get("downloaded"), locale)
+        total = translate_status(data.get("size"), locale)
+        speed = translate_status(data.get("speed"), locale)
+        eta = translate_status(data.get("eta"), locale)
         value = 0.0 if percent is None else max(0.0, min(1.0, float(percent) / 100.0))
         done = percent is not None and float(percent) >= 100.0
         color = ft.Colors.GREEN if done else ft.Colors.BLUE
@@ -2133,7 +2170,8 @@ class GUIProcessMixin:
         self.download_progress_percent.color = color
         self.download_progress_bar.value = value
         self.download_progress_bar.color = color
-        self.download_progress_detail.value = f"{completed} / {total}  {speed}  ETA {eta}".strip()
+        eta_label = translate_status("ETA", locale)
+        self.download_progress_detail.value = f"{completed} / {total}  {speed}  {eta_label} {eta}".strip()
         self.download_progress_detail.color = ft.Colors.GREEN if done else ft.Colors.GREY
 
     def _progress_log_line(self, item):
@@ -2341,6 +2379,8 @@ class GUIProcessMixin:
         if is_nvidia_cuda:
             dynamic_defaults["torch.compile"] = True
             dynamic_defaults["TensorRT"] = True
+        elif "CUDA" in (current_device_label or "") and devices_module.IS_ROCM:
+            dynamic_defaults["MIGraphX"] = True
         self.apply_config(dynamic_defaults, keep_optional=False)
         self.locale = current_locale
         self.lang_dd.value = "English" if current_locale == "EN" else "简体中文"

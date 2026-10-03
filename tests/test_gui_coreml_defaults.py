@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from gui.config import default_coreml_enabled
 from gui.process import GUIProcessMixin
 from utils.bootstrap import _normalize_legacy_settings
@@ -59,7 +61,8 @@ def test_reset_defaults_enables_coreml_on_macos(monkeypatch) -> None:
     assert target.applied["CoreML"] is True
 
 
-def test_reset_defaults_keeps_coreml_disabled_on_windows(monkeypatch) -> None:
+@pytest.mark.parametrize("is_rocm", [False, True])
+def test_reset_defaults_keeps_coreml_disabled_on_windows(monkeypatch, is_rocm) -> None:
     import gui.process as gui_process
 
     class Harness:
@@ -89,9 +92,12 @@ def test_reset_defaults_keeps_coreml_disabled_on_windows(monkeypatch) -> None:
             pass
 
     monkeypatch.setattr(gui_process, "OS_NAME", "Windows")
+    monkeypatch.setattr(gui_process.devices_module, "IS_ROCM", is_rocm)
     monkeypatch.setattr(gui_process, "get_primary_monitor_index", lambda: 1)
     target = Harness()
 
     GUIProcessMixin.reset_defaults(target, None)
 
     assert target.applied["CoreML"] is False
+    assert target.applied["MIGraphX"] is is_rocm
+    assert target.applied["TensorRT"] is (not is_rocm)

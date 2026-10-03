@@ -106,6 +106,7 @@ from .windows_input import (
     _set_cursor_pos,
     _start_physical_input_monitor,
     _physical_input_generation,
+    _physical_mouse_active,
     _physical_keyboard_active,
     _set_alt_long_press_callback,
     _clear_alt_long_press_callback,
@@ -1153,6 +1154,7 @@ class OpenXrVulkanPresenter(
         # session.  The runtime must tear down this child and let the parent
         # relaunch it with a fresh Vulkan/OpenXR instance.
         self.fatal_device_loss = False
+        self._runtime_stop_requested = False
         self._shutdown_event: Any | None = None
         self._presenter_commands: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=2)
         self._output_adapter: Any | None = None
@@ -1202,6 +1204,9 @@ class OpenXrVulkanPresenter(
         self._desktop_settings_last_action = 0.0
         self._settings_menu_pose: tuple[tuple[float, ...], tuple[float, ...]] | None = None
         self._settings_menu_cursor_uv: tuple[float, float] | None = None
+        self._settings_menu_cursor_hits: tuple[
+            tuple[float, float] | None, tuple[float, float] | None
+        ] = (None, None)
         self._settings_menu_values: dict[str, float | bool] = {}
         self._settings_menu_last_redraw = 0.0
         self._settings_menu_last_adjust = 0.0
@@ -1209,6 +1214,9 @@ class OpenXrVulkanPresenter(
         self._settings_menu_allow_curve = True
         self._settings_menu_grab_hand: int | None = None
         self._settings_menu_grab_relative: np.ndarray | None = None
+        self._settings_menu_grab_filtered_pose: np.ndarray | None = None
+        self._settings_menu_grab_local_uv: tuple[float, float] | None = None
+        self._settings_menu_grab_anchor_w: np.ndarray | None = None
         self._settings_menu_grip_down = [False, False]
         self._openxr_render_scale_auto = bool(self.config.render_scale_auto)
         self._openxr_render_scale = max(
@@ -1251,6 +1259,9 @@ class OpenXrVulkanPresenter(
         self._tool_overlay_last_output_id: int | None = None
         self._right_grip_screen_pointer_applied = False
         self._controller_callout_rgba: np.ndarray | None = None
+        self._controller_guide_texture_locale: str | None = None
+        self._controller_guide_quad_fallback = False
+        self._controller_guide_diagnostics: dict[str, str] = {}
         self._msdf_font_atlas: MsdfFontAtlas | None = None
         self._vulkan_msdf_quad_renderer: VulkanMsdfQuadRenderer | None = None
         self._vulkan_projection_screen_pass: VulkanProjectionScreenPass | None = None
@@ -1727,6 +1738,7 @@ class OpenXrVulkanPresenter(
             self._initialize_filament_bridges()
             self._initialize_msdf_text_atlas()
             self._initialize_msdf_quad_renderer()
+            self._configure_controller_guide_quad_fallback()
             if self._rocm_backend:
                 # VDXR/AMD rejects tool-quad swapchain creation/enumeration
                 # after the frame loop starts. Build the reusable pool at the
@@ -1775,6 +1787,7 @@ class OpenXrVulkanPresenter(
 
     def _recreate_reference_space_after_runtime_change(self) -> None:
         """Recreate the base XR space after a runtime relocation event."""
+        self._reset_settings_menu_grab()
         if self.xr is None or self.session is None or self._reference_space_type is None:
             self._profile_space_applied = False
             return
@@ -2705,11 +2718,32 @@ class OpenXrVulkanPresenter(
             self._send_arrow_impl(float(values.get("horizontal", 0.0)), "left", "right")
             self._send_arrow_impl(float(values.get("vertical", 0.0)), "up", "down")
         elif action == "scroll_axes":
-            self._accum_scroll(
-                float(values.get("horizontal", 0.0)),
-                float(values.get("vertical", 0.0)),
-                float(values.get("dt", self._last_frame_dt)),
-            )
+            horizontal = float(values.get("horizontal", 0.0))
+            vertical = -float(values.get("vertical", 0.0))
+            dt = float(values.get("dt", self._last_frame_dt))
+            menu = self._settings_menu
+            menu_hit = self._settings_menu_ray_hit(1) if menu.visible else None
+            if menu.visible and menu.scroll_viewport_contains(menu_hit):
+                slider_drag = bool(
+                    self._settings_menu_trigger_down[0]
+                    or self._settings_menu_trigger_down[1]
+                ) and bool(
+                    self._settings_menu.active_key
+                    and not self._settings_menu.active_key.startswith("step:")
+                )
+                if (
+                    not _physical_mouse_active()
+                    and self._settings_menu_grab_hand is None
+                    and not slider_drag
+                ):
+                    menu.scroll_by_wheel_axis(
+                        vertical, dt, float(self._input_deadzone())
+                    )
+                # A menu hit owns the vertical wheel component, including at
+                # the scroll limits. Preserve horizontal desktop scrolling.
+                self._accum_scroll(horizontal, 0.0, dt)
+            else:
+                self._accum_scroll(horizontal, vertical, dt)
         elif action in {"copy", "cut", "paste", "enter"}:
             # The hardware keyboard has priority over shortcut injection:
             # clipboard gestures are dropped while the user types on the
@@ -3092,8 +3126,26 @@ class OpenXrVulkanPresenter(
                             )
                             if edge_angle < self._ray_edge_deadzone_rad:
                                 direction = edge_direction
+        direction = self._settings_menu_grab_ray_direction(hand, origin, direction)
         direction /= max(float(np.linalg.norm(direction)), 1e-8)
         return origin, direction
+
+    def _settings_menu_grab_ray_direction(
+        self, hand: int, origin: np.ndarray, fallback: np.ndarray
+    ) -> np.ndarray:
+        """Aim the grabbed controller beam at the fixed panel-local anchor."""
+        if int(hand) != self._settings_menu_grab_hand:
+            return fallback
+        anchor = self._settings_menu_grab_anchor_w
+        if anchor is None:
+            return fallback
+        direction = np.asarray(anchor, dtype=np.float64) - np.asarray(
+            origin, dtype=np.float64
+        )
+        length = float(np.linalg.norm(direction))
+        if length <= 1e-6:
+            return fallback
+        return direction / length
 
     @staticmethod
     def _normalize_interaction_ray(direction: np.ndarray) -> np.ndarray:
@@ -4298,6 +4350,7 @@ class OpenXrVulkanPresenter(
         self._cancel_touch_contacts()
         if self._head_position_w is None or self._head_model_matrix is None:
             return
+        self._reset_settings_menu_grab()
         head_basis = np.asarray(self._head_model_matrix[:3, :3], dtype=np.float64)
         right = head_basis[:, 0]
         up = head_basis[:, 1]
@@ -4665,10 +4718,37 @@ class OpenXrVulkanPresenter(
         )
         self._set_settings_menu_matrix(seat_delta @ menu_matrix)
 
+    def _reset_settings_menu_grab(self) -> None:
+        self._settings_menu_grab_hand = None
+        self._settings_menu_grab_relative = None
+        self._settings_menu_grab_filtered_pose = None
+        self._settings_menu_grab_local_uv = None
+        self._settings_menu_grab_anchor_w = None
+        self._settings_menu_cursor_hits = (None, None)
+
+    def _settings_menu_point_world(
+        self, local_uv: tuple[float, float] | None
+    ) -> np.ndarray | None:
+        if local_uv is None:
+            return None
+        menu_matrix = self._settings_menu_matrix()
+        if menu_matrix is None:
+            return None
+        u, v = (float(value) for value in local_uv)
+        local_point = np.asarray(
+            ((u - 0.5) * SETTINGS_MENU_WORLD_SIZE[0],
+             (0.5 - v) * SETTINGS_MENU_WORLD_SIZE[1], 0.0),
+            dtype=np.float64,
+        )
+        return menu_matrix[:3, 3] + menu_matrix[:3, :3] @ local_point
+
     def _handle_settings_menu_grip_drag(
         self, inputs, hits: tuple[tuple[float, float] | None, ...]
     ) -> None:
         grip_matrices = (self._grip_mat_l, self._grip_mat_r)
+        active_hand = self._settings_menu_grab_hand
+        if active_hand is not None and grip_matrices[active_hand] is None:
+            self._reset_settings_menu_grab()
         for hand in (0, 1):
             pressed = float(inputs[hand].get("grip", 0.0) or 0.0) > 0.5
             if pressed and not self._settings_menu_grip_down[hand]:
@@ -4681,6 +4761,12 @@ class OpenXrVulkanPresenter(
                     menu_matrix = self._settings_menu_matrix()
                     if menu_matrix is not None:
                         self._settings_menu_grab_hand = hand
+                        self._settings_menu_grab_local_uv = (
+                            float(hits[hand][0]), float(hits[hand][1])
+                        )
+                        self._settings_menu_grab_filtered_pose = np.asarray(
+                            grip_matrices[hand], dtype=np.float64
+                        ).copy()
                         self._settings_menu_grab_relative = (
                             np.linalg.inv(np.asarray(grip_matrices[hand], dtype=np.float64))
                             @ menu_matrix
@@ -4688,35 +4774,43 @@ class OpenXrVulkanPresenter(
             elif not pressed and self._settings_menu_grip_down[hand]:
                 self._settings_menu_grip_down[hand] = False
                 if self._settings_menu_grab_hand == hand:
-                    self._settings_menu_grab_hand = None
-                    self._settings_menu_grab_relative = None
+                    self._reset_settings_menu_grab()
         hand = self._settings_menu_grab_hand
         if (
             hand is not None
             and self._settings_menu_grab_relative is not None
             and grip_matrices[hand] is not None
         ):
-            target = (
-                np.asarray(grip_matrices[hand], dtype=np.float64)
-                @ self._settings_menu_grab_relative
+            raw_grip = np.asarray(grip_matrices[hand], dtype=np.float64)
+            filtered = self._settings_menu_grab_filtered_pose
+            if filtered is None:
+                filtered = raw_grip.copy()
+            dt = max(0.001, min(0.1, float(self._last_frame_dt)))
+
+            position_delta = raw_grip[:3, 3] - filtered[:3, 3]
+            position_error = float(np.linalg.norm(position_delta))
+            position_follow = min(1.0, 0.3 + position_error / 0.04)
+            position_alpha = 1.0 - (1.0 - position_follow) ** (dt * 90.0)
+            filtered[:3, 3] += position_delta * position_alpha
+
+            previous_quaternion = self._mat3_to_quat(filtered[:3, :3])
+            target_quaternion = self._mat3_to_quat(raw_grip[:3, :3])
+            dot = min(abs(float(np.dot(previous_quaternion, target_quaternion))), 1.0)
+            angle_error = 2.0 * math.acos(dot) if dot < 1.0 else 0.0
+            if angle_error >= self._ray_deadzone_rad:
+                rotation_follow = min(1.0, 0.3 + angle_error / 0.04)
+                rotation_alpha = 1.0 - (1.0 - rotation_follow) ** (dt * 90.0)
+                filtered_quaternion = self._slerp_quat(
+                    previous_quaternion, target_quaternion, rotation_alpha
+                )
+                filtered[:3, :3] = self._quat_to_mat3(filtered_quaternion)
+
+            self._settings_menu_grab_filtered_pose = filtered
+            target = filtered @ self._settings_menu_grab_relative
+            self._set_settings_menu_matrix(target)
+            self._settings_menu_grab_anchor_w = self._settings_menu_point_world(
+                self._settings_menu_grab_local_uv
             )
-            current = self._settings_menu_matrix()
-            if current is None:
-                self._set_settings_menu_matrix(target)
-                return
-            # Panel-drag debounce (same spirit as the screen-drag deadzone):
-            # follow the grip with an exponential filter whose strength grows
-            # with the requested displacement. A steady hand's mm-scale jitter
-            # is attenuated frame over frame instead of vibrating the panel,
-            # while a deliberate fast move stays near rigid. Only the
-            # translation is filtered; the grip orientation tracks rigidly.
-            delta = float(np.linalg.norm(target[:3, 3] - current[:3, 3]))
-            follow = min(1.0, 0.3 + delta / 0.04)
-            smoothed = target.copy()
-            smoothed[:3, 3] = (
-                current[:3, 3] + (target[:3, 3] - current[:3, 3]) * follow
-            )
-            self._set_settings_menu_matrix(smoothed)
 
     def _refresh_settings_menu_values(self) -> None:
         snapshot = None
@@ -4887,15 +4981,18 @@ class OpenXrVulkanPresenter(
 
     def _desktop_settings_snapshot(self) -> dict[str, Any]:
         self._refresh_settings_menu_values()
+        layout = self._settings_menu.layout(
+            allow_curve=self._settings_menu_allow_curve,
+            show_glow=self._filament_glow_environment_enabled,
+            lang=self._overlay_language(),
+            values=self._settings_menu_values,
+        )
         return {
             "tab": str(self._settings_menu.tab),
             "lang": self._overlay_language(),
             "input_monitor_rect": self._target_monitor_rect(),
-            "controls": self._settings_menu.controls(
-                allow_curve=self._settings_menu_allow_curve,
-                show_glow=self._filament_glow_environment_enabled,
-                lang=self._overlay_language(),
-            ),
+            "controls": layout.controls,
+            "groups": layout.groups,
             "values": dict(self._settings_menu_values),
         }
 
@@ -4995,8 +5092,47 @@ class OpenXrVulkanPresenter(
             return u, v
         return None
 
+    def _settings_menu_cursor_overlay_specs(self, rgba, head):
+        """Place the standard screen cursor rings on the settings panel."""
+        if not self._settings_menu.visible or self._settings_menu_pose is None:
+            return []
+        menu_matrix = self._settings_menu_matrix()
+        if menu_matrix is None:
+            return []
+        normal = menu_matrix[:3, 2]
+        specs = []
+        for hand, local_uv in enumerate(self._settings_menu_cursor_hits):
+            if local_uv is None:
+                continue
+            if hand == self._settings_menu_grab_hand:
+                hit_world = self._settings_menu_grab_anchor_w
+            else:
+                hit_world = self._settings_menu_point_world(local_uv)
+            if hit_world is None:
+                continue
+            matrix = menu_matrix.copy()
+            matrix[:3, 3] = hit_world + normal * 0.003
+            distance = float(np.linalg.norm(matrix[:3, 3] - head))
+            radius = 0.012 * float(np.clip(distance / 2.0, 0.35, 50.0))
+            position, rotation = self._overlay_pose_from_matrix(matrix)
+            specs.append((
+                f"laser_cursor_{hand}", rgba, position,
+                (radius * 2.0, radius * 2.0), rotation,
+            ))
+        return specs
+
     def _apply_settings_menu_control(self, control, uv, *, persist: bool = False) -> None:
         key = control.key
+        if key == "runtime:stop":
+            if self._runtime_stop_requested:
+                return
+            self._reset_settings_menu_grab()
+            self._runtime_stop_requested = True
+            self._settings_menu.set_stopping(True)
+            self._accept_output = False
+            if self._shutdown_event is not None:
+                self._shutdown_event.set()
+            return
         if key.startswith("tab:"):
             self._settings_menu.set_tab(key[4:])
             return
@@ -5050,6 +5186,7 @@ class OpenXrVulkanPresenter(
                 )
             return
         if key == "close":
+            self._reset_settings_menu_grab()
             self._settings_menu.close()
             return
         if key == "openxr:render_auto":
@@ -5121,6 +5258,7 @@ class OpenXrVulkanPresenter(
             return
         if key.startswith("room:model:"):
             model = key.split(":", 2)[2]
+            self._reset_settings_menu_grab()
             # Environment reload replaces screen state immediately; flush any
             # final controller adjustment before switching profiles.
             self._persist_screen_state(force=True)
@@ -5128,6 +5266,7 @@ class OpenXrVulkanPresenter(
             return
         if key.startswith("room:seat:"):
             indices = {"front": 0, "middle": 1, "back": 2}
+            self._reset_settings_menu_grab()
             self._apply_settings_menu_seat(indices[key.rsplit(":", 1)[1]])
             return
         if key == "room:toggle_screen_reflection":
@@ -5385,38 +5524,60 @@ class OpenXrVulkanPresenter(
                     return True
             return False
 
-        hits = (self._settings_menu_ray_hit(0), self._settings_menu_ray_hit(1))
-        self._handle_settings_menu_grip_drag(inputs, hits)
-        if self._settings_menu_grab_hand is not None:
-            hits = (self._settings_menu_ray_hit(0), self._settings_menu_ray_hit(1))
-        hover = None
-        for hand in (0, 1):
-            if hits[hand] is not None:
-                hover = self._settings_menu.hit_test(
-                    hits[hand], allow_curve=self._settings_menu_allow_curve,
-                    show_glow=self._filament_glow_environment_enabled,
-                    lang=self._overlay_language(),
-                )
-                break
+        starting_hits = (self._settings_menu_grab_hand is None)
+        if starting_hits:
+            grip_hits = (self._settings_menu_ray_hit(0), self._settings_menu_ray_hit(1))
+        else:
+            grip_hits = (self._settings_menu_grab_local_uv, None)
+        self._handle_settings_menu_grip_drag(inputs, grip_hits)
+        grab_hand = self._settings_menu_grab_hand
+        hits = tuple(
+            self._settings_menu_grab_local_uv
+            if hand == grab_hand
+            else self._settings_menu_ray_hit(hand)
+            for hand in (0, 1)
+        )
+        self._settings_menu_cursor_hits = hits
+        controls_by_hand = tuple(
+            None if hand == grab_hand and float(inputs[hand].get("grip", 0.0) or 0.0) > 0.5
+            or hits[hand] is None
+            else self._settings_menu.hit_test(
+                hits[hand], allow_curve=self._settings_menu_allow_curve,
+                show_glow=self._filament_glow_environment_enabled,
+                lang=self._overlay_language(),
+                values=self._settings_menu_values,
+            )
+            for hand in (0, 1)
+        )
+        hover = next((control for control in controls_by_hand if control is not None), None)
         next_hover = None if hover is None else hover.key
         next_cursor = next((hit for hit in hits if hit is not None), None)
         if next_cursor != self._settings_menu_cursor_uv:
             self._settings_menu_cursor_uv = next_cursor
-            self._settings_menu.mark_dirty()
         if next_hover != self._settings_menu.hover_key:
             self._settings_menu.hover_key = next_hover
             self._settings_menu.mark_dirty()
         for hand in (0, 1):
             trigger = float(inputs[hand].get("trigger", 0.0) or 0.0)
+            if grab_hand == hand and float(inputs[hand].get("grip", 0.0) or 0.0) > 0.5:
+                self._settings_menu_trigger_down[hand] = trigger >= 0.7
+                if self._settings_menu.active_hand == hand:
+                    self._settings_menu.active_hand = None
+                    self._settings_menu.active_key = None
+                continue
+            control_for_hand = controls_by_hand[hand]
             if not self._settings_menu_trigger_down[hand] and trigger >= 0.7:
                 if self._settings_menu.active_hand is None:
                     self._settings_menu.active_hand = hand
-                    self._settings_menu.active_key = next_hover
+                    self._settings_menu.active_key = (
+                        None if control_for_hand is None else control_for_hand.key
+                    )
                     self._settings_menu_trigger_down[hand] = True
                     if hits[hand] is None:
+                        self._reset_settings_menu_grab()
                         self._settings_menu.close()
-                    elif hover is not None:
-                        self._apply_settings_menu_control(hover, hits[hand])
+                    elif control_for_hand is not None:
+                        self._apply_settings_menu_control(control_for_hand, hits[hand])
             elif self._settings_menu_trigger_down[hand] and trigger <= 0.3:
                 self._settings_menu_trigger_down[hand] = False
                 if self._settings_menu.active_hand == hand:
@@ -5453,11 +5614,7 @@ class OpenXrVulkanPresenter(
                 and self._settings_menu.active_hand == hand
                 and hits[hand] is not None
             ):
-                control = self._settings_menu.hit_test(
-                    hits[hand], allow_curve=self._settings_menu_allow_curve,
-                    show_glow=self._filament_glow_environment_enabled,
-                    lang=self._overlay_language(),
-                )
+                control = control_for_hand
                 if control is not None and control.kind == "slider" and control.key == self._settings_menu.active_key:
                     now = time.perf_counter()
                     if now - self._settings_menu_last_adjust >= 0.05:
@@ -5604,6 +5761,11 @@ class OpenXrVulkanPresenter(
 
     def _request_fatal_device_loss(self) -> None:
         """Latch device loss and stop all producer output immediately."""
+        if self._runtime_stop_requested:
+            self._accept_output = False
+            if self._shutdown_event is not None:
+                self._shutdown_event.set()
+            return
         self.fatal_device_loss = True
         self.exit_requested = True
         self._accept_output = False
@@ -5687,6 +5849,7 @@ class OpenXrVulkanPresenter(
         # worker thread and can otherwise enqueue another Vulkan submission
         # while teardown is destroying the adapter/device.
         self._accept_output = False
+        self._reset_settings_menu_grab()
         self._persist_screen_state(force=True)
         if _TOUCH_AVAILABLE and _touch_injector is not None:
             try:
@@ -5849,6 +6012,21 @@ class OpenXrVulkanPresenter(
             self.swapchains.clear()
             self._multiview_active = False
 
+            for attr in (
+                "_aim_space_l",
+                "_aim_space_r",
+                "_grip_space_l",
+                "_grip_space_r",
+            ):
+                action_space = getattr(self, attr, None)
+                if action_space is None:
+                    continue
+                try:
+                    xr.destroy_space(action_space)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
             if self.reference_space is not None:
                 try:
                     xr.destroy_space(self.reference_space)
@@ -5869,6 +6047,18 @@ class OpenXrVulkanPresenter(
                 self.session = None
                 self.session_running = False
 
+        if xr is not None and self.instance is not None:
+            if not vulkan_device_lost:
+                # The XR instance still references the Vulkan device through
+                # its graphics binding, so release it before closing Vulkan.
+                # After device loss, skip xrDestroyInstance: VDXR can access
+                # freed loader state and turn a recoverable error into an AV.
+                try:
+                    xr.destroy_instance(self.instance)
+                except Exception:
+                    pass
+            self.instance = None
+
         if self.vulkan is not None:
             try:
                 self.vulkan.close()
@@ -5886,18 +6076,6 @@ class OpenXrVulkanPresenter(
                 pass
         self._provisional_vk_device = None
         self._provisional_vk_instance = None
-
-        if xr is not None and self.instance is not None:
-            if not vulkan_device_lost:
-                # Destroy the XR instance while its Vulkan device is still
-                # valid. Calling xrDestroyInstance through VDXR after device
-                # loss can access freed loader state and turn a recoverable
-                # runtime error into a process-level access violation.
-                try:
-                    xr.destroy_instance(self.instance)
-                except Exception:
-                    pass
-            self.instance = None
 
         self.system_id = None
         self.swapchain_format = None
@@ -6359,22 +6537,30 @@ class OpenXrVulkanPresenter(
         """Create the pooled tool-quad swapchains before the frame loop starts."""
         if self.xr is None or self.session is None or self.vulkan is None:
             return
-        if self._tool_quads_disabled():
+        if _env_flag("D2S_OPENXR_DISABLE_TOOL_QUADS"):
             return
-        keys = (
-            "screen_osd",
-            "depth_osd",
-            "screen_fps",
-            "hand_fps",
-            "hand_help",
-            "screen_help",
-            "aperture",
-            "keyboard",
-            "settings_menu",
-            "controller_proxy_callout",
-            "laser_cursor_0",
-            "laser_cursor_1",
-        )
+        if self._tool_quads_disabled():
+            # VDXR rejects mid-frame swapchain creation. Reserve only the
+            # controller help layers it is safe to expose in its isolated
+            # ROCm path; explicit full isolation above still creates none.
+            keys = ["hand_help"]
+            if self._vulkan_controller_proxy_enabled or self._controller_guide_quad_fallback:
+                keys.append("controller_proxy_callout")
+        else:
+            keys = [
+                "screen_osd",
+                "depth_osd",
+                "screen_fps",
+                "hand_fps",
+                "hand_help",
+                "screen_help",
+                "aperture",
+                "keyboard",
+                "settings_menu",
+                "controller_proxy_callout",
+                "laser_cursor_0",
+                "laser_cursor_1",
+            ]
         pool_size = self._tool_quad_pool_size()
         format_value = self._tool_quad_format()
         created = 0
@@ -7420,11 +7606,19 @@ class OpenXrVulkanPresenter(
                 and getattr(bridge, "controller_guide_abi_available", False)
                 and hasattr(bridge, "set_controller_guide_texture")
             ):
-                if self._controller_callout_rgba is None:
-                    self._controller_callout_rgba = build_controller_callout_rgba(lang="CN")
+                language = self._overlay_language()
+                self._controller_callout_rgba = build_controller_callout_rgba(
+                    lang=language
+                )
                 bridge.set_controller_guide_texture(self._controller_callout_rgba)
+                self._controller_guide_texture_locale = language
+                self._report_controller_guide_state(
+                    "texture", "uploaded", f"path=Filament layer 2 locale={language}"
+                )
                 print(
-                    "Filament controller guide loaded: projection_layer=True",
+                    "Filament controller guide loaded: projection_layer=True "
+                    f"texture={self._controller_callout_rgba.shape[1]}x"
+                    f"{self._controller_callout_rgba.shape[0]} locale={language}",
                     flush=True,
                 )
             self._apply_filament_scene_exposure_to_bridge(bridge)
@@ -8735,6 +8929,11 @@ class OpenXrVulkanPresenter(
         return executor, reads
 
     def _update_filament_controllers(self, bridge: Any) -> None:
+        # The operation-guide surface is anchored to the tracked right grip and
+        # does not depend on loading controller-model meshes. Keep the B-button
+        # callout alive when a low-overhead ROCm run disables those meshes.
+        if not self._vulkan_controller_proxy_enabled:
+            self._update_filament_controller_guide(bridge)
         if (
             self._vulkan_controller_proxy_enabled
             or self._controller_brand is None
@@ -8745,7 +8944,6 @@ class OpenXrVulkanPresenter(
             or not hasattr(bridge, "set_controller_inputs")
         ):
             return
-        self._update_filament_controller_guide(bridge)
         offset = np.eye(4, dtype=np.float32)
         offset[:3, 3] = np.asarray(
             self._controller_calibration_offset, dtype=np.float32
@@ -8826,21 +9024,97 @@ class OpenXrVulkanPresenter(
                     laser_matrix[:3, 3] = beam_origin.astype(np.float32)
                     bridge.set_controller_laser(hand, laser_matrix, visible=True)
     def _update_filament_controller_guide(self, bridge: Any) -> None:
-        if (
+        has_abi = bool(
             getattr(bridge, "controller_guide_abi_available", False)
             and hasattr(bridge, "set_controller_guide")
-        ):
-            geometry = self._controller_guide_geometry()
-            if geometry is None:
-                bridge.set_controller_guide(np.eye(4, dtype=np.float32), visible=False)
-            else:
-                position, size, basis = geometry
-                guide_matrix = np.eye(4, dtype=np.float32)
-                guide_matrix[:3, 0] = (basis[:, 0] * size[0]).astype(np.float32)
-                guide_matrix[:3, 1] = (basis[:, 1] * size[1]).astype(np.float32)
-                guide_matrix[:3, 2] = basis[:, 2].astype(np.float32)
-                guide_matrix[:3, 3] = np.asarray(position, dtype=np.float32)
-                bridge.set_controller_guide(guide_matrix, visible=True)
+        )
+        if not has_abi:
+            reason = "ABI unavailable" if not getattr(
+                bridge, "controller_guide_abi_available", False
+            ) else "pose setter unavailable"
+            self._report_controller_guide_state(
+                "abi", reason,
+                "quad fallback active" if self._controller_guide_quad_fallback
+                else "quad fallback inactive",
+            )
+            return
+
+        language = self._overlay_language()
+        if self._controller_guide_texture_locale != language:
+            try:
+                rgba = build_controller_callout_rgba(lang=language)
+                bridge.set_controller_guide_texture(rgba)
+                self._controller_callout_rgba = rgba
+                self._controller_guide_texture_locale = language
+                self._report_controller_guide_state(
+                    "texture", "uploaded", f"path=Filament layer 2 locale={language}"
+                )
+            except Exception as exc:
+                self._report_controller_guide_state(
+                    "texture", "upload failed", f"{type(exc).__name__}: {exc}"
+                )
+
+        geometry = self._controller_guide_geometry()
+        guide_matrix = np.eye(4, dtype=np.float32)
+        if geometry is None:
+            visible = False
+        else:
+            position, size, basis = geometry
+            guide_matrix[:3, 0] = (basis[:, 0] * size[0]).astype(np.float32)
+            guide_matrix[:3, 1] = (basis[:, 1] * size[1]).astype(np.float32)
+            guide_matrix[:3, 2] = basis[:, 2].astype(np.float32)
+            guide_matrix[:3, 3] = np.asarray(position, dtype=np.float32)
+            visible = True
+        try:
+            bridge.set_controller_guide(guide_matrix, visible=visible)
+            self._report_controller_guide_state(
+                "submit", "visible" if visible else "hidden",
+                "path=Filament layer 2",
+            )
+        except Exception as exc:
+            self._report_controller_guide_state(
+                "submit", "failed", f"path=Filament layer 2 {type(exc).__name__}: {exc}"
+            )
+
+    def _report_controller_guide_state(
+        self, channel: str, state: str, details: str = "",
+    ) -> None:
+        previous = self._controller_guide_diagnostics.get(channel)
+        if previous == state:
+            return
+        self._controller_guide_diagnostics[channel] = state
+        print(
+            f"[OpenXRViewer] controller guide {channel}: {state}"
+            + (f" ({details})" if details else ""),
+            flush=True,
+        )
+
+    def _configure_controller_guide_quad_fallback(self) -> None:
+        bridge = self.filament_bridge
+        has_abi = bool(
+            bridge is not None
+            and getattr(bridge, "controller_guide_abi_available", False)
+            and hasattr(bridge, "set_controller_guide")
+        )
+        if self._vulkan_controller_proxy_enabled or has_abi:
+            self._controller_guide_quad_fallback = False
+            return
+        if not self._rocm_backend:
+            return
+        if _env_flag("D2S_OPENXR_DISABLE_TOOL_QUADS"):
+            self._report_controller_guide_state(
+                "fallback", "disabled", "explicit OpenXR overlay isolation"
+            )
+            return
+        if self._vulkan_msdf_quad_renderer is None:
+            self._report_controller_guide_state(
+                "fallback", "unavailable", "ROCm GPU Quad renderer unavailable"
+            )
+            return
+        self._controller_guide_quad_fallback = True
+        self._report_controller_guide_state(
+            "fallback", "enabled", "pre-created controller callout Quad"
+        )
 
     def _reset_screen_crop_hysteresis(self) -> None:
         self._screen_crop_hysteresis_candidate = None
@@ -11205,7 +11479,10 @@ class OpenXrVulkanPresenter(
                 self._tool_overlay_last_output_id = frame_id
                 self._tool_overlay_sbs_window_frames += 1
                 timestamp = float(output_frame.timestamp)
-                latency_ms = (now - timestamp) * 1000.0
+                # _frame_now precedes controller/view preparation. Measure
+                # frame age at this boundary, after output conversion and
+                # before projection, while retaining the low-rate snapshot.
+                latency_ms = (time.perf_counter() - timestamp) * 1000.0
                 if 0.0 <= latency_ms <= 10000.0:
                     self._tool_overlay_pending_latency_ms = latency_ms
         sbs_elapsed = now - self._tool_overlay_sbs_window_started
@@ -11325,12 +11602,22 @@ class OpenXrVulkanPresenter(
 
     def _tool_quads_disabled(self) -> bool:
         """Return whether optional OpenXR tool quads must stay out of VDXR."""
+        if _env_flag("D2S_OPENXR_DISABLE_TOOL_QUADS"):
+            return True
         if self._rocm_backend and _env_flag("D2S_ROCM_ENABLE_OPENXR_OVERLAYS"):
             return False
-        return bool(
-            getattr(self, "_rocm_openxr_runtime_active", False)
-            or _env_flag("D2S_OPENXR_DISABLE_TOOL_QUADS")
-        )
+        return bool(getattr(self, "_rocm_openxr_runtime_active", False))
+
+    def _filter_tool_quad_specs_for_runtime(self, specs: list[tuple]) -> list[tuple]:
+        """Keep only controller help overlays in the default ROCm VDXR path."""
+        if not self._tool_quads_disabled():
+            return specs
+        if _env_flag("D2S_OPENXR_DISABLE_TOOL_QUADS"):
+            return []
+        if getattr(self, "_rocm_openxr_runtime_active", False):
+            allowed = {"controller_proxy_callout", "hand_help"}
+            return [spec for spec in specs if spec[0] in allowed]
+        return []
 
     def _can_use_screen_quad_reprojection(
         self, frame: VulkanStereoOutputFrame | None
@@ -12092,7 +12379,7 @@ class OpenXrVulkanPresenter(
             )
             specs.append(("screen_help", rgba, panel_position, (panel_w, panel_h), panel_rotation))
 
-        if self._vulkan_controller_proxy_enabled:
+        if self._vulkan_controller_proxy_enabled or self._controller_guide_quad_fallback:
             callout_key = ("controller_proxy_callout", language)
             controller_callout = self._tool_quad_texture_cache.get(
                 "controller_proxy_callout"
@@ -12109,6 +12396,9 @@ class OpenXrVulkanPresenter(
                 self._tool_quad_texture_keys[
                     "controller_proxy_callout"
                 ] = callout_key
+                self._report_controller_guide_state(
+                    "texture", "uploaded", f"path=OpenXR callout Quad locale={language}"
+                )
             geometry = self._controller_guide_geometry()
             if geometry is not None:
                 callout_position, callout_size, callout_basis = geometry
@@ -12123,6 +12413,13 @@ class OpenXrVulkanPresenter(
                         callout_size,
                         callout_rotation,
                     )
+                )
+                self._report_controller_guide_state(
+                    "submit", "visible", "path=OpenXR callout Quad"
+                )
+            else:
+                self._report_controller_guide_state(
+                    "submit", "hidden", "path=OpenXR callout Quad"
                 )
 
         if self._hand_fps_visible:
@@ -12196,7 +12493,6 @@ class OpenXrVulkanPresenter(
                     self._settings_menu,
                     self._settings_menu_values,
                     hover_key=self._settings_menu.hover_key,
-                    cursor_uv=self._settings_menu_cursor_uv,
                     lang=language,
                 )
                 self._tool_quad_texture_cache["settings_menu"] = menu_rgba
@@ -12210,6 +12506,13 @@ class OpenXrVulkanPresenter(
                 "settings_menu", menu_rgba, menu_position,
                 SETTINGS_MENU_WORLD_SIZE, menu_rotation
             ))
+
+            cursor_rgba = self._tool_quad_texture_cache.get("laser_cursor")
+            if cursor_rgba is None:
+                cursor_rgba = build_cursor_rgba(64)
+                self._tool_quad_texture_cache["laser_cursor"] = cursor_rgba
+                self._tool_quad_texture_keys["laser_cursor"] = ("legacy_cursor_ring", 64)
+            specs.extend(self._settings_menu_cursor_overlay_specs(cursor_rgba, head))
 
         if not self._settings_menu.visible:
             cursor_rgba = self._tool_quad_texture_cache.get("laser_cursor")
@@ -12229,10 +12532,8 @@ class OpenXrVulkanPresenter(
         specs_ready = time.perf_counter()
         if self._tool_quads_dead:
             return []
-        if self._tool_quads_disabled():
-            # Diagnostic escape hatch: Virtual Desktop's runtime can fail MSDF
-            # tool-quad swapchain enumeration (RuntimeFailureError, caught) and
-            # the quad overlays (menu / cursor / callouts) are then skipped.
+        specs = self._filter_tool_quad_specs_for_runtime(specs)
+        if not specs:
             return []
         layers = []
         for spec in specs:
@@ -12320,11 +12621,35 @@ class OpenXrVulkanPresenter(
     def _controller_guide_geometry(self):
         """Return the world-space panel geometry for the Projection Layer guide."""
         if self._grip_mat_r is None or self._head_position_w is None:
+            self._report_controller_guide_state(
+                "geometry", "tracking unavailable", "right grip or head pose missing"
+            )
             return None
-        controller_position = np.asarray(self._grip_mat_r[:3, 3], dtype=np.float64)
-        to_head = np.asarray(self._head_position_w, dtype=np.float64) - controller_position
+        grip = np.asarray(self._grip_mat_r, dtype=np.float64)
+        head_position = np.asarray(self._head_position_w, dtype=np.float64)
+        if (
+            grip.shape != (4, 4)
+            or head_position.shape != (3,)
+            or not np.all(np.isfinite(grip))
+            or not np.all(np.isfinite(head_position))
+        ):
+            self._report_controller_guide_state(
+                "geometry", "invalid pose", "expected finite 4x4 grip and 3D head poses"
+            )
+            return None
+        controller_position = grip[:3, 3]
+        to_head = head_position - controller_position
         distance = float(np.linalg.norm(to_head))
-        if distance <= 1e-6 or distance > self.config.controller_guide_max_distance:
+        if not np.isfinite(distance) or distance <= 1e-6:
+            self._report_controller_guide_state(
+                "geometry", "invalid distance", f"distance={distance!r}m"
+            )
+            return None
+        if distance > self.config.controller_guide_max_distance:
+            self._report_controller_guide_state(
+                "geometry", "beyond range",
+                f"distance={distance:.2f}m limit={self.config.controller_guide_max_distance:.2f}m",
+            )
             return None
 
         def normalized(vector):
@@ -12334,9 +12659,18 @@ class OpenXrVulkanPresenter(
         button_position = self._controller_b_button_world_position()
         if button_position is None:
             button_position = controller_position
-        forward = normalized(np.asarray(self._head_position_w, dtype=np.float64) - button_position)
+        forward = normalized(head_position - button_position)
         world_up = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
-        right = normalized(np.cross(world_up, forward))
+        right_vector = np.cross(world_up, forward)
+        if float(np.linalg.norm(right_vector)) <= 1e-6:
+            controller_right = grip[:3, 0]
+            right_vector = controller_right - forward * float(np.dot(controller_right, forward))
+        if float(np.linalg.norm(right_vector)) <= 1e-6:
+            fallback_axis = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+            if abs(float(np.dot(fallback_axis, forward))) > 0.95:
+                fallback_axis = np.asarray((0.0, 0.0, 1.0), dtype=np.float64)
+            right_vector = fallback_axis - forward * float(np.dot(fallback_axis, forward))
+        right = normalized(right_vector)
         up = normalized(np.cross(forward, right))
 
         # Keep the Quad head-facing while solving its center from the B button
@@ -12350,6 +12684,15 @@ class OpenXrVulkanPresenter(
             + forward * 0.006
         )
         basis = np.column_stack((right, up, forward))
+        if not np.all(np.isfinite(basis)):
+            self._report_controller_guide_state(
+                "geometry", "invalid geometry", "non-finite guide basis"
+            )
+            return None
+        self._report_controller_guide_state(
+            "geometry", "visible",
+            f"distance={distance:.2f}m limit={self.config.controller_guide_max_distance:.2f}m",
+        )
         return (
             tuple(float(value) for value in panel_position),
             (0.34, 0.255),

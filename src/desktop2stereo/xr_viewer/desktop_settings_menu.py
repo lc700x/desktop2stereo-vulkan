@@ -13,20 +13,79 @@ import math
 import multiprocessing
 import os
 import queue
+import subprocess
 import threading
 import tkinter as tk
 from pathlib import Path
 from typing import Any
 
 from gui.localization import gettext_for, normalize_locale
+from .settings_menu import (
+    OPENXR_MENU_COLORS,
+    OPENXR_MENU_GROUP_LABELS,
+    OPENXR_MENU_RADII,
+    _MENU_TITLE_CARD_GAP,
+    _MENU_TITLE_HEIGHT,
+)
 
 
 DESKTOP_SETTINGS_ICON_TRANSPARENT_COLOR = "#010101"
 DESKTOP_SETTINGS_ICON_OPACITY = 0.40
 DESKTOP_SETTINGS_ICON_SIZE = (51, 57)
 DESKTOP_SETTINGS_ICON_IMAGE_SIZE = (42, 42)
-_FLET_PANEL_SIZE = (640, 650)
+_FLET_PANEL_SIZE = (760, 650)
 _FLET_PANEL_POLL_SECONDS = 0.08
+_FLET_SIDEBAR_WIDTH = 176
+_FLET_FONT_ASSETS_DIR = Path(__file__).resolve().parent / "fonts"
+
+
+def _menu_color(token: str) -> str:
+    return OPENXR_MENU_COLORS[token]
+
+
+def _quit_flet_when_parent_exits(parent_process: Any, commands: Any) -> None:
+    """Close the separate Flet process if a native runtime crash skips stop()."""
+    parent_process.join()
+    try:
+        commands.put_nowait("__quit__")
+    except Exception:
+        pass
+
+
+def _watch_flet_parent(commands: Any) -> None:
+    parent_process = multiprocessing.parent_process()
+    if parent_process is None:
+        return
+    threading.Thread(
+        target=_quit_flet_when_parent_exits,
+        args=(parent_process, commands),
+        name="desktop-settings-parent-watch",
+        daemon=True,
+    ).start()
+
+
+def _stop_flet_process(process: Any) -> None:
+    if process is None or process.pid is None:
+        return
+    process.join(timeout=2.0)
+    if not process.is_alive():
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/f", "/t", "/pid", str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2.0,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        process.join(timeout=1.0)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1.0)
 
 
 def _icon_geometry_for_monitor(
@@ -84,6 +143,7 @@ def _drain_latest(source: Any) -> Any | None:
 def _snapshot_layout_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
     """Identify structural changes without treating live values as a rebuild."""
     controls = tuple(snapshot.get("controls") or ())
+    values = dict(snapshot.get("values") or {})
     return (
         str(snapshot.get("tab") or "picture"),
         normalize_locale(snapshot.get("lang", "EN")),
@@ -96,9 +156,19 @@ def _snapshot_layout_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
                 float(control.maximum),
                 float(control.step),
                 bool(control.enabled),
+                str(getattr(control, "group", "")),
+                bool(getattr(control, "fixed", False)),
             )
             for control in controls
-            if not str(control.key).startswith("step:")
+        ),
+        tuple(
+            (str(group.key), str(group.title))
+            for group in snapshot.get("groups", ())
+        ),
+        tuple(
+            (str(control.key), _control_is_selected(str(control.key), values))
+            for control in controls
+            if str(control.kind) in {"button", "toggle"}
         ),
     )
 
@@ -128,6 +198,53 @@ def _format_value(value: float, step: float, key: str = "") -> str:
     if step >= 0.1:
         return f"{value:.1f}"
     return f"{value:.2f}"
+
+
+def _toggle_value_for(key: str, values: dict[str, Any]) -> bool:
+    """Map shared menu actions to the setting value shown by their switches."""
+    if key == "depth:toggle_stereo":
+        try:
+            return float(values.get("depth_strength", 0.0)) > 0.0
+        except (TypeError, ValueError):
+            return False
+    if key == "depth:toggle_cross_eyed":
+        return bool(values.get("cross_eyed", False))
+    if key == "room:toggle_screen_reflection":
+        return bool(values.get("room:screen_reflection_enabled", True))
+    if key == "screen:dynamic_crop":
+        return bool(values.get("screen:dynamic_crop", False))
+    return bool(values.get(key, False))
+
+
+def _control_is_selected(key: str, values: dict[str, Any]) -> bool:
+    """Return the active state for Meta selectable buttons and mode tiles."""
+    if key == "openxr:render_auto":
+        return bool(values.get("openxr_render_auto", False))
+    if key.startswith("screen:section:"):
+        return key.rsplit(":", 1)[1] == str(values.get("screen:section", "layout"))
+    if key.startswith("screen:type:"):
+        target_angles = {
+            "screen:type:flat": 0.0,
+            "screen:type:subtle": math.radians(20.0),
+            "screen:type:medium": math.radians(30.0),
+            "screen:type:deep": 0.72,
+        }
+        try:
+            angle = float(values.get("screen:curve_half_angle", 0.0))
+        except (TypeError, ValueError):
+            return False
+        return abs(angle - target_angles[key]) < 1e-3
+    if key.startswith("glow:"):
+        return key == f"glow:{values.get('glow:mode', 'off')}"
+    if key.startswith("room:model:"):
+        return key == f"room:model:{values.get('room:model', 'Default')}"
+    if key.startswith("room:seat:"):
+        try:
+            seat_index = int(values.get("room:seat_index", 0)) % 3
+        except (TypeError, ValueError):
+            seat_index = 0
+        return key == f"room:seat:{('front', 'middle', 'back')[seat_index]}"
+    return False
 
 
 def _screen_button_row_group(key: str) -> str | None:
@@ -166,6 +283,7 @@ def _run_flet_desktop_settings_app(
     input_monitor_rect: tuple[int, int, int, int] | None,
 ) -> None:
     """Run Flet in its own process because Flet owns the main-thread signals."""
+    _watch_flet_parent(commands)
     try:
         from gui.flet_runtime import ensure_vendored_flet_view
 
@@ -188,8 +306,12 @@ def _run_flet_desktop_settings_app(
         page.title = translate("Desktop2Stereo OpenXR Settings")
         page.padding = 0
         page.spacing = 0
-        page.bgcolor = "#14161a"
-        page.theme = ft.Theme(color_scheme_seed="blue", font_family="Microsoft YaHei")
+        page.bgcolor = _menu_color("surface")
+        page.fonts = {"Inter": "InterVariable.ttf"}
+        page.theme = ft.Theme(
+            color_scheme_seed=_menu_color("primary"),
+            font_family="Inter",
+        )
         page.theme_mode = ft.ThemeMode.DARK
         icon_path = Path(__file__).resolve().parents[1] / "icon2.ico"
         if icon_path.is_file():
@@ -199,39 +321,71 @@ def _run_flet_desktop_settings_app(
         panel_position = _flet_panel_position_for_monitor(input_monitor_rect)
         if panel_position is not None:
             page.window.left, page.window.top = panel_position
-        page.window.min_width = 460
+        page.window.min_width = 580
         page.window.min_height = 420
         page.window.maximizable = False
         page.window.always_on_top = True
         page.window.prevent_close = True
         page.window.visible = False
 
-        body = ft.Column(
+        body_content = ft.Column(
             controls=[
                 ft.Text(
                     translate("Waiting for OpenXR settings..."),
-                    color="#c9d1d9",
+                    color=_menu_color("text_secondary"),
                     size=14,
                 )
             ],
             expand=True,
             scroll=ft.ScrollMode.AUTO,
-            spacing=8,
+            spacing=16,
+        )
+        body = ft.Container(
+            content=body_content,
+            expand=True,
+            padding=ft.Padding.only(top=16),
+        )
+        sidebar = ft.Column(expand=True, spacing=16)
+        section_toolbar = ft.Container(height=0)
+        main_column = ft.Column(
+            controls=[section_toolbar, body],
+            expand=True,
+            spacing=0,
+        )
+        main_area = ft.Container(
+            content=main_column,
+            expand=True,
+            padding=ft.Padding.only(right=16, top=16, bottom=16),
+        )
+        layout = ft.Row(
+            controls=[
+                ft.Container(
+                    width=_FLET_SIDEBAR_WIDTH,
+                    expand=False,
+                    bgcolor=_menu_color("surface_container"),
+                    border_radius=OPENXR_MENU_RADII["group"],
+                    padding=16,
+                    content=sidebar,
+                ),
+                main_area,
+            ],
+            spacing=16,
+            expand=True,
+            vertical_alignment=ft.CrossAxisAlignment.STRETCH,
         )
         page.add(
             ft.Container(
                 expand=True,
-                bgcolor="#14161a",
+                bgcolor=_menu_color("surface"),
                 padding=16,
-                content=body,
+                content=layout,
             )
         )
 
         slider_widgets: dict[str, tuple[Any, Any, float]] = {}
+        step_widgets: dict[str, tuple[Any, Any]] = {}
         toggle_widgets: dict[str, Any] = {}
         layout_signature: tuple[Any, ...] | None = None
-        tab_group: Any | None = None
-        tab_keys: tuple[str, ...] = ()
         visible = False
 
         def queue_action(key: str, value: float | None = None) -> None:
@@ -255,284 +409,481 @@ def _run_flet_desktop_settings_app(
 
             return on_change
 
-        def on_tab_change(event: Any) -> None:
-            try:
-                index = int(event.data)
-            except (AttributeError, TypeError, ValueError):
-                return
-            if 0 <= index < len(tab_keys):
-                queue_action(tab_keys[index])
-
         def rebuild(snapshot: dict[str, Any]) -> None:
-            nonlocal layout_signature, locale, tab_group, tab_keys
+            nonlocal layout_signature, locale
             slider_widgets.clear()
+            step_widgets.clear()
             toggle_widgets.clear()
             locale = normalize_locale(snapshot.get("lang", "EN"))
             page.title = translate("Desktop2Stereo OpenXR Settings")
             controls = tuple(snapshot.get("controls") or ())
             tab = str(snapshot.get("tab") or "picture")
-            tab_controls = [
-                control for control in controls if str(control.key).startswith("tab:")
+            values = dict(snapshot.get("values") or {})
+            groups = tuple(snapshot.get("groups") or ())
+            group_titles = {
+                str(group.key): str(group.title)
+                for group in groups
+            }
+            controls_by_key = {str(control.key): control for control in controls}
+            nav_controls = [
+                item for item in controls if str(item.key).startswith("tab:")
             ]
-            tab_keys = tuple(str(control.key) for control in tab_controls)
-            content: list[Any] = [
-                ft.Container(
-                    content=ft.Column(
-                        controls=[
-                            ft.Text(
-                                translate("OpenXR Settings"),
-                                size=20,
-                                weight=ft.FontWeight.W_600,
-                                color="#f0f6fc",
-                            ),
-                            ft.Text(
-                                translate(
-                                    "Physical mouse controls are synchronized with the in-headset menu."
-                                ),
-                                size=12,
-                                color="#8b949e",
-                            ),
-                        ],
-                        spacing=4,
-                    ),
-                    padding=ft.Padding(4, 4, 4, 2),
-                )
+            stop_control = next(
+                (item for item in controls if str(item.key) == "runtime:stop"),
+                None,
+            )
+            section_controls = [
+                item for item in controls if str(item.key).startswith("screen:section:")
             ]
-            if tab_controls:
-                selected_index = next(
-                    (
-                        index
-                        for index, control in enumerate(tab_controls)
-                        if str(control.key) == f"tab:{tab}"
-                    ),
-                    0,
-                )
-                tab_group = ft.Tabs(
-                    length=len(tab_controls),
-                    selected_index=selected_index,
-                    animation_duration=0,
-                    on_change=on_tab_change,
-                    content=ft.TabBar(
-                        tabs=[
-                            ft.Tab(label=translate(str(control.label)))
-                            for control in tab_controls
-                        ],
-                        scrollable=False,
-                        divider_color="#30363d",
-                        indicator_color="#58a6ff",
-                        label_color="#ffffff",
-                        unselected_label_color="#8b949e",
-                    ),
-                )
-                content.append(
-                    ft.Container(
-                        content=tab_group,
-                        padding=ft.Padding(0, 6, 0, 4),
-                    )
-                )
-                content.append(ft.Divider(height=1, color="#30363d"))
-            else:
-                tab_group = None
 
-            snapshot_values = dict(snapshot.get("values") or {})
-            if tab == "screen":
-                section_label = (
-                    "Screen crop"
-                    if str(snapshot_values.get("screen:section", "layout")) == "crop"
-                    else "Screen geometry"
-                )
-                content.append(
-                    ft.Container(
-                        content=ft.Row(
-                            controls=[
-                                ft.Text(
-                                    translate(section_label),
-                                    size=16,
-                                    weight=ft.FontWeight.W_600,
-                                    color="#f0f6fc",
-                                ),
-                                ft.Container(expand=True),
-                                ft.Text(
-                                    translate("One section at a time"),
-                                    size=11,
-                                    color="#8b949e",
-                                ),
-                            ],
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        ),
-                        padding=ft.Padding(4, 8, 4, 2),
-                    )
-                )
-            button_row_group: str | None = None
-            button_row_controls: list[Any] = []
-
-            def flush_button_row() -> None:
-                nonlocal button_row_group
-                if button_row_controls:
-                    group_titles = {
-                        "depth_modes": "Depth mode",
-                        "glow_modes": "Glow effects",
-                        "room_models": "Environment",
-                        "room_seats": "Seat position",
-                        "room_reflection": "Scene controls",
-                        "screen_curveness": "Screen shape",
-                        "screen_rotation": "Screen rotation",
-                    }
-                    row_content: list[Any] = []
-                    group_title = group_titles.get(button_row_group or "")
-                    if group_title:
-                        row_content.append(
-                            ft.Text(
-                                translate(group_title),
-                                size=12,
-                                color="#8b949e",
-                            )
-                        )
-                    row_content.append(
-                        ft.Row(
-                            controls=list(button_row_controls),
-                            spacing=8,
-                            # Let Flet form the same compact multi-column
-                            # groups as the headset panel on narrower windows.
-                            wrap=True,
-                            run_spacing=8,
-                        )
-                    )
-                    content.append(
-                        ft.Container(
-                            content=ft.Column(controls=row_content, spacing=6),
-                            bgcolor="#1b222c",
-                            border_radius=10,
-                            padding=ft.Padding(10, 8, 10, 8),
-                        )
-                    )
-                    button_row_controls.clear()
-                button_row_group = None
-
-            def make_button(control: Any) -> Any:
+            def make_button(control: Any, *, width: int | None = None) -> Any:
                 key = str(control.key)
-                active = (
-                    key.startswith("screen:section:")
-                    and key.rsplit(":", 1)[1]
-                    == str(dict(snapshot.get("values") or {}).get("screen:section", "layout"))
+                active = _control_is_selected(key, values)
+                destructive = key == "runtime:stop"
+                enabled = bool(control.enabled)
+                state = ft.ControlState
+                background = (
+                    _menu_color("destructive") if destructive and enabled
+                    else _menu_color("surface_container_high") if destructive or not active
+                    else _menu_color("selection_container")
+                )
+                text_color = (
+                    _menu_color("text_disabled") if not enabled
+                    else _menu_color("destructive_text") if destructive
+                    else _menu_color("selection_text") if active
+                    else _menu_color("text_primary")
+                )
+                hover_color = (
+                    _menu_color("destructive_hover") if destructive
+                    else _menu_color("selection_hover_container") if active
+                    else _menu_color("primary_hover")
+                )
+                button_height = (
+                    48 if key.startswith(("screen:section:", "screen:rotate:"))
+                    else 64
+                )
+                button_width = (
+                    width if width is not None
+                    else _FLET_SIDEBAR_WIDTH - 32 if destructive
+                    else None
                 )
                 return ft.ElevatedButton(
-                    content=translate(str(control.label)),
+                    content=ft.Text(
+                        translate(str(control.label)),
+                        size=18,
+                        weight=ft.FontWeight.W_600,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
                     on_click=queue_button(key),
-                    disabled=not bool(control.enabled),
-                    style=ft.ButtonStyle(bgcolor="#1f3a5d" if active else None),
+                    disabled=not enabled,
+                    width=button_width,
+                    height=button_height,
+                    style=ft.ButtonStyle(
+                        bgcolor={
+                            state.DEFAULT: background,
+                            state.HOVERED: hover_color,
+                            state.FOCUSED: hover_color,
+                            state.PRESSED: (
+                                _menu_color("destructive_hover")
+                                if destructive else _menu_color("primary")
+                            ),
+                            state.DISABLED: _menu_color("surface_container_high"),
+                        },
+                        color={
+                            state.DEFAULT: text_color,
+                            state.HOVERED: (
+                                _menu_color("destructive_text")
+                                if destructive else _menu_color("primary_state_text")
+                            ),
+                            state.FOCUSED: (
+                                _menu_color("destructive_text")
+                                if destructive else _menu_color("primary_state_text")
+                            ),
+                            state.PRESSED: (
+                                _menu_color("destructive_text")
+                                if destructive else _menu_color("primary_state_text")
+                            ),
+                            state.DISABLED: _menu_color("text_disabled"),
+                        },
+                        padding=ft.Padding.symmetric(horizontal=8, vertical=8),
+                        elevation=0,
+                        text_style=ft.TextStyle(size=18, weight=ft.FontWeight.W_600),
+                        shape=ft.RoundedRectangleBorder(
+                            radius=OPENXR_MENU_RADII["control"],
+                        ),
+                        alignment=ft.Alignment.CENTER,
+                    ),
                 )
 
-            for control in controls:
+            def make_step_button(control: Any) -> Any:
+                return ft.ElevatedButton(
+                    content="-" if ":minus:" in str(control.key) else "+",
+                    on_click=queue_button(str(control.key)),
+                    disabled=not bool(control.enabled),
+                    width=64,
+                    height=64,
+                    style=ft.ButtonStyle(
+                        bgcolor={
+                            ft.ControlState.DEFAULT: _menu_color("surface_container_high"),
+                            ft.ControlState.HOVERED: _menu_color("primary_hover"),
+                            ft.ControlState.PRESSED: _menu_color("primary"),
+                            ft.ControlState.DISABLED: _menu_color("surface_container"),
+                        },
+                        color={
+                            ft.ControlState.DEFAULT: _menu_color("text_primary"),
+                            ft.ControlState.HOVERED: _menu_color("primary_state_text"),
+                            ft.ControlState.PRESSED: _menu_color("primary_state_text"),
+                            ft.ControlState.DISABLED: _menu_color("text_disabled"),
+                        },
+                        elevation=0,
+                        text_style=ft.TextStyle(size=24, weight=ft.FontWeight.W_600),
+                        shape=ft.RoundedRectangleBorder(radius=24),
+                    ),
+                )
+
+            def nav_button(control: Any) -> Any:
                 key = str(control.key)
-                if key.startswith(("tab:", "step:")):
+                active = key == f"tab:{tab}"
+                state = ft.ControlState
+                nav_icons = {
+                    "tab:screen": ft.Icons.CROP_LANDSCAPE,
+                    "tab:depth": ft.Icons.LAYERS,
+                    "tab:glow": ft.Icons.AUTO_AWESOME,
+                    "tab:room": ft.Icons.HOME_WORK,
+                    "tab:picture": ft.Icons.IMAGE,
+                }
+                return ft.ElevatedButton(
+                    content=ft.Row(
+                        controls=[
+                            ft.Icon(
+                                nav_icons.get(key, ft.Icons.SETTINGS),
+                                size=20,
+                                color=(
+                                    _menu_color("selection_text")
+                                    if active else _menu_color("text_secondary")
+                                ),
+                            ),
+                            ft.Text(
+                                translate(str(control.label)),
+                                size=18,
+                                weight=ft.FontWeight.W_600,
+                                text_align=ft.TextAlign.LEFT,
+                                expand=True,
+                            ),
+                        ],
+                        spacing=12,
+                        expand=True,
+                        alignment=ft.MainAxisAlignment.START,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    on_click=queue_button(key),
+                    width=_FLET_SIDEBAR_WIDTH - 32,
+                    height=64,
+                    style=ft.ButtonStyle(
+                        bgcolor={
+                            state.DEFAULT: (
+                                _menu_color("selection_container")
+                                if active else _menu_color("surface_container_high")
+                            ),
+                            state.HOVERED: _menu_color("selection_hover_container"),
+                            state.FOCUSED: _menu_color("selection_hover_container"),
+                            state.PRESSED: _menu_color("primary"),
+                            state.DISABLED: _menu_color("surface_container"),
+                        },
+                        color={
+                            state.DEFAULT: (
+                                _menu_color("selection_text")
+                                if active else _menu_color("text_primary")
+                            ),
+                            state.HOVERED: _menu_color("selection_text"),
+                            state.FOCUSED: _menu_color("selection_text"),
+                            state.PRESSED: _menu_color("primary_state_text"),
+                            state.DISABLED: _menu_color("text_disabled"),
+                        },
+                        padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+                        elevation=0,
+                        text_style=ft.TextStyle(size=18, weight=ft.FontWeight.W_600),
+                        shape=ft.RoundedRectangleBorder(
+                            radius=OPENXR_MENU_RADII["control"],
+                        ),
+                        alignment=ft.Alignment.CENTER_LEFT,
+                    ),
+                )
+
+            def step_controls_for(slider_key: str) -> tuple[Any | None, Any | None]:
+                minus = controls_by_key.get(f"step:minus:{slider_key}")
+                plus = controls_by_key.get(f"step:plus:{slider_key}")
+                return minus, plus
+
+            slider_key_groups: dict[str, list[Any]] = {}
+            for item in controls:
+                key = str(item.key)
+                if key.startswith(("tab:", "step:")) or key in {
+                    "runtime:stop", "section:reset_defaults",
+                } or key.startswith("screen:section:"):
                     continue
-                if key == "section:reset_defaults":
-                    flush_button_row()
-                    content.append(
+                group_key = str(getattr(item, "group", "") or "settings")
+                slider_key_groups.setdefault(group_key, []).append(item)
+
+            def render_slider(control: Any) -> Any:
+                key = str(control.key)
+                try:
+                    current = float(values.get(key, float(control.minimum)))
+                except (TypeError, ValueError):
+                    current = float(control.minimum)
+                current = _bounded_slider_value(
+                    current, float(control.minimum), float(control.maximum)
+                )
+                value_label = ft.Text(
+                    _format_value(current, float(control.step), key),
+                    width=80,
+                    size=16,
+                    text_align=ft.TextAlign.RIGHT,
+                    color=_menu_color("text_secondary"),
+                )
+                slider = ft.Slider(
+                    value=current,
+                    min=float(control.minimum),
+                    max=float(control.maximum),
+                    divisions=_slider_divisions(control),
+                    active_color=_menu_color("primary"),
+                    inactive_color=_menu_color("track"),
+                    thumb_color=_menu_color("text_primary"),
+                    overlay_color=_menu_color("primary_hover_container"),
+                    on_change=queue_slider(
+                        key, value_label, float(control.step)
+                    ),
+                    disabled=not bool(control.enabled),
+                    expand=True,
+                )
+                minus_control, plus_control = step_controls_for(key)
+                minus_button = (
+                    make_step_button(minus_control)
+                    if minus_control is not None else ft.Container(width=64)
+                )
+                plus_button = (
+                    make_step_button(plus_control)
+                    if plus_control is not None else ft.Container(width=64)
+                )
+                step_widgets[key] = (minus_button, plus_button)
+                slider_widgets[key] = (
+                    slider, value_label, float(control.step)
+                )
+                return ft.Column(
+                    controls=[
                         ft.Row(
                             controls=[
-                                ft.Container(expand=True),
-                                make_button(control),
+                                ft.Text(
+                                    translate(str(control.label)),
+                                    size=18,
+                                    color=_menu_color("text_primary"),
+                                    text_align=ft.TextAlign.LEFT,
+                                    expand=True,
+                                ),
+                                value_label,
                             ],
-                            alignment=ft.MainAxisAlignment.END,
+                            spacing=8,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        ft.Row(
+                            controls=[
+                                minus_button,
+                                slider,
+                                plus_button,
+                            ],
+                            spacing=8,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                    ],
+                    spacing=8,
+                )
+
+            content: list[Any] = []
+            for group_key, items in slider_key_groups.items():
+                children: list[Any] = []
+                pending_buttons: list[Any] = []
+
+                def flush_buttons() -> None:
+                    if not pending_buttons:
+                        return
+                    buttons = list(pending_buttons)
+                    pending_buttons.clear()
+                    if group_key == "screen_shape":
+                        content_row = ft.Row(
+                            controls=buttons,
+                            alignment=ft.MainAxisAlignment.CENTER,
+                            spacing=16,
+                            wrap=True,
+                            run_spacing=16,
                         )
-                    )
-                    continue
-                if str(control.kind) == "slider":
-                    flush_button_row()
-                    try:
-                        current = float(
-                            snapshot_values.get(
-                                key,
-                                float(control.minimum),
+                    else:
+                        content_row = ft.Row(
+                            controls=buttons,
+                            alignment=ft.MainAxisAlignment.CENTER,
+                            spacing=16,
+                            wrap=True,
+                            run_spacing=16,
+                        )
+                    children.append(content_row)
+
+                shape_controls = (
+                    [item for item in items if str(item.key).startswith("screen:type:")],
+                    [item for item in items if str(item.key).startswith("screen:rotate:")],
+                ) if group_key == "screen_shape" else None
+                if shape_controls is not None:
+                    for shape_row in shape_controls:
+                        row_buttons = [
+                            make_button(item, width=160 if str(item.key).startswith("screen:rotate:") else 96)
+                            for item in shape_row
+                        ]
+                        children.append(
+                            ft.Row(
+                                controls=row_buttons,
+                                alignment=ft.MainAxisAlignment.CENTER,
+                                spacing=16,
+                                wrap=True,
+                                run_spacing=16,
                             )
                         )
-                    except (TypeError, ValueError):
-                        current = float(control.minimum)
-                    current = _bounded_slider_value(
-                        current,
-                        float(control.minimum),
-                        float(control.maximum),
+                else:
+                    button_items = [
+                        item for item in items
+                        if str(item.kind) not in {"slider", "toggle"}
+                    ]
+                    button_items_by_key = {str(item.key): item for item in button_items}
+                    ordered_items: list[Any] = []
+                    for item in items:
+                        key = str(item.key)
+                        if key in button_items_by_key:
+                            ordered_items.append(item)
+                        elif str(item.kind) in {"slider", "toggle"}:
+                            ordered_items.append(item)
+                    for item in ordered_items:
+                        if str(item.kind) == "slider":
+                            flush_buttons()
+                            children.append(render_slider(item))
+                        elif str(item.kind) == "toggle":
+                            flush_buttons()
+                            toggle = ft.Switch(
+                                label=translate(str(item.label)),
+                                label_position=ft.LabelPosition.LEFT,
+                                label_text_style=ft.TextStyle(
+                                    size=18,
+                                    color=_menu_color("text_primary"),
+                                ),
+                                value=_toggle_value_for(str(item.key), values),
+                                active_color=_menu_color("text_primary"),
+                                active_track_color=_menu_color("switch_track_active"),
+                                inactive_thumb_color=_menu_color("text_primary"),
+                                inactive_track_color=_menu_color("track"),
+                                focus_color=_menu_color("primary_hover"),
+                                hover_color=_menu_color("primary_hover_container"),
+                                track_outline_color=_menu_color("surface_container"),
+                                disabled=not bool(item.enabled),
+                                on_change=lambda _event, toggle_key=str(item.key): queue_action(toggle_key),
+                            )
+                            toggle_widgets[str(item.key)] = toggle
+                            children.append(
+                                ft.Row(
+                                    controls=[toggle],
+                                    alignment=ft.MainAxisAlignment.START,
+                                )
+                            )
+                        else:
+                            width = None
+                            key = str(item.key)
+                            if group_key == "room_models":
+                                width = 136
+                            elif group_key == "room_seats":
+                                width = 136
+                            elif group_key == "screen_crop":
+                                width = 136
+                            elif group_key == "glow_modes":
+                                width = 216
+                            elif group_key == "depth_modes":
+                                width = 216
+                            pending_buttons.append(make_button(item, width=width))
+                    flush_buttons()
+
+                group_title = translate(
+                    group_titles.get(group_key)
+                    or OPENXR_MENU_GROUP_LABELS.get(group_key, "")
+                )
+                group_card = ft.Container(
+                    content=ft.Column(
+                        controls=children,
+                        spacing=16,
+                        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                    ),
+                    bgcolor=_menu_color("surface_container"),
+                    border_radius=OPENXR_MENU_RADII["group"],
+                    padding=16,
+                )
+                group_content: Any = group_card
+                if group_title:
+                    group_content = ft.Column(
+                        controls=[
+                            ft.Container(
+                                height=_MENU_TITLE_HEIGHT,
+                                alignment=ft.Alignment.CENTER_LEFT,
+                                padding=ft.Padding.only(left=16, right=16),
+                                content=ft.Text(
+                                    group_title,
+                                    size=20,
+                                    weight=ft.FontWeight.W_600,
+                                    color=_menu_color("text_secondary"),
+                                    text_align=ft.TextAlign.LEFT,
+                                ),
+                            ),
+                            group_card,
+                        ],
+                        spacing=_MENU_TITLE_CARD_GAP,
+                        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                     )
-                    value_label = ft.Text(
-                        _format_value(current, float(control.step), key),
-                        width=56,
-                        text_align=ft.TextAlign.RIGHT,
-                        color="#c9d1d9",
-                    )
-                    slider = ft.Slider(
-                        value=current,
-                        min=float(control.minimum),
-                        max=float(control.maximum),
-                        divisions=_slider_divisions(control),
-                        on_change=queue_slider(
-                            key,
-                            value_label,
-                            float(control.step),
-                        ),
-                        disabled=not bool(control.enabled),
+                content.append(group_content)
+
+            if section_controls:
+                toolbar_controls = [
+                    ft.Container(
+                        content=make_button(item, width=236),
                         expand=True,
                     )
-                    slider_widgets[key] = (
-                        slider,
-                        value_label,
-                        float(control.step),
-                    )
-                    content.append(
+                    for item in section_controls
+                ]
+                section_toolbar.height = 88
+                section_toolbar.content = ft.Column(
+                    controls=[
                         ft.Container(
-                            content=ft.Column(
-                                controls=[
-                                    ft.Row(
-                                        controls=[
-                                            ft.Text(
-                                                translate(str(control.label)),
-                                                size=14,
-                                                color="#e6edf3",
-                                            ),
-                                            ft.Container(expand=True),
-                                            value_label,
-                                        ],
-                                    ),
-                                    slider,
-                                ],
-                                spacing=4,
+                            height=24,
+                            alignment=ft.Alignment.CENTER_LEFT,
+                            content=ft.Text(
+                                translate(group_titles.get("screen_page_heading") or "Screen geometry"),
+                                size=18,
+                                weight=ft.FontWeight.W_600,
+                                color=_menu_color("text_primary"),
+                                text_align=ft.TextAlign.LEFT,
                             ),
-                            bgcolor="#1b222c",
-                            border_radius=10,
-                            padding=ft.Padding(12, 8, 12, 8),
-                        )
-                    )
-                elif str(control.kind) == "toggle":
-                    flush_button_row()
-                    current = bool(snapshot_values.get(key, False))
-                    toggle = ft.Switch(
-                        label=translate(str(control.label)),
-                        value=current,
-                        disabled=not bool(control.enabled),
-                        on_change=lambda _event, toggle_key=key: queue_action(toggle_key),
-                    )
-                    toggle_widgets[key] = toggle
-                    content.append(
-                        ft.Container(
-                            content=toggle,
-                            bgcolor="#1b222c",
-                            border_radius=10,
-                            padding=ft.Padding(12, 6, 12, 6),
-                        )
-                    )
-                else:
-                    row_group = _button_row_group(key)
-                    if row_group is None:
-                        flush_button_row()
-                        content.append(make_button(control))
-                    else:
-                        if button_row_group != row_group:
-                            flush_button_row()
-                            button_row_group = row_group
-                        button_row_controls.append(make_button(control))
-            flush_button_row()
-            body.controls = content
+                        ),
+                        ft.Row(
+                            controls=toolbar_controls,
+                            spacing=16,
+                            expand=True,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                    ],
+                    spacing=16,
+                    expand=True,
+                )
+            else:
+                section_toolbar.height = 0
+                section_toolbar.content = ft.Container()
+
+            sidebar.controls = [
+                *(nav_button(control) for control in nav_controls),
+                ft.Container(expand=True),
+                make_button(stop_control) if stop_control is not None else ft.Container(height=64),
+            ]
+            body_content.controls = content
             layout_signature = _snapshot_layout_signature(snapshot)
 
         def apply_values(snapshot: dict[str, Any]) -> bool:
@@ -555,11 +906,22 @@ def _run_flet_desktop_settings_app(
                     value_label.value = _format_value(value, step, key)
                     changed = True
             for key, toggle in toggle_widgets.items():
-                if key not in values:
-                    continue
-                value = bool(values[key])
+                value = _toggle_value_for(key, values)
                 if bool(toggle.value) != value:
                     toggle.value = value
+                    changed = True
+            controls_by_key = {
+                str(control.key): control
+                for control in snapshot.get("controls", ())
+            }
+            for slider_key, (minus_button, plus_button) in step_widgets.items():
+                minus = controls_by_key.get(f"step:minus:{slider_key}")
+                plus = controls_by_key.get(f"step:plus:{slider_key}")
+                if minus is not None and minus_button.disabled != (not bool(minus.enabled)):
+                    minus_button.disabled = not bool(minus.enabled)
+                    changed = True
+                if plus is not None and plus_button.disabled != (not bool(plus.enabled)):
+                    plus_button.disabled = not bool(plus.enabled)
                     changed = True
             return changed
 
@@ -613,6 +975,7 @@ def _run_flet_desktop_settings_app(
             main,
             name="desktop2stereo-openxr-settings",
             view=ft.AppView.FLET_APP_HIDDEN,
+            assets_dir=str(_FLET_FONT_ASSETS_DIR),
         )
     except Exception as exc:
         print(
@@ -684,6 +1047,7 @@ class DesktopOpenXrSettingsWindow:
             self._flet_commands.put_nowait("__quit__")
         except Exception:
             pass
+        _stop_flet_process(self._flet_process)
         icon_thread = self._icon_thread
         if (
             icon_thread is not None

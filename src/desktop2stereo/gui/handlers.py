@@ -785,8 +785,10 @@ class GUIHandlerMixin:
             self._sync_visibility()
             # Refresh backend status display if visible
             self._refresh_backend_status_display()
-            if self._status_key:
-                self.set_status(UI_MESSAGES[self.locale].get(self._status_key, self.status_text.value), key=self._status_key)
+            self._refresh_status_display()
+            progress = getattr(self, "_download_progress_payload", None)
+            if progress is not None:
+                self._update_download_progress(progress)
             t = UI_MESSAGES[self.locale]
             cur = self.theme_dd.value
             cn_map = {"系统": "system", "蓝色": "blue", "绿色": "green", "红色": "red",
@@ -998,7 +1000,7 @@ class GUIHandlerMixin:
         self.preview_btn.content.value = t["Preview"]
         self.refresh_btn.content.value = t["Refresh"]
         self.reset_btn.content.value = t["Reset"]
-        self.stop_btn.content.value = t["Stop"]
+        self.stop_btn.content.value = self._stop_button_text()
         self.run_btn.content.value = t["Run"]
         self.report_issue_btn.content.value = t.get("Report issue", "Report bug")
         self.open_log_file_btn.content.value = t.get("Open log file", "Open log")

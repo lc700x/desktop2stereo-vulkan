@@ -39,6 +39,18 @@ class CoreControllerRayMixin:
         return quaternion / max(float(np.linalg.norm(quaternion)), 1e-10)
 
     @staticmethod
+    def _quat_to_mat3(quaternion):
+        x, y, z, w = quaternion
+        return np.array(
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
+                [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x)],
+                [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)],
+            ],
+            dtype=np.float64,
+        )
+
+    @staticmethod
     def _slerp_quat(first, second, amount):
         dot = float(np.dot(first, second))
         if dot < 0.0:

@@ -1,13 +1,29 @@
 # Desktop2Stereo OpenXR viewer: shared overlay RGBA texture builders.
 
+from functools import lru_cache
+from pathlib import Path
+
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from gui.localization import gettext_for, normalize_locale
 from .keyboard_layout import _KB_ROWS, _KB_TEX_H, _KB_TEX_W, _KB_UNITS_WIDE, _KeyEntry
 from .laser_params import CURSOR_RING_INNER_RATIO
-from .settings_menu import SETTINGS_MENU_TEXTURE_SIZE
+from .settings_menu import (
+    OPENXR_MENU_COLORS,
+    OPENXR_MENU_RADII,
+    SETTINGS_MENU_TEXTURE_SIZE,
+    _MENU_TITLE_HEIGHT,
+    _MENU_TITLE_CARD_GAP,
+    _CONTENT_PANEL_LEFT,
+    _CONTENT_PANEL_RIGHT,
+    _SIDEBAR_PANEL_LEFT,
+    _SIDEBAR_PANEL_RIGHT,
+)
 from viewer.controller_help import get_controller_help_rows
+
+
+_INTER_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "InterVariable.ttf"
 
 
 def build_msdf_text_osd_rgba(
@@ -92,13 +108,16 @@ def build_msdf_text_osd_rgba(
     return np.ascontiguousarray(rgba)
 
 
-def load_overlay_font(size, font_type=None, *, prefer_cjk=False, bold=False):
+@lru_cache(maxsize=64)
+def _load_overlay_font_cached(size, font_type, prefer_cjk, bold):
     candidates = []
     if prefer_cjk:
         candidates.append(
             r"C:\Windows\Fonts\msyhbd.ttc" if bold
             else r"C:\Windows\Fonts\msyh.ttc"
         )
+    elif _INTER_FONT_PATH.is_file():
+        candidates.append(str(_INTER_FONT_PATH))
     if bold:
         candidates.extend((
             r"C:\Windows\Fonts\seguisb.ttf",
@@ -113,32 +132,73 @@ def load_overlay_font(size, font_type=None, *, prefer_cjk=False, bold=False):
         if not candidate:
             continue
         try:
-            return ImageFont.truetype(candidate, size)
+            font = ImageFont.truetype(candidate, size)
+            if Path(candidate) == _INTER_FONT_PATH:
+                font.set_variation_by_name("SemiBold" if bold else "Regular")
+            return font
         except Exception:
             continue
     return ImageFont.load_default()
 
 
+def load_overlay_font(size, font_type=None, *, prefer_cjk=False, bold=False):
+    font_key = None if font_type is None else str(font_type)
+    return _load_overlay_font_cached(
+        int(size), font_key, bool(prefer_cjk), bool(bold)
+    )
+
+
+def _fit_overlay_font(draw, text, size, max_width, *, prefer_cjk=True, bold=False, minimum=14):
+    for font_size in range(int(size), int(minimum) - 1, -1):
+        font = load_overlay_font(font_size, prefer_cjk=prefer_cjk, bold=bold)
+        if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+            return font
+    return load_overlay_font(minimum, prefer_cjk=prefer_cjk, bold=bold)
+
+
 def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, lang="EN"):
-    """Rasterize the XR menu as a compact opaque navy control console."""
+    """Rasterize the shared, grid-aligned XR settings layout."""
     width, height = SETTINGS_MENU_TEXTURE_SIZE
     image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
+
+    def rgba(token, alpha=255):
+        value = OPENXR_MENU_COLORS[token].lstrip("#")
+        return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4)) + (alpha,)
+
     colors = {
-        "shell": (21, 30, 45, 250),
-        "header": (25, 35, 52, 255),
-        "card": (27, 38, 56, 255),
-        "card_alt": (31, 43, 63, 255),
-        "border": (47, 61, 82, 255),
-        "track": (91, 103, 122, 255),
-        "blue": (42, 116, 242, 255),
-        "blue_hover": (73, 145, 255, 255),
-        "text": (239, 243, 250, 255),
-        "muted": (165, 176, 194, 255),
-        "disabled": (91, 101, 117, 255),
+        "shell": rgba("surface", 250),
+        "header": rgba("surface_header"),
+        "card": rgba("surface_container"),
+        "card_alt": rgba("surface_container_high"),
+        "track": rgba("track"),
+        "blue": rgba("primary"),
+        "blue_hover": rgba("primary_hover"),
+        "blue_state_text": rgba("primary_state_text"),
+        "blue_container": rgba("primary_container"),
+        "blue_hover_container": rgba("primary_hover_container"),
+        "selection_container": rgba("selection_container"),
+        "selection_text": rgba("selection_text"),
+        "switch_track_active": rgba("switch_track_active"),
+        "text": rgba("text_primary"),
+        "muted": rgba("text_secondary"),
+        "disabled": rgba("text_disabled"),
+        "stop": rgba("destructive"),
+        "stop_hover": rgba("destructive_hover"),
+        "stop_text": rgba("destructive_text"),
     }
+    locale = normalize_locale(lang)
+    prefer_cjk = locale == "CN"
+    layout = menu.layout(
+        allow_curve=bool(values.get("screen_allow_curve", True)),
+        show_glow=bool(values.get("show_glow_tab", False)),
+        lang=locale,
+        values=values,
+    )
+    controls = layout.controls
+    controls_by_key = {control.key: control for control in controls}
+    translate = lambda message: gettext_for(locale, message)
     outer_inset = 16
-    content_inset = 34
     draw.rounded_rectangle(
         # Use an explicit inclusive endpoint so the transparent margin is
         # exactly the same on all four sides of the texture.
@@ -148,219 +208,465 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
             width - 1 - outer_inset,
             height - 1 - outer_inset,
         ),
-        radius=30,
-        fill=colors["shell"], outline=colors["border"], width=4,
+        radius=OPENXR_MENU_RADII["panel"],
+        fill=colors["shell"],
     )
     draw.rounded_rectangle(
-        (34, 20, width - 34, 96), radius=15,
-        # The tab buttons already provide their own outlines.  Keep the
-        # header's slightly lighter surface, but avoid a second enclosing
-        # stroke around the tab strip.
-        fill=colors["header"],
-    )
-    draw.rounded_rectangle(
-        # Keep the content card inset consistent on the horizontal edges
-        # and at the bottom of the outer menu shell.
         (
-            content_inset,
-            105,
-            width - 1 - content_inset,
-            height - 1 - content_inset,
+            _SIDEBAR_PANEL_LEFT, 32,
+            _SIDEBAR_PANEL_RIGHT, height - 32,
         ),
-        radius=20,
-        fill=colors["card"], outline=colors["border"], width=2,
+        radius=OPENXR_MENU_RADII["group"],
+        fill=colors["card"],
     )
-    label_font = load_overlay_font(21, prefer_cjk=True)
-    button_font = load_overlay_font(23, prefer_cjk=True, bold=True)
-    tab_font = load_overlay_font(32, prefer_cjk=True, bold=True)
-    value_font = load_overlay_font(19, prefer_cjk=True)
-    section_font = load_overlay_font(21, prefer_cjk=True, bold=True)
-    reset_font = load_overlay_font(17, prefer_cjk=True)
-    locale = normalize_locale(lang)
-    translate = lambda message: gettext_for(locale, message)
-    controls = menu.controls(
-        allow_curve=bool(values.get("screen_allow_curve", True)),
-        show_glow=bool(values.get("show_glow_tab", False)),
-        lang=locale,
-    )
-    # Separators belong to the card background. Drawing them before controls
-    # prevents the lines from crossing localized labels, tracks, or buttons.
-    separator_y = {
-        "picture": (283, 379, 474, 570, 665, 760),
-        "depth": (351,),
-        "glow": (405,),
-        "room": (310, 405, 510, 625, 755),
-        "screen": (
-            (205, 420, 590, 756)
-            if getattr(menu, "screen_section", "layout") == "crop"
-            else (335, 442, 552, 660, 756)
+    draw.rounded_rectangle(
+        (
+            _CONTENT_PANEL_LEFT, 32,
+            _CONTENT_PANEL_RIGHT, height - 32,
         ),
-    }
-    for y in separator_y[menu.tab]:
-        draw.line((70, y, width - 70, y), fill=colors["border"], width=1)
-    if menu.tab == "picture":
-        draw.line((512, 175, 512, height - 45), fill=colors["border"], width=1)
-    controls_by_key = {control.key: control for control in controls}
-    for control in controls:
-        if control.kind == "slider_step":
-            continue
-        x0, y0, x1, y1 = control.rect
-        box = (int(x0 * width), int(y0 * height), int(x1 * width), int(y1 * height))
-        hovered = control.key == hover_key
-        active = control.key.startswith("tab:") and control.key[4:] == menu.tab
-        if control.key.startswith("screen:type:"):
+        radius=OPENXR_MENU_RADII["group"],
+        fill=colors["shell"],
+    )
+    content_viewport_px = tuple(
+        int(round(value * size))
+        for value, size in zip(
+            layout.content_viewport, (width, height, width, height)
+        )
+    )
+    content_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    content_draw = ImageDraw.Draw(content_layer)
+
+    def pixel_rect(control):
+        return tuple(
+            int(round(value * size))
+            for value, size in zip(control.rect, (width, height, width, height))
+        )
+
+    def wrap_text(target, text, font, max_width):
+        """Wrap translated labels at word boundaries, then at glyph boundaries."""
+        lines = []
+        for paragraph in str(text).splitlines() or [""]:
+            current = ""
+            for character in paragraph:
+                candidate = current + character
+                if not current or target.textlength(candidate, font=font) <= max_width:
+                    current = candidate
+                    continue
+                break_at = current.rfind(" ")
+                if break_at > 0:
+                    lines.append(current[:break_at].rstrip())
+                    current = current[break_at + 1:].lstrip() + character
+                else:
+                    lines.append(current.rstrip())
+                    current = character.lstrip()
+            lines.append(current.rstrip())
+        return "\n".join(lines)
+
+    def centered_text(target, text, box, font_size, *, bold=False, minimum=18, color=None):
+        x0, y0, x1, y1 = box
+        font = _fit_overlay_font(
+            target, text, font_size, max(1, x1 - x0 - 16),
+            prefer_cjk=prefer_cjk, bold=bold, minimum=minimum,
+        )
+        wrapped = wrap_text(target, text, font, max(1, x1 - x0 - 16))
+        bbox = target.multiline_textbbox((0, 0), wrapped, font=font, spacing=2, align="center")
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        target.multiline_text(
+            (
+                (x0 + x1 - text_width) / 2 - bbox[0],
+                (y0 + y1 - text_height) / 2 - bbox[1],
+            ),
+            wrapped, font=font, fill=color or colors["text"], spacing=2,
+            align="center",
+        )
+
+    def selected_for(control):
+        key = control.key
+        if key.startswith("tab:"):
+            return key[4:] == menu.tab
+        if key.startswith("screen:type:"):
             target_angles = {
                 "screen:type:flat": 0.0,
                 "screen:type:subtle": np.deg2rad(20.0),
                 "screen:type:medium": np.deg2rad(30.0),
                 "screen:type:deep": 0.72,
             }
-            active = abs(
+            return abs(
                 float(values.get("screen:curve_half_angle", 0.0))
-                - float(target_angles[control.key])
+                - float(target_angles[key])
             ) < 1e-3
-        elif control.key == "depth:toggle_stereo":
-            active = float(values.get("depth_strength", 0.0)) > 0.0
-        elif control.key == "depth:toggle_cross_eyed":
-            active = bool(values.get("cross_eyed", False))
-        elif control.key.startswith("glow:"):
-            active = control.key == f"glow:{values.get('glow:mode', 'off')}"
-        elif control.key.startswith("room:model:"):
-            active = control.key == f"room:model:{values.get('room:model', 'Default')}"
-        elif control.key.startswith("room:seat:"):
-            seat_keys = ("front", "middle", "back")
-            active = control.key == (
-                f"room:seat:{seat_keys[int(values.get('room:seat_index', 0)) % 3]}"
+        if key == "depth:toggle_stereo":
+            return float(values.get("depth_strength", 0.0)) > 0.0
+        if key == "depth:toggle_cross_eyed":
+            return bool(values.get("cross_eyed", False))
+        if key.startswith("glow:"):
+            return key == f"glow:{values.get('glow:mode', 'off')}"
+        if key.startswith("room:model:"):
+            return key == f"room:model:{values.get('room:model', 'Default')}"
+        if key.startswith("room:seat:"):
+            seats = ("front", "middle", "back")
+            index = int(values.get("room:seat_index", 0)) % len(seats)
+            return key == f"room:seat:{seats[index]}"
+        if key == "room:toggle_screen_reflection":
+            return bool(values.get("room:screen_reflection_enabled", True))
+        if key == "openxr:render_auto":
+            return bool(values.get("openxr_render_auto", False))
+        if key.startswith("screen:section:"):
+            return key.rsplit(":", 1)[1] == getattr(menu, "screen_section", "layout")
+        if key == "screen:dynamic_crop":
+            return bool(values.get("screen:dynamic_crop", False))
+        return False
+
+    def draw_group(target, group):
+        if not group.title:
+            return
+        x0, y0, x1, _y1 = pixel_rect(group)
+        group_title = translate(group.title)
+        font = _fit_overlay_font(
+            target, group_title, 20, x1 - x0 - 32,
+            prefer_cjk=prefer_cjk, bold=True, minimum=18,
+        )
+        bounds = target.textbbox((0, 0), group_title, font=font)
+        title_height = bounds[3] - bounds[1]
+        target.text(
+            (
+                x0 + 16 - bounds[0],
+                y0 + (_MENU_TITLE_HEIGHT - title_height) / 2 - bounds[1],
+            ),
+            group_title,
+            font=font,
+            fill=colors["muted"],
+        )
+
+    def draw_navigation_icon(target, tab, left, top, color):
+        right, bottom = left + 24, top + 24
+        if tab == "screen":
+            target.rounded_rectangle(
+                (left + 2, top + 3, right - 2, bottom - 6),
+                radius=3, outline=color, width=2,
             )
-        elif control.key == "room:toggle_screen_reflection":
-            active = bool(values.get("room:screen_reflection_enabled", True))
-        elif control.key == "openxr:render_auto":
-            active = bool(values.get("openxr_render_auto", False))
-        elif control.key.startswith("screen:section:"):
-            active = control.key.rsplit(":", 1)[1] == getattr(
-                menu, "screen_section", "layout"
+            target.line(
+                (left + 7, bottom - 2, right - 7, bottom - 2),
+                fill=color, width=2,
             )
-        elif control.key == "screen:dynamic_crop":
-            active = bool(values.get("screen:dynamic_crop", False))
-        label = translate(control.label)
-        if control.kind == "slider":
-            value = float(values.get(control.key, control.minimum))
-            fraction = max(0.0, min(1.0, (value - control.minimum) / max(control.maximum - control.minimum, 1e-9)))
-            center_y = (box[1] + box[3]) // 2
-            track = (box[0], center_y - 4, box[2], center_y + 4)
-            draw.rounded_rectangle(track, radius=4, fill=colors["track"])
-            fill_x = int(box[0] + (box[2] - box[0]) * fraction)
-            draw.rounded_rectangle(
-                (box[0], center_y - 4, max(box[0] + 4, fill_x), center_y + 4),
-                radius=4, fill=colors["blue_hover"] if hovered else colors["blue"],
+            target.line(
+                ((left + right) // 2, bottom - 6, (left + right) // 2, bottom - 2),
+                fill=color, width=2,
             )
-            draw.ellipse(
-                (fill_x - 10, center_y - 10, fill_x + 10, center_y + 10),
-                fill=colors["text"], outline=colors["blue"] if hovered else colors["border"], width=2,
+        elif tab == "depth":
+            for offset in (0, 6, 12):
+                target.line(
+                    (
+                        left + 3, top + 5 + offset,
+                        left + 12, top + 1 + offset,
+                        left + 21, top + 5 + offset,
+                    ),
+                    fill=color, width=2, joint="curve",
+                )
+                target.line(
+                    (
+                        left + 3, top + 5 + offset,
+                        left + 3, top + 8 + offset,
+                        left + 12, top + 12 + offset,
+                        left + 21, top + 8 + offset,
+                        left + 21, top + 5 + offset,
+                    ),
+                    fill=color, width=2, joint="curve",
+                )
+        elif tab == "glow":
+            center = ((left + right) // 2, (top + bottom) // 2)
+            target.ellipse(
+                (center[0] - 4, center[1] - 4, center[0] + 4, center[1] + 4),
+                outline=color, width=2,
             )
-            minus_control = controls_by_key[f"step:minus:{control.key}"]
-            plus_control = controls_by_key[f"step:plus:{control.key}"]
-            minus_x = int((minus_control.rect[0] + minus_control.rect[2]) * 0.5 * width)
-            plus_x = int((plus_control.rect[0] + plus_control.rect[2]) * 0.5 * width)
-            minus_hovered = hover_key == minus_control.key
-            plus_hovered = hover_key == plus_control.key
-            draw.ellipse((minus_x - 11, center_y - 11, minus_x + 11, center_y + 11), fill=colors["card_alt"], outline=colors["blue_hover"] if minus_hovered else colors["border"], width=2)
-            draw.line((minus_x - 4, center_y, minus_x + 4, center_y), fill=colors["muted"], width=2)
-            draw.ellipse((plus_x - 11, center_y - 11, plus_x + 11, center_y + 11), fill=colors["card_alt"], outline=colors["blue_hover"] if plus_hovered else colors["border"], width=2)
-            draw.line((plus_x - 4, center_y, plus_x + 4, center_y), fill=colors["muted"], width=2)
-            draw.line((plus_x, center_y - 4, plus_x, center_y + 4), fill=colors["muted"], width=2)
-            draw.text((box[0], box[1] - 32), label, font=label_font, fill=colors["text"])
-            value_text = (
-                f"{round(value * 100):.0f}%"
-                if control.key == "openxr_render_scale"
-                else f"{value:.0f}% each"
-                if control.key in {"screen:crop_width", "screen:crop_height"}
-                else f"{value:.2f}"
+            for start, end in (
+                ((center[0], top + 1), (center[0], top + 5)),
+                ((center[0], bottom - 5), (center[0], bottom - 1)),
+                ((left + 1, center[1]), (left + 5, center[1])),
+                ((right - 5, center[1]), (right - 1, center[1])),
+                ((left + 4, top + 4), (left + 7, top + 7)),
+                ((right - 7, bottom - 7), (right - 4, bottom - 4)),
+                ((right - 4, top + 4), (right - 7, top + 7)),
+                ((left + 7, bottom - 7), (left + 4, bottom - 4)),
+            ):
+                target.line((*start, *end), fill=color, width=2)
+        elif tab == "room":
+            target.line(
+                (
+                    left + 2, top + 11, left + 12, top + 3,
+                    right - 2, top + 11,
+                ),
+                fill=color, width=2, joint="curve",
             )
-            value_box = draw.textbbox((0, 0), value_text, font=value_font)
-            draw.text(
-                (box[2] - (value_box[2] - value_box[0]), box[1] - 31),
-                value_text, font=value_font, fill=colors["blue_hover"] if hovered else colors["muted"],
+            target.rectangle(
+                (left + 5, top + 10, right - 5, bottom - 2),
+                outline=color, width=2,
+            )
+            target.rectangle(
+                (left + 10, top + 15, left + 14, bottom - 2),
+                outline=color, width=1,
             )
         else:
-            button_fill = colors["card_alt"]
-            outline = colors["border"]
-            if active:
-                button_fill, outline = (31, 58, 93, 255), colors["blue"]
-            elif hovered:
-                button_fill, outline = (37, 53, 77, 255), colors["blue_hover"]
-            elif not control.enabled:
-                button_fill = (27, 34, 47, 255)
-            draw.rounded_rectangle(box, radius=13, fill=button_fill, outline=outline, width=2)
-            if control.kind == "toggle":
-                switch_width = min(72, max(42, (box[2] - box[0]) // 3))
-                switch_height = min(32, max(22, (box[3] - box[1]) // 2))
-                switch_x1 = box[2] - 18
-                switch_x0 = switch_x1 - switch_width
-                switch_y0 = (box[1] + box[3] - switch_height) // 2
-                switch_y1 = switch_y0 + switch_height
-                draw.rounded_rectangle(
-                    (switch_x0, switch_y0, switch_x1, switch_y1),
-                    radius=switch_height // 2,
-                    fill=colors["blue"] if active else colors["track"],
-                )
-                knob_x = switch_x1 - switch_height // 2 if active else switch_x0 + switch_height // 2
-                draw.ellipse(
-                    (knob_x - switch_height // 2 + 3, switch_y0 + 3,
-                     knob_x + switch_height // 2 - 3, switch_y1 - 3),
-                    fill=colors["text"],
-                )
-            if active:
-                draw.rounded_rectangle((box[0] + 20, box[3] - 5, box[2] - 20, box[3] - 1), radius=2, fill=colors["blue"])
-            if control.key.startswith("screen:type:"):
-                cx = (box[0] + box[2]) // 2
-                arc_y = box[1] + 45
-                half_span = 35
-                depth = {
-                    "screen:type:flat": 0,
-                    "screen:type:subtle": 7,
-                    "screen:type:medium": 13,
-                    "screen:type:deep": 20,
-                }[control.key]
-                arc_color = colors["blue_hover"] if active else colors["muted"]
-                points = []
-                for index in range(25):
-                    t = index / 24.0
-                    x = cx - half_span + 2.0 * half_span * t
-                    y = arc_y + depth * (1.0 - (2.0 * t - 1.0) ** 2)
-                    points.append((x, y))
-                draw.line(points, fill=arc_color, width=4)
-            control_font = (
-                tab_font if control.key.startswith("tab:")
-                else reset_font if control.key == "section:reset_defaults"
-                else label_font if control.key.startswith("room:model:")
-                else button_font
+            target.rounded_rectangle(
+                (left + 2, top + 3, right - 2, bottom - 3),
+                radius=3, outline=color, width=2,
             )
-            bbox = draw.textbbox((0, 0), label, font=control_font)
-            text_color = colors["blue_hover"] if active else (colors["text"] if control.enabled else colors["disabled"])
-            draw.text(
-                ((box[0] + box[2] - (bbox[2] - bbox[0])) / 2,
-                 (box[1] + box[3] - (bbox[3] - bbox[1])) / 2 + (28 if control.key.startswith("screen:type:") else -2)),
-                label, font=control_font, fill=text_color,
+            target.ellipse(
+                (left + 6, top + 7, left + 10, top + 11),
+                outline=color, width=2,
             )
-    section_labels = {
-        "picture": "Video appearance",
-        "depth": "Stereo depth",
-        "glow": "Glow effects",
-        "room": "Scene controls",
-        "screen": (
-            "Screen crop" if getattr(menu, "screen_section", "layout") == "crop"
-            else "Screen geometry"
-        ),
-    }
-    draw.text(
-        (82, 112), translate(section_labels[menu.tab]),
-        font=section_font, fill=colors["text"],
+            target.line(
+                (left + 4, bottom - 6, left + 9, top + 14,
+                 left + 13, bottom - 8, left + 17, top + 15,
+                 right - 4, top + 12),
+                fill=color, width=2, joint="curve",
+            )
+
+    def draw_slider(target, control):
+        box = pixel_rect(control)
+        x0, y0, x1, y1 = box
+        center_y = (y0 + y1) // 2
+        current = float(values.get(control.key, control.minimum))
+        fraction = max(
+            0.0,
+            min(1.0, (current - control.minimum) / max(control.maximum - control.minimum, 1e-9)),
+        )
+        track_left = x0 + 10
+        track_right = x1 - 10
+        target.rounded_rectangle(
+            (track_left, center_y - 4, track_right, center_y + 4),
+            radius=4, fill=colors["track"],
+        )
+        fill_x = int(track_left + (track_right - track_left) * fraction)
+        if fill_x > track_left:
+            target.rounded_rectangle(
+                (track_left, center_y - 4, fill_x, center_y + 4),
+                radius=4, fill=colors["blue_hover"] if control.key == hover_key else colors["blue"],
+            )
+        target.ellipse(
+            (fill_x - 10, center_y - 10, fill_x + 10, center_y + 10),
+            fill=colors["text"],
+        )
+        minus = controls_by_key[f"step:minus:{control.key}"]
+        plus = controls_by_key[f"step:plus:{control.key}"]
+        for step_control, is_plus in ((minus, False), (plus, True)):
+            sx0, sy0, sx1, sy1 = pixel_rect(step_control)
+            step_x = (sx0 + sx1) // 2
+            step_hovered = step_control.key == hover_key
+            step_pressed = step_control.key == getattr(menu, "active_key", None)
+            if not step_control.enabled:
+                button_fill, glyph_color = colors["card"], colors["disabled"]
+            elif step_pressed:
+                button_fill, glyph_color = colors["blue"], colors["blue_state_text"]
+            elif step_hovered:
+                button_fill, glyph_color = colors["blue_hover"], colors["blue_state_text"]
+            else:
+                button_fill, glyph_color = colors["card_alt"], colors["text"]
+            target.ellipse(
+                (step_x - 16, center_y - 16, step_x + 16, center_y + 16),
+                fill=button_fill,
+            )
+            target.line(
+                (step_x - 5, center_y, step_x + 5, center_y),
+                fill=glyph_color, width=3,
+            )
+            if is_plus:
+                target.line(
+                    (step_x, center_y - 5, step_x, center_y + 5),
+                    fill=glyph_color, width=3,
+                )
+        label = translate(control.label)
+        value_text = (
+            f"{round(current * 100):.0f}%"
+            if control.key == "openxr_render_scale"
+            else f"{current:.0f}% each"
+            if control.key in {"screen:crop_width", "screen:crop_height"}
+            else f"{current:.2f}"
+        )
+        row_left = int(minus.rect[0] * width)
+        row_right = int(plus.rect[2] * width)
+        value_column = min(80, max(64, row_right - row_left - 128))
+        value_left = row_right - value_column
+        label_font = _fit_overlay_font(
+            target, label, 18, max(1, value_left - row_left - 8),
+            prefer_cjk=prefer_cjk, minimum=18,
+        )
+        value_font = _fit_overlay_font(
+            target, value_text, 16, max(1, row_right - value_left),
+            prefer_cjk=prefer_cjk, minimum=14,
+        )
+        label_box = target.textbbox((0, 0), label, font=label_font)
+        value_box = target.textbbox((0, 0), value_text, font=value_font)
+        label_top = center_y - 43
+        target.text(
+            (row_left - label_box[0], label_top - label_box[1]),
+            label, font=label_font, fill=colors["text"],
+        )
+        value_width = value_box[2] - value_box[0]
+        target.text(
+            (row_right - value_width - value_box[0], label_top - value_box[1]),
+            value_text, font=value_font,
+            fill=colors["text"] if control.key == hover_key else colors["muted"],
+        )
+
+    def draw_control(target, control):
+        if control.kind == "slider_step":
+            return
+        box = pixel_rect(control)
+        x0, y0, x1, y1 = box
+        hovered = control.key == hover_key
+        pressed = control.key == getattr(menu, "active_key", None)
+        active = selected_for(control)
+        label = translate(control.label)
+        if control.kind == "slider":
+            draw_slider(target, control)
+            return
+
+        if control.key == "runtime:stop":
+            fill = (
+                colors["card_alt"] if not control.enabled
+                else colors["stop_hover"] if hovered or pressed else colors["stop"]
+            )
+        elif not control.enabled:
+            fill = colors["card"]
+        elif pressed:
+            fill = colors["blue"]
+        elif hovered:
+            fill = colors["blue_hover"]
+        elif active:
+            fill = colors["selection_container"]
+        else:
+            fill = colors["card_alt"]
+        if control.kind == "toggle":
+            fill = colors["blue"] if pressed else colors["blue_hover"] if hovered else colors["card"]
+        target.rounded_rectangle(
+            box, radius=OPENXR_MENU_RADII["control"], fill=fill,
+        )
+        text_color = (
+            colors["disabled"] if not control.enabled
+            else colors["stop_text"] if control.key == "runtime:stop"
+            else colors["selection_text"] if active or hovered or pressed
+            else colors["text"]
+        )
+        if control.kind == "toggle":
+            switch_width = min(72, max(48, (x1 - x0) // 4))
+            switch_height = 32
+            switch_x1 = x1 - 16
+            switch_x0 = switch_x1 - switch_width
+            switch_y0 = (y0 + y1 - switch_height) // 2
+            switch_y1 = switch_y0 + switch_height
+            target.rounded_rectangle(
+                (switch_x0, switch_y0, switch_x1, switch_y1),
+                radius=switch_height // 2,
+                fill=colors["switch_track_active"] if active else colors["track"],
+            )
+            knob_x = switch_x1 - switch_height // 2 if active else switch_x0 + switch_height // 2
+            target.ellipse(
+                (knob_x - switch_height // 2 + 3, switch_y0 + 3,
+                 knob_x + switch_height // 2 - 3, switch_y1 - 3),
+                fill=colors["text"],
+            )
+            button_font = _fit_overlay_font(
+                target, label, 18, max(1, switch_x0 - x0 - 32),
+                prefer_cjk=prefer_cjk, minimum=18,
+            )
+            bbox = target.textbbox((0, 0), label, font=button_font)
+            target.text(
+                (x0 + 16 - bbox[0], (y0 + y1 - (bbox[3] - bbox[1])) / 2 - bbox[1]),
+                label, font=button_font, fill=text_color,
+            )
+            return
+
+        if control.key.startswith("tab:"):
+            icon_color = (
+                colors["selection_text"] if active or hovered or pressed
+                else colors["muted"]
+            )
+            icon_left = x0 + 16
+            icon_top = (y0 + y1 - 24) // 2
+            draw_navigation_icon(
+                target, control.key.split(":", 1)[1],
+                icon_left, icon_top, icon_color,
+            )
+            font = _fit_overlay_font(
+                target, label, 18, max(1, x1 - icon_left - 48),
+                prefer_cjk=prefer_cjk, bold=True, minimum=18,
+            )
+            bbox = target.textbbox((0, 0), label, font=font)
+            text_top = (y0 + y1 - (bbox[3] - bbox[1])) / 2 - bbox[1]
+            target.text(
+                (icon_left + 36 - bbox[0], text_top),
+                label, font=font, fill=text_color,
+            )
+            return
+
+        if control.key.startswith("screen:type:"):
+            cx = (x0 + x1) // 2
+            arc_y = y0 + 22
+            half_span = min(35, max(24, (x1 - x0) // 3))
+            depth = {
+                "screen:type:flat": 0,
+                "screen:type:subtle": 7,
+                "screen:type:medium": 13,
+                "screen:type:deep": 20,
+            }[control.key]
+            arc_color = (
+                colors["disabled"] if not control.enabled
+                else colors["blue_state_text"] if active
+                else colors["muted"]
+            )
+            points = []
+            for index in range(25):
+                t = index / 24.0
+                x = cx - half_span + 2.0 * half_span * t
+                y = arc_y + depth * (1.0 - (2.0 * t - 1.0) ** 2)
+                points.append((x, y))
+            target.line(points, fill=arc_color, width=4)
+            text_box = (x0 + 4, y0 + 48, x1 - 4, y1 - 4)
+            centered_text(target, label, text_box, 18, bold=True, color=text_color)
+            return
+
+        button_font_size = 20 if control.key in {"runtime:stop"} else 18
+        centered_text(
+            target, label, (x0 + 8, y0 + 4, x1 - 8, y1 - 4),
+            button_font_size,
+            bold=control.key.startswith(("tab:", "runtime:stop")),
+            minimum=18,
+            color=text_color,
+        )
+
+    for group in layout.groups:
+        if group.fixed:
+            if group.title:
+                draw_group(draw, group)
+            continue
+        box = pixel_rect(group)
+        if group.title:
+            x0, y0, x1, y1 = box
+            card_box = (
+                x0, y0 + _MENU_TITLE_HEIGHT + _MENU_TITLE_CARD_GAP,
+                x1, y1,
+            )
+        else:
+            card_box = box
+        content_draw.rounded_rectangle(
+            card_box,
+            radius=OPENXR_MENU_RADII["group"],
+            fill=colors["card"],
+        )
+        draw_group(content_draw, group)
+    for control in controls:
+        target = draw if control.fixed else content_draw
+        if control.fixed:
+            draw_control(target, control)
+        else:
+            draw_control(target, control)
+    clip_x0, clip_y0, clip_x1, clip_y1 = content_viewport_px
+    image.alpha_composite(
+        content_layer.crop((clip_x0, clip_y0, clip_x1, clip_y1)),
+        dest=(clip_x0, clip_y0),
     )
-    if cursor_uv is not None:
-        cx, cy = int(cursor_uv[0] * width), int(cursor_uv[1] * height)
-        draw.ellipse((cx - 11, cy - 11, cx + 11, cy + 11), outline=colors["blue_hover"], width=4)
-        draw.ellipse((cx - 4, cy - 4, cx + 4, cy + 4), fill=colors["text"])
     return np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
 
 
@@ -834,25 +1140,42 @@ def build_controller_callout_rgba(*, font_type=None, lang="CN", size=(2048, 1536
     # producing dark borders in the OpenXR compositor.
     img = Image.new("RGBA", (width, height), (255, 255, 255, 0))
     draw = ImageDraw.Draw(img)
-    title_font = load_overlay_font(int(round(28 * scale)), font_type, prefer_cjk=True)
-    body_font = load_overlay_font(int(round(20 * scale)), font_type, prefer_cjk=True)
     border = (255, 255, 255, 255)
     title_color = (255, 255, 255, 255)
     body_color = (255, 255, 255, 255)
     fill = (255, 255, 255, 0)
-
-    if str(lang).upper() == "CN":
-        callouts = (
-            ((700, 210, 950, 330), "B 键", ("长按：显示操作说明",), (540, 300)),
-        )
-    else:
-        callouts = (
-            ((700, 210, 950, 330), "B button", ("Hold: show operation guide",), (540, 300)),
-        )
+    callouts = ((
+        (700, 210, 950, 330),
+        gettext_for(lang, "B button"),
+        (gettext_for(lang, "Hold: show operation guide"),),
+        (540, 300),
+    ),)
 
     for rect, title, lines, target in callouts:
         x0, y0, x1, y1 = rect
         scaled_rect = rectangle(rect)
+        text_width = max(
+            1,
+            scaled_rect[2] - scaled_rect[0] - int(round(32 * scale_x)),
+        )
+
+        def fit_font(text, nominal_size):
+            minimum_size = max(12, int(round(14 * scale)))
+            for font_size in range(int(nominal_size), minimum_size - 1, -1):
+                font = load_overlay_font(
+                    font_size, font_type, prefer_cjk=True
+                )
+                if draw.textbbox((0, 0), text, font=font)[2] <= text_width:
+                    return font
+            return load_overlay_font(
+                minimum_size, font_type, prefer_cjk=True
+            )
+
+        title_font = fit_font(title, int(round(28 * scale)))
+        body_fonts = tuple(
+            fit_font(line, int(round(20 * scale)))
+            for line in lines
+        )
         draw.rounded_rectangle(
             scaled_rect,
             radius=max(1, int(round(8 * scale))),
@@ -861,10 +1184,10 @@ def build_controller_callout_rgba(*, font_type=None, lang="CN", size=(2048, 1536
             width=max(1, int(round(3 * scale))),
         )
         draw.text(point((x0 + 16, y0 + 10)), title, font=title_font, fill=title_color)
-        for index, line in enumerate(lines):
+        for index, (line, body_font) in enumerate(zip(lines, body_fonts)):
             draw.text(
                 point((x0 + 16, y0 + 52 + index * 30)),
-                f"• {line}",
+                line,
                 font=body_font,
                 fill=body_color,
             )
@@ -883,7 +1206,6 @@ def build_controller_callout_rgba(*, font_type=None, lang="CN", size=(2048, 1536
         draw.ellipse((tx - radius, ty - radius, tx + radius, ty + radius), fill=border)
 
     return np.ascontiguousarray(np.asarray(img, dtype=np.uint8))
-
 
 def build_team_help_rgba(*, font_type=None, lang="EN"):
     rows, _env_rows = get_controller_help_rows(lang)

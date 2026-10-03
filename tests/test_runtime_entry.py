@@ -63,6 +63,22 @@ def test_stop_request_watcher_sets_runtime_event(tmp_path: Path) -> None:
     assert not request.exists()
 
 
+def test_openxr_user_stop_wins_racing_fatal_device_loss():
+    from types import SimpleNamespace
+
+    from app_runtime.runtime_entry import _openxr_runtime_exit_code
+
+    presenter = SimpleNamespace(
+        fatal_device_loss=True,
+        _runtime_stop_requested=True,
+    )
+    assert _openxr_runtime_exit_code(presenter) == 0
+
+    presenter._runtime_stop_requested = False
+    assert _openxr_runtime_exit_code(presenter) == 77
+    assert _openxr_runtime_exit_code(None) == 0
+
+
 def test_legacy_streamer_normalizes_to_mjpeg() -> None:
     from utils.run_mode import normalize_run_mode, resolve_run_mode
 

@@ -1,19 +1,83 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
-import unicodedata
-
-from gui.localization import gettext_for, normalize_locale
-
+from typing import Iterable, Mapping
 
 SETTINGS_MENU_TEXTURE_SIZE = (1024, 832)
 SETTINGS_MENU_WORLD_SIZE = (0.95, 0.77)
 OPENXR_RENDER_SCALE_MIN = 0.5
 OPENXR_RENDER_SCALE_MAX = 4.0
-# The content subtitle is rendered at texture Y=112. Keep the shared action
-# row below that baseline so it cannot collide with the title in any locale.
-SETTINGS_MENU_ACTION_ROW = (0.17, 0.225)
+# Shared semantic tokens keep the in-headset and desktop OpenXR panels aligned.
+OPENXR_MENU_COLORS = {
+    "surface": "#242424",
+    "surface_header": "#2C2C2C",
+    "surface_container": "#303030",
+    "surface_container_high": "#484848",
+    "outline": "#828993",
+    "track": "#848B95",
+    "primary": "#165FC2",
+    "primary_hover": "#1C67C3",
+    "primary_state_text": "#EBEDF0",
+    "primary_container": "#1766C7",
+    "switch_track_active": "#16B85F",
+    "primary_hover_container": "#1C67C3",
+    "selection_container": "#165FC2",
+    "selection_hover_container": "#1C67C3",
+    "selection_text": "#EBEDF0",
+    "text_primary": "#EBEDF0",
+    "text_secondary": "#BEC4CC",
+    "text_disabled": "#A3A8B0",
+    "destructive": "#B33248",
+    "destructive_hover": "#B83B50",
+    "destructive_text": "#EBEDF0",
+    "destructive_outline": "#C68289",
+}
+OPENXR_MENU_RADII = {
+    "panel": 24,
+    "group": 16,
+    "control": 8,
+}
+_GRID = 8
+_MENU_GROUP_PADDING = 16
+_MENU_GROUP_GAP = 16
+_MENU_TITLE_HEIGHT = 24
+_MENU_TITLE_CARD_GAP = 16
+_MENU_CONTROL_GAP = 16
+_MENU_SLIDER_ROW_STEP = 80
+_SIDEBAR_PANEL_LEFT = 32
+_SIDEBAR_PANEL_RIGHT = 256
+_SIDEBAR_CONTROL_PADDING = 16
+_SIDEBAR_CONTROL_LEFT = _SIDEBAR_PANEL_LEFT + _SIDEBAR_CONTROL_PADDING
+_SIDEBAR_CONTROL_WIDTH = (
+    _SIDEBAR_PANEL_RIGHT - _SIDEBAR_PANEL_LEFT
+    - 2 * _SIDEBAR_CONTROL_PADDING
+)
+_CONTENT_PANEL_LEFT = _SIDEBAR_PANEL_RIGHT + _MENU_GROUP_GAP
+_CONTENT_PANEL_RIGHT = SETTINGS_MENU_TEXTURE_SIZE[0] - 32
+_CONTENT_PANEL_WIDTH = _CONTENT_PANEL_RIGHT - _CONTENT_PANEL_LEFT
+_CONTENT_LEFT = _CONTENT_PANEL_LEFT + _MENU_GROUP_PADDING
+_CONTENT_RIGHT = _CONTENT_PANEL_RIGHT - _MENU_GROUP_PADDING
+_CONTENT_WIDTH = _CONTENT_RIGHT - _CONTENT_LEFT
+_CONTENT_TOP = 32
+_CONTENT_BOTTOM = 768
+
+OPENXR_MENU_GROUP_LABELS = {
+    "render_quality": "Render quality",
+    "color_adjustment": "Color adjustment",
+    "screen_shape": "Screen shape",
+    "screen_placement": "Screen placement",
+    "screen_crop": "Crop settings",
+    "depth_modes": "Stereo mode",
+    "glow_modes": "Glow mode",
+    "room_models": "Environment",
+    "room_seats": "Seat position",
+    "room_scene": "Scene controls",
+}
+
+
+def _rect_px(x0: int, y0: int, x1: int, y1: int) -> tuple[float, float, float, float]:
+    width, height = SETTINGS_MENU_TEXTURE_SIZE
+    return x0 / width, y0 / height, x1 / width, y1 / height
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +90,8 @@ class MenuControl:
     maximum: float = 1.0
     step: float = 0.05
     enabled: bool = True
+    group: str = ""
+    fixed: bool = False
 
     def contains(self, u: float, v: float) -> bool:
         x0, y0, x1, y1 = self.rect
@@ -37,6 +103,22 @@ class MenuControl:
         raw = self.minimum + fraction * (self.maximum - self.minimum)
         steps = round((raw - self.minimum) / max(self.step, 1e-9))
         return max(self.minimum, min(self.maximum, self.minimum + steps * self.step))
+
+
+@dataclass(frozen=True, slots=True)
+class MenuGroup:
+    key: str
+    title: str
+    rect: tuple[float, float, float, float]
+    fixed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class MenuLayout:
+    controls: tuple[MenuControl, ...]
+    groups: tuple[MenuGroup, ...]
+    content_viewport: tuple[float, float, float, float]
+    scroll_max: float
 
 
 PICTURE_CONTROLS = (
@@ -71,7 +153,7 @@ PICTURE_DEFAULTS = {
 
 
 class OpenXrSettingsMenu:
-    """Renderer-independent tab, hit-test, and trigger state for the XR menu."""
+    """Renderer-independent sidebar, hit-test, and trigger state for the XR menu."""
 
     tabs = ("picture", "depth", "glow", "room", "screen")
 
@@ -89,8 +171,14 @@ class OpenXrSettingsMenu:
         self.revision = 0
         self._trigger_down = [False, False]
         self._outside_down = [False, False]
+        self.stopping = False
         self.room_models: tuple[tuple[str, str], ...] = ()
         self.room_tab_visible = True
+        self.scroll_offset = 0.0
+        self._layout_cache_key: tuple[object, ...] | None = None
+        self._layout_cache_base: MenuLayout | None = None
+        self._layout_cache_view_key: tuple[object, ...] | None = None
+        self._layout_cache_value: MenuLayout | None = None
 
     def open(self) -> None:
         self.visible = True
@@ -105,6 +193,14 @@ class OpenXrSettingsMenu:
         self.active_key = None
         self.mark_dirty()
 
+    def set_stopping(self, stopping: bool = True) -> bool:
+        stopping = bool(stopping)
+        if self.stopping == stopping:
+            return False
+        self.stopping = stopping
+        self.mark_dirty()
+        return True
+
     def mark_dirty(self) -> None:
         self.dirty = True
         self.revision += 1
@@ -114,6 +210,7 @@ class OpenXrSettingsMenu:
             return False
         self.tab = tab
         self.hover_key = None
+        self.scroll_offset = 0.0
         self.mark_dirty()
         return True
 
@@ -122,228 +219,592 @@ class OpenXrSettingsMenu:
             return False
         self.screen_section = section
         self.hover_key = None
+        self.scroll_offset = 0.0
         self.mark_dirty()
         return True
 
-    def controls(
+    def layout(
         self, *, allow_curve: bool = True, show_glow: bool = False,
-        lang: str = "EN",
-    ) -> tuple[MenuControl, ...]:
-        # Keep the geometry controls immediately available while preserving
-        # the existing order of the middle tabs.  Both the XR renderer and
-        # the Flet mirror consume this shared ordering.
+        lang: str = "EN", values: Mapping[str, object] | None = None,
+    ) -> MenuLayout:
+        """Build one grid-aligned layout shared by rendering, ray hits and Flet."""
+        cache_key = (
+            self.tab, self.screen_section, bool(allow_curve), bool(show_glow),
+            str(lang), self.room_models, self.stopping,
+        )
+        if cache_key == self._layout_cache_key and self._layout_cache_base is not None:
+            return self._materialize_layout(self._layout_cache_base, values)
+        controls: list[MenuControl] = []
+        groups: list[MenuGroup] = []
+
+        def rect(x: int, y: int, width: int, height: int) -> tuple[float, float, float, float]:
+            return _rect_px(x, y, x + width, y + height)
+
+        def add(
+            key: str,
+            label: str,
+            box: tuple[int, int, int, int],
+            *,
+            kind: str = "button",
+            minimum: float = 0.0,
+            maximum: float = 1.0,
+            step: float = 0.05,
+            enabled: bool = True,
+            group: str = "",
+            fixed: bool = False,
+        ) -> None:
+            x, y, width, height = box
+            controls.append(MenuControl(
+                key, label, rect(x, y, width, height), kind, minimum, maximum,
+                step, enabled, group, fixed,
+            ))
+
+        def add_group(
+            key: str,
+            x: int,
+            y: int,
+            width: int,
+            height: int,
+            *,
+            title: str | None = None,
+            fixed: bool = False,
+        ) -> None:
+            groups.append(MenuGroup(
+                key,
+                title if title is not None else OPENXR_MENU_GROUP_LABELS.get(key, ""),
+                rect(x, y, width, height),
+                fixed,
+            ))
+
+        def add_slider(
+            key: str,
+            label: str,
+            x: int,
+            row_y: int,
+            row_width: int,
+            minimum: float,
+            maximum: float,
+            step: float,
+            group: str,
+        ) -> None:
+            # +/- retain 64 px ray targets. The slider and both targets share a
+            # center line, with 8 px between neighboring hit regions.
+            center_y = row_y + 48
+            slider_left = x + 72
+            slider_right = x + row_width - 72
+            add(
+                key, label,
+                (slider_left, center_y - 24, slider_right - slider_left, 48),
+                kind="slider", minimum=minimum, maximum=maximum, step=step,
+                group=group,
+            )
+            add(
+                f"step:minus:{key}", "-",
+                (x, center_y - 32, 64, 64),
+                kind="slider_step", minimum=minimum, maximum=maximum,
+                step=step, group=group,
+            )
+            add(
+                f"step:plus:{key}", "+",
+                (x + row_width - 64, center_y - 32, 64, 64),
+                kind="slider_step", minimum=minimum, maximum=maximum,
+                step=step, group=group,
+            )
+
+        def add_button(
+            key: str,
+            label: str,
+            box: tuple[int, int, int, int],
+            *,
+            group: str,
+            kind: str = "button",
+            enabled: bool = True,
+            fixed: bool = False,
+        ) -> None:
+            add(key, label, box, kind=kind, group=group, enabled=enabled, fixed=fixed)
+
+        # Keep fixed navigation anchored to the top of the panel. Group labels
+        # carry page context, so the redundant global title bar is omitted.
         visible_tabs = ["screen", "depth"]
         if show_glow:
             visible_tabs.append("glow")
-        # Environment selection is managed from this tab, so it must remain
-        # available even while the Default environment is active.
-        visible_tabs.append("room")
-        visible_tabs.append("picture")
-        left, right, gap = 0.04, 0.96, 0.008
-        locale = normalize_locale(lang)
-        labels = {
-            tab: gettext_for(locale, tab.title()) for tab in visible_tabs
-        }
-        # Keep every target comfortably hittable, then distribute remaining
-        # width according to the localized title's approximate display width.
-        minimum_width = 0.135
-        available = right - left - gap * (len(visible_tabs) - 1)
-        flexible = max(0.0, available - minimum_width * len(visible_tabs))
-        weights = {
-            tab: max(2.0, sum(
-                2.0 if unicodedata.east_asian_width(character) in {"W", "F"}
-                else 1.0
-                for character in labels[tab]
-            ))
-            for tab in visible_tabs
-        }
-        weight_total = sum(weights.values())
-        controls = []
-        x0 = left
-        for tab in visible_tabs:
-            tab_width = minimum_width + flexible * weights[tab] / weight_total
-            controls.append(MenuControl(
-                f"tab:{tab}", tab.title(), (x0, 0.035, x0 + tab_width, 0.11)
-            ))
-            x0 += tab_width + gap
-        if self.tab in {"picture", "depth", "screen"}:
-            controls.append(MenuControl(
-                "section:reset_defaults", "Reset to default values",
-                (0.70, SETTINGS_MENU_ACTION_ROW[0], 0.92, SETTINGS_MENU_ACTION_ROW[1]),
-            ))
+        visible_tabs.extend(("room", "picture"))
+        for index, tab in enumerate(visible_tabs):
+            y0 = 64 + index * 80
+            add_button(
+                f"tab:{tab}", tab.title(),
+                (_SIDEBAR_CONTROL_LEFT, y0, _SIDEBAR_CONTROL_WIDTH, 64),
+                group="navigation", fixed=True,
+            )
+        add_button(
+            "runtime:stop", "Stop",
+            (_SIDEBAR_CONTROL_LEFT, 704, _SIDEBAR_CONTROL_WIDTH, 64),
+            group="navigation_actions", enabled=not self.stopping, fixed=True,
+        )
+        # Screen Layout/Crop is true secondary navigation and stays pinned
+        # while its longer settings page scrolls.
+        if self.tab == "screen":
+            add_group(
+                "screen_page_heading", _CONTENT_PANEL_LEFT, 32,
+                _CONTENT_PANEL_WIDTH, 48,
+                title="Screen geometry", fixed=True,
+            )
+            add_group(
+                "screen_navigation", _CONTENT_PANEL_LEFT, 88,
+                _CONTENT_PANEL_WIDTH, 48, title="", fixed=True,
+            )
+            navigation_width = (_CONTENT_WIDTH - _MENU_CONTROL_GAP) // 2
+            add_button(
+                "screen:section:layout", "Layout",
+                (_CONTENT_LEFT, 88, navigation_width, 48),
+                group="screen_navigation", fixed=True,
+            )
+            add_button(
+                "screen:section:crop", "Crop",
+                (
+                    _CONTENT_LEFT + navigation_width + _MENU_CONTROL_GAP,
+                    88, navigation_width, 48,
+                ),
+                group="screen_navigation", fixed=True,
+            )
+
         if self.tab == "picture":
-            controls.append(MenuControl(
+            render_keys = {
+                "openxr_render_scale", "vulkan_projection_min_lod",
+                "vulkan_projection_max_lod", "vulkan_projection_mip_lod_bias",
+                "vulkan_projection_rcas_sharpness",
+            }
+            color_controls = tuple(item for item in PICTURE_CONTROLS if item[0] not in render_keys)
+            render_controls = tuple(item for item in PICTURE_CONTROLS if item[0] in render_keys)
+            render_height = 536
+            color_height = 544
+            picture_gap = _MENU_CONTROL_GAP
+            picture_column_width = (_CONTENT_PANEL_WIDTH - picture_gap) // 2
+            render_group_x = _CONTENT_PANEL_LEFT
+            color_group_x = render_group_x + picture_column_width + picture_gap
+            render_control_x = render_group_x + _MENU_GROUP_PADDING
+            color_control_x = color_group_x + _MENU_GROUP_PADDING
+            picture_control_width = picture_column_width - 2 * _MENU_GROUP_PADDING
+            add_group(
+                "render_quality", render_group_x, 32,
+                picture_column_width, render_height,
+            )
+            add_group(
+                "color_adjustment", color_group_x, 32,
+                picture_column_width, color_height,
+            )
+            add_button(
                 "openxr:render_auto", "Headset optimized",
-                (0.08, SETTINGS_MENU_ACTION_ROW[0], 0.55, SETTINGS_MENU_ACTION_ROW[1]),
-            ))
-            for index, (key, label, minimum, maximum, step) in enumerate(PICTURE_CONTROLS):
-                column, row = divmod(index, 6)
-                y0 = 0.24 + row * 0.115
-                x0 = 0.08 + column * 0.47
-                self._append_slider_controls(
-                    controls, key, label,
-                    (x0, y0 + 0.045, x0 + 0.38, y0 + 0.09),
-                    minimum, maximum, step,
+                (render_control_x, 88, picture_control_width, 48),
+                group="render_quality",
+            )
+            for index, (key, label, minimum, maximum, step) in enumerate(render_controls):
+                add_slider(
+                    key, label, render_control_x,
+                    152 + index * _MENU_SLIDER_ROW_STEP, picture_control_width,
+                    minimum, maximum, step, "render_quality",
+                )
+            for index, (key, label, minimum, maximum, step) in enumerate(color_controls):
+                add_slider(
+                    key, label, color_control_x,
+                    80 + index * _MENU_SLIDER_ROW_STEP, picture_control_width,
+                    minimum, maximum, step, "color_adjustment",
                 )
         elif self.tab == "depth":
-            self._append_slider_controls(
-                controls, "depth_strength", "Depth strength",
-                (0.16, 0.29, 0.84, 0.36), 0.0, 1.0, 0.05,
+            add_group(
+                "depth_strength", _CONTENT_PANEL_LEFT, 32,
+                _CONTENT_PANEL_WIDTH, 112, title="",
             )
-            controls.extend((
-                MenuControl("depth:toggle_stereo", "2D / 3D", (0.12, 0.46, 0.44, 0.58)),
-                MenuControl("depth:toggle_cross_eyed", "Cross eyed", (0.56, 0.46, 0.88, 0.58)),
-            ))
+            add_slider(
+                "depth_strength", "Depth strength", _CONTENT_LEFT, 40, _CONTENT_WIDTH,
+                0.0, 1.0, 0.05, "depth_strength",
+            )
+            add_group(
+                "depth_modes", _CONTENT_PANEL_LEFT, 160,
+                _CONTENT_PANEL_WIDTH, 136,
+            )
+            mode_width = (_CONTENT_WIDTH - _MENU_CONTROL_GAP) // 2
+            add_button(
+                "depth:toggle_stereo", "2D / 3D",
+                (_CONTENT_LEFT, 216, mode_width, 64),
+                group="depth_modes", kind="toggle",
+            )
+            add_button(
+                "depth:toggle_cross_eyed", "Cross eyed",
+                (
+                    _CONTENT_LEFT + mode_width + _MENU_CONTROL_GAP,
+                    216, mode_width, 64,
+                ), group="depth_modes", kind="toggle",
+            )
         elif self.tab == "glow" and show_glow:
-            controls.extend((
-                MenuControl("glow:surround", "Surround Glow", (0.08, 0.22, 0.47, 0.42)),
-                MenuControl("glow:glow", "Glow", (0.53, 0.22, 0.92, 0.42)),
-                MenuControl("glow:veil", "Veil", (0.08, 0.53, 0.47, 0.73)),
-                MenuControl("glow:off", "OFF", (0.53, 0.53, 0.92, 0.73)),
-            ))
-            self._append_slider_controls(
-                controls, "glow:transparency", "Glow transparency",
-                (0.12, 0.80, 0.88, 0.85), 0.0, 1.0, 0.05,
+            add_group(
+                "glow_modes", _CONTENT_PANEL_LEFT, 32,
+                _CONTENT_PANEL_WIDTH, 216,
+            )
+            glow_column_width = (_CONTENT_WIDTH - _MENU_CONTROL_GAP) // 2
+            for key, label, box in (
+                (
+                    "glow:surround", "Surround Glow",
+                    (_CONTENT_LEFT, 88, glow_column_width, 64),
+                ),
+                (
+                    "glow:glow", "Glow",
+                    (
+                        _CONTENT_LEFT + glow_column_width + _MENU_CONTROL_GAP,
+                        88, glow_column_width, 64,
+                    ),
+                ),
+                (
+                    "glow:veil", "Veil",
+                    (_CONTENT_LEFT, 168, glow_column_width, 64),
+                ),
+                (
+                    "glow:off", "OFF",
+                    (
+                        _CONTENT_LEFT + glow_column_width + _MENU_CONTROL_GAP,
+                        168, glow_column_width, 64,
+                    ),
+                ),
+            ):
+                add_button(key, label, box, group="glow_modes")
+            add_group(
+                "glow_transparency", _CONTENT_PANEL_LEFT, 264,
+                _CONTENT_PANEL_WIDTH, 112, title="",
+            )
+            add_slider(
+                "glow:transparency", "Glow transparency",
+                _CONTENT_LEFT, 272, _CONTENT_WIDTH,
+                0.0, 1.0, 0.05, "glow_transparency",
             )
         elif self.tab == "room":
-            model_count = max(1, len(self.room_models))
-            columns = min(5, model_count)
-            model_width = 0.84 / columns
-            for index, (model_key, model_label) in enumerate(self.room_models):
-                column, row = index % columns, index // columns
-                x0 = 0.08 + column * model_width
-                y0 = 0.19 + row * 0.06
-                controls.append(MenuControl(
-                    f"room:model:{model_key}", model_label,
-                    (x0, y0, x0 + model_width - 0.008, y0 + 0.048),
-                ))
-            seat_y = 0.39
-            controls.extend((
-                MenuControl("room:seat:front", "Front", (0.08, seat_y, 0.31, seat_y + 0.08)),
-                MenuControl("room:seat:middle", "Middle", (0.385, seat_y, 0.615, seat_y + 0.08)),
-                MenuControl("room:seat:back", "Back", (0.69, seat_y, 0.92, seat_y + 0.08)),
-                MenuControl(
-                    "room:toggle_screen_reflection", "Screen reflection light",
-                    (0.31, 0.52, 0.69, 0.60),
-                ),
-            ))
-            self._append_slider_controls(
-                controls, "room:seat_height", "Seat height",
-                (0.12, 0.68, 0.88, 0.73), -3.0, 3.0, 0.05,
-            )
-            self._append_slider_controls(
-                controls, "room:exposure", "Scene brightness",
-                (0.12, 0.84, 0.88, 0.89), -8.0, 8.0, 0.1,
-            )
-        else:
-            controls.extend((
-                MenuControl(
-                    "screen:section:layout", "Layout",
-                    (0.08, SETTINGS_MENU_ACTION_ROW[0], 0.37, SETTINGS_MENU_ACTION_ROW[1]),
-                ),
-                MenuControl(
-                    "screen:section:crop", "Crop",
-                    (0.40, SETTINGS_MENU_ACTION_ROW[0], 0.69, SETTINGS_MENU_ACTION_ROW[1]),
-                ),
-            ))
-            if self.screen_section == "crop":
-                controls.extend((
-                    MenuControl("screen:auto_crop", "Auto Crop", (0.08, 0.26, 0.46, 0.38)),
-                    MenuControl(
-                        "screen:dynamic_crop", "Dynamic Crop", (0.54, 0.26, 0.92, 0.38),
-                        "toggle",
-                    ),
-                    MenuControl("screen:reset_crop", "Reset Crop", (0.32, 0.47, 0.68, 0.57)),
-                ))
-                self._append_slider_controls(
-                    controls, "screen:crop_width", "Width crop (Left / Right)",
-                    (0.12, 0.68, 0.88, 0.73), 0.0, 45.0, 1.0,
+            y = _CONTENT_TOP
+            if self.room_models:
+                columns = min(3, len(self.room_models))
+                rows = (len(self.room_models) + columns - 1) // columns
+                row_height = 64
+                group_height = (
+                    _MENU_TITLE_HEIGHT + _MENU_TITLE_CARD_GAP
+                    + _MENU_GROUP_PADDING + rows * row_height
+                    + max(0, rows - 1) * _MENU_CONTROL_GAP
+                    + _MENU_GROUP_PADDING
                 )
-                self._append_slider_controls(
-                    controls, "screen:crop_height", "Height crop (Top / Bottom)",
-                    (0.12, 0.84, 0.88, 0.89), 0.0, 45.0, 1.0,
+                add_group(
+                    "room_models", _CONTENT_PANEL_LEFT, y,
+                    _CONTENT_PANEL_WIDTH, group_height,
                 )
-                return tuple(controls)
-            controls.extend((
-                MenuControl(
-                    "screen:type:flat", "Flat", (0.065, 0.24, 0.245, 0.40),
-                    enabled=True,
-                ),
-                MenuControl(
-                    "screen:type:subtle", "Subtle", (0.295, 0.24, 0.475, 0.40),
-                    enabled=allow_curve,
-                ),
-                MenuControl(
-                    "screen:type:medium", "Medium", (0.525, 0.24, 0.705, 0.40),
-                    enabled=allow_curve,
-                ),
-                MenuControl(
-                    "screen:type:deep", "Deep", (0.755, 0.24, 0.935, 0.40),
-                    enabled=allow_curve,
-                ),
-            ))
-            controls.extend((
-                MenuControl("screen:rotate:-90", "-90°", (0.20, 0.43, 0.40, 0.52)),
-                MenuControl("screen:rotate:+90", "+90°", (0.60, 0.43, 0.80, 0.52)),
-            ))
-            self._append_slider_controls(
-                controls, "screen:width", "Screen size",
-                (0.12, 0.58, 0.88, 0.63), 0.25, 2.0, 0.01,
+                horizontal_gap = _MENU_CONTROL_GAP
+                content_width = _CONTENT_WIDTH
+                column_width = (
+                    content_width - (columns - 1) * horizontal_gap
+                ) // columns
+                total_width = columns * column_width + (columns - 1) * horizontal_gap
+                start_x = _CONTENT_LEFT + (content_width - total_width) // 2
+                for index, (model_key, model_label) in enumerate(self.room_models):
+                    column, row = index % columns, index // columns
+                    x0 = start_x + column * (column_width + horizontal_gap)
+                    y0 = (
+                        y + _MENU_TITLE_HEIGHT + _MENU_TITLE_CARD_GAP
+                        + _MENU_GROUP_PADDING + row * _MENU_SLIDER_ROW_STEP
+                    )
+                    add_button(
+                        f"room:model:{model_key}", model_label,
+                        (x0, y0, column_width, row_height),
+                        group="room_models",
+                    )
+                y += group_height + _MENU_GROUP_GAP
+            add_group(
+                "room_seats", _CONTENT_PANEL_LEFT, y,
+                _CONTENT_PANEL_WIDTH, 136,
             )
-            self._append_slider_controls(
-                controls, "screen:height", "Screen height",
-                (0.12, 0.71, 0.88, 0.76), -10.0, 10.0, 0.05,
+            seat_width = (_CONTENT_WIDTH - 2 * _MENU_CONTROL_GAP) // 3
+            seat_gap = _MENU_CONTROL_GAP
+            content_width = _CONTENT_WIDTH
+            seat_start = _CONTENT_LEFT + (
+                content_width - (seat_width * 3 + seat_gap * 2)
+            ) // 2
+            for index, (seat, label) in enumerate((
+                ("front", "Front"), ("middle", "Middle"), ("back", "Back"),
+            )):
+                add_button(
+                    f"room:seat:{seat}", label,
+                    (seat_start + index * (seat_width + seat_gap), y + 56, seat_width, 64),
+                    group="room_seats",
+                )
+            y += 136 + _MENU_GROUP_GAP
+            add_group(
+                "room_scene", _CONTENT_PANEL_LEFT, y,
+                _CONTENT_PANEL_WIDTH, 320,
             )
-            self._append_slider_controls(
-                controls, "screen:distance", "Screen distance",
-                # Keep the mirror in sync with the headset presets, including
-                # the 1000" IMAX distance (20x). The controller itself has
-                # always been able to reach this range.
-                (0.12, 0.84, 0.88, 0.89), 0.25, 20.0, 0.05,
+            add_button(
+                "room:toggle_screen_reflection", "Screen reflection light",
+                (_CONTENT_LEFT, y + 56, _CONTENT_WIDTH, 64),
+                group="room_scene", kind="toggle",
             )
-        return tuple(controls)
+            add_slider(
+                "room:seat_height", "Seat height", _CONTENT_LEFT,
+                y + 128, _CONTENT_WIDTH,
+                -3.0, 3.0, 0.05, "room_scene",
+            )
+            add_slider(
+                "room:exposure", "Scene brightness", _CONTENT_LEFT,
+                y + 224, _CONTENT_WIDTH,
+                -8.0, 8.0, 0.1, "room_scene",
+            )
+        elif self.tab == "screen" and self.screen_section == "crop":
+            add_group(
+                "screen_crop", _CONTENT_PANEL_LEFT, 152,
+                _CONTENT_PANEL_WIDTH, 160, title="",
+            )
+            crop_button_width = (_CONTENT_WIDTH - _MENU_CONTROL_GAP) // 2
+            crop_reset_width = 168
+            crop_reset_x = _CONTENT_PANEL_LEFT + (
+                _CONTENT_PANEL_WIDTH - crop_reset_width
+            ) // 2
+            for key, label, box, kind in (
+                (
+                    "screen:auto_crop", "Auto Crop",
+                    (_CONTENT_LEFT, 168, crop_button_width, 64), "button",
+                ),
+                (
+                    "screen:dynamic_crop", "Dynamic Crop",
+                    (
+                        _CONTENT_LEFT + crop_button_width + _MENU_CONTROL_GAP,
+                        168, crop_button_width, 64,
+                    ), "toggle",
+                ),
+                (
+                    "screen:reset_crop", "Reset Crop",
+                    (crop_reset_x, 248, crop_reset_width, 48), "button",
+                ),
+            ):
+                add_button(key, label, box, group="screen_crop", kind=kind)
+            add_group(
+                "screen_crop_ranges", _CONTENT_PANEL_LEFT, 328,
+                _CONTENT_PANEL_WIDTH, 224, title="Crop range",
+            )
+            add_slider(
+                "screen:crop_width", "Width crop (Left / Right)",
+                _CONTENT_LEFT, 376, _CONTENT_WIDTH,
+                0.0, 45.0, 1.0, "screen_crop_ranges",
+            )
+            add_slider(
+                "screen:crop_height", "Height crop (Top / Bottom)",
+                _CONTENT_LEFT, 456, _CONTENT_WIDTH,
+                0.0, 45.0, 1.0, "screen_crop_ranges",
+            )
+        elif self.tab == "screen":
+            add_group(
+                "screen_shape", _CONTENT_PANEL_LEFT, 152,
+                _CONTENT_PANEL_WIDTH, 200, title="",
+            )
+            shape_items = (
+                ("screen:type:flat", "Flat", True),
+                ("screen:type:subtle", "Subtle", allow_curve),
+                ("screen:type:medium", "Medium", allow_curve),
+                ("screen:type:deep", "Deep", allow_curve),
+            )
+            shape_width = (_CONTENT_WIDTH - 3 * _MENU_CONTROL_GAP) // 4
+            for index, (key, label, enabled) in enumerate(shape_items):
+                x0 = _CONTENT_LEFT + index * (shape_width + _MENU_CONTROL_GAP)
+                add_button(
+                    key, label, (x0, 168, shape_width, 104),
+                    group="screen_shape", enabled=enabled,
+                )
+            for key, label, x0 in (
+                (
+                    "screen:rotate:-90", "Rotate -90",
+                    _CONTENT_PANEL_LEFT + (_CONTENT_PANEL_WIDTH - 336) // 2,
+                ),
+                (
+                    "screen:rotate:+90", "Rotate +90",
+                    _CONTENT_PANEL_LEFT + (_CONTENT_PANEL_WIDTH - 336) // 2 + 176,
+                ),
+            ):
+                add_button(
+                    key, label, (x0, 288, 160, 48), group="screen_shape",
+                )
+            add_group(
+                "screen_placement", _CONTENT_PANEL_LEFT, 368,
+                _CONTENT_PANEL_WIDTH, 304,
+            )
+            for index, (key, label, minimum, maximum, step) in enumerate((
+                ("screen:width", "Screen size", 0.25, 2.0, 0.01),
+                ("screen:height", "Screen height", -10.0, 10.0, 0.05),
+                ("screen:distance", "Screen distance", 0.25, 20.0, 0.05),
+            )):
+                add_slider(
+                    key, label, _CONTENT_LEFT,
+                    416 + index * _MENU_SLIDER_ROW_STEP, _CONTENT_WIDTH,
+                    minimum, maximum, step, "screen_placement",
+                )
+
+        viewport_y = 152 if self.tab == "screen" else _CONTENT_TOP
+        viewport = rect(
+            _CONTENT_PANEL_LEFT, viewport_y,
+            _CONTENT_PANEL_RIGHT - _CONTENT_PANEL_LEFT,
+            _CONTENT_BOTTOM - viewport_y,
+        )
+        content_bottom = max(
+            [viewport_y, *(int(round(group.rect[3] * SETTINGS_MENU_TEXTURE_SIZE[1]))
+                            for group in groups if not group.fixed)],
+        )
+        scroll_max = max(0.0, float(content_bottom - _CONTENT_BOTTOM))
+        self._layout_cache_key = cache_key
+        self._layout_cache_base = MenuLayout(
+            tuple(controls), tuple(groups), viewport, scroll_max,
+        )
+        self._layout_cache_view_key = None
+        self._layout_cache_value = None
+        return self._materialize_layout(self._layout_cache_base, values)
+
+    def _materialize_layout(
+        self, base: MenuLayout, values: Mapping[str, object] | None,
+    ) -> MenuLayout:
+        self.scroll_offset = min(max(0.0, float(self.scroll_offset)), base.scroll_max)
+        slider_keys = tuple(
+            control.key for control in base.controls if control.kind == "slider"
+        )
+        values_key = None if values is None else tuple(
+            (key, repr(values.get(key))) for key in slider_keys
+        )
+        view_key = (float(self.scroll_offset), values_key)
+        if view_key == self._layout_cache_view_key and self._layout_cache_value is not None:
+            return self._layout_cache_value
+
+        offset = self.scroll_offset / SETTINGS_MENU_TEXTURE_SIZE[1]
+
+        def shifted_rect(
+            value: tuple[float, float, float, float], fixed: bool,
+        ) -> tuple[float, float, float, float]:
+            if fixed or offset <= 0.0:
+                return value
+            x0, y0, x1, y1 = value
+            return x0, y0 - offset, x1, y1 - offset
+
+        controls = tuple(
+            item if shifted_rect(item.rect, item.fixed) is item.rect else MenuControl(
+                item.key, item.label, shifted_rect(item.rect, item.fixed),
+                item.kind, item.minimum, item.maximum, item.step, item.enabled,
+                item.group, item.fixed,
+            )
+            for item in base.controls
+        )
+        groups = tuple(
+            item if shifted_rect(item.rect, item.fixed) is item.rect else MenuGroup(
+                item.key, item.title, shifted_rect(item.rect, item.fixed), item.fixed,
+            )
+            for item in base.groups
+        )
+        controls = self._apply_slider_step_states(controls, values)
+        result = MenuLayout(controls, groups, base.content_viewport, base.scroll_max)
+        self._layout_cache_view_key = view_key
+        self._layout_cache_value = result
+        return result
+
+    def controls(
+        self, *, allow_curve: bool = True, show_glow: bool = False,
+        lang: str = "EN", values: Mapping[str, object] | None = None,
+    ) -> tuple[MenuControl, ...]:
+        return self.layout(
+            allow_curve=allow_curve, show_glow=show_glow, lang=lang, values=values,
+        ).controls
+
+    def scroll_viewport_contains(self, uv: tuple[float, float] | None) -> bool:
+        if uv is None:
+            return False
+        viewport = self.layout().content_viewport
+        u, v = (float(value) for value in uv)
+        return viewport[0] <= u <= viewport[2] and viewport[1] <= v <= viewport[3]
+
+    def scroll_by_wheel_axis(
+        self, axis: float, delta_seconds: float, deadzone: float,
+    ) -> bool:
+        amount = float(axis)
+        magnitude = abs(amount)
+        if magnitude <= float(deadzone):
+            return False
+        layout = self.layout()
+        if layout.scroll_max <= 0.0:
+            return False
+        normalized = (magnitude - float(deadzone)) / max(1.0 - float(deadzone), 1e-6)
+        speed = 2.0 + (35.0 - 2.0) * normalized ** 2.8
+        wheel_pixels = amount * speed * max(0.0, min(0.1, float(delta_seconds))) * 48.0
+        next_offset = min(
+            layout.scroll_max,
+            max(0.0, self.scroll_offset - wheel_pixels),
+        )
+        if abs(next_offset - self.scroll_offset) < 0.5:
+            return False
+        self.scroll_offset = next_offset
+        self.mark_dirty()
+        return True
 
     @staticmethod
-    def _append_slider_controls(
-        controls: list[MenuControl],
-        key: str,
-        label: str,
-        rect: tuple[float, float, float, float],
-        minimum: float,
-        maximum: float,
-        step: float,
-    ) -> None:
-        controls.append(
-            MenuControl(key, label, rect, "slider", minimum, maximum, step)
-        )
-        x0, y0, x1, y1 = rect
-        center_y = (y0 + y1) * 0.5
-        half_height = max(0.018, (y1 - y0) * 0.5)
-        controls.extend((
-            MenuControl(
-                f"step:minus:{key}", "-",
-                (x0 - 0.035, center_y - half_height,
-                 x0 - 0.005, center_y + half_height),
-                "slider_step", minimum, maximum, step,
-            ),
-            MenuControl(
-                f"step:plus:{key}", "+",
-                (x1 + 0.005, center_y - half_height,
-                 x1 + 0.035, center_y + half_height),
-                "slider_step", minimum, maximum, step,
-            ),
-        ))
+    def _apply_slider_step_states(
+        controls: tuple[MenuControl, ...],
+        values: Mapping[str, object] | None,
+    ) -> tuple[MenuControl, ...]:
+        if values is None:
+            return controls
+        sliders = {
+            control.key: control for control in controls
+            if control.kind == "slider"
+        }
+        updated = []
+        for control in controls:
+            if control.kind != "slider_step":
+                updated.append(control)
+                continue
+            _prefix, operation, slider_key = control.key.split(":", 2)
+            slider = sliders.get(slider_key)
+            if slider is None:
+                updated.append(control)
+                continue
+            try:
+                value = float(values.get(slider_key, slider.minimum))
+            except (TypeError, ValueError):
+                updated.append(control)
+                continue
+            tolerance = max(abs(slider.step) * 1e-6, 1e-9)
+            at_limit = (
+                value <= slider.minimum + tolerance
+                if operation == "minus"
+                else value >= slider.maximum - tolerance
+            )
+            updated.append(MenuControl(
+                control.key,
+                control.label,
+                control.rect,
+                control.kind,
+                control.minimum,
+                control.maximum,
+                control.step,
+                control.enabled and not at_limit,
+                control.group,
+                control.fixed,
+            ))
+        return tuple(updated)
 
     def hit_test(
         self, uv: tuple[float, float] | None, *, allow_curve: bool = True,
         show_glow: bool = False, lang: str = "EN",
+        values: Mapping[str, object] | None = None,
     ) -> MenuControl | None:
         if uv is None:
             return None
         u, v = uv
-        for control in reversed(self.controls(
-            allow_curve=allow_curve, show_glow=show_glow, lang=lang
-        )):
+        layout = self.layout(
+            allow_curve=allow_curve, show_glow=show_glow, lang=lang, values=values,
+        )
+        for control in reversed(layout.controls):
+            if (
+                not control.fixed
+                and not (
+                    layout.content_viewport[0] <= float(u) <= layout.content_viewport[2]
+                    and layout.content_viewport[1] <= float(v) <= layout.content_viewport[3]
+                )
+            ):
+                continue
             if control.enabled and control.contains(float(u), float(v)):
                 return control
         return None
