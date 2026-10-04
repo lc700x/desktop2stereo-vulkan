@@ -351,14 +351,25 @@ def test_openxr_render_resolution_environment_override_has_priority(monkeypatch)
     assert _resolve_openxr_render_scale({"XR Render": 0.75}) == 1.5
 
 
-def test_openxr_headset_auto_uses_quest2_optimized_scale(monkeypatch):
+@pytest.mark.parametrize(
+    ("headset_model", "expected_scale"),
+    [
+        ("Meta Quest 2", 1.24),
+        ("Meta Quest 3", 1.24),
+        ("Meta Quest 3S", 1.09),
+        ("Meta Quest Pro", 1.23),
+        ("Pico 4 / 4 Ultra", 1.44),
+        ("Pico Neo 3", 1.25),
+    ],
+)
+def test_openxr_headset_auto_uses_model_optimized_scale(monkeypatch, headset_model, expected_scale):
     from app_runtime.runtime_entry import _resolve_openxr_render_scale
 
     monkeypatch.delenv("D2S_OPENXR_RENDER_RESOLUTION", raising=False)
     monkeypatch.delenv("D2S_OPENXR_RENDER_SCALE", raising=False)
     assert _resolve_openxr_render_scale(
-        {"XR Render Mode": "auto", "XR Headset Model": "Meta Quest 2"}
-    ) == pytest.approx(1.24)
+        {"XR Render Mode": "auto", "XR Headset Model": headset_model}
+    ) == pytest.approx(expected_scale)
 
 def test_openxr_filament_color_defaults_come_from_common_json() -> None:
     from app_runtime.runtime_entry import _openxr_filament_config

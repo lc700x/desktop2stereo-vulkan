@@ -31,39 +31,40 @@ vec2 crop_source_uv(vec2 display_uv) {
     return mix(crop_min_uv(), crop_max_uv(), clamp(display_uv, vec2(0.0), vec2(1.0)));
 }
 
-float sinc(float value) {
-    float magnitude = abs(value);
-    if (magnitude < 1e-4) {
-        return 1.0;
+vec4 sample_pixel_area(vec2 uv) {
+    vec2 source_min_uv = crop_min_uv();
+    vec2 source_max_uv = crop_max_uv();
+    vec2 source_uv = crop_source_uv(uv);
+    vec2 source_dx = dFdx(source_uv);
+    vec2 source_dy = dFdy(source_uv);
+    vec2 source_size = vec2(textureSize(screen_texture, 0));
+    float footprint_x = length(source_dx * source_size);
+    float footprint_y = length(source_dy * source_size);
+    if (max(footprint_x, footprint_y) <= 1.0) {
+        return textureLod(screen_texture, source_uv, 0.0);
     }
-    float pi_value = 3.14159265358979323846 * value;
-    return sin(pi_value) / pi_value;
-}
 
-float lanczos2_weight(float value) {
-    float magnitude = abs(value);
-    return magnitude < 2.0 ? sinc(value) * sinc(value * 0.5) : 0.0;
-}
-
-vec4 sample_lanczos2(vec2 uv) {
-    float scale = max(params.up.w, 1.0);
+    // Four-point Gauss-Legendre quadrature integrates the projected pixel's
+    // footprint instead of sampling sparsely across neighboring pixels.
+    const float offsets[4] = float[](
+        -0.4305681558, -0.1699905218, 0.1699905218, 0.4305681558
+    );
+    const float weights[4] = float[](
+        0.1739274226, 0.3260725774, 0.3260725774, 0.1739274226
+    );
     vec4 total = vec4(0.0);
-    float total_weight = 0.0;
-    for (int y = -1; y <= 2; ++y) {
-        for (int x = -1; x <= 2; ++x) {
-            vec2 offset = vec2(float(x), float(y)) - vec2(0.5);
-            float weight = lanczos2_weight(offset.x / scale)
-                * lanczos2_weight(offset.y / scale);
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
             vec2 sample_uv = clamp(
-                crop_source_uv(uv) + offset * vec2(params.center.w, params.right.w) * scale,
-                crop_min_uv(),
-                crop_max_uv()
+                source_uv + source_dx * offsets[x] + source_dy * offsets[y],
+                source_min_uv,
+                source_max_uv
             );
-            total += texture(screen_texture, sample_uv) * weight;
-            total_weight += weight;
+            total += textureLod(screen_texture, sample_uv, 0.0)
+                * weights[x] * weights[y];
         }
     }
-    return total / max(total_weight, 1e-5);
+    return total;
 }
 
 float luma(vec3 color) {
@@ -178,7 +179,7 @@ void main() {
     vec4 color = params.center.w < 0.0
         ? vec4(sample_easu(texture_uv), 1.0)
         : (params.size_curve.w > 0.5
-            ? sample_lanczos2(texture_uv)
+            ? sample_pixel_area(texture_uv)
             : texture(screen_texture, crop_source_uv(texture_uv)));
     output_color = vec4(color.rgb, params.size_curve.w < -0.5
         ? clamp(dot(color.rgb, vec3(0.299, 0.587, 0.114)) * 0.35, 0.0, 0.35)

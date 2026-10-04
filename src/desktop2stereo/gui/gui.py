@@ -9,7 +9,7 @@ Mixins:
 import os
 import asyncio
 import logging
-from .flet_runtime import ensure_vendored_flet_view
+from .flet_runtime import ensure_vendored_flet_view, stop_flet_descendants
 
 ensure_vendored_flet_view()
 
@@ -223,7 +223,19 @@ class Desktop2StereoGUI(
 def main():
     """Entry point for the GUI application."""
     _setup_console_logging()
-    ft.run(_async_main)
+    try:
+        ft.run(_async_main)
+    finally:
+        try:
+            remaining = stop_flet_descendants(os.getpid())
+        except Exception:
+            logger.exception("Failed to inspect Flet client processes at GUI shutdown")
+        else:
+            if remaining:
+                logger.error(
+                    "Flet client processes remained after GUI shutdown: %s",
+                    ", ".join(str(pid) for pid in remaining),
+                )
 
 
 async def _async_main(page: ft.Page):

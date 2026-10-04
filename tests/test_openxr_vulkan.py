@@ -1548,6 +1548,55 @@ def test_projection_quality_chain_defaults_to_direct_gpu_and_can_be_enabled(monk
     assert presenter._vulkan_projection_quality_chain_requested is True
 
 
+def test_projection_quality_chain_uses_native_mips_for_cuda_screen_minification(monkeypatch) -> None:
+    monkeypatch.setenv("D2S_VULKAN_PROJECTION_QUALITY_CHAIN", "1")
+    presenter = OpenXrVulkanPresenter()
+    presenter._rocm_backend = False
+    presenter._filament_screen = ((0.0, 0.0, -2.0), 2.0, 1.0, (0.0, 0.0, 0.0))
+    presenter._projection_eye_extents = lambda: ((1440, 1584), (1440, 1584))
+    presenter._screen_footprint_pixels = lambda _view, _target: (773.0, 447.0)
+    frame = VulkanStereoOutputFrame(
+        frame_id=1,
+        timestamp=0.0,
+        left_eye=SimpleNamespace(width=2560, height=1440),
+        right_eye=SimpleNamespace(width=2560, height=1440),
+        metadata={},
+    )
+
+    plan = presenter._apply_screen_sampling_policy(frame, [object(), object()])
+
+    assert plan is not None
+    assert plan.mode == "native_mip"
+    assert plan.filter_scale == pytest.approx(3.31, abs=0.05)
+    assert plan.quality_width is None
+    assert plan.quality_height is None
+
+
+@pytest.mark.parametrize(
+    "configured_max_lod, expected_max_lod",
+    [(0.35, 1.73), (2.25, 2.25)],
+)
+def test_native_mip_projection_exposes_the_projected_footprint_lod(
+    configured_max_lod, expected_max_lod
+) -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._rocm_backend = False
+    presenter._active_screen_sampling_plan = SimpleNamespace(
+        mode="native_mip", filter_scale=3.32
+    )
+    applied = {}
+    presenter._vulkan_projection_screen_pass = SimpleNamespace(
+        set_sampling_config=lambda **values: applied.update(values)
+    )
+    frame = SimpleNamespace(
+        metadata={"vulkan_projection_max_lod": configured_max_lod}
+    )
+
+    presenter._apply_vulkan_projection_sampling(frame, quality_chain_enabled=True)
+
+    assert applied["max_lod"] == pytest.approx(expected_max_lod, abs=0.01)
+
+
 def test_rocm_defaults_to_stable_vulkan_controller_and_no_tool_quads(monkeypatch) -> None:
     monkeypatch.setattr(
         OpenXrVulkanPresenter,
@@ -1863,6 +1912,72 @@ def test_filament_controller_overlay_runs_after_vulkan_composer() -> None:
     overlay = source.index("self._render_filament_controller_overlay", composer)
     output_commit = source.index("composer_frame.metadata", overlay)
     assert composer < overlay < output_commit
+
+
+@pytest.mark.parametrize(
+    "tracked_hand, guide_state, visibility_abi, expected_overlay",
+    [
+        (None, "hidden", True, False),
+        (0, "hidden", True, True),
+        (1, "hidden", True, True),
+        (None, "visible", True, True),
+        (None, "failed", True, True),
+        (None, None, True, True),
+        (None, "hidden", False, True),
+    ],
+)
+def test_empty_controller_overlay_skips_only_confirmed_hidden_surfaces(
+    tracked_hand, guide_state, visibility_abi, expected_overlay
+) -> None:
+    visible = []
+    overlays = []
+    bridge = SimpleNamespace(
+        controller_abi_available=True,
+        controller_visibility_abi_available=visibility_abi,
+        controller_guide_abi_available=True,
+        controller_overlay_abi_available=True,
+        laser_abi_available=True,
+        set_controller_visible=lambda hand, value: visible.append((hand, value)),
+        set_controller_laser=lambda *_args, **_kwargs: None,
+        set_controller_pose=lambda *_args: None,
+        set_controller_inputs=lambda *_args, **_kwargs: None,
+        set_active_eye=lambda *_args: None,
+        set_acquired_image=lambda *_args: None,
+        render_controller_overlay=lambda: overlays.append(True),
+    )
+    presenter = OpenXrVulkanPresenter()
+    presenter.filament_bridge = bridge
+    presenter._filament_controller_overlay_after_composer = True
+    presenter._controller_brand = SimpleNamespace(left_glb="left", right_glb="right")
+    presenter._update_filament_controller_guide = lambda *_args: None
+    presenter._controller_guide_diagnostics["submit"] = guide_state
+    presenter._frame_now = 10.0
+    presenter._laser_last_move_l = presenter._laser_last_move_r = 10.0
+    presenter._controller_input = lambda *_args: {}
+    presenter._controller_interaction_ray = lambda *_args: (None, None)
+    if tracked_hand is not None:
+        setattr(presenter, "_grip_mat_l" if tracked_hand == 0 else "_grip_mat_r", np.eye(4))
+    presenter._update_filament_controllers(bridge)
+    presenter._render_filament_controller_overlay(
+        [(object(), 3), (object(), 5)], lambda *_args: None
+    )
+    assert len(overlays) == (2 if expected_overlay else 0)
+    if not expected_overlay:
+        assert visible == [(0, False), (1, False)]
+        presenter._grip_mat_r = np.eye(4)
+        presenter._update_filament_controllers(bridge)
+        presenter._render_filament_controller_overlay(
+            [(object(), 3), (object(), 5)], lambda *_args: None
+        )
+        assert len(overlays) == 2
+
+
+def test_empty_controller_overlay_recovers_when_controller_model_becomes_unavailable() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_controller_overlay_empty = True
+    presenter._controller_brand = None
+    presenter._update_filament_controllers(SimpleNamespace())
+    assert not presenter._filament_controller_overlay_empty
 
 
 def test_projection_composer_base_pass_defers_controller_layers() -> None:
@@ -5129,12 +5244,18 @@ def test_presenter_close_stops_worker_output_before_teardown(monkeypatch) -> Non
         def close(self):
             xr_events.append(("close_vulkan", None))
 
+    class FakeHostImage:
+        def close(self):
+            xr_events.append(("close_host_image", None))
+
     presenter.xr = FakeXr()
     presenter.session = object()
     presenter.instance = instance
     presenter.vulkan = FakeVulkan()
     presenter._aim_space_l, presenter._aim_space_r = action_spaces[:2]
     presenter._grip_space_l, presenter._grip_space_r = action_spaces[2:]
+    presenter._visual_regression_source_host_images[0] = FakeHostImage()
+    presenter._visual_regression_projection_host_images[0] = FakeHostImage()
     session = presenter.session
     monkeypatch.setattr(presenter, "_persist_screen_state", lambda **_kwargs: None)
 
@@ -5146,8 +5267,12 @@ def test_presenter_close_stops_worker_output_before_teardown(monkeypatch) -> Non
         ("end_session", session),
         ("destroy_session", session),
         ("destroy_instance", instance),
+        ("close_host_image", None),
+        ("close_host_image", None),
         ("close_vulkan", None),
     ]
+    assert presenter._visual_regression_source_host_images == {}
+    assert presenter._visual_regression_projection_host_images == {}
     assert all(
         getattr(presenter, attr) is None
         for attr in ("_aim_space_l", "_aim_space_r", "_grip_space_l", "_grip_space_r")

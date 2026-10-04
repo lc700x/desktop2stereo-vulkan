@@ -4,8 +4,10 @@ from __future__ import annotations
 import os
 import hashlib
 import logging
+import subprocess
 import shutil
 import tarfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -21,6 +23,159 @@ _ARCHIVE_DIGEST_FILE = ".archive.sha256"
 _LINUX_FALLBACK_ARTIFACTS = (
     "flet-linux-ubuntu22.04-light-amd64.tar.gz",
 )
+
+
+def _flet_process_ids(entries: list[tuple[int, int, str]], parent_pid: int) -> tuple[int, ...]:
+    children: dict[int, list[int]] = {}
+    process_info: dict[int, tuple[int, str]] = {}
+    for pid, parent, name in entries:
+        children.setdefault(parent, []).append(pid)
+        process_info[pid] = (parent, name)
+
+    pending = list(children.get(int(parent_pid), ()))
+    descendants: set[int] = set()
+    flet_processes: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in descendants:
+            continue
+        descendants.add(pid)
+        info = process_info.get(pid)
+        if info is None:
+            continue
+        _, name = info
+        if name.casefold() == "flet.exe":
+            flet_processes.add(pid)
+        pending.extend(children.get(pid, ()))
+    return tuple(sorted(flet_processes))
+
+
+def _windows_process_snapshot() -> list[tuple[int, int, str]]:
+    if os.name != "nt":
+        return []
+
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ProcessEntry32W),
+    ]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ProcessEntry32W),
+    ]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    invalid_handle = ctypes.c_void_p(-1).value
+    if not snapshot or snapshot == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    entries: list[tuple[int, int, str]] = []
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        has_entry = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while has_entry:
+            entries.append(
+                (
+                    int(entry.th32ProcessID),
+                    int(entry.th32ParentProcessID),
+                    str(entry.szExeFile),
+                )
+            )
+            has_entry = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return entries
+
+
+def _terminate_windows_processes(process_ids: tuple[int, ...]) -> None:
+    if not process_ids:
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    process_terminate = 0x0001
+    synchronize = 0x00100000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    for pid in process_ids:
+        handle = kernel32.OpenProcess(process_terminate | synchronize, False, int(pid))
+        if not handle:
+            continue
+        try:
+            kernel32.TerminateProcess(handle, 1)
+            kernel32.WaitForSingleObject(handle, 1000)
+        finally:
+            kernel32.CloseHandle(handle)
+
+
+def stop_flet_descendants(parent_pid: int, *, timeout_s: float = 3.0) -> tuple[int, ...]:
+    """Reap only this GUI's bundled Flet clients after its window closes."""
+    if os.name != "nt":
+        return ()
+
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    attempted: set[int] = set()
+    while True:
+        remaining = _flet_process_ids(_windows_process_snapshot(), parent_pid)
+        if not remaining:
+            return ()
+        for pid in remaining:
+            if pid in attempted:
+                continue
+            attempted.add(pid)
+            try:
+                subprocess.run(
+                    ["taskkill", "/f", "/t", "/pid", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=2.0,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.SubprocessError):
+                logger.exception("Failed to stop Flet client process %s", pid)
+        if time.monotonic() >= deadline:
+            remaining = _flet_process_ids(_windows_process_snapshot(), parent_pid)
+            _terminate_windows_processes(remaining)
+            terminate_deadline = time.monotonic() + 1.0
+            while remaining and time.monotonic() < terminate_deadline:
+                time.sleep(0.05)
+                remaining = _flet_process_ids(_windows_process_snapshot(), parent_pid)
+            return remaining
+        time.sleep(0.05)
 
 
 def ensure_vendored_flet_view() -> str | None:

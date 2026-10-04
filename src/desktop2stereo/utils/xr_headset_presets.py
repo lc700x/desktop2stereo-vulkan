@@ -36,13 +36,18 @@ class XRHeadsetPreset:
 
 
 XR_HEADSET_PRESETS = (
-    # Meta's Quest 2 render-scale guidance places the physical panel near
-    # 1.24x of the 100% per-eye render target.
+    # Use published panel-to-default-eye-buffer ratios in Headset optimized
+    # mode where vendors document both values. Other models retain the runtime
+    # recommendation; projection sampling adapts to the live swapchain.
     XRHeadsetPreset("Meta Quest 2", "vr", "Meta Quest 2", 1.3, 2, 1.24),
-    XRHeadsetPreset("Meta Quest 3", "vr", "Meta Quest 3", 1.3, 4),
-    XRHeadsetPreset("Meta Quest Pro", "vr", "Meta Quest Pro", 1.1, 4),
-    XRHeadsetPreset("Pico 4 / 4 Ultra", "vr", "Pico 4 / 4 Ultra", 20.0, 4),
-    XRHeadsetPreset("Pico Neo 3", "vr", "Pico Neo 3", 1.5, 4),
+    XRHeadsetPreset("Meta Quest 3", "vr", "Meta Quest 3", 1.3, 4, 1.24),
+    XRHeadsetPreset("Meta Quest 3S", "vr", "Meta Quest 3S", 1.3, 4, 1.09),
+    XRHeadsetPreset("Meta Quest Pro", "vr", "Meta Quest Pro", 1.1, 4, 1.23),
+    # PICO documents 2160px/eye against a 1504px default eye buffer for PICO 4.
+    XRHeadsetPreset("Pico 4 / 4 Ultra", "vr", "Pico 4 / 4 Ultra", 20.0, 4, 1.44),
+    # Neo 3's 1832x1920 panel/eye and ~1500x1500 default buffer give a
+    # geometric-mean scale of about 1.25.
+    XRHeadsetPreset("Pico Neo 3", "vr", "Pico Neo 3", 1.5, 4, 1.25),
     XRHeadsetPreset("HTC VIVE XR Elite", "vr", "HTC VIVE XR Elite", 20.0, 4),
     XRHeadsetPreset("HTC VIVE Focus 3 / Vision", "vr", "HTC VIVE Focus 3 / Vision", 1.5, 4),
     XRHeadsetPreset("HTC VIVE Pro / Cosmos", "vr", "HTC VIVE Pro / Cosmos", 1.5, 2),
@@ -68,7 +73,6 @@ _PRESET_ALIASES = {
     "雷神 Air 1S": "Thunderobot Air 1S",
     "华为 Vision Glass": "Huawei Vision Glass",
 }
-
 
 def resolve_xr_headset_preset(value: str | None) -> XRHeadsetPreset:
     text = str(value or "").strip()

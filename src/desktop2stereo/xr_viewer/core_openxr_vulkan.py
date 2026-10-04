@@ -6327,6 +6327,20 @@ class OpenXrVulkanPresenter(
                     pass
             self.instance = None
 
+        # These diagnostic images own Vulkan allocations and must be released
+        # while their device is still alive.
+        for host_image in tuple(
+            self._visual_regression_source_host_images.values()
+        ) + tuple(self._visual_regression_projection_host_images.values()):
+            try:
+                host_image.close()
+            except Exception:
+                pass
+        self._visual_regression_source_host_images.clear()
+        self._visual_regression_projection_host_images.clear()
+        self._visual_regression_capture_eyes.clear()
+        self._visual_regression_capture_failed = False
+
         if self.vulkan is not None:
             try:
                 self.vulkan.close()
@@ -6364,17 +6378,6 @@ class OpenXrVulkanPresenter(
         self._has_presented_frame = False
         self._last_quad_layers = []
         self._last_screen_quad_layers = []
-        for host_image in tuple(
-            self._visual_regression_source_host_images.values()
-        ) + tuple(self._visual_regression_projection_host_images.values()):
-            try:
-                host_image.close()
-            except Exception:
-                pass
-        self._visual_regression_source_host_images.clear()
-        self._visual_regression_projection_host_images.clear()
-        self._visual_regression_capture_eyes.clear()
-        self._visual_regression_capture_failed = False
         self._source_frame_wait_logged = False
         self._accept_output = False
         self._filament_animation_origin = None
@@ -8151,9 +8154,22 @@ class OpenXrVulkanPresenter(
                     rcas_sharpness=0.0,
                 )
                 return
+            max_lod = metadata.get("vulkan_projection_max_lod", 0.35)
+            plan = self._active_screen_sampling_plan
+            if (
+                plan is not None
+                and plan.mode == "native_mip"
+                and not self._rocm_backend
+            ):
+                # The source mip chain must expose the levels needed to filter
+                # this screen's actual projected footprint.
+                max_lod = max(
+                    float(max_lod),
+                    math.log2(max(1.0, float(plan.filter_scale))),
+                )
             screen_pass.set_sampling_config(
                 min_lod=metadata.get("vulkan_projection_min_lod", 0.0),
-                max_lod=metadata.get("vulkan_projection_max_lod", 0.35),
+                max_lod=max_lod,
                 mip_lod_bias=metadata.get("vulkan_projection_mip_lod_bias", -0.35),
                 rcas_sharpness=metadata.get("vulkan_projection_rcas_sharpness", 0.5),
             )
@@ -9034,6 +9050,15 @@ class OpenXrVulkanPresenter(
                 quality_width=None,
                 quality_height=None,
             )
+        elif (
+            self._vulkan_projection_quality_chain_requested
+            and self._rocm_projection_quality_chain_enabled
+            and not self._rocm_backend
+            and plan.filter_scale > 1.0
+        ):
+            # Let the mip chain prefilter minified CUDA screen textures before
+            # the final OpenXR projection instead of using a one-level image.
+            plan = replace(plan, mode="native_mip", quality_width=None, quality_height=None)
         status = (
             plan.source_width,
             plan.source_height,
@@ -9197,6 +9222,8 @@ class OpenXrVulkanPresenter(
         return executor, reads
 
     def _update_filament_controllers(self, bridge: Any) -> None:
+        # Only skip an overlay after this frame's visibility updates succeeded.
+        self._filament_controller_overlay_empty = False
         if self._controller_input_disabled:
             for hand in (0, 1):
                 if getattr(bridge, "controller_visibility_abi_available", False):
@@ -9304,6 +9331,17 @@ class OpenXrVulkanPresenter(
                     laser_matrix[:3, 2] = (normal_axis * 0.006).astype(np.float32)
                     laser_matrix[:3, 3] = beam_origin.astype(np.float32)
                     bridge.set_controller_laser(hand, laser_matrix, visible=True)
+        self._filament_controller_overlay_empty = bool(
+            self._grip_mat_l is None
+            and self._grip_mat_r is None
+            and getattr(bridge, "controller_visibility_abi_available", False)
+            and getattr(bridge, "laser_abi_available", False)
+            and (
+                not getattr(bridge, "controller_guide_abi_available", False)
+                or self._controller_guide_diagnostics.get("submit") == "hidden"
+            )
+        )
+
     def _update_filament_controller_guide(self, bridge: Any) -> None:
         has_abi = bool(
             getattr(bridge, "controller_guide_abi_available", False)
@@ -10412,6 +10450,7 @@ class OpenXrVulkanPresenter(
             not self._filament_controller_overlay_after_composer
             or bridge is None
             or self._multiview_active
+            or getattr(self, "_filament_controller_overlay_empty", False)
         ):
             return
         if not bool(getattr(bridge, "controller_overlay_abi_available", False)):

@@ -1,8 +1,88 @@
 from __future__ import annotations
 
 import zipfile
+from pathlib import Path
 
 from gui import flet_runtime
+
+
+def test_flet_process_tree_targets_only_client_descendants() -> None:
+    processes = [
+        (10, 1, "desktop2stereo.exe"),
+        (11, 10, "python.exe"),
+        (12, 11, "flet.exe"),
+        (13, 12, "renderer.exe"),
+        (20, 1, "other-app.exe"),
+        (21, 20, "flet.exe"),
+    ]
+
+    assert flet_runtime._flet_process_ids(processes, 10) == (12,)
+
+
+def test_main_gui_reaps_its_flet_client_when_flet_run_raises(monkeypatch) -> None:
+    import os
+
+    import pytest
+    from gui import gui
+
+    stopped = []
+    monkeypatch.setattr(gui, "_setup_console_logging", lambda: None)
+    monkeypatch.setattr(
+        gui,
+        "stop_flet_descendants",
+        lambda pid: stopped.append(pid) or (),
+    )
+
+    def fail_run(*args, **kwargs):
+        raise RuntimeError("simulated Flet close")
+
+    monkeypatch.setattr(gui.ft, "run", fail_run)
+    with pytest.raises(RuntimeError, match="simulated Flet close"):
+        gui.main()
+
+    assert stopped == [os.getpid()]
+
+
+def test_stop_flet_descendants_terminates_only_owned_client(tmp_path) -> None:
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import time
+
+    import pytest
+
+    if os.name != "nt":
+        pytest.skip("Windows Flet client process cleanup is Windows-specific")
+
+    client_path = tmp_path / "flet.exe"
+    shutil.copy2(sys.executable, client_path)
+    child_env = os.environ.copy()
+    child_env["PATH"] = (
+        str(Path(sys.executable).parent)
+        + os.pathsep
+        + child_env.get("PATH", "")
+    )
+    client = subprocess.Popen(
+        [str(client_path), "-c", "import time; time.sleep(60)"],
+        env=child_env,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if client.pid in {pid for pid, _, _ in flet_runtime._windows_process_snapshot()}:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the test Flet client process did not start")
+
+        assert flet_runtime.stop_flet_descendants(os.getpid(), timeout_s=2.0) == ()
+        client.wait(timeout=5.0)
+    finally:
+        if client.poll() is None:
+            client.kill()
+            client.wait(timeout=2.0)
 
 
 def _write_client_archive(path, content: str) -> None:
