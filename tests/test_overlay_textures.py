@@ -78,7 +78,7 @@ def test_settings_menu_canvas_has_room_below_bottom_controls():
         SETTINGS_MENU_TEXTURE_SIZE[1], SETTINGS_MENU_TEXTURE_SIZE[0]
     )
     controls = {control.key: control for control in menu.controls()}
-    assert "section:reset_defaults" not in controls
+    assert controls["reset:screen_placement"].group == "screen_placement"
     stop = controls["runtime:stop"]
     assert int(stop.rect[3] * rgba.shape[0]) == 768
     assert max(
@@ -86,6 +86,35 @@ def test_settings_menu_canvas_has_room_below_bottom_controls():
         for group in menu.layout().groups
         if not group.fixed
     ) <= 768
+
+
+def test_settings_menu_shows_a_right_scrollbar_only_when_content_overflows():
+    menu = OpenXrSettingsMenu()
+    menu.room_models = tuple(
+        (f"room_{index}", f"Environment {index}") for index in range(20)
+    )
+    menu.set_tab("room")
+    layout = menu.layout()
+    viewport = tuple(round(value * size) for value, size in zip(
+        layout.content_viewport, (1024, 832, 1024, 832)
+    ))
+    scrollbar_x = viewport[2] - 8
+    track_top = viewport[1] + 8
+    track_bottom = viewport[3] - 8
+    at_top = build_settings_menu_rgba(menu, {})
+
+    assert tuple(at_top[track_top + 20, scrollbar_x, :3]) == (190, 196, 204)
+    assert tuple(at_top[track_bottom - 8, scrollbar_x, :3]) == (72, 72, 72)
+
+    menu.scroll_offset = layout.scroll_max
+    at_bottom = build_settings_menu_rgba(menu, {})
+    assert tuple(at_bottom[track_top + 20, scrollbar_x, :3]) == (72, 72, 72)
+    assert tuple(at_bottom[track_bottom - 8, scrollbar_x, :3]) == (190, 196, 204)
+
+    menu = OpenXrSettingsMenu()
+    menu.set_tab("room")
+    no_overflow = build_settings_menu_rgba(menu, {})
+    assert tuple(no_overflow[400, scrollbar_x, :3]) == (48, 48, 48)
 
 
 def test_settings_menu_omits_the_global_title_and_left_aligns_section_headings():
@@ -161,17 +190,31 @@ def test_settings_menu_content_card_has_balanced_bottom_inset():
     assert tuple(rgba[height - 25, center_x]) == (36, 36, 36, 250)
 
 
+def test_screen_subsections_render_as_flat_underlined_tabs():
+    menu = OpenXrSettingsMenu()
+    rgba = build_settings_menu_rgba(menu, {})
+    shell = (36, 36, 36, 250)
+    primary = (22, 95, 194, 255)
+    card_alt = (72, 72, 72, 255)
+
+    assert tuple(rgba[80, 320]) == shell
+    assert tuple(rgba[80, 640]) == shell
+    assert tuple(rgba[102, 320]) == primary
+    assert tuple(rgba[102, 640]) == card_alt
+
+
 def test_settings_menu_shell_has_equal_texture_edge_margins():
     menu = OpenXrSettingsMenu()
     rgba = build_settings_menu_rgba(menu, {})
     shell = (36, 36, 36, 250)
     transparent = (0, 0, 0, 0)
-    center_x = 636  # Centered in the 8 px gap between the fixed Layout/Crop tabs.
+    edge_x = 20
+    center_x = 636
     center_y = SETTINGS_MENU_TEXTURE_SIZE[1] // 2
-    assert tuple(rgba[100, center_x]) == shell
-    assert tuple(rgba[110, center_x]) == shell
-    assert tuple(rgba[115, center_x]) == shell
-    assert tuple(rgba[15, center_x]) == transparent
+    assert tuple(rgba[100, edge_x]) == shell
+    assert tuple(rgba[110, edge_x]) == shell
+    assert tuple(rgba[115, edge_x]) == shell
+    assert tuple(rgba[15, edge_x]) == transparent
     assert tuple(rgba[center_y, 20]) == shell
     assert tuple(rgba[center_y, 15]) == transparent
     assert tuple(rgba[811, center_x]) == shell
@@ -218,7 +261,7 @@ def test_openxr_settings_menu_text_is_centered_and_active_selection_has_no_under
     plus = controls["step:plus:screen:width"]
     text_left = max(_CONTENT_LEFT, round(minus.rect[0] * rgba.shape[1]))
     text_right = min(_CONTENT_RIGHT, round(plus.rect[2] * rgba.shape[1]))
-    text_region = rgba[408:440, text_left:text_right, :3]
+    text_region = rgba[448:480, text_left:text_right, :3]
     text_mask = np.any(
         np.all(text_region == text_primary, axis=2)
         | np.all(text_region == (190, 196, 204), axis=2),

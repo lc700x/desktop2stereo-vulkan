@@ -523,6 +523,32 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
             draw_slider(target, control)
             return
 
+        if control.key.startswith("screen:section:"):
+            indicator_color = (
+                colors["blue"] if active or pressed
+                else colors["blue_hover"] if hovered
+                else colors["card_alt"]
+            )
+            target.line(
+                (x0, y1 - 2, x1 - 1, y1 - 2),
+                fill=colors["card_alt"], width=2,
+            )
+            if active or hovered or pressed:
+                target.rounded_rectangle(
+                    (x0, y1 - 4, x1 - 1, y1 - 1),
+                    radius=2, fill=indicator_color,
+                )
+            text_color = (
+                colors["text"] if active
+                else colors["blue_hover"] if hovered or pressed
+                else colors["muted"]
+            )
+            centered_text(
+                target, label, (x0 + 8, y0 + 2, x1 - 8, y1 - 8),
+                18, bold=active, minimum=18, color=text_color,
+            )
+            return
+
         if control.key == "runtime:stop":
             fill = (
                 colors["card_alt"] if not control.enabled
@@ -667,6 +693,31 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
         content_layer.crop((clip_x0, clip_y0, clip_x1, clip_y1)),
         dest=(clip_x0, clip_y0),
     )
+    if layout.scroll_max > 0.0:
+        track_top = clip_y0 + 8
+        track_bottom = clip_y1 - 8
+        track_height = track_bottom - track_top
+        viewport_height = clip_y1 - clip_y0
+        content_height = viewport_height + layout.scroll_max
+        thumb_height = min(
+            track_height,
+            max(48, int(round(track_height * viewport_height / content_height))),
+        )
+        thumb_travel = track_height - thumb_height
+        scroll_fraction = menu.scroll_offset / layout.scroll_max
+        thumb_top = track_top + int(round(thumb_travel * scroll_fraction))
+        track_left = clip_x1 - 12
+        track_right = track_left + 7
+        draw.rounded_rectangle(
+            (track_left, track_top, track_right, track_bottom - 1),
+            radius=4,
+            fill=colors["card_alt"],
+        )
+        draw.rounded_rectangle(
+            (track_left, thumb_top, track_right, thumb_top + thumb_height - 1),
+            radius=4,
+            fill=colors["muted"],
+        )
     return np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
 
 

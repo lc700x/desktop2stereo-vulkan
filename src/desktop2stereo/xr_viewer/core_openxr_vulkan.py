@@ -80,7 +80,6 @@ from .overlay_textures import (
     build_cursor_rgba,
     build_fps_overlay_rgba,
     build_help_rgba,
-    build_team_help_rgba,
     build_keyboard_rgba,
     build_screen_adjust_osd_rgba,
     build_screen_preset_osd_rgba,
@@ -1210,6 +1209,7 @@ class OpenXrVulkanPresenter(
         self._settings_menu_values: dict[str, float | bool] = {}
         self._settings_menu_last_redraw = 0.0
         self._settings_menu_last_adjust = 0.0
+        self._settings_menu_reset_defaults: dict[str, Any] = {}
         self._settings_menu_trigger_down = [False, False]
         self._settings_menu_allow_curve = True
         self._settings_menu_grab_hand: int | None = None
@@ -1895,17 +1895,23 @@ class OpenXrVulkanPresenter(
             if self._on_breakdown_inc is not None:
                 self._on_breakdown_inc("openxr_input_sample", 1)
             self._sync_controller_inputs(1.0 / 90.0)
-            self._update_aim_poses(frame_state.predicted_display_time)
-            self._update_grip_poses(frame_state.predicted_display_time)
-            self._smooth_controller_poses()
+            controller_chord_consumed = self._update_controller_input_toggle()
+            if not (
+                self._controller_input_disabled
+                or self._controller_toggle_wait_for_release
+            ):
+                self._update_aim_poses(frame_state.predicted_display_time)
+                self._update_grip_poses(frame_state.predicted_display_time)
+                self._smooth_controller_poses()
             self._grip_l_now = bool(self._controller_input(0).get("grip", 0.0) > 0.5)
             self._grip_r_now = bool(self._controller_input(1).get("grip", 0.0) > 0.5)
-            menu_consumed = self._handle_settings_menu_input()
-            if not menu_consumed:
-                self._handle_keyboard_input()
-                self._handle_vulkan_pointer_input()
-            self._handle_controller_shortcuts()
-            self._handle_controller_guide_input(self._last_frame_dt)
+            if not controller_chord_consumed:
+                menu_consumed = self._handle_settings_menu_input()
+                if not menu_consumed:
+                    self._handle_keyboard_input()
+                    self._handle_vulkan_pointer_input()
+                self._handle_controller_shortcuts(controller_toggle_checked=True)
+                self._handle_controller_guide_input(self._last_frame_dt)
             self._persist_screen_state_if_changed()
             self._last_controller_input_error = None
         except Exception as exc:
@@ -1913,6 +1919,8 @@ class OpenXrVulkanPresenter(
             # the failure observable instead of silently disabling all
             # keyboard, drag, and shortcut handling for the session.
             error = f"{type(exc).__name__}: {exc}"
+            if type(exc).__name__ == "SessionNotFocused":
+                self._reset_controller_toggle_timer()
             if error != self._last_controller_input_error:
                 self._last_controller_input_error = error
                 if type(exc).__name__ == "SessionNotFocused":
@@ -2169,10 +2177,8 @@ class OpenXrVulkanPresenter(
             self.xr.end_frame(self.session, recovery_info)
 
     def _set_shortcut_panel(self, name: str | None) -> None:
-        # Legacy Menu/A cycle: hidden -> FPS -> FPS + vertical screen guide
-        # -> hidden. The guide never replaces the FPS panel at state 2.
-        # Menu and B panels are mutually exclusive so a stale guide cannot
-        # remain visible when the user switches to the other control path.
+        # Menu/A cycle: hidden -> FPS -> FPS + screen-side shortcut guide -> hidden.
+        # The screen overlays stay anchored to the screen, with FPS at its lower-left.
         self._hand_panel_cycle = 0
         self._hand_fps_visible = False
         self._hand_operation_guide_visible = False
@@ -2182,18 +2188,12 @@ class OpenXrVulkanPresenter(
         self._operation_guide_visible = self._screen_operation_guide_visible
 
     def _set_hand_shortcut_panel(self, name: str | None) -> None:
-        # Legacy B cycle: hidden -> hand FPS -> hand FPS + hand guide -> hidden.
-        # Selecting the B panel clears the Menu-owned screen panel first.
-        self._status_panel_cycle = 0
-        self._fps_overlay_visible = False
-        self._screen_operation_guide_visible = False
-        self._aperture_visible = False
-        self._hand_fps_visible = name in {"fps", "guide"}
+        # Retain compatibility for callers from the legacy B-panel path.
+        self._hand_fps_visible = name == "fps"
         self._hand_operation_guide_visible = name == "guide"
-        # Keep the legacy compatibility flag true for the controller-attached
-        # B-panel; Menu uses _screen_operation_guide_visible above.
         self._operation_guide_visible = (
-            self._screen_operation_guide_visible or self._hand_operation_guide_visible
+            self._screen_operation_guide_visible
+            or self._hand_operation_guide_visible
         )
 
     def _set_shortcut_skybox_brightness(self, brightness: float) -> None:
@@ -2598,6 +2598,83 @@ class OpenXrVulkanPresenter(
             return None
         return max(0.0, value)
 
+    def _reset_controller_interaction_state(self) -> None:
+        """Release controller-owned interactions before suppressing input."""
+        self._cancel_touch_contacts()
+        for name, up_flag in (
+            ("left", _MOUSEEVENTF_RIGHTUP),
+            ("right", _MOUSEEVENTF_LEFTUP),
+        ):
+            if self._pointer_state.get(name) != "idle":
+                _send_mouse_flags(up_flag)
+            self._pointer_state[name] = "idle"
+            self._pointer_press_time[name] = 0.0
+            self._touch_trig_prev[name] = float(
+                self._controller_input(0 if name == "left" else 1).get(
+                    "trigger", 0.0
+                ) or 0.0
+            )
+
+        for hand in ("l", "r"):
+            held_key_attr = f"_kb_held_key_{hand}"
+            held_mods_attr = f"_kb_held_mods_{hand}"
+            held_mods = getattr(self, held_mods_attr, None)
+            if held_mods is not None:
+                try:
+                    shift_dn, ctrl_dn, alt_dn, win_dn, key = held_mods
+                    kbd = ctypes.windll.user32.keybd_event
+                    kbd(int(key), 0, _KEYEVENTF_KEYUP, 0)
+                    for active, virtual_key in (
+                        (win_dn, 0x5B),
+                        (alt_dn, 0x12),
+                        (shift_dn, 0x10),
+                        (ctrl_dn, 0x11),
+                    ):
+                        if active:
+                            kbd(virtual_key, 0, _KEYEVENTF_KEYUP, 0)
+                except (AttributeError, OSError, TypeError, ValueError):
+                    pass
+            setattr(self, held_key_attr, None)
+            setattr(self, held_mods_attr, None)
+            setattr(self, f"_kb_trig_prev_{hand}", 0.0)
+            setattr(self, f"_kb_rpt_t_{hand}", 0.0)
+            setattr(self, f"_kb_rpt_n_{hand}", 0)
+
+        if self._arrow_left_held or self._arrow_right_held:
+            try:
+                self._send_arrow_impl(0.0, "left", "right", deadzone=0.04)
+            except (AttributeError, OSError):
+                self._arrow_left_held = False
+                self._arrow_right_held = False
+        if self._arrow_up_held or self._arrow_down_held:
+            try:
+                self._send_arrow_impl(0.0, "up", "down", deadzone=0.04)
+            except (AttributeError, OSError):
+                self._arrow_up_held = False
+                self._arrow_down_held = False
+
+        self._settings_menu_trigger_down = [False, False]
+        if hasattr(self._settings_menu, "_trigger_down"):
+            self._settings_menu._trigger_down = [False, False]
+        self._settings_menu_cursor_hits = (None, None)
+        self._reset_settings_menu_grab()
+        self._grip_l_now = False
+        self._grip_r_now = False
+        self._grip_target_l = None
+        self._grip_target_r = None
+        self._both_grip_anchor = None
+        self._keyboard_grab_anchor = None
+        self._kb_grab_local_l = None
+        self._kb_grab_local_r = None
+        for name in self._shortcut_last:
+            self._shortcut_last[name] = False
+            self._shortcut_pressed_at[name] = 0.0
+            self._shortcut_long_fired[name] = False
+        self._guide_ab_started_at = 0.0
+        self._guide_brand_switch_fired = False
+        self._guide_calibration_fired = False
+        self._guide_calibration_b_last = False
+
     def _dispatch_controller_shortcut(self, action: str, **values) -> None:
         """Apply shared shortcut actions to Vulkan-owned presentation state."""
         if action == "cycle_status_panel":
@@ -2605,11 +2682,20 @@ class OpenXrVulkanPresenter(
             self._set_shortcut_panel(
                 (None, "fps", "guide")[self._status_panel_cycle]
             )
-        elif action == "cycle_hand_panel":
-            # Match the legacy B long-press state machine exactly.
-            self._hand_panel_cycle = (self._hand_panel_cycle + 1) % 3
-            self._set_hand_shortcut_panel(
-                (None, "fps", "guide")[self._hand_panel_cycle]
+        elif action == "toggle_operation_guide":
+            self._hand_operation_guide_visible = not bool(
+                self._hand_operation_guide_visible
+            )
+            self._operation_guide_visible = (
+                self._screen_operation_guide_visible
+                or self._hand_operation_guide_visible
+            )
+        elif action == "controller_input_mode_changed":
+            self._reset_controller_interaction_state()
+            print(
+                "[OpenXRViewer] Controller input "
+                f"{'disabled' if values.get('disabled') else 'enabled'}",
+                flush=True,
             )
         elif action == "toggle_keyboard":
             self._keyboard_visible = not self._keyboard_visible
@@ -2626,9 +2712,13 @@ class OpenXrVulkanPresenter(
                 self._keyboard_texture_key = None
         elif action == "reset_screen":
             if self._filament_screen_initial is not None and self._filament_screen is not None:
-                position, width, height, _initial_rotation = self._filament_screen_initial
-                _old_position, _old_width, _old_height, rotation = self._filament_screen
-                self._filament_screen = (position, width, height, rotation)
+                initial = self._filament_screen_initial
+                if self._operation_guide_environment_mode():
+                    self._filament_screen = initial
+                else:
+                    position, width, height, _initial_rotation = initial
+                    _old_position, _old_width, _old_height, rotation = self._filament_screen
+                    self._filament_screen = (position, width, height, rotation)
                 self._persist_screen_state(force=True)
                 self._preset_name_overlay = "Screen Reset"
                 self._preset_osd_show_t = time.perf_counter()
@@ -2642,7 +2732,7 @@ class OpenXrVulkanPresenter(
                 "Curved Screen" if self._screen_curved else "Flat Screen"
             )
             self._preset_osd_show_t = time.perf_counter()
-        elif action == "toggle_background":
+        elif action in {"toggle_background", "toggle_environment_background"}:
             if self._filament_skybox_brightness > 0.0:
                 self._shortcut_saved_skybox_brightness = (
                     self._filament_skybox_brightness
@@ -2652,11 +2742,8 @@ class OpenXrVulkanPresenter(
                 self._set_shortcut_skybox_brightness(
                     self._shortcut_saved_skybox_brightness or 1.0
                 )
-        elif action == "cycle_environment_light":
-            # The shared shortcut name predates the renderer split. In v2.5,
-            # releasing X after 1-4 seconds cycles the screen-edge effects;
-            # it does not cycle room-light presets.
-            self._cycle_filament_glow_mode()
+        elif action == "cycle_room_environment":
+            self._cycle_room_environment()
         elif action == "toggle_passthrough":
             bridge = self.filament_bridge
             if bridge is None or not getattr(
@@ -2715,8 +2802,14 @@ class OpenXrVulkanPresenter(
                 float(values.get("distance_delta", 0.0)),
             )
         elif action == "arrow_axes":
-            self._send_arrow_impl(float(values.get("horizontal", 0.0)), "left", "right")
-            self._send_arrow_impl(float(values.get("vertical", 0.0)), "up", "down")
+            self._send_arrow_impl(
+                float(values.get("horizontal", 0.0)),
+                "left", "right", deadzone=0.04,
+            )
+            self._send_arrow_impl(
+                float(values.get("vertical", 0.0)),
+                "up", "down", deadzone=0.04,
+            )
         elif action == "scroll_axes":
             horizontal = float(values.get("horizontal", 0.0))
             vertical = -float(values.get("vertical", 0.0))
@@ -4045,8 +4138,8 @@ class OpenXrVulkanPresenter(
             self._reset_screen_control_hold("size")
             self._reset_screen_control_axis()
         stick_active = (
-            abs(float(inputs[0].get("joystick_x", 0.0))) > self._input_deadzone()
-            or abs(float(inputs[0].get("joystick_y", 0.0))) > self._input_deadzone(),
+            abs(float(inputs[0].get("joystick_x", 0.0))) > 0.04
+            or abs(float(inputs[0].get("joystick_y", 0.0))) > 0.04,
             abs(float(inputs[1].get("joystick_x", 0.0))) > self._input_deadzone()
             or abs(float(inputs[1].get("joystick_y", 0.0))) > self._input_deadzone(),
         )
@@ -4570,6 +4663,150 @@ class OpenXrVulkanPresenter(
         self._filament_glow_shell_height = 9.5
         self._veil_intensity = 1.5
         self._veil_alpha = 1.0
+        self._settings_menu_reset_defaults = {}
+
+    def _capture_settings_menu_reset_defaults(
+        self,
+        profile_values: dict[str, Any] | None = None,
+        lighting_values: dict[str, Any] | None = None,
+    ) -> None:
+        """Capture per-environment menu defaults before user adjustments."""
+        defaults: dict[str, Any] = {
+            "room:seat_index": int(self._filament_view_pose_index),
+            "room:exposure": float(self._filament_scene_exposure),
+            "room:screen_reflection_enabled": bool(
+                self._environment_screen_light_enabled
+            ),
+        }
+        if self._filament_screen_initial is not None:
+            defaults["screen:rotation"] = tuple(
+                float(value) for value in self._filament_screen_initial[3]
+            )
+            defaults["screen:curve_half_angle"] = float(
+                self._screen_initial_curve_half_angle
+            )
+
+        authored_glow = {**dict(profile_values or {}), **dict(lighting_values or {})}
+        override_mode = os.environ.get("D2S_OPENXR_GLOW_MODE")
+        defaults["glow:mode"] = self._normalize_filament_glow_mode(
+            override_mode or authored_glow.get("glow_mode", "off")
+        )
+        try:
+            veil_alpha = float(authored_glow.get("veil_alpha", 1.0))
+        except (TypeError, ValueError):
+            veil_alpha = 1.0
+        defaults["glow:transparency"] = min(1.0, max(0.0, 1.0 - veil_alpha))
+        self._settings_menu_reset_defaults = defaults
+
+    def _reset_settings_menu_card(self, key: str) -> None:
+        defaults = self._settings_menu_reset_defaults
+        if key == "reset:screen_placement":
+            initial = self._filament_screen_initial
+            current = self._filament_screen
+            if initial is not None and current is not None:
+                self._filament_screen = (
+                    initial[0], initial[1], initial[2], current[3]
+                )
+                self._persist_screen_state(force=True)
+                self._refresh_settings_menu_values()
+        elif key == "reset:screen_shape":
+            initial = self._filament_screen_initial
+            current = self._filament_screen
+            if initial is not None and current is not None:
+                rotation = defaults.get("screen:rotation", initial[3])
+                self._filament_screen = (
+                    current[0], current[1], current[2], tuple(rotation)
+                )
+            half_angle = float(defaults.get(
+                "screen:curve_half_angle", self._screen_initial_curve_half_angle
+            ))
+            self._screen_curve_half_angle = max(0.0, min(half_angle, math.pi / 2.0))
+            self._screen_curved = (
+                self._settings_menu_allow_curve
+                and self._screen_curve_half_angle > 1e-6
+            )
+            if not self._screen_curved:
+                self._screen_curve_half_angle = 0.0
+            self._persist_screen_state(force=True)
+            self._refresh_settings_menu_values()
+        elif key == "reset:depth_stereo":
+            settings = {"depth_strength": 0.25, "cross_eyed": False}
+            self._settings_menu_values.update(settings)
+            self._dispatch_controller_shortcut(
+                "set_runtime_settings", settings=settings, persist=True
+            )
+        elif key == "reset:render_quality":
+            settings = {
+                name: value for name, value in PICTURE_DEFAULTS.items()
+                if name.startswith("vulkan_projection_")
+            }
+            self._settings_menu_values.update(settings)
+            self._dispatch_controller_shortcut(
+                "set_runtime_settings", settings=settings, persist=True
+            )
+        elif key == "reset:color_adjustment":
+            settings = {
+                name: value for name, value in PICTURE_DEFAULTS.items()
+                if name.startswith("color_")
+            }
+            self._settings_menu_values.update(settings)
+            self._dispatch_controller_shortcut(
+                "set_runtime_settings", settings=settings, persist=True
+            )
+        elif key == "reset:glow_modes":
+            mode = self._normalize_filament_glow_mode(
+                defaults.get("glow:mode", self._filament_glow_mode)
+            )
+            self._set_filament_glow_mode(mode, persist=True)
+            self._settings_menu_values["glow:mode"] = mode
+        elif key == "reset:glow_transparency":
+            transparency = min(1.0, max(0.0, float(defaults.get(
+                "glow:transparency", 1.0 - self._veil_alpha
+            ))))
+            self._veil_alpha = 1.0 - transparency
+            self._settings_menu_values["glow:transparency"] = transparency
+            self._persist_filament_glow_transparency()
+        elif key == "reset:room_seats":
+            index = int(defaults.get("room:seat_index", 0))
+            if self._filament_view_poses:
+                self._apply_settings_menu_seat(index)
+            else:
+                previous_head_transform = (
+                    None if self._profile_head_transform is None
+                    else np.asarray(
+                        self._profile_head_transform, dtype=np.float64
+                    ).copy()
+                )
+                if self._profile_head_transform is not None:
+                    self._profile_head_transform[1, 3] -= float(
+                        self._room_seat_height_offset
+                    )
+                    self._move_settings_menu_with_profile_head(
+                        previous_head_transform
+                    )
+                self._room_seat_height_offset = 0.0
+                self._settings_menu_values["room:seat_index"] = index
+                self._settings_menu_values["room:seat_height"] = 0.0
+        elif key == "reset:room_scene":
+            self._filament_scene_exposure = float(defaults.get(
+                "room:exposure", self._filament_scene_exposure
+            ))
+            self._environment_screen_light_enabled = bool(defaults.get(
+                "room:screen_reflection_enabled",
+                self._environment_screen_light_enabled,
+            ))
+            self._settings_menu_values["room:exposure"] = (
+                self._filament_scene_exposure
+            )
+            self._settings_menu_values["room:screen_reflection_enabled"] = (
+                self._environment_screen_light_enabled
+            )
+            self._apply_filament_scene_exposure_to_bridge()
+            if not self._environment_screen_light_enabled and self.filament_bridge is not None:
+                self._update_environment_screen_lights(None, self.filament_bridge)
+        else:
+            return
+        self._settings_menu.mark_dirty()
 
     def _hot_switch_environment(self, model: str) -> bool:
         try:
@@ -4636,6 +4873,9 @@ class OpenXrVulkanPresenter(
             )
             self._reset_environment_profile_state()
             self._load_filament_profile()
+            self._shortcut_saved_skybox_brightness = (
+                self._filament_skybox_brightness
+            )
             self._filament_glow_environment_enabled = bool(
                 glb_path is None and panorama_path is None
             )
@@ -4700,6 +4940,27 @@ class OpenXrVulkanPresenter(
             self._preset_osd_show_t = time.perf_counter()
             self._settings_menu.mark_dirty()
             return False
+
+    def _cycle_room_environment(self) -> None:
+        models = tuple(
+            str(key) for key, _label in self._settings_menu.room_models
+        )
+        if not models:
+            return
+        current = str(
+            self._settings_menu_values.get("room:model")
+            or (
+                Path(self.config.filament_profile_path).parent.name
+                if self.config.filament_profile_path else "Default"
+            )
+        )
+        current_index = next(
+            (index for index, model in enumerate(models)
+             if model.casefold() == current.casefold()),
+            -1,
+        )
+        next_model = models[(current_index + 1) % len(models)]
+        self._hot_switch_environment(next_model)
 
     def _move_settings_menu_with_profile_head(
         self, previous_head_transform: np.ndarray | None
@@ -5094,7 +5355,11 @@ class OpenXrVulkanPresenter(
 
     def _settings_menu_cursor_overlay_specs(self, rgba, head):
         """Place the standard screen cursor rings on the settings panel."""
-        if not self._settings_menu.visible or self._settings_menu_pose is None:
+        if (
+            self._controller_input_disabled
+            or not self._settings_menu.visible
+            or self._settings_menu_pose is None
+        ):
             return []
         menu_matrix = self._settings_menu_matrix()
         if menu_matrix is None:
@@ -5188,6 +5453,9 @@ class OpenXrVulkanPresenter(
         if key == "close":
             self._reset_settings_menu_grab()
             self._settings_menu.close()
+            return
+        if key.startswith("reset:"):
+            self._reset_settings_menu_card(key)
             return
         if key == "openxr:render_auto":
             self._openxr_render_scale_auto = True
@@ -8929,6 +9197,19 @@ class OpenXrVulkanPresenter(
         return executor, reads
 
     def _update_filament_controllers(self, bridge: Any) -> None:
+        if self._controller_input_disabled:
+            for hand in (0, 1):
+                if getattr(bridge, "controller_visibility_abi_available", False):
+                    bridge.set_controller_visible(hand, False)
+                if (
+                    getattr(bridge, "laser_abi_available", False)
+                    and hasattr(bridge, "set_controller_laser")
+                ):
+                    bridge.set_controller_laser(
+                        hand, np.eye(4, dtype=np.float32), visible=False
+                    )
+                self._reset_smoothed_ray(hand)
+            return
         # The operation-guide surface is anchored to the tracked right grip and
         # does not depend on loading controller-model meshes. Keep the B-button
         # callout alive when a low-overhead ROCm run disables those meshes.
@@ -9686,6 +9967,13 @@ class OpenXrVulkanPresenter(
                 self._filament_screen_initial = self._filament_screen
         if self._filament_screen_profile_authored:
             self._apply_persisted_screen_state()
+        lighting_defaults = (
+            self._filament_lighting_presets[
+                self._filament_lighting_preset_index
+            ]
+            if self._filament_lighting_presets else {}
+        )
+        self._capture_settings_menu_reset_defaults(profile, lighting_defaults)
         print(
             f"Loaded Filament profile view: {self._profile_view_name} "
             f"world_position={world_position_vec.tolist()} glb_position={glb_position.tolist()} "
@@ -11845,11 +12133,22 @@ class OpenXrVulkanPresenter(
         return self._overlay_pose_from_matrix(matrix)
 
     def _operation_guide_environment_mode(self) -> bool:
-        name = str(getattr(self, "_profile_view_name", "") or "").strip().lower()
-        return bool(name and name not in {"default", "none"})
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
+        profile_path = config.filament_profile_path
+        if profile_path:
+            environment_name = Path(profile_path).parent.name.strip().lower()
+            if environment_name and environment_name not in {"default", "none"}:
+                return True
+        return bool(
+            config.filament_glb_path or config.filament_panorama_path
+        )
 
     def _cursor_overlay_specs(self, rgba, screen_pose, head):
         """Build the legacy laser hit rings as transparent tool quads."""
+        if self._controller_input_disabled:
+            return []
         specs = []
         for hand in (0, 1):
             origin, direction = self._controller_interaction_ray(hand)
@@ -12321,6 +12620,7 @@ class OpenXrVulkanPresenter(
             help_key = (
                 "screen_help",
                 language,
+                environment_mode,
                 round(screen_guide_scale, 4),
                 "gpu-msdf"
                 if self._vulkan_msdf_quad_renderer is not None
@@ -12328,13 +12628,12 @@ class OpenXrVulkanPresenter(
             )
             rgba = self._tool_quad_texture_cache.get("screen_help")
             if rgba is None or self._tool_quad_texture_keys.get("screen_help") != help_key:
-                # This is the legacy screen-side vertical guide. The
-                # controller-attached two-column guide is a different panel.
                 if msdf_atlas is not None:
-                    rows, _env_rows = get_controller_help_rows(language)
+                    rows, env_rows = get_controller_help_rows(language)
+                    selected_rows = env_rows if environment_mode else rows
                     msdf_request = _build_msdf_help_panel(
                         msdf_atlas,
-                        rows,
+                        selected_rows,
                         two_columns=False,
                         size_scale=screen_guide_scale,
                         canvas_scale=1.0,
@@ -12352,7 +12651,9 @@ class OpenXrVulkanPresenter(
                             radius=int(msdf_request.radius),
                         )
                 else:
-                    rgba = build_team_help_rgba(lang=language)
+                    rgba = build_help_rgba(
+                        environment_mode=environment_mode, lang=language
+                    )
                 self._tool_quad_texture_cache["screen_help"] = rgba
                 self._tool_quad_texture_keys["screen_help"] = help_key
             # The panel always follows the screen height. Its MSDF texture

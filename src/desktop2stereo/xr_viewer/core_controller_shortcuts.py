@@ -8,7 +8,9 @@ class CoreControllerShortcutsMixin:
 
     _SHORTCUT_LONG_SECONDS = 1.0
     _MENU_SHORT_MAX_SECONDS = 0.6
-    _X_PASSTHROUGH_SECONDS = 4.0
+    _CONTROLLER_TOGGLE_SECONDS = 5.0
+    _TRIGGER_PRESS_THRESHOLD = 0.7
+    _TRIGGER_RELEASE_THRESHOLD = 0.3
 
     def _init_controller_shortcuts(self) -> None:
         self._shortcut_last = {
@@ -22,15 +24,57 @@ class CoreControllerShortcutsMixin:
         }
         self._shortcut_pressed_at = {name: 0.0 for name in self._shortcut_last}
         self._shortcut_long_fired = {name: False for name in self._shortcut_last}
+        self._controller_input_disabled = False
+        self._controller_toggle_started_at: float | None = None
+        self._controller_toggle_wait_for_release = False
 
     def _shortcut_time(self) -> float:
         frame_now = float(getattr(self, "_frame_now", 0.0) or 0.0)
         return frame_now if frame_now > 0.0 else time.perf_counter()
 
-    def _emit_controller_shortcut(self, action: str) -> None:
+    def _emit_controller_shortcut(self, action: str, **values) -> None:
         dispatcher = getattr(self, "_dispatch_controller_shortcut", None)
         if callable(dispatcher):
-            dispatcher(action)
+            dispatcher(action, **values)
+
+    def _reset_controller_toggle_timer(self) -> None:
+        self._controller_toggle_started_at = None
+
+    def _update_controller_input_toggle(self) -> bool:
+        """Consume the simultaneous trigger chord and switch controller input."""
+        left, right = self._controller_inputs
+        left_trigger = float(left.get("trigger", 0.0) or 0.0)
+        right_trigger = float(right.get("trigger", 0.0) or 0.0)
+        both_pressed = (
+            left_trigger >= self._TRIGGER_PRESS_THRESHOLD
+            and right_trigger >= self._TRIGGER_PRESS_THRESHOLD
+        )
+        both_released = (
+            left_trigger <= self._TRIGGER_RELEASE_THRESHOLD
+            and right_trigger <= self._TRIGGER_RELEASE_THRESHOLD
+        )
+
+        if self._controller_toggle_wait_for_release:
+            if both_released:
+                self._controller_toggle_wait_for_release = False
+            return True
+
+        if both_pressed:
+            now = self._shortcut_time()
+            if self._controller_toggle_started_at is None:
+                self._controller_toggle_started_at = now
+            elif now - self._controller_toggle_started_at >= self._CONTROLLER_TOGGLE_SECONDS:
+                self._controller_input_disabled = not self._controller_input_disabled
+                self._controller_toggle_started_at = None
+                self._controller_toggle_wait_for_release = True
+                self._emit_controller_shortcut(
+                    "controller_input_mode_changed",
+                    disabled=self._controller_input_disabled,
+                )
+            return True
+
+        self._reset_controller_toggle_timer()
+        return bool(self._controller_input_disabled)
 
     @staticmethod
     def _shortcut_pressed(hand: dict[str, float], name: str) -> bool:
@@ -67,16 +111,11 @@ class CoreControllerShortcutsMixin:
             self._shortcut_pressed_at[name] = now
             self._shortcut_long_fired[name] = False
         if pressed and not self._shortcut_long_fired[name]:
-            if now - self._shortcut_pressed_at[name] >= self._X_PASSTHROUGH_SECONDS:
-                self._emit_controller_shortcut("toggle_passthrough")
+            if now - self._shortcut_pressed_at[name] >= self._SHORTCUT_LONG_SECONDS:
+                self._emit_controller_shortcut("toggle_environment_background")
                 self._shortcut_long_fired[name] = True
         if not pressed and was_pressed and not self._shortcut_long_fired[name]:
-            held = now - self._shortcut_pressed_at[name]
-            self._emit_controller_shortcut(
-                "cycle_environment_light"
-                if held >= self._SHORTCUT_LONG_SECONDS
-                else "toggle_keyboard"
-            )
+            self._emit_controller_shortcut("toggle_keyboard")
         self._shortcut_last[name] = pressed
 
     def _update_stick_shortcut(
@@ -103,13 +142,20 @@ class CoreControllerShortcutsMixin:
             self._emit_controller_shortcut("copy" if hand == "left" else "paste")
         self._shortcut_last[name] = pressed
 
-    def _handle_controller_shortcuts(self) -> None:
+    def _handle_controller_shortcuts(
+        self, *, controller_toggle_checked: bool = False
+    ) -> None:
         """Translate controller snapshots into legacy semantic actions."""
+        if (
+            not controller_toggle_checked
+            and self._update_controller_input_toggle()
+        ):
+            return
         left, right = self._controller_inputs
         now = self._shortcut_time()
         pressed = self._shortcut_pressed
 
-        menu = pressed(left, "menu_button") or pressed(right, "menu_button")
+        menu = pressed(left, "menu_button")
         menu_was_pressed = self._shortcut_last["menu"]
         if menu and not menu_was_pressed:
             self._shortcut_pressed_at["menu"] = now
@@ -134,14 +180,21 @@ class CoreControllerShortcutsMixin:
         )
         self._update_short_long_button(
             "b", b, now,
-            short_action="toggle_background",
-            long_action="cycle_hand_panel",
+            short_action="toggle_passthrough",
+            long_action="toggle_operation_guide",
             enabled=normal_ab,
+        )
+        environment_mode_fn = getattr(self, "_operation_guide_environment_mode", None)
+        environment_mode = bool(
+            environment_mode_fn() if callable(environment_mode_fn) else False
         )
         self._update_short_long_button(
             "y", pressed(left, "y_button"), now,
             short_action="reset_screen",
-            long_action="cycle_screen_preset",
+            long_action=(
+                "cycle_room_environment" if environment_mode
+                else "cycle_screen_preset"
+            ),
         )
         self._update_x_shortcuts(pressed(left, "x_button"), now)
 

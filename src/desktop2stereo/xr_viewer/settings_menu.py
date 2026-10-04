@@ -68,6 +68,8 @@ OPENXR_MENU_GROUP_LABELS = {
     "screen_placement": "Screen placement",
     "screen_crop": "Crop settings",
     "depth_modes": "Stereo mode",
+    "depth_stereo": "Stereo depth",
+    "render_resolution": "Render resolution",
     "glow_modes": "Glow mode",
     "room_models": "Environment",
     "room_seats": "Seat position",
@@ -346,24 +348,24 @@ class OpenXrSettingsMenu:
         if self.tab == "screen":
             add_group(
                 "screen_page_heading", _CONTENT_PANEL_LEFT, 32,
-                _CONTENT_PANEL_WIDTH, 48,
+                _CONTENT_PANEL_WIDTH, 24,
                 title="Screen geometry", fixed=True,
             )
             add_group(
-                "screen_navigation", _CONTENT_PANEL_LEFT, 88,
+                "screen_navigation", _CONTENT_PANEL_LEFT, 56,
                 _CONTENT_PANEL_WIDTH, 48, title="", fixed=True,
             )
-            navigation_width = (_CONTENT_WIDTH - _MENU_CONTROL_GAP) // 2
+            navigation_width = _CONTENT_WIDTH // 2
             add_button(
                 "screen:section:layout", "Layout",
-                (_CONTENT_LEFT, 88, navigation_width, 48),
+                (_CONTENT_LEFT, 56, navigation_width, 48),
                 group="screen_navigation", fixed=True,
             )
             add_button(
                 "screen:section:crop", "Crop",
                 (
-                    _CONTENT_LEFT + navigation_width + _MENU_CONTROL_GAP,
-                    88, navigation_width, 48,
+                    _CONTENT_LEFT + navigation_width,
+                    56, navigation_width, 48,
                 ),
                 group="screen_navigation", fixed=True,
             )
@@ -376,8 +378,9 @@ class OpenXrSettingsMenu:
             }
             color_controls = tuple(item for item in PICTURE_CONTROLS if item[0] not in render_keys)
             render_controls = tuple(item for item in PICTURE_CONTROLS if item[0] in render_keys)
-            render_height = 536
-            color_height = 544
+            render_quality_controls = tuple(
+                item for item in render_controls if item[0] != "openxr_render_scale"
+            )
             picture_gap = _MENU_CONTROL_GAP
             picture_column_width = (_CONTENT_PANEL_WIDTH - picture_gap) // 2
             render_group_x = _CONTENT_PANEL_LEFT
@@ -386,60 +389,89 @@ class OpenXrSettingsMenu:
             color_control_x = color_group_x + _MENU_GROUP_PADDING
             picture_control_width = picture_column_width - 2 * _MENU_GROUP_PADDING
             add_group(
-                "render_quality", render_group_x, 32,
-                picture_column_width, render_height,
+                "render_resolution", render_group_x, 32,
+                picture_column_width, 224,
+            )
+            add_group(
+                "render_quality", render_group_x, 272,
+                picture_column_width, 448,
             )
             add_group(
                 "color_adjustment", color_group_x, 32,
-                picture_column_width, color_height,
+                picture_column_width, 608,
             )
             add_button(
                 "openxr:render_auto", "Headset optimized",
                 (render_control_x, 88, picture_control_width, 48),
-                group="render_quality",
+                group="render_resolution",
             )
-            for index, (key, label, minimum, maximum, step) in enumerate(render_controls):
+            add_slider(
+                "openxr_render_scale", "Render Resolution", render_control_x,
+                152, picture_control_width,
+                OPENXR_RENDER_SCALE_MIN, OPENXR_RENDER_SCALE_MAX, 0.05,
+                "render_resolution",
+            )
+            for index, (key, label, minimum, maximum, step) in enumerate(render_quality_controls):
                 add_slider(
                     key, label, render_control_x,
-                    152 + index * _MENU_SLIDER_ROW_STEP, picture_control_width,
+                    328 + index * _MENU_SLIDER_ROW_STEP, picture_control_width,
                     minimum, maximum, step, "render_quality",
                 )
+            add_button(
+                "reset:render_quality", "Reset",
+                (
+                    render_group_x + picture_column_width
+                    - _MENU_GROUP_PADDING - 120,
+                    664, 120, 40,
+                ),
+                group="render_quality",
+            )
             for index, (key, label, minimum, maximum, step) in enumerate(color_controls):
                 add_slider(
                     key, label, color_control_x,
-                    80 + index * _MENU_SLIDER_ROW_STEP, picture_control_width,
+                    88 + index * _MENU_SLIDER_ROW_STEP, picture_control_width,
                     minimum, maximum, step, "color_adjustment",
                 )
+            add_button(
+                "reset:color_adjustment", "Reset",
+                (
+                    color_group_x + picture_column_width
+                    - _MENU_GROUP_PADDING - 120,
+                    584, 120, 40,
+                ),
+                group="color_adjustment",
+            )
         elif self.tab == "depth":
             add_group(
-                "depth_strength", _CONTENT_PANEL_LEFT, 32,
-                _CONTENT_PANEL_WIDTH, 112, title="",
+                "depth_stereo", _CONTENT_PANEL_LEFT, 32,
+                _CONTENT_PANEL_WIDTH, 296,
             )
             add_slider(
-                "depth_strength", "Depth strength", _CONTENT_LEFT, 40, _CONTENT_WIDTH,
-                0.0, 1.0, 0.05, "depth_strength",
-            )
-            add_group(
-                "depth_modes", _CONTENT_PANEL_LEFT, 160,
-                _CONTENT_PANEL_WIDTH, 136,
+                "depth_strength", "Depth strength", _CONTENT_LEFT, 88, _CONTENT_WIDTH,
+                0.0, 1.0, 0.05, "depth_stereo",
             )
             mode_width = (_CONTENT_WIDTH - _MENU_CONTROL_GAP) // 2
             add_button(
                 "depth:toggle_stereo", "2D / 3D",
-                (_CONTENT_LEFT, 216, mode_width, 64),
-                group="depth_modes", kind="toggle",
+                (_CONTENT_LEFT, 192, mode_width, 48),
+                group="depth_stereo", kind="toggle",
             )
             add_button(
                 "depth:toggle_cross_eyed", "Cross eyed",
                 (
-                    _CONTENT_LEFT + mode_width + _MENU_CONTROL_GAP,
-                    216, mode_width, 64,
-                ), group="depth_modes", kind="toggle",
+                    _CONTENT_LEFT + mode_width + _MENU_CONTROL_GAP, 192,
+                    mode_width, 48,
+                ), group="depth_stereo", kind="toggle",
+            )
+            add_button(
+                "reset:depth_stereo", "Reset",
+                (_CONTENT_RIGHT - 120, 272, 120, 40),
+                group="depth_stereo",
             )
         elif self.tab == "glow" and show_glow:
             add_group(
                 "glow_modes", _CONTENT_PANEL_LEFT, 32,
-                _CONTENT_PANEL_WIDTH, 216,
+                _CONTENT_PANEL_WIDTH, 272,
             )
             glow_column_width = (_CONTENT_WIDTH - _MENU_CONTROL_GAP) // 2
             for key, label, box in (
@@ -467,14 +499,24 @@ class OpenXrSettingsMenu:
                 ),
             ):
                 add_button(key, label, box, group="glow_modes")
+            add_button(
+                "reset:glow_modes", "Reset",
+                (_CONTENT_RIGHT - 120, 248, 120, 40),
+                group="glow_modes",
+            )
             add_group(
-                "glow_transparency", _CONTENT_PANEL_LEFT, 264,
-                _CONTENT_PANEL_WIDTH, 112, title="",
+                "glow_transparency", _CONTENT_PANEL_LEFT, 320,
+                _CONTENT_PANEL_WIDTH, 168, title="",
             )
             add_slider(
                 "glow:transparency", "Glow transparency",
-                _CONTENT_LEFT, 272, _CONTENT_WIDTH,
+                _CONTENT_LEFT, 336, _CONTENT_WIDTH,
                 0.0, 1.0, 0.05, "glow_transparency",
+            )
+            add_button(
+                "reset:glow_transparency", "Reset",
+                (_CONTENT_RIGHT - 120, 432, 120, 40),
+                group="glow_transparency",
             )
         elif self.tab == "room":
             y = _CONTENT_TOP
@@ -514,7 +556,7 @@ class OpenXrSettingsMenu:
                 y += group_height + _MENU_GROUP_GAP
             add_group(
                 "room_seats", _CONTENT_PANEL_LEFT, y,
-                _CONTENT_PANEL_WIDTH, 136,
+                _CONTENT_PANEL_WIDTH, 264,
             )
             seat_width = (_CONTENT_WIDTH - 2 * _MENU_CONTROL_GAP) // 3
             seat_gap = _MENU_CONTROL_GAP
@@ -530,72 +572,75 @@ class OpenXrSettingsMenu:
                     (seat_start + index * (seat_width + seat_gap), y + 56, seat_width, 64),
                     group="room_seats",
                 )
-            y += 136 + _MENU_GROUP_GAP
+            add_slider(
+                "room:seat_height", "Seat height", _CONTENT_LEFT,
+                y + 120, _CONTENT_WIDTH,
+                -3.0, 3.0, 0.05, "room_seats",
+            )
+            add_button(
+                "reset:room_seats", "Reset",
+                (_CONTENT_RIGHT - 120, y + 208, 120, 40),
+                group="room_seats",
+            )
+            y += 264 + _MENU_GROUP_GAP
             add_group(
                 "room_scene", _CONTENT_PANEL_LEFT, y,
-                _CONTENT_PANEL_WIDTH, 320,
+                _CONTENT_PANEL_WIDTH, 264,
             )
             add_button(
                 "room:toggle_screen_reflection", "Screen reflection light",
-                (_CONTENT_LEFT, y + 56, _CONTENT_WIDTH, 64),
+                (_CONTENT_LEFT, y + 56, _CONTENT_WIDTH, 48),
                 group="room_scene", kind="toggle",
             )
             add_slider(
-                "room:seat_height", "Seat height", _CONTENT_LEFT,
-                y + 128, _CONTENT_WIDTH,
-                -3.0, 3.0, 0.05, "room_scene",
-            )
-            add_slider(
                 "room:exposure", "Scene brightness", _CONTENT_LEFT,
-                y + 224, _CONTENT_WIDTH,
+                y + 112, _CONTENT_WIDTH,
                 -8.0, 8.0, 0.1, "room_scene",
+            )
+            add_button(
+                "reset:room_scene", "Reset",
+                (_CONTENT_RIGHT - 120, y + 208, 120, 40),
+                group="room_scene",
             )
         elif self.tab == "screen" and self.screen_section == "crop":
             add_group(
-                "screen_crop", _CONTENT_PANEL_LEFT, 152,
-                _CONTENT_PANEL_WIDTH, 160, title="",
+                "screen_crop", _CONTENT_PANEL_LEFT, 120,
+                _CONTENT_PANEL_WIDTH, 368, title="Crop settings",
             )
             crop_button_width = (_CONTENT_WIDTH - _MENU_CONTROL_GAP) // 2
-            crop_reset_width = 168
-            crop_reset_x = _CONTENT_PANEL_LEFT + (
-                _CONTENT_PANEL_WIDTH - crop_reset_width
-            ) // 2
             for key, label, box, kind in (
                 (
                     "screen:auto_crop", "Auto Crop",
-                    (_CONTENT_LEFT, 168, crop_button_width, 64), "button",
+                    (_CONTENT_LEFT, 176, crop_button_width, 64), "button",
                 ),
                 (
                     "screen:dynamic_crop", "Dynamic Crop",
                     (
                         _CONTENT_LEFT + crop_button_width + _MENU_CONTROL_GAP,
-                        168, crop_button_width, 64,
+                        176, crop_button_width, 64,
                     ), "toggle",
-                ),
-                (
-                    "screen:reset_crop", "Reset Crop",
-                    (crop_reset_x, 248, crop_reset_width, 48), "button",
                 ),
             ):
                 add_button(key, label, box, group="screen_crop", kind=kind)
-            add_group(
-                "screen_crop_ranges", _CONTENT_PANEL_LEFT, 328,
-                _CONTENT_PANEL_WIDTH, 224, title="Crop range",
-            )
             add_slider(
                 "screen:crop_width", "Width crop (Left / Right)",
-                _CONTENT_LEFT, 376, _CONTENT_WIDTH,
-                0.0, 45.0, 1.0, "screen_crop_ranges",
+                _CONTENT_LEFT, 248, _CONTENT_WIDTH,
+                0.0, 45.0, 1.0, "screen_crop",
             )
             add_slider(
                 "screen:crop_height", "Height crop (Top / Bottom)",
-                _CONTENT_LEFT, 456, _CONTENT_WIDTH,
-                0.0, 45.0, 1.0, "screen_crop_ranges",
+                _CONTENT_LEFT, 328, _CONTENT_WIDTH,
+                0.0, 45.0, 1.0, "screen_crop",
+            )
+            add_button(
+                "screen:reset_crop", "Reset Crop",
+                (_CONTENT_RIGHT - 160, 424, 160, 48),
+                group="screen_crop",
             )
         elif self.tab == "screen":
             add_group(
-                "screen_shape", _CONTENT_PANEL_LEFT, 152,
-                _CONTENT_PANEL_WIDTH, 200, title="",
+                "screen_shape", _CONTENT_PANEL_LEFT, 120,
+                _CONTENT_PANEL_WIDTH, 264, title="Screen shape",
             )
             shape_items = (
                 ("screen:type:flat", "Flat", True),
@@ -607,25 +652,30 @@ class OpenXrSettingsMenu:
             for index, (key, label, enabled) in enumerate(shape_items):
                 x0 = _CONTENT_LEFT + index * (shape_width + _MENU_CONTROL_GAP)
                 add_button(
-                    key, label, (x0, 168, shape_width, 104),
+                    key, label, (x0, 176, shape_width, 72),
                     group="screen_shape", enabled=enabled,
                 )
             for key, label, x0 in (
                 (
                     "screen:rotate:-90", "Rotate -90",
-                    _CONTENT_PANEL_LEFT + (_CONTENT_PANEL_WIDTH - 336) // 2,
+                    _CONTENT_PANEL_LEFT + (_CONTENT_PANEL_WIDTH - 304) // 2,
                 ),
                 (
                     "screen:rotate:+90", "Rotate +90",
-                    _CONTENT_PANEL_LEFT + (_CONTENT_PANEL_WIDTH - 336) // 2 + 176,
+                    _CONTENT_PANEL_LEFT + (_CONTENT_PANEL_WIDTH - 304) // 2 + 160,
                 ),
             ):
                 add_button(
-                    key, label, (x0, 288, 160, 48), group="screen_shape",
+                    key, label, (x0, 264, 144, 48), group="screen_shape",
                 )
+            add_button(
+                "reset:screen_shape", "Reset",
+                (_CONTENT_RIGHT - 120, 328, 120, 40),
+                group="screen_shape",
+            )
             add_group(
-                "screen_placement", _CONTENT_PANEL_LEFT, 368,
-                _CONTENT_PANEL_WIDTH, 304,
+                "screen_placement", _CONTENT_PANEL_LEFT, 400,
+                _CONTENT_PANEL_WIDTH, 336,
             )
             for index, (key, label, minimum, maximum, step) in enumerate((
                 ("screen:width", "Screen size", 0.25, 2.0, 0.01),
@@ -634,11 +684,16 @@ class OpenXrSettingsMenu:
             )):
                 add_slider(
                     key, label, _CONTENT_LEFT,
-                    416 + index * _MENU_SLIDER_ROW_STEP, _CONTENT_WIDTH,
+                    456 + index * 64, _CONTENT_WIDTH,
                     minimum, maximum, step, "screen_placement",
                 )
+            add_button(
+                "reset:screen_placement", "Reset",
+                (_CONTENT_RIGHT - 120, 680, 120, 40),
+                group="screen_placement",
+            )
 
-        viewport_y = 152 if self.tab == "screen" else _CONTENT_TOP
+        viewport_y = 120 if self.tab == "screen" else _CONTENT_TOP
         viewport = rect(
             _CONTENT_PANEL_LEFT, viewport_y,
             _CONTENT_PANEL_RIGHT - _CONTENT_PANEL_LEFT,

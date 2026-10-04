@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from xr_viewer.core_controller_guide_input import CoreControllerGuideInputMixin
+from xr_viewer.core_controller_input import CoreControllerInputMixin
 from xr_viewer.core_controller_shortcuts import CoreControllerShortcutsMixin
 from viewer.controller_help import get_controller_help_rows
 
@@ -129,13 +130,87 @@ def test_calibration_axes_and_b_save_suppress_normal_controls() -> None:
 
 
 def test_operation_guide_matches_b_long_press_product_contract() -> None:
-    cn_rows, _cn_environment_rows = get_controller_help_rows("CN")
-    en_rows, _en_environment_rows = get_controller_help_rows("EN")
+    cn_rows, cn_environment_rows = get_controller_help_rows("CN")
+    en_rows, en_environment_rows = get_controller_help_rows("EN")
 
     assert ("右 B 键", "长按 1s", "显示/隐藏操作指南", False) in cn_rows
+    assert ("右 B 键", "长按 1s", "显示/隐藏操作指南", False) in cn_environment_rows
     assert (
         "Right B button",
         "Long press 1s",
         "Show/hide operation guide",
         False,
     ) in en_rows
+    assert (
+        "Right B button",
+        "Long press 1s",
+        "Show/hide operation guide",
+        False,
+    ) in en_environment_rows
+    assert any("同时长按 5s" in row[1] for row in cn_rows)
+    assert any("同时长按 5s" in row[1] for row in cn_environment_rows)
+    assert any("Hold together 5s" in row[1] for row in en_rows)
+    assert any("Hold together 5s" in row[1] for row in en_environment_rows)
+
+
+def test_left_stick_radial_deadzone_and_response_curve_are_bounded() -> None:
+    normalize = CoreControllerInputMixin._normalize_left_stick
+
+    assert normalize(0.05, 0.0) == (0.0, 0.0)
+    assert normalize(0.08, 0.0) == (0.0, 0.0)
+    low_x, low_y = normalize(0.10, 0.0)
+    mid_x, _mid_y = normalize(0.5, 0.0)
+    full_x, _full_y = normalize(1.0, 0.0)
+    diagonal_x, diagonal_y = normalize(1.0, 1.0)
+
+    assert low_x > 0.0 and low_y == 0.0
+    assert low_x < mid_x < full_x == 1.0
+    assert diagonal_x == diagonal_y
+    diagonal_magnitude = (diagonal_x**2 + diagonal_y**2) ** 0.5
+    assert 0.99 < diagonal_magnitude <= 1.0
+    assert normalize(-0.10, 0.0)[0] == -low_x
+
+
+def test_left_stick_activation_is_lower_without_changing_right_stick_deadzone() -> None:
+    host = GuideHost()
+
+    assert host._guide_axis_active(0.10, left=True)
+    assert not host._guide_axis_active(0.10)
+
+
+def test_disabled_controller_sampling_reads_only_both_trigger_actions() -> None:
+    class Runtime:
+        def __init__(self) -> None:
+            self.synced = False
+
+        def sync_actions(self, _session, _sync_info) -> None:
+            self.synced = True
+
+    class InputHost(CoreControllerInputMixin):
+        def __init__(self) -> None:
+            self.xr = Runtime()
+            self.session = object()
+            self._xr_actions_sync_info = object()
+            self._act_left_trigger = "left-trigger"
+            self._act_right_trigger = "right-trigger"
+            self._controller_input_disabled = True
+            self._controller_toggle_wait_for_release = False
+            self._controller_inputs = ({}, {})
+            self.read_actions: list[tuple[str, str]] = []
+
+        def _read_float_action(self, action, hand_path: str) -> float:
+            self.read_actions.append((action, hand_path))
+            return 0.8 if action == "left-trigger" else 0.9
+
+    host = InputHost()
+    host._sync_controller_inputs(1.0 / 90.0)
+
+    assert host.xr.synced
+    assert host.read_actions == [
+        ("left-trigger", "/user/hand/left"),
+        ("right-trigger", "/user/hand/right"),
+    ]
+    assert host._controller_inputs == (
+        {"trigger": 0.8},
+        {"trigger": 0.9},
+    )

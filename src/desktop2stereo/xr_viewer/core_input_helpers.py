@@ -46,7 +46,9 @@ class CoreInputHelpersMixin:
         state[1] = False
         state[2] = 0.0
 
-    def _send_arrow_impl(self, value, neg_dir, pos_dir):
+    def _send_arrow_impl(
+        self, value, neg_dir, pos_dir, *, deadzone: float | None = None
+    ):
         """Send arrow key hold/release based on stick value. Only fires on edge transitions."""
         VK_MAP = {'up': 0x26, 'down': 0x28, 'left': 0x25, 'right': 0x27}
         neg_attr = f'_arrow_{neg_dir}_held'
@@ -64,28 +66,37 @@ class CoreInputHelpersMixin:
                     setattr(self, attr, False)
             return
 
-        if abs(value) <= self._input_deadzone():
-            for attr in (neg_attr, pos_attr):
-                if getattr(self, attr):
-                    vk = neg_vk if attr == neg_attr else pos_vk
-                    ctypes.windll.user32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, 0)
-                    setattr(self, attr, False)
-            return
+        press_threshold = (
+            float(self._input_deadzone()) if deadzone is None else float(deadzone)
+        )
+        release_threshold = press_threshold * 0.65
+        negative_active = value < -press_threshold or (
+            getattr(self, neg_attr) and value < -release_threshold
+        )
+        positive_active = value > press_threshold or (
+            getattr(self, pos_attr) and value > release_threshold
+        )
 
-        if value < -self._input_deadzone():
+        if negative_active:
             if not getattr(self, neg_attr):
                 ctypes.windll.user32.keybd_event(neg_vk, 0, 0, 0)
                 setattr(self, neg_attr, True)
             if getattr(self, pos_attr):
                 ctypes.windll.user32.keybd_event(pos_vk, 0, _KEYEVENTF_KEYUP, 0)
                 setattr(self, pos_attr, False)
-        elif value > self._input_deadzone():
+        elif positive_active:
             if not getattr(self, pos_attr):
                 ctypes.windll.user32.keybd_event(pos_vk, 0, 0, 0)
                 setattr(self, pos_attr, True)
             if getattr(self, neg_attr):
                 ctypes.windll.user32.keybd_event(neg_vk, 0, _KEYEVENTF_KEYUP, 0)
                 setattr(self, neg_attr, False)
+        else:
+            for attr in (neg_attr, pos_attr):
+                if getattr(self, attr):
+                    vk = neg_vk if attr == neg_attr else pos_vk
+                    ctypes.windll.user32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, 0)
+                    setattr(self, attr, False)
 
     def _press_key_impl(self, key, key_idx, held_key_attr, held_mods_attr):
         """Press and hold a regular key on the virtual keyboard (key-down only)."""

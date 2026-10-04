@@ -9,6 +9,8 @@ from xr_viewer.settings_menu import (
     _CONTENT_RIGHT,
     _MENU_GROUP_GAP,
     _MENU_GROUP_PADDING,
+    _MENU_TITLE_CARD_GAP,
+    _MENU_TITLE_HEIGHT,
     _SIDEBAR_PANEL_RIGHT,
     PICTURE_DEFAULTS,
     SETTINGS_MENU_TEXTURE_SIZE,
@@ -117,9 +119,12 @@ def test_depth_tab_exposes_runtime_depth_controls():
     keys = set(controls)
     assert {
         "depth_strength", "depth:toggle_stereo",
-        "depth:toggle_cross_eyed",
+        "depth:toggle_cross_eyed", "reset:depth_stereo",
     } <= keys
-    assert "section:reset_defaults" not in keys
+    assert {controls[key].group for key in (
+        "depth_strength", "depth:toggle_stereo",
+        "depth:toggle_cross_eyed", "reset:depth_stereo",
+    )} == {"depth_stereo"}
     assert controls["depth:toggle_stereo"].kind == "toggle"
     assert controls["depth:toggle_cross_eyed"].kind == "toggle"
     depth = next(control for control in menu.controls() if control.key == "depth_strength")
@@ -135,7 +140,7 @@ def test_glow_tab_is_visible_only_for_default_environment():
     menu.set_tab("glow")
     assert {
         "glow:surround", "glow:glow", "glow:veil", "glow:off",
-        "glow:transparency",
+        "glow:transparency", "reset:glow_modes", "reset:glow_transparency",
     } <= {control.key for control in menu.controls(show_glow=True)}
     transparency = next(
         control for control in menu.controls(show_glow=True)
@@ -211,7 +216,7 @@ def test_stop_target_is_fixed_on_every_page_and_disabled_while_stopping():
     assert not menu.set_stopping()
 
 
-def test_screen_tab_exposes_distance_and_rotation_without_a_global_reset_button():
+def test_screen_layout_has_shape_and_placement_resets_in_their_cards():
     menu = OpenXrSettingsMenu()
     menu.set_tab("screen")
     controls = {control.key: control for control in menu.controls()}
@@ -220,7 +225,8 @@ def test_screen_tab_exposes_distance_and_rotation_without_a_global_reset_button(
         "screen:distance", "screen:rotate:-90",
         "screen:rotate:+90",
     } <= keys
-    assert "section:reset_defaults" not in keys
+    assert controls["reset:screen_shape"].group == "screen_shape"
+    assert controls["reset:screen_placement"].group == "screen_placement"
     height = next(control for control in menu.controls() if control.key == "screen:height")
     assert (height.minimum, height.maximum, height.step) == (-10.0, 10.0, 0.05)
     distance = controls["screen:distance"]
@@ -245,6 +251,8 @@ def test_screen_crop_section_has_symmetric_crop_controls_and_navigation():
         "screen:crop_height",
     } <= controls.keys()
     assert controls["screen:dynamic_crop"].kind == "toggle"
+    assert controls["screen:reset_crop"].group == "screen_crop"
+    assert controls["screen:crop_height"].group == "screen_crop"
     assert (
         controls["screen:crop_width"].minimum,
         controls["screen:crop_width"].maximum,
@@ -268,11 +276,11 @@ def test_screen_subsection_and_page_content_use_the_shared_top_alignment():
         for name in ("flat", "subtle", "medium", "deep")
     ]
 
-    assert min(control.rect[1] for control in section_tabs) == pytest.approx(88 / 832)
+    assert min(control.rect[1] for control in section_tabs) == pytest.approx(56 / 832)
     assert max(control.rect[3] for control in section_tabs) < min(
         control.rect[1] for control in type_controls
     )
-    assert min(control.rect[1] for control in type_controls) == pytest.approx(168 / 832)
+    assert min(control.rect[1] for control in type_controls) == pytest.approx(176 / 832)
     assert min(
         right.rect[0] - left.rect[2]
         for left, right in zip(type_controls, type_controls[1:])
@@ -296,7 +304,8 @@ def test_room_tab_exposes_models_three_seats_and_live_sliders():
         "room:model:3d_a", "room:model:3d_b",
         "room:seat:front", "room:seat:middle", "room:seat:back",
         "room:seat_height", "room:exposure",
-        "room:toggle_screen_reflection",
+        "room:toggle_screen_reflection", "reset:room_seats",
+        "reset:room_scene",
     } <= controls.keys()
     assert (controls["room:seat_height"].minimum, controls["room:seat_height"].maximum) == (-3.0, 3.0)
     assert (controls["room:exposure"].minimum, controls["room:exposure"].maximum) == (-8.0, 8.0)
@@ -335,11 +344,13 @@ def test_room_tab_keeps_three_model_rows_above_seat_and_live_controls():
 
     assert model_bottom < seat_top
     assert reflection.rect[2] - reflection.rect[0] == pytest.approx(688 / 1024)
-    assert reflection.rect[3] < seat_height.rect[1]
-    assert seat_height.rect[3] < exposure.rect[1]
+    assert seat_height.rect[3] < controls["reset:room_seats"].rect[1]
+    assert controls["reset:room_seats"].rect[3] < reflection.rect[1]
+    assert reflection.rect[3] < exposure.rect[1]
+    assert exposure.rect[3] < controls["reset:room_scene"].rect[1]
 
 
-def test_picture_layout_uses_the_full_content_width_without_a_reset_toolbar():
+def test_picture_resets_are_scoped_to_quality_and_color_cards():
     menu = OpenXrSettingsMenu()
     menu.set_tab("picture")
     control_list = menu.controls()
@@ -349,11 +360,49 @@ def test_picture_layout_uses_the_full_content_width_without_a_reset_toolbar():
         for control in control_list
         if not control.key.startswith("tab:") and control.key != "runtime:stop"
     )
+    assert controls["reset:render_quality"].group == "render_quality"
+    assert controls["reset:color_adjustment"].group == "color_adjustment"
     assert "section:reset_defaults" not in controls
     assert set(PICTURE_DEFAULTS) == {
         key for key, control in controls.items() if control.kind == "slider"
     }
+    assert controls["openxr_render_scale"].group == "render_resolution"
+    assert controls["openxr:render_auto"].group == "render_resolution"
     assert "close" not in controls
+
+
+def test_picture_resolution_card_has_separate_non_overlapping_controls():
+    menu = OpenXrSettingsMenu()
+    menu.set_tab("picture")
+    controls = {control.key: control for control in menu.controls()}
+    pixels = lambda control: tuple(round(value * size) for value, size in zip(
+        control.rect, (1024, 832, 1024, 832)
+    ))
+
+    auto = pixels(controls["openxr:render_auto"])
+    resolution_steps = [
+        pixels(controls[key]) for key in (
+            "step:minus:openxr_render_scale", "step:plus:openxr_render_scale",
+        )
+    ]
+    resolution_group = next(
+        group for group in menu.layout().groups
+        if group.key == "render_resolution"
+    )
+    quality_group = next(
+        group for group in menu.layout().groups
+        if group.key == "render_quality"
+    )
+    resolution_group_pixels = tuple(round(value * size) for value, size in zip(
+        resolution_group.rect, (1024, 832, 1024, 832)
+    ))
+    quality_group_pixels = tuple(round(value * size) for value, size in zip(
+        quality_group.rect, (1024, 832, 1024, 832)
+    ))
+
+    assert auto[3] < min(step[1] for step in resolution_steps)
+    assert max(step[3] for step in resolution_steps) < resolution_group_pixels[3]
+    assert resolution_group_pixels[3] < quality_group_pixels[1]
 
 
 def test_each_page_uses_the_shared_top_edge_without_a_redundant_global_header():
@@ -363,7 +412,7 @@ def test_each_page_uses_the_shared_top_edge_without_a_redundant_global_header():
         layout = menu.layout(show_glow=True)
         content_groups = [group for group in layout.groups if not group.fixed]
         assert content_groups
-        expected_top = 152 if tab == "screen" else 32
+        expected_top = 120 if tab == "screen" else 32
         assert min(round(group.rect[1] * 832) for group in content_groups) == expected_top
         if tab == "screen":
             heading = next(group for group in layout.groups if group.key == "screen_page_heading")
@@ -371,7 +420,7 @@ def test_each_page_uses_the_shared_top_edge_without_a_redundant_global_header():
             assert round(heading.rect[1] * 832) == 32
 
 
-def test_screen_secondary_tabs_share_one_aligned_row_without_a_reset_toolbar():
+def test_screen_reset_stays_in_placement_card_below_secondary_navigation():
     menu = OpenXrSettingsMenu()
     controls = {control.key: control for control in menu.controls()}
     toolbar = [
@@ -383,10 +432,11 @@ def test_screen_secondary_tabs_share_one_aligned_row_without_a_reset_toolbar():
         control.rect, (1024, 832, 1024, 832)
     )) for control in toolbar]
     assert boxes == [
-        (288, 88, 624, 136),
-        (640, 88, 976, 136),
+        (288, 56, 632, 104),
+        (632, 56, 976, 104),
     ]
-    assert "section:reset_defaults" not in controls
+    assert controls["reset:screen_placement"].group == "screen_placement"
+    assert controls["reset:screen_placement"].rect[1] > toolbar[1].rect[3]
 
 
 @pytest.mark.parametrize("tab", OpenXrSettingsMenu.tabs)
@@ -520,8 +570,11 @@ def test_room_model_grid_wraps_to_three_columns_and_computes_scroll_extent(model
         (item.rect[2] - item.rect[0]) * 1024 <= max_column_width
         for item in models
     )
-    if model_count <= 5:
+    if model_count <= 1:
         assert layout.scroll_max == 0
+    elif model_count <= 5:
+        assert layout.scroll_max > 0
+        assert layout.scroll_max <= 40
     else:
         assert layout.scroll_max > 0
 
@@ -566,12 +619,76 @@ def test_room_scroll_tracks_the_content_and_clamps_at_both_ends():
     assert menu.scroll_offset == pytest.approx(0.0)
 
 
+def test_scrolled_room_reset_buttons_remain_inside_the_viewport_and_hit_test():
+    menu = OpenXrSettingsMenu()
+    menu.room_models = tuple(
+        (f"room_{index}", f"Environment {index}") for index in range(20)
+    )
+    menu.set_tab("room")
+    menu.scroll_offset = menu.layout().scroll_max
+    controls = {control.key: control for control in menu.controls()}
+
+    for key in ("reset:room_seats", "reset:room_scene"):
+        control = controls[key]
+        center = (
+            (control.rect[0] + control.rect[2]) * 0.5,
+            (control.rect[1] + control.rect[3]) * 0.5,
+        )
+        assert menu.scroll_viewport_contains(center)
+        assert menu.hit_test(center).key == key
+
+
+@pytest.mark.parametrize(
+    ("tab", "section", "reset_keys"),
+    (
+        ("picture", None, ("reset:render_quality", "reset:color_adjustment")),
+        ("depth", None, ("reset:depth_stereo",)),
+        ("glow", None, ("reset:glow_modes", "reset:glow_transparency")),
+        ("room", None, ("reset:room_seats", "reset:room_scene")),
+        ("screen", "layout", ("reset:screen_shape", "reset:screen_placement")),
+        ("screen", "crop", ("screen:reset_crop",)),
+    ),
+)
+def test_card_resets_stay_in_their_group_and_hit_test(tab, section, reset_keys):
+    menu = OpenXrSettingsMenu()
+    menu.set_tab(tab)
+    if section is not None:
+        menu.set_screen_section(section)
+    controls = {control.key: control for control in menu.controls(show_glow=True)}
+    groups = {group.key: group for group in menu.layout(show_glow=True).groups}
+
+    for key in reset_keys:
+        control = controls[key]
+        group = groups[control.group]
+        width, height = SETTINGS_MENU_TEXTURE_SIZE
+        control_box = tuple(round(value * size) for value, size in zip(
+            control.rect, (width, height, width, height)
+        ))
+        group_box = tuple(round(value * size) for value, size in zip(
+            group.rect, (width, height, width, height)
+        ))
+        card_top = group_box[1]
+        if group.title:
+            card_top += _MENU_TITLE_HEIGHT + _MENU_TITLE_CARD_GAP
+
+        assert control_box[0] >= group_box[0] + 16
+        assert control_box[2] <= group_box[2] - 16
+        assert control_box[1] >= card_top + 16
+        assert control_box[3] <= group_box[3] - 16
+        center = (
+            (control.rect[0] + control.rect[2]) * 0.5,
+            (control.rect[1] + control.rect[3]) * 0.5,
+        )
+        assert group.rect[0] <= center[0] <= group.rect[2]
+        assert group.rect[1] <= center[1] <= group.rect[3]
+        assert menu.hit_test(center, show_glow=True).key == key
+
+
 def test_group_cards_use_balanced_insets_and_consistent_vertical_gaps():
     menu = OpenXrSettingsMenu()
     cases = (
-        ("screen", "screen_shape", "screen_placement", 152, 352, 368, 672),
-        ("depth", "depth_strength", "depth_modes", 32, 144, 160, 296),
-        ("glow", "glow_modes", "glow_transparency", 32, 248, 264, 376),
+        ("screen", "screen_shape", "screen_placement", 120, 384, 400, 736),
+        ("glow", "glow_modes", "glow_transparency", 32, 304, 320, 488),
     )
     for tab, first_key, second_key, first_top, first_bottom, second_top, second_bottom in cases:
         menu.set_tab(tab)
@@ -582,6 +699,87 @@ def test_group_cards_use_balanced_insets_and_consistent_vertical_gaps():
         assert (first[1], first[3]) == (first_top, first_bottom)
         assert (second[1], second[3]) == (second_top, second_bottom)
         assert second[1] - first[3] == 16
+
+    menu.set_tab("depth")
+    depth_groups = {group.key: group for group in menu.layout().groups}
+    assert tuple(round(value * 832) for value in depth_groups["depth_stereo"].rect)[1::2] == (
+        32, 328,
+    )
+
+
+def test_glow_mode_resets_have_consistent_spacing_from_controls_and_card_edges():
+    menu = OpenXrSettingsMenu()
+    menu.set_tab("glow")
+    layout = menu.layout(show_glow=True)
+    groups = {group.key: group for group in layout.groups}
+    controls = {control.key: control for control in layout.controls}
+
+    def pixel_rect(rect):
+        return tuple(round(value * size) for value, size in zip(
+            rect,
+            (SETTINGS_MENU_TEXTURE_SIZE[0], SETTINGS_MENU_TEXTURE_SIZE[1]) * 2,
+        ))
+
+    modes = [
+        pixel_rect(controls[key].rect)
+        for key in ("glow:surround", "glow:glow", "glow:veil", "glow:off")
+    ]
+    mode_reset = pixel_rect(controls["reset:glow_modes"].rect)
+    mode_card = pixel_rect(groups["glow_modes"].rect)
+    transparency_steps = [
+        pixel_rect(controls[key].rect)
+        for key in (
+            "step:minus:glow:transparency",
+            "step:plus:glow:transparency",
+        )
+    ]
+    transparency_reset = pixel_rect(controls["reset:glow_transparency"].rect)
+    transparency_card = pixel_rect(groups["glow_transparency"].rect)
+
+    assert mode_reset[1] - max(rect[3] for rect in modes) == 16
+    assert mode_card[3] - mode_reset[3] == 16
+    assert transparency_card[1] - mode_card[3] == 16
+    assert transparency_reset[1] - max(rect[3] for rect in transparency_steps) == 16
+    assert transparency_card[3] - transparency_reset[3] == 16
+
+
+@pytest.mark.parametrize("tab", OpenXrSettingsMenu.tabs)
+def test_controls_respect_their_cards_content_safe_area(tab):
+    menu = OpenXrSettingsMenu()
+    menu.set_tab(tab)
+    if tab == "room":
+        menu.room_models = tuple(
+            (f"room_{index}", f"Environment {index}") for index in range(5)
+        )
+    if tab == "screen":
+        sections = ("layout", "crop")
+    else:
+        sections = (None,)
+
+    for section in sections:
+        if section is not None:
+            menu.set_screen_section(section)
+        layout = menu.layout(show_glow=True)
+        groups = {group.key: group for group in layout.groups}
+        for control in layout.controls:
+            group = groups.get(control.group)
+            if group is None or control.fixed:
+                continue
+            width, height = SETTINGS_MENU_TEXTURE_SIZE
+            control_box = tuple(round(value * size) for value, size in zip(
+                control.rect, (width, height, width, height)
+            ))
+            group_box = tuple(round(value * size) for value, size in zip(
+                group.rect, (width, height, width, height)
+            ))
+            card_top = group_box[1]
+            if group.title:
+                card_top += _MENU_TITLE_HEIGHT + _MENU_TITLE_CARD_GAP
+
+            assert control_box[0] >= group_box[0] + 16, control.key
+            assert control_box[2] <= group_box[2] - 16, control.key
+            assert control_box[1] >= card_top + 16, control.key
+            assert control_box[3] <= group_box[3] - 16, control.key
 
 
 def test_room_groups_keep_symmetric_grid_spacing_and_content_padding():

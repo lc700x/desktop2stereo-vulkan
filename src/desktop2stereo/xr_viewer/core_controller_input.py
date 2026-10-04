@@ -6,8 +6,29 @@ import ctypes
 
 
 _VIVE_TB_Y = 0.5
+_LEFT_STICK_DEADZONE = 0.08
+_LEFT_STICK_RESPONSE_EXPONENT = 0.75
 
 class CoreControllerInputMixin:
+    @staticmethod
+    def _normalize_left_stick(x: float, y: float) -> tuple[float, float]:
+        """Apply a small radial deadzone and responsive, bounded stick curve."""
+        x = max(-1.0, min(1.0, float(x or 0.0)))
+        y = max(-1.0, min(1.0, float(y or 0.0)))
+        magnitude = (x * x + y * y) ** 0.5
+        if magnitude > 1.0:
+            x /= magnitude
+            y /= magnitude
+            magnitude = 1.0
+        if magnitude <= _LEFT_STICK_DEADZONE:
+            return 0.0, 0.0
+        normalized = (magnitude - _LEFT_STICK_DEADZONE) / (
+            1.0 - _LEFT_STICK_DEADZONE
+        )
+        response = normalized ** _LEFT_STICK_RESPONSE_EXPONENT
+        scale = response / magnitude
+        return x * scale, y * scale
+
     def _read_bool_action_raw(self, action, hand_path):
         if action is None:
             return False
@@ -194,9 +215,25 @@ class CoreControllerInputMixin:
 
     def _sync_controller_inputs(self, delta_seconds: float) -> None:
         self.xr.sync_actions(self.session, self._xr_actions_sync_info)
+        if (
+            getattr(self, "_controller_input_disabled", False)
+            or getattr(self, "_controller_toggle_wait_for_release", False)
+        ):
+            left_trigger = self._read_float_action(
+                self._act_left_trigger, "/user/hand/left"
+            )
+            right_trigger = self._read_float_action(
+                self._act_right_trigger, "/user/hand/right"
+            )
+            self._controller_inputs = (
+                {"trigger": left_trigger},
+                {"trigger": right_trigger},
+            )
+            return
         self._update_trackpad_button_emu()
         lx, ly = self._read_stick_action(self._act_left_stick, "/user/hand/left")
         rx, ry = self._read_stick_action(self._act_right_stick, "/user/hand/right")
+        lx, ly = self._normalize_left_stick(lx, ly)
 
         def values(hand: str, left: bool) -> dict[str, float]:
             prefix = "left_" if left else "right_"

@@ -4,7 +4,8 @@ from __future__ import annotations
 class CoreControllerGuideInputMixin:
     """Resolve continuous and chorded controls listed in the operation guide."""
 
-    _GUIDE_DEADZONE = 0.15
+    _GUIDE_LEFT_DEADZONE = 0.03
+    _GUIDE_RIGHT_DEADZONE = 0.15
     _BRAND_SWITCH_SECONDS = 0.5
     _CALIBRATION_SECONDS = 5.0
     _SCREEN_ROTATION_SPEED = 45.0
@@ -23,8 +24,11 @@ class CoreControllerGuideInputMixin:
         if callable(dispatcher):
             dispatcher(action, **values)
 
-    def _guide_axis_active(self, value: float) -> bool:
-        return abs(float(value)) > self._GUIDE_DEADZONE
+    def _guide_axis_active(self, value: float, *, left: bool = False) -> bool:
+        deadzone = (
+            self._GUIDE_LEFT_DEADZONE if left else self._GUIDE_RIGHT_DEADZONE
+        )
+        return abs(float(value)) > deadzone
 
     def _handle_controller_guide_input(self, delta_seconds: float) -> None:
         """Resolve one frame without applying renderer-specific mutations."""
@@ -68,7 +72,11 @@ class CoreControllerGuideInputMixin:
         ry = float(right.get("joystick_y", 0.0) or 0.0)
 
         if calibration:
-            if any(self._guide_axis_active(value) for value in (ly, rx, ry)):
+            if (
+                self._guide_axis_active(ly, left=True)
+                or self._guide_axis_active(rx)
+                or self._guide_axis_active(ry)
+            ):
                 self._emit_guide_action(
                     "adjust_controller_calibration",
                     offset_y=ly * 0.15 * dt,
@@ -90,7 +98,10 @@ class CoreControllerGuideInputMixin:
             if keyboard and left_target == "keyboard":
                 # The legacy viewer used the left stick axes directly for
                 # keyboard orbit. Stick click remains a separate shortcut.
-                if self._guide_axis_active(lx) or self._guide_axis_active(ly):
+                if (
+                    self._guide_axis_active(lx, left=True)
+                    or self._guide_axis_active(ly, left=True)
+                ):
                     self._emit_guide_action(
                         "orbit_keyboard", horizontal=lx * dt, vertical=ly * dt
                     )
@@ -104,7 +115,10 @@ class CoreControllerGuideInputMixin:
                 # Preserve both legacy rotation mappings: left stick handles
                 # local fine rotation and right stick handles independent yaw
                 # and pitch rotation while the left grip is held.
-                if self._guide_axis_active(lx) or self._guide_axis_active(ly):
+                if (
+                    self._guide_axis_active(lx, left=True)
+                    or self._guide_axis_active(ly, left=True)
+                ):
                     self._emit_guide_action(
                         "rotate_screen",
                         yaw_delta=-lx * self._SCREEN_ROTATION_SPEED * dt,
@@ -120,14 +134,17 @@ class CoreControllerGuideInputMixin:
 
         if grip_r and not grip_l:
             if keyboard and right_target == "keyboard":
-                if self._guide_axis_active(lx) or self._guide_axis_active(ly):
+                if (
+                    self._guide_axis_active(lx, left=True)
+                    or self._guide_axis_active(ly, left=True)
+                ):
                     self._emit_guide_action(
                         "resize_keyboard",
                         width_delta=lx * self._SCREEN_SIZE_SPEED * dt,
                         distance_delta=ly * self._SCREEN_DISTANCE_SPEED * dt,
                     )
             else:
-                if self._guide_axis_active(ly):
+                if self._guide_axis_active(ly, left=True):
                     self._emit_guide_action(
                         "adjust_depth_strength",
                         delta=ly * self._DEPTH_STRENGTH_SPEED * dt,

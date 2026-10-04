@@ -1,6 +1,11 @@
 from types import SimpleNamespace
+import multiprocessing
+import os
 import queue
+import subprocess
+import sys
 import threading
+import time
 
 
 def _control(
@@ -22,6 +27,17 @@ def _control(
         step=step,
         enabled=enabled,
     )
+
+
+def _spawn_waiting_flet_descendant(start_gate, child_pipe) -> None:
+    if not start_gate.wait(timeout=10):
+        return
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    child_pipe.send(child.pid)
+    child.wait()
 
 
 def test_desktop_settings_icon_uses_transparent_70_percent_style():
@@ -154,14 +170,68 @@ def test_screen_curveness_and_rotation_use_separate_flet_rows():
     assert _screen_button_row_group("screen:rotate:+90") == "screen_rotation"
     assert _screen_button_row_group("screen:section:crop") == "screen_section"
     assert _screen_button_row_group("section:reset_defaults") is None
-    assert _button_row_group("depth:toggle_stereo") == "depth_modes"
-    assert _button_row_group("depth:toggle_cross_eyed") == "depth_modes"
+    assert _button_row_group("depth:toggle_stereo") == "depth_stereo"
+    assert _button_row_group("depth:toggle_cross_eyed") == "depth_stereo"
     assert _button_row_group("glow:surround") == "glow_modes"
     assert _button_row_group("glow:off") == "glow_modes"
     assert _button_row_group("room:model:Default") == "room_models"
     assert _button_row_group("room:seat:middle") == "room_seats"
-    assert _button_row_group("room:toggle_screen_reflection") == "room_reflection"
-    assert _button_row_group("section:reset_defaults") is None
+    assert _button_row_group("room:toggle_screen_reflection") == "room_scene"
+    assert _button_row_group("reset:color_adjustment") == "color_adjustment"
+    assert _button_row_group("reset:screen_placement") == "screen_placement"
+    assert _button_row_group("screen:reset_crop") == "screen_crop"
+    assert _button_row_group("section:reset_defaults") == "screen_placement"
+
+
+def test_flet_controls_use_one_compact_dimension_step():
+    from xr_viewer.desktop_settings_menu import (
+        _FLET_BUTTON_HEIGHT,
+        _FLET_PANEL_SIZE,
+        _FLET_SECONDARY_BUTTON_HEIGHT,
+        _FLET_SIDEBAR_WIDTH,
+        _FLET_SPACING,
+        _FLET_STEP_BUTTON_SIZE,
+        _compact_flet_dimension,
+    )
+
+    assert _FLET_PANEL_SIZE == (760, 650)
+    assert _FLET_SIDEBAR_WIDTH == 144
+    assert _FLET_SPACING == 8
+    assert _FLET_BUTTON_HEIGHT == 40
+    assert _FLET_SECONDARY_BUTTON_HEIGHT == 32
+    assert _FLET_STEP_BUTTON_SIZE == 40
+    assert _compact_flet_dimension(64) == 48
+    assert _compact_flet_dimension(48) == 40
+    assert _compact_flet_dimension(136) == 104
+    assert _compact_flet_dimension(216) == 160
+    assert _compact_flet_dimension(236) == 176
+
+
+def test_flet_step_button_symbols_use_centered_zero_padding_style():
+    import flet as ft
+
+    from xr_viewer.desktop_settings_menu import (
+        _make_step_button_label,
+        _make_step_button_style,
+    )
+
+    style = _make_step_button_style(ft)
+    minus = _make_step_button_label(ft, "step:minus:color_brightness")
+    plus = _make_step_button_label(ft, "step:plus:color_brightness")
+
+    assert style.alignment == ft.Alignment.CENTER
+    assert style.padding == ft.Padding.symmetric(horizontal=0, vertical=0)
+    assert minus.value == "-" and plus.value == "+"
+    assert minus.text_align == plus.text_align == ft.TextAlign.CENTER
+
+
+def test_flet_reset_actions_are_rendered_as_card_footer_controls():
+    from xr_viewer.desktop_settings_menu import _is_reset_control
+
+    assert _is_reset_control("reset:room_scene")
+    assert _is_reset_control("screen:reset_crop")
+    assert _is_reset_control("section:reset_defaults")
+    assert not _is_reset_control("room:exposure")
 
 
 def test_flet_formats_symmetric_crop_values_for_the_shared_snapshot():
@@ -352,6 +422,54 @@ def test_settings_stop_kills_flet_process_tree_after_timeout(monkeypatch):
     assert commands[0][1]["timeout"] == 2.0
     assert process.join_calls == [2.0, 1.0]
     assert not process.terminated
+
+
+def test_windows_settings_job_kills_worker_and_flet_descendants_on_owner_close():
+    import pytest
+    from gui.flet_runtime import _windows_process_snapshot
+    from xr_viewer.desktop_settings_menu import _WindowsKillOnCloseJob
+
+    if os.name != "nt":
+        pytest.skip("Windows Job Objects are only available on Windows")
+
+    context = multiprocessing.get_context("spawn")
+    start_gate = context.Event()
+    parent_pipe, child_pipe = context.Pipe(duplex=False)
+    worker = context.Process(
+        target=_spawn_waiting_flet_descendant,
+        args=(start_gate, child_pipe),
+        name="test-flet-job-worker",
+    )
+    job = _WindowsKillOnCloseJob()
+    descendant_pid = None
+    try:
+        worker.start()
+        assert job.assign(worker.pid), "worker could not be assigned to its cleanup job"
+        start_gate.set()
+        assert parent_pipe.poll(5.0), "worker did not start its Flet-like child"
+        descendant_pid = parent_pipe.recv()
+
+        # Closing the final job handle models the owning Desktop2Stereo process
+        # crashing before it can run the normal stop callback.
+        job._kernel32.CloseHandle(job._handle)
+        job._handle = None
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            running = {pid for pid, _, _ in _windows_process_snapshot()}
+            if descendant_pid not in running:
+                break
+            time.sleep(0.05)
+        assert descendant_pid not in {pid for pid, _, _ in _windows_process_snapshot()}
+    finally:
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=2.0)
+        job.close()
+        parent_pipe.close()
+        child_pipe.close()
 
 
 def test_physical_mouse_control_uses_the_existing_openxr_action_queue():

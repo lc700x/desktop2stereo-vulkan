@@ -2508,6 +2508,31 @@ def test_filament_controller_lifecycle_hides_each_idle_hand_independently() -> N
     ]
 
 
+def test_disabled_controller_input_hides_both_models_and_lasers() -> None:
+    class Bridge:
+        controller_visibility_abi_available = True
+        laser_abi_available = True
+
+        def __init__(self) -> None:
+            self.visible = []
+            self.lasers = []
+
+        def set_controller_visible(self, hand, visible) -> None:
+            self.visible.append((hand, visible))
+
+        def set_controller_laser(self, hand, matrix, *, visible) -> None:
+            self.lasers.append((hand, visible))
+
+    presenter = OpenXrVulkanPresenter()
+    presenter._controller_input_disabled = True
+    bridge = Bridge()
+
+    presenter._update_filament_controllers(bridge)
+
+    assert bridge.visible == [(0, False), (1, False)]
+    assert bridge.lasers == [(0, False), (1, False)]
+
+
 def test_controller_touch_actions_cover_thumbstick_trackpad_and_thumbrest() -> None:
     root = Path(__file__).resolve().parents[1]
     actions = (APP_ROOT / "xr_viewer/core_controller_actions.py").read_text(
@@ -2593,7 +2618,7 @@ def test_vulkan_presenter_exposes_legacy_overlay_shortcut_state() -> None:
     assert presenter._keyboard_visible is False
 
 
-def test_vulkan_b_long_press_cycles_hand_fps_and_operation_guide() -> None:
+def test_vulkan_b_long_press_toggles_hand_guide_and_menu_clears_it() -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._frame_now = 1.0
     presenter._controller_inputs = ({}, {"b_button": 1.0})
@@ -2602,53 +2627,51 @@ def test_vulkan_b_long_press_cycles_hand_fps_and_operation_guide() -> None:
     presenter._frame_now = 2.01
     presenter._handle_controller_shortcuts()
 
-    # First B hold: hand FPS only.
-    assert presenter._hand_fps_visible is True
-    assert presenter._hand_operation_guide_visible is False
-    assert presenter._operation_guide_visible is False
-    assert presenter._fps_overlay_visible is False
-    assert presenter._aperture_visible is False
-
-    presenter._dispatch_controller_shortcut("cycle_hand_panel")
-    assert presenter._hand_fps_visible is True
+    assert presenter._hand_fps_visible is False
     assert presenter._hand_operation_guide_visible is True
     assert presenter._operation_guide_visible is True
     assert presenter._fps_overlay_visible is False
+    assert presenter._aperture_visible is False
 
-    presenter._dispatch_controller_shortcut("cycle_hand_panel")
-    assert presenter._hand_fps_visible is False
+    presenter._dispatch_controller_shortcut("cycle_status_panel")
+    assert presenter._fps_overlay_visible is True
     assert presenter._hand_operation_guide_visible is False
+    assert presenter._screen_operation_guide_visible is False
+    assert presenter._operation_guide_visible is False
+
+    presenter._dispatch_controller_shortcut("toggle_operation_guide")
+    assert presenter._hand_operation_guide_visible is True
+    assert presenter._operation_guide_visible is True
+
+
+def test_menu_panel_cycle_is_hidden_fps_guide_then_hidden() -> None:
+    presenter = OpenXrVulkanPresenter()
+
+    presenter._dispatch_controller_shortcut("cycle_status_panel")
+    assert presenter._fps_overlay_visible is True
+    assert presenter._screen_operation_guide_visible is False
+
+    presenter._dispatch_controller_shortcut("cycle_status_panel")
+    assert presenter._fps_overlay_visible is True
+    assert presenter._screen_operation_guide_visible is True
+    assert presenter._operation_guide_visible is True
+
+    presenter._dispatch_controller_shortcut("cycle_status_panel")
+    assert presenter._fps_overlay_visible is False
+    assert presenter._screen_operation_guide_visible is False
     assert presenter._operation_guide_visible is False
 
 
-def test_menu_panel_cycle_keeps_fps_when_vertical_screen_guide_is_shown() -> None:
+def test_menu_panel_cycle_clears_hand_operation_guide() -> None:
     presenter = OpenXrVulkanPresenter()
 
+    presenter._dispatch_controller_shortcut("toggle_operation_guide")
+    assert presenter._operation_guide_visible is True
     presenter._dispatch_controller_shortcut("cycle_status_panel")
-    assert presenter._fps_overlay_visible is True
-    assert presenter._screen_operation_guide_visible is False
-
-    presenter._dispatch_controller_shortcut("cycle_status_panel")
-    assert presenter._fps_overlay_visible is True
-    assert presenter._screen_operation_guide_visible is True
-
-    presenter._dispatch_controller_shortcut("cycle_status_panel")
-    assert presenter._fps_overlay_visible is False
-    assert presenter._screen_operation_guide_visible is False
-
-
-def test_menu_and_b_panel_cycles_do_not_leave_the_other_guide_visible() -> None:
-    presenter = OpenXrVulkanPresenter()
-
-    presenter._dispatch_controller_shortcut("cycle_status_panel")
-    presenter._dispatch_controller_shortcut("cycle_status_panel")
-    assert presenter._screen_operation_guide_visible is True
-
-    presenter._dispatch_controller_shortcut("cycle_hand_panel")
-    assert presenter._hand_fps_visible is True
     assert presenter._hand_operation_guide_visible is False
     assert presenter._screen_operation_guide_visible is False
-    assert presenter._fps_overlay_visible is False
+    assert presenter._operation_guide_visible is False
+    assert presenter._fps_overlay_visible is True
 
 
 def test_screen_operation_guide_keeps_screen_height_and_scales_text() -> None:
@@ -2749,20 +2772,18 @@ def test_vulkan_shortcuts_cycle_screen_preset_and_background() -> None:
     assert presenter._filament_skybox_brightness == pytest.approx(1.0)
 
 
-def test_x_long_press_action_cycles_v25_glow_modes_not_room_lighting() -> None:
+def test_x_long_press_action_toggles_skybox_background_not_room_lighting() -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._filament_glow_mode = "off"
     presenter._filament_glow_intensity_multiplier = 0.0
 
-    observed = []
-    for _ in range(4):
-        presenter._dispatch_controller_shortcut("cycle_environment_light")
-        observed.append(presenter._filament_glow_mode)
-
-    assert observed == ["surround", "glow", "veil", "off"]
+    presenter._dispatch_controller_shortcut("toggle_environment_background")
+    assert presenter._filament_skybox_brightness == pytest.approx(0.0)
+    presenter._dispatch_controller_shortcut("toggle_environment_background")
+    assert presenter._filament_skybox_brightness == pytest.approx(1.0)
+    assert presenter._filament_glow_mode == "off"
     assert presenter._filament_glow_intensity_multiplier == pytest.approx(0.0)
     assert presenter._filament_glow_shell_intensity_multiplier == pytest.approx(0.0)
-    assert presenter._preset_name_overlay == "Off"
 
 
 def test_screen_adjustment_osd_is_submitted_as_quad_layer() -> None:
@@ -2871,6 +2892,13 @@ def test_fps_and_operation_guides_select_gpu_msdf_quad_requests() -> None:
         (0.0, 0.0, -0.5),
         (0.0, 0.0, 0.0, 1.0),
     )
+    screen_overlay_models = []
+
+    def capture_screen_overlay_pose(local_model):
+        screen_overlay_models.append(np.asarray(local_model).copy())
+        return (0.0, 0.0, -2.0), (0.0, 0.0, 0.0, 1.0)
+
+    presenter._screen_overlay_pose = capture_screen_overlay_pose
     presenter._cursor_overlay_specs = lambda *_args: []
     presenter._upload_tool_quad = lambda *args: args
 
@@ -2884,6 +2912,13 @@ def test_fps_and_operation_guides_select_gpu_msdf_quad_requests() -> None:
     assert set(by_name) == {"screen_fps", "screen_help", "hand_help"}
     assert all(isinstance(value, VulkanMsdfQuadRequest) for value in by_name.values())
     assert all(value.width > 0 and value.height > 0 for value in by_name.values())
+    fps_spec = next(spec for spec in specs if spec[0] == "screen_fps")
+    assert len(screen_overlay_models) == 1
+    assert screen_overlay_models[0][:3, 3] == pytest.approx((
+        -2.4 / 2.0 + fps_spec[3][0] / 2.0,
+        -1.35 / 2.0 - 1.35 * 0.02 - fps_spec[3][1] / 2.0,
+        0.0,
+    ))
 
 
 def test_msdf_osd_canvas_width_follows_text_advance() -> None:
@@ -7030,13 +7065,208 @@ def test_settings_menu_screen_rotation_and_reset_restore_profile_pose() -> None:
     assert presenter._filament_screen[3] == pytest.approx((10.0, 20.0, 120.0))
 
     presenter._apply_settings_menu_control(
-        MenuControl("section:reset_defaults", "", (0.0, 0.0, 0.0, 0.0)),
+        controls["reset:screen_placement"],
         (0.0, 0.0),
     )
     assert presenter._filament_screen == (
         initial[0], initial[1], initial[2], (10.0, 20.0, 120.0)
     )
     assert presenter._screen_curve_half_angle == pytest.approx(math.radians(20.0))
+
+
+def test_screen_menu_resets_are_safe_without_a_screen_resource() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._settings_menu.set_tab("screen")
+    controls = {item.key: item for item in presenter._settings_menu.controls()}
+
+    presenter._apply_settings_menu_control(controls["reset:screen_shape"], None)
+    presenter._apply_settings_menu_control(controls["reset:screen_placement"], None)
+
+    assert presenter._filament_screen is None
+
+
+def test_settings_menu_screen_shape_reset_restores_only_shape_defaults() -> None:
+    presenter = OpenXrVulkanPresenter()
+    initial = ((1.0, 2.0, -3.0), 4.0, 2.25, (10.0, 20.0, 30.0))
+    presenter._filament_screen_initial = initial
+    presenter._filament_screen = (
+        initial[0], initial[1], initial[2], (0.0, 0.0, 120.0)
+    )
+    presenter._settings_menu_reset_defaults.update({
+        "screen:rotation": initial[3],
+        "screen:curve_half_angle": math.radians(20.0),
+    })
+    presenter._screen_curve_half_angle = 0.72
+    presenter._screen_curved = True
+    presenter._settings_menu.set_tab("screen")
+    controls = {item.key: item for item in presenter._settings_menu.controls()}
+
+    presenter._apply_settings_menu_control(controls["reset:screen_shape"], None)
+
+    assert presenter._filament_screen == initial
+    assert presenter._screen_curve_half_angle == pytest.approx(math.radians(20.0))
+    assert presenter._screen_curved
+
+
+def test_settings_menu_depth_reset_persists_depth_without_changing_other_cards() -> None:
+    calls = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda action, **values: calls.append(
+            (action, values)
+        ) or True
+    )
+    presenter._settings_menu_values.update({
+        "depth_strength": 0.8,
+        "cross_eyed": True,
+        "color_brightness": 1.4,
+    })
+    presenter._settings_menu.set_tab("depth")
+    controls = {item.key: item for item in presenter._settings_menu.controls()}
+
+    presenter._apply_settings_menu_control(controls["reset:depth_stereo"], None)
+
+    assert presenter._settings_menu_values["depth_strength"] == 0.25
+    assert presenter._settings_menu_values["cross_eyed"] is False
+    assert presenter._settings_menu_values["color_brightness"] == 1.4
+    assert calls[-1] == (
+        "set_runtime_settings",
+        {"settings": {"depth_strength": 0.25, "cross_eyed": False}, "persist": True},
+    )
+
+
+def test_settings_menu_picture_quality_reset_preserves_resolution_and_color() -> None:
+    calls = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda action, **values: calls.append(
+            (action, values)
+        ) or True
+    )
+    presenter._settings_menu_values.update({
+        "openxr_render_scale": 1.65,
+        "openxr_render_auto": True,
+        "vulkan_projection_min_lod": 0.6,
+        "vulkan_projection_max_lod": 1.5,
+        "vulkan_projection_mip_lod_bias": 0.0,
+        "vulkan_projection_rcas_sharpness": 0.0,
+        "color_brightness": 1.4,
+    })
+    presenter._openxr_render_scale_auto = True
+    presenter._pending_openxr_render_scale = 1.65
+    presenter._settings_menu.set_tab("picture")
+    controls = {item.key: item for item in presenter._settings_menu.controls()}
+
+    presenter._apply_settings_menu_control(controls["reset:render_quality"], None)
+
+    assert presenter._settings_menu_values["openxr_render_scale"] == 1.65
+    assert presenter._settings_menu_values["openxr_render_auto"] is True
+    assert presenter._openxr_render_scale_auto is True
+    assert presenter._pending_openxr_render_scale == 1.65
+    assert presenter._settings_menu_values["color_brightness"] == 1.4
+    assert presenter._settings_menu_values["vulkan_projection_max_lod"] == 0.35
+    assert calls[-1][1]["settings"] == {
+        "vulkan_projection_min_lod": 0.0,
+        "vulkan_projection_max_lod": 0.35,
+        "vulkan_projection_mip_lod_bias": -0.35,
+        "vulkan_projection_rcas_sharpness": 0.5,
+    }
+
+
+def test_settings_menu_glow_and_room_scene_resets_use_active_environment_defaults() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._settings_menu_reset_defaults.update({
+        "glow:mode": "veil",
+        "glow:transparency": 0.35,
+        "room:exposure": -1.25,
+        "room:screen_reflection_enabled": False,
+    })
+    presenter._settings_menu_values.update({
+        "glow:mode": "glow",
+        "glow:transparency": 0.0,
+        "room:exposure": 3.0,
+        "room:screen_reflection_enabled": True,
+    })
+    presenter._filament_glow_mode = "glow"
+    presenter._filament_glow_environment_enabled = True
+    presenter._veil_alpha = 1.0
+    presenter._filament_scene_exposure = 3.0
+    presenter._environment_screen_light_enabled = True
+    presenter._settings_menu.set_tab("glow")
+
+    presenter._reset_settings_menu_card("reset:glow_modes")
+    presenter._reset_settings_menu_card("reset:glow_transparency")
+    presenter._reset_settings_menu_card("reset:room_scene")
+
+    assert presenter._filament_glow_mode == "veil"
+    assert presenter._settings_menu_values["glow:mode"] == "veil"
+    assert presenter._veil_alpha == pytest.approx(0.65)
+    assert presenter._filament_scene_exposure == -1.25
+    assert presenter._environment_screen_light_enabled is False
+    assert presenter._settings_menu_values["room:screen_reflection_enabled"] is False
+
+
+def test_room_seat_reset_is_safe_without_profile_poses() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._profile_head_transform = np.eye(4, dtype=np.float32)
+    presenter._profile_head_transform[1, 3] = 1.5
+    presenter._room_seat_height_offset = 0.75
+    presenter._settings_menu_reset_defaults["room:seat_index"] = 0
+
+    presenter._reset_settings_menu_card("reset:room_seats")
+
+    assert presenter._profile_head_transform[1, 3] == pytest.approx(0.75)
+    assert presenter._room_seat_height_offset == 0.0
+    assert presenter._settings_menu_values["room:seat_height"] == 0.0
+
+
+def test_room_seat_reset_clears_offset_without_profile_transform() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._profile_head_transform = None
+    presenter._room_seat_height_offset = 0.75
+
+    presenter._reset_settings_menu_card("reset:room_seats")
+
+    assert presenter._room_seat_height_offset == 0.0
+
+
+def test_environment_profile_switch_refreshes_menu_reset_defaults(monkeypatch) -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._reset_environment_profile_state()
+    presenter._filament_view_pose_index = 2
+    presenter._filament_scene_exposure = 0.75
+    presenter._environment_screen_light_enabled = True
+    presenter._screen_initial_curve_half_angle = 0.4
+    presenter._filament_screen_initial = (
+        (0.0, 0.0, -2.0), 2.0, 1.125, (1.0, 2.0, 3.0)
+    )
+    monkeypatch.setenv("D2S_OPENXR_GLOW_MODE", "glow")
+
+    presenter._capture_settings_menu_reset_defaults(
+        {"glow_mode": "off", "veil_alpha": 0.9},
+        {"glow_mode": "veil", "veil_alpha": 0.2},
+    )
+
+    first = dict(presenter._settings_menu_reset_defaults)
+    assert first["glow:mode"] == "glow"
+    assert first["glow:transparency"] == pytest.approx(0.8)
+    assert first["room:seat_index"] == 2
+    assert first["room:exposure"] == 0.75
+    assert first["screen:rotation"] == (1.0, 2.0, 3.0)
+
+    monkeypatch.delenv("D2S_OPENXR_GLOW_MODE")
+    presenter._reset_environment_profile_state()
+    presenter._filament_view_pose_index = 1
+    presenter._filament_scene_exposure = 0.0
+    presenter._environment_screen_light_enabled = False
+    presenter._screen_initial_curve_half_angle = 0.0
+    presenter._capture_settings_menu_reset_defaults(
+        {"glow_mode": "off"}, {}
+    )
+
+    assert presenter._settings_menu_reset_defaults["glow:mode"] == "off"
+    assert presenter._settings_menu_reset_defaults["room:seat_index"] == 1
+    assert presenter._settings_menu_reset_defaults["room:exposure"] == 0.0
+    assert presenter._settings_menu_reset_defaults["room:screen_reflection_enabled"] is False
+    assert "screen:rotation" not in presenter._settings_menu_reset_defaults
 
 
 def test_settings_menu_render_scale_step_schedules_one_rebuild() -> None:

@@ -9,12 +9,15 @@ transparent floating launcher requested for the OpenXR desktop view.
 from __future__ import annotations
 
 import asyncio
+import ctypes
+from ctypes import wintypes
 import math
 import multiprocessing
 import os
 import queue
 import subprocess
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from typing import Any
@@ -35,12 +38,210 @@ DESKTOP_SETTINGS_ICON_SIZE = (51, 57)
 DESKTOP_SETTINGS_ICON_IMAGE_SIZE = (42, 42)
 _FLET_PANEL_SIZE = (760, 650)
 _FLET_PANEL_POLL_SECONDS = 0.08
-_FLET_SIDEBAR_WIDTH = 176
+_FLET_SIDEBAR_WIDTH = 144
+_FLET_SPACING = 8
+_FLET_BUTTON_HEIGHT = 40
+_FLET_SECONDARY_BUTTON_HEIGHT = 32
+_FLET_STEP_BUTTON_SIZE = 40
 _FLET_FONT_ASSETS_DIR = Path(__file__).resolve().parent / "fonts"
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _JobObjectIoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _JobObjectIoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class _JobObjectBasicAccountingInformation(ctypes.Structure):
+    _fields_ = [
+        ("TotalUserTime", ctypes.c_longlong),
+        ("TotalKernelTime", ctypes.c_longlong),
+        ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+        ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+        ("TotalPageFaultCount", wintypes.DWORD),
+        ("TotalProcesses", wintypes.DWORD),
+        ("ActiveProcesses", wintypes.DWORD),
+        ("TotalTerminatedProcesses", wintypes.DWORD),
+    ]
+
+
+class _WindowsKillOnCloseJob:
+    """Own the Flet worker and all of its descendants as one Windows job."""
+
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    _PROCESS_SET_QUOTA = 0x0100
+    _PROCESS_TERMINATE = 0x0001
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise OSError("Windows process jobs are only available on Windows")
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        self._kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        self._kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            wintypes.INT,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        self._kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        self._kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self._kernel32.OpenProcess.restype = wintypes.HANDLE
+        self._kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        self._kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        self._kernel32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            wintypes.INT,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        self._kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+        self._kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        self._kernel32.TerminateJobObject.restype = wintypes.BOOL
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel32.CloseHandle.restype = wintypes.BOOL
+
+        self._handle = self._kernel32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = _JobObjectExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self._kernel32.SetInformationJobObject(
+            self._handle,
+            self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+            raise error
+
+    def assign(self, process_id: int) -> bool:
+        process_handle = self._kernel32.OpenProcess(
+            self._PROCESS_SET_QUOTA | self._PROCESS_TERMINATE,
+            False,
+            int(process_id),
+        )
+        if not process_handle:
+            return False
+        try:
+            return bool(
+                self._kernel32.AssignProcessToJobObject(
+                    self._handle,
+                    process_handle,
+                )
+            )
+        finally:
+            self._kernel32.CloseHandle(process_handle)
+
+    def _active_process_count(self) -> int | None:
+        info = _JobObjectBasicAccountingInformation()
+        if not self._kernel32.QueryInformationJobObject(
+            self._handle,
+            self._JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            None,
+        ):
+            return None
+        return int(info.ActiveProcesses)
+
+    def close(self) -> None:
+        handle = self._handle
+        if not handle:
+            return
+        try:
+            active = self._active_process_count()
+            if active:
+                self._kernel32.TerminateJobObject(handle, 1)
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    active = self._active_process_count()
+                    if active is None or active == 0:
+                        break
+                    time.sleep(0.05)
+        finally:
+            self._kernel32.CloseHandle(handle)
+            self._handle = None
 
 
 def _menu_color(token: str) -> str:
     return OPENXR_MENU_COLORS[token]
+
+
+def _compact_flet_dimension(value: int) -> int:
+    """Fit desktop menu controls into the next compact Flet size step."""
+    scaled = float(value) * 0.75
+    return max(32, int(math.floor(scaled / 8.0 + 0.5) * 8))
+
+
+def _is_reset_control(key: str) -> bool:
+    return (
+        key.startswith("reset:")
+        or key in {"screen:reset_crop", "section:reset_defaults"}
+    )
+
+
+def _make_step_button_style(ft: Any) -> Any:
+    state = ft.ControlState
+    return ft.ButtonStyle(
+        bgcolor={
+            state.DEFAULT: _menu_color("surface_container_high"),
+            state.HOVERED: _menu_color("primary_hover"),
+            state.PRESSED: _menu_color("primary"),
+            state.DISABLED: _menu_color("surface_container"),
+        },
+        color={
+            state.DEFAULT: _menu_color("text_primary"),
+            state.HOVERED: _menu_color("primary_state_text"),
+            state.PRESSED: _menu_color("primary_state_text"),
+            state.DISABLED: _menu_color("text_disabled"),
+        },
+        padding=ft.Padding.symmetric(horizontal=0, vertical=0),
+        elevation=0,
+        text_style=ft.TextStyle(size=16, weight=ft.FontWeight.W_600),
+        shape=ft.RoundedRectangleBorder(radius=20),
+        alignment=ft.Alignment.CENTER,
+    )
+
+
+def _make_step_button_label(ft: Any, key: str) -> Any:
+    symbol = "-" if ":minus:" in key else "+"
+    return ft.Text(symbol, size=16, text_align=ft.TextAlign.CENTER)
 
 
 def _quit_flet_when_parent_exits(parent_process: Any, commands: Any) -> None:
@@ -260,11 +461,17 @@ def _screen_button_row_group(key: str) -> str | None:
 
 def _button_row_group(key: str) -> str | None:
     """Return the compact Flet row group matching the headset menu layout."""
+    if key.startswith("reset:"):
+        return key.split(":", 1)[1]
+    if key == "section:reset_defaults":
+        return "screen_placement"
+    if key == "screen:reset_crop":
+        return "screen_crop"
     screen_group = _screen_button_row_group(key)
     if screen_group is not None:
         return screen_group
     if key in {"depth:toggle_stereo", "depth:toggle_cross_eyed"}:
-        return "depth_modes"
+        return "depth_stereo"
     if key in {"glow:surround", "glow:glow", "glow:veil", "glow:off"}:
         return "glow_modes"
     if key.startswith("room:model:"):
@@ -272,7 +479,7 @@ def _button_row_group(key: str) -> str | None:
     if key.startswith("room:seat:"):
         return "room_seats"
     if key == "room:toggle_screen_reflection":
-        return "room_reflection"
+        return "room_scene"
     return None
 
 
@@ -281,8 +488,16 @@ def _run_flet_desktop_settings_app(
     actions: Any,
     commands: Any,
     input_monitor_rect: tuple[int, int, int, int] | None,
+    start_gate: Any | None = None,
 ) -> None:
     """Run Flet in its own process because Flet owns the main-thread signals."""
+    if start_gate is not None and not start_gate.wait(timeout=5.0):
+        print(
+            "[DesktopSettings] Flet process ownership was not established; "
+            "the settings window will not start.",
+            flush=True,
+        )
+        return
     _watch_flet_parent(commands)
     try:
         from gui.flet_runtime import ensure_vendored_flet_view
@@ -338,14 +553,14 @@ def _run_flet_desktop_settings_app(
             ],
             expand=True,
             scroll=ft.ScrollMode.AUTO,
-            spacing=16,
+            spacing=_FLET_SPACING,
         )
         body = ft.Container(
             content=body_content,
             expand=True,
-            padding=ft.Padding.only(top=16),
+            padding=ft.Padding.only(top=8),
         )
-        sidebar = ft.Column(expand=True, spacing=16)
+        sidebar = ft.Column(expand=True, spacing=_FLET_SPACING)
         section_toolbar = ft.Container(height=0)
         main_column = ft.Column(
             controls=[section_toolbar, body],
@@ -355,7 +570,7 @@ def _run_flet_desktop_settings_app(
         main_area = ft.Container(
             content=main_column,
             expand=True,
-            padding=ft.Padding.only(right=16, top=16, bottom=16),
+            padding=ft.Padding.only(right=8, top=8, bottom=8),
         )
         layout = ft.Row(
             controls=[
@@ -364,12 +579,12 @@ def _run_flet_desktop_settings_app(
                     expand=False,
                     bgcolor=_menu_color("surface_container"),
                     border_radius=OPENXR_MENU_RADII["group"],
-                    padding=16,
+                    padding=8,
                     content=sidebar,
                 ),
                 main_area,
             ],
-            spacing=16,
+            spacing=_FLET_SPACING,
             expand=True,
             vertical_alignment=ft.CrossAxisAlignment.STRETCH,
         )
@@ -377,7 +592,7 @@ def _run_flet_desktop_settings_app(
             ft.Container(
                 expand=True,
                 bgcolor=_menu_color("surface"),
-                padding=16,
+                padding=8,
                 content=layout,
             )
         )
@@ -459,18 +674,19 @@ def _run_flet_desktop_settings_app(
                     else _menu_color("primary_hover")
                 )
                 button_height = (
-                    48 if key.startswith(("screen:section:", "screen:rotate:"))
-                    else 64
+                    _FLET_SECONDARY_BUTTON_HEIGHT if _is_reset_control(key) or key.startswith(
+                        ("screen:section:", "screen:rotate:")
+                    ) else _FLET_BUTTON_HEIGHT
                 )
                 button_width = (
                     width if width is not None
-                    else _FLET_SIDEBAR_WIDTH - 32 if destructive
+                    else _FLET_SIDEBAR_WIDTH - 24 if destructive
                     else None
                 )
                 return ft.ElevatedButton(
                     content=ft.Text(
                         translate(str(control.label)),
-                        size=18,
+                        size=14,
                         weight=ft.FontWeight.W_600,
                         text_align=ft.TextAlign.CENTER,
                     ),
@@ -505,9 +721,12 @@ def _run_flet_desktop_settings_app(
                             ),
                             state.DISABLED: _menu_color("text_disabled"),
                         },
-                        padding=ft.Padding.symmetric(horizontal=8, vertical=8),
+                        padding=ft.Padding.symmetric(horizontal=6, vertical=4),
                         elevation=0,
-                        text_style=ft.TextStyle(size=18, weight=ft.FontWeight.W_600),
+                        text_style=ft.TextStyle(
+                            size=14,
+                            weight=ft.FontWeight.W_600,
+                        ),
                         shape=ft.RoundedRectangleBorder(
                             radius=OPENXR_MENU_RADII["control"],
                         ),
@@ -517,28 +736,12 @@ def _run_flet_desktop_settings_app(
 
             def make_step_button(control: Any) -> Any:
                 return ft.ElevatedButton(
-                    content="-" if ":minus:" in str(control.key) else "+",
+                    content=_make_step_button_label(ft, str(control.key)),
                     on_click=queue_button(str(control.key)),
                     disabled=not bool(control.enabled),
-                    width=64,
-                    height=64,
-                    style=ft.ButtonStyle(
-                        bgcolor={
-                            ft.ControlState.DEFAULT: _menu_color("surface_container_high"),
-                            ft.ControlState.HOVERED: _menu_color("primary_hover"),
-                            ft.ControlState.PRESSED: _menu_color("primary"),
-                            ft.ControlState.DISABLED: _menu_color("surface_container"),
-                        },
-                        color={
-                            ft.ControlState.DEFAULT: _menu_color("text_primary"),
-                            ft.ControlState.HOVERED: _menu_color("primary_state_text"),
-                            ft.ControlState.PRESSED: _menu_color("primary_state_text"),
-                            ft.ControlState.DISABLED: _menu_color("text_disabled"),
-                        },
-                        elevation=0,
-                        text_style=ft.TextStyle(size=24, weight=ft.FontWeight.W_600),
-                        shape=ft.RoundedRectangleBorder(radius=24),
-                    ),
+                    width=_FLET_STEP_BUTTON_SIZE,
+                    height=_FLET_STEP_BUTTON_SIZE,
+                    style=_make_step_button_style(ft),
                 )
 
             def nav_button(control: Any) -> Any:
@@ -557,7 +760,7 @@ def _run_flet_desktop_settings_app(
                         controls=[
                             ft.Icon(
                                 nav_icons.get(key, ft.Icons.SETTINGS),
-                                size=20,
+                                size=16,
                                 color=(
                                     _menu_color("selection_text")
                                     if active else _menu_color("text_secondary")
@@ -565,20 +768,20 @@ def _run_flet_desktop_settings_app(
                             ),
                             ft.Text(
                                 translate(str(control.label)),
-                                size=18,
+                                size=14,
                                 weight=ft.FontWeight.W_600,
                                 text_align=ft.TextAlign.LEFT,
                                 expand=True,
                             ),
                         ],
-                        spacing=12,
+                        spacing=6,
                         expand=True,
                         alignment=ft.MainAxisAlignment.START,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     on_click=queue_button(key),
-                    width=_FLET_SIDEBAR_WIDTH - 32,
-                    height=64,
+                    width=_FLET_SIDEBAR_WIDTH - 24,
+                    height=_FLET_BUTTON_HEIGHT,
                     style=ft.ButtonStyle(
                         bgcolor={
                             state.DEFAULT: (
@@ -600,9 +803,9 @@ def _run_flet_desktop_settings_app(
                             state.PRESSED: _menu_color("primary_state_text"),
                             state.DISABLED: _menu_color("text_disabled"),
                         },
-                        padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+                        padding=ft.Padding.symmetric(horizontal=8, vertical=4),
                         elevation=0,
-                        text_style=ft.TextStyle(size=18, weight=ft.FontWeight.W_600),
+                        text_style=ft.TextStyle(size=14, weight=ft.FontWeight.W_600),
                         shape=ft.RoundedRectangleBorder(
                             radius=OPENXR_MENU_RADII["control"],
                         ),
@@ -619,7 +822,7 @@ def _run_flet_desktop_settings_app(
             for item in controls:
                 key = str(item.key)
                 if key.startswith(("tab:", "step:")) or key in {
-                    "runtime:stop", "section:reset_defaults",
+                    "runtime:stop",
                 } or key.startswith("screen:section:"):
                     continue
                 group_key = str(getattr(item, "group", "") or "settings")
@@ -636,8 +839,8 @@ def _run_flet_desktop_settings_app(
                 )
                 value_label = ft.Text(
                     _format_value(current, float(control.step), key),
-                    width=80,
-                    size=16,
+                    width=56,
+                    size=12,
                     text_align=ft.TextAlign.RIGHT,
                     color=_menu_color("text_secondary"),
                 )
@@ -659,11 +862,11 @@ def _run_flet_desktop_settings_app(
                 minus_control, plus_control = step_controls_for(key)
                 minus_button = (
                     make_step_button(minus_control)
-                    if minus_control is not None else ft.Container(width=64)
+                    if minus_control is not None else ft.Container(width=_FLET_STEP_BUTTON_SIZE)
                 )
                 plus_button = (
                     make_step_button(plus_control)
-                    if plus_control is not None else ft.Container(width=64)
+                    if plus_control is not None else ft.Container(width=_FLET_STEP_BUTTON_SIZE)
                 )
                 step_widgets[key] = (minus_button, plus_button)
                 slider_widgets[key] = (
@@ -675,14 +878,14 @@ def _run_flet_desktop_settings_app(
                             controls=[
                                 ft.Text(
                                     translate(str(control.label)),
-                                    size=18,
+                                    size=16,
                                     color=_menu_color("text_primary"),
                                     text_align=ft.TextAlign.LEFT,
                                     expand=True,
                                 ),
                                 value_label,
                             ],
-                            spacing=8,
+                            spacing=4,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
                         ft.Row(
@@ -691,15 +894,23 @@ def _run_flet_desktop_settings_app(
                                 slider,
                                 plus_button,
                             ],
-                            spacing=8,
+                            spacing=4,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
                     ],
-                    spacing=8,
+                    spacing=4,
                 )
 
             content: list[Any] = []
-            for group_key, items in slider_key_groups.items():
+            for group_key, group_items in slider_key_groups.items():
+                reset_items = [
+                    item for item in group_items
+                    if _is_reset_control(str(item.key))
+                ]
+                items = [
+                    item for item in group_items
+                    if not _is_reset_control(str(item.key))
+                ]
                 children: list[Any] = []
                 pending_buttons: list[Any] = []
 
@@ -712,17 +923,17 @@ def _run_flet_desktop_settings_app(
                         content_row = ft.Row(
                             controls=buttons,
                             alignment=ft.MainAxisAlignment.CENTER,
-                            spacing=16,
+                            spacing=_FLET_SPACING,
                             wrap=True,
-                            run_spacing=16,
+                            run_spacing=_FLET_SPACING,
                         )
                     else:
                         content_row = ft.Row(
                             controls=buttons,
                             alignment=ft.MainAxisAlignment.CENTER,
-                            spacing=16,
+                            spacing=_FLET_SPACING,
                             wrap=True,
-                            run_spacing=16,
+                            run_spacing=_FLET_SPACING,
                         )
                     children.append(content_row)
 
@@ -733,16 +944,21 @@ def _run_flet_desktop_settings_app(
                 if shape_controls is not None:
                     for shape_row in shape_controls:
                         row_buttons = [
-                            make_button(item, width=160 if str(item.key).startswith("screen:rotate:") else 96)
+                            make_button(
+                                item,
+                                width=_compact_flet_dimension(
+                                    160 if str(item.key).startswith("screen:rotate:") else 96
+                                ),
+                            )
                             for item in shape_row
                         ]
                         children.append(
                             ft.Row(
                                 controls=row_buttons,
                                 alignment=ft.MainAxisAlignment.CENTER,
-                                spacing=16,
+                                spacing=_FLET_SPACING,
                                 wrap=True,
-                                run_spacing=16,
+                                run_spacing=_FLET_SPACING,
                             )
                         )
                 else:
@@ -768,7 +984,7 @@ def _run_flet_desktop_settings_app(
                                 label=translate(str(item.label)),
                                 label_position=ft.LabelPosition.LEFT,
                                 label_text_style=ft.TextStyle(
-                                    size=18,
+                                    size=14,
                                     color=_menu_color("text_primary"),
                                 ),
                                 value=_toggle_value_for(str(item.key), values),
@@ -793,17 +1009,29 @@ def _run_flet_desktop_settings_app(
                             width = None
                             key = str(item.key)
                             if group_key == "room_models":
-                                width = 136
+                                width = _compact_flet_dimension(136)
                             elif group_key == "room_seats":
-                                width = 136
+                                width = _compact_flet_dimension(136)
                             elif group_key == "screen_crop":
-                                width = 136
-                            elif group_key == "glow_modes":
-                                width = 216
-                            elif group_key == "depth_modes":
-                                width = 216
+                                width = _compact_flet_dimension(136)
+                            elif group_key in {"glow_modes", "depth_stereo"}:
+                                width = _compact_flet_dimension(216)
                             pending_buttons.append(make_button(item, width=width))
                     flush_buttons()
+
+                if reset_items:
+                    children.append(
+                        ft.Row(
+                            controls=[
+                                make_button(
+                                    item,
+                                    width=_compact_flet_dimension(160),
+                                )
+                                for item in reset_items
+                            ],
+                            alignment=ft.MainAxisAlignment.END,
+                        )
+                    )
 
                 group_title = translate(
                     group_titles.get(group_key)
@@ -812,12 +1040,12 @@ def _run_flet_desktop_settings_app(
                 group_card = ft.Container(
                     content=ft.Column(
                         controls=children,
-                        spacing=16,
+                        spacing=_FLET_SPACING,
                         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                     ),
                     bgcolor=_menu_color("surface_container"),
                     border_radius=OPENXR_MENU_RADII["group"],
-                    padding=16,
+                    padding=8,
                 )
                 group_content: Any = group_card
                 if group_title:
@@ -826,10 +1054,10 @@ def _run_flet_desktop_settings_app(
                             ft.Container(
                                 height=_MENU_TITLE_HEIGHT,
                                 alignment=ft.Alignment.CENTER_LEFT,
-                                padding=ft.Padding.only(left=16, right=16),
+                                padding=ft.Padding.only(left=8, right=8),
                                 content=ft.Text(
                                     group_title,
-                                    size=20,
+                                    size=16,
                                     weight=ft.FontWeight.W_600,
                                     color=_menu_color("text_secondary"),
                                     text_align=ft.TextAlign.LEFT,
@@ -837,7 +1065,7 @@ def _run_flet_desktop_settings_app(
                             ),
                             group_card,
                         ],
-                        spacing=_MENU_TITLE_CARD_GAP,
+                        spacing=_FLET_SPACING,
                         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                     )
                 content.append(group_content)
@@ -845,12 +1073,14 @@ def _run_flet_desktop_settings_app(
             if section_controls:
                 toolbar_controls = [
                     ft.Container(
-                        content=make_button(item, width=236),
+                        content=make_button(
+                            item, width=_compact_flet_dimension(236)
+                        ),
                         expand=True,
                     )
                     for item in section_controls
                 ]
-                section_toolbar.height = 88
+                section_toolbar.height = 72
                 section_toolbar.content = ft.Column(
                     controls=[
                         ft.Container(
@@ -858,7 +1088,7 @@ def _run_flet_desktop_settings_app(
                             alignment=ft.Alignment.CENTER_LEFT,
                             content=ft.Text(
                                 translate(group_titles.get("screen_page_heading") or "Screen geometry"),
-                                size=18,
+                                size=14,
                                 weight=ft.FontWeight.W_600,
                                 color=_menu_color("text_primary"),
                                 text_align=ft.TextAlign.LEFT,
@@ -866,12 +1096,12 @@ def _run_flet_desktop_settings_app(
                         ),
                         ft.Row(
                             controls=toolbar_controls,
-                            spacing=16,
+                            spacing=_FLET_SPACING,
                             expand=True,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
                     ],
-                    spacing=16,
+                    spacing=_FLET_SPACING,
                     expand=True,
                 )
             else:
@@ -881,7 +1111,7 @@ def _run_flet_desktop_settings_app(
             sidebar.controls = [
                 *(nav_button(control) for control in nav_controls),
                 ft.Container(expand=True),
-                make_button(stop_control) if stop_control is not None else ft.Container(height=64),
+                make_button(stop_control) if stop_control is not None else ft.Container(height=_FLET_BUTTON_HEIGHT),
             ]
             body_content.controls = content
             layout_signature = _snapshot_layout_signature(snapshot)
@@ -1005,6 +1235,7 @@ class DesktopOpenXrSettingsWindow:
         self._input_monitor_rect = monitor_rect
         self._icon_geometry: tuple[int, int, int, int] | None = None
         self._flet_process: multiprocessing.Process | None = None
+        self._flet_job: _WindowsKillOnCloseJob | None = None
         self._icon_thread: threading.Thread | None = None
         self._icon_stopped = threading.Event()
 
@@ -1016,18 +1247,63 @@ class DesktopOpenXrSettingsWindow:
         if not desktop_settings_menu_enabled() or self._started.is_set():
             return
         self._started.set()
-        self._flet_process = multiprocessing.get_context("spawn").Process(
+        context = multiprocessing.get_context("spawn")
+        flet_job: _WindowsKillOnCloseJob | None = None
+        start_gate = None
+        if os.name == "nt":
+            try:
+                flet_job = _WindowsKillOnCloseJob()
+                start_gate = context.Event()
+            except Exception as exc:
+                self._started.clear()
+                print(
+                    "[DesktopSettings] Could not establish Flet process ownership; "
+                    f"settings window not started ({type(exc).__name__}: {exc}).",
+                    flush=True,
+                )
+                return
+
+        self._flet_process = context.Process(
             target=_run_flet_desktop_settings_app,
             args=(
                 self._snapshots,
                 self._actions,
                 self._flet_commands,
                 self._input_monitor_rect,
+                start_gate,
             ),
             name="desktop2stereo-openxr-settings",
             daemon=True,
         )
-        self._flet_process.start()
+        try:
+            self._flet_process.start()
+        except Exception as exc:
+            _stop_flet_process(self._flet_process)
+            if flet_job is not None:
+                flet_job.close()
+            self._flet_process = None
+            self._started.clear()
+            print(
+                "[DesktopSettings] Could not start Flet settings process; "
+                f"settings window not started ({type(exc).__name__}: {exc}).",
+                flush=True,
+            )
+            return
+
+        if flet_job is not None:
+            if not flet_job.assign(self._flet_process.pid):
+                _stop_flet_process(self._flet_process)
+                flet_job.close()
+                self._flet_process = None
+                self._started.clear()
+                print(
+                    "[DesktopSettings] Could not assign the Flet process to its "
+                    "cleanup job; settings window not started.",
+                    flush=True,
+                )
+                return
+            self._flet_job = flet_job
+            start_gate.set()
         self._icon_thread = threading.Thread(
             target=self._run_icon,
             name="desktop-settings-menu-icon",
@@ -1047,7 +1323,12 @@ class DesktopOpenXrSettingsWindow:
             self._flet_commands.put_nowait("__quit__")
         except Exception:
             pass
-        _stop_flet_process(self._flet_process)
+        try:
+            _stop_flet_process(self._flet_process)
+        finally:
+            if self._flet_job is not None:
+                self._flet_job.close()
+                self._flet_job = None
         icon_thread = self._icon_thread
         if (
             icon_thread is not None
