@@ -6,6 +6,7 @@ import re
 import struct
 import subprocess
 import threading
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
@@ -587,3 +588,56 @@ def test_controller_and_unlit_laser_ignore_room_exposure() -> None:
 def test_native_screen_has_opt_in_multiview_eye_diagnostic() -> None:
     root = Path(__file__).resolve().parents[1]
     assert not (root / "native/filament/bridge/bridge_screen.cpp").exists()
+
+
+@pytest.mark.parametrize("format_name", ("VK_FORMAT_R8G8B8A8_SRGB", "VK_FORMAT_R8G8B8A8_UNORM"))
+def test_empty_eye_background_remains_exact_black_on_gpu(format_name: str) -> None:
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("vulkan")
+    from viewer.vulkan_context import (
+        ImageState, VulkanCapabilityError, VulkanContext, VulkanUnavailableError,
+    )
+    from viewer.vulkan_resources import VulkanHostReadbackBuffer, VulkanTransientImage
+
+    if not default_bridge_path().is_file():
+        pytest.skip("The platform Filament bridge is not installed")
+    try:
+        context = VulkanContext.create()
+    except (VulkanCapabilityError, VulkanUnavailableError) as exc:
+        pytest.skip(f"A compatible Vulkan GPU is unavailable: {exc}")
+
+    with context, ExitStack() as stack:
+        vk = context.vk
+        images = []
+        for eye in range(2):
+            image = VulkanTransientImage(context, 64, 64, format=getattr(vk, format_name), label=f"black-eye-{eye}")
+            stack.callback(image.close)
+            images.append(image)
+        host = VulkanHostReadbackBuffer(context, 64, 64, label="black-eye-readback")
+        stack.callback(host.close)
+        bridge = FilamentVulkanBridge()
+        stack.callback(bridge.close)
+        bridge.create(
+            instance=context.instance, physical_device=context.physical_device,
+            device=context.device, queue_family_index=context.queue_family_index,
+        )
+        for eye, image in enumerate(images):
+            bridge.create_eye_swapchain(eye, [image.image], format=image.format, width=64, height=64)
+        for _frame in range(4):
+            for eye, image in enumerate(images):
+                bridge.set_active_eye(eye)
+                bridge.set_camera_projection(90, 1)
+                bridge.set_acquired_image(0)
+                bridge.begin_frame()
+                bridge.end_frame()
+                context.register_image_state(image.image, ImageState(
+                    layout=vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    access_mask=vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    stage_mask=vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    queue_family_index=context.queue_family_index,
+                ))
+                timeline = context.copy_image_to_host_buffer(image.resource, host)
+                context.wait_for_timeline(timeline)
+                rgba = host.read_rgba()
+                assert not np.any(rgba[:, :, :3]), "Empty OpenXR eye background must stay exactly black"
+                assert np.all(rgba[:, :, 3] == 255), "Opaque background alpha must be preserved"

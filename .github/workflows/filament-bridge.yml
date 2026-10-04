@@ -167,6 +167,7 @@ jobs:
 
   commit-native-binaries:
     name: Commit native bridge binaries
+    if: github.ref == 'refs/heads/main'
     needs:
       - build-windows
       - build

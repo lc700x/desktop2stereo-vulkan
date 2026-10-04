@@ -96,6 +96,13 @@ FilamentBridge* bridge_context_create(
             bridge_set_error(bridge.get(), "Filament Vulkan eye resource creation failed");
             return bridge.release();
         }
+        // Output stays linear until the sRGB target store. Filament's 8-bit
+        // dithering assumes an already encoded output; here it lifts black
+        // pixels and adds noise even to untouched transparent overlays.
+        eye.view->setDithering(filament::View::Dithering::NONE);
+        eye.foreground_view->setDithering(filament::View::Dithering::NONE);
+        eye.controller_view->setDithering(filament::View::Dithering::NONE);
+        eye.controller_guide_view->setDithering(filament::View::Dithering::NONE);
         // Renderer::ClearOptions defaults to clear=false. OpenXR supplies an
         // external image ring whose previous color content is undefined for
         // the next frame, so every eye renderer must clear it explicitly.
