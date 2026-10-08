@@ -30,8 +30,11 @@ from .settings_snapshot import (
     SnapshotChangeClass,
 )
 from .compute_backend import probe_opengl_stereo_backend, resolve_stereo_compute_backend
-from .output import ensure_bchw, make_sbs, match_depth
-from .output_quality import apply_output_quality, output_quality_requires_eye_images
+from .output import ensure_bchw, make_sbs, match_depth, output_edge_aa_enabled
+from .output_quality import (
+    apply_output_quality,
+    output_quality_requires_eye_images,
+)
 from .synthesis import StereoConfig, StereoResult, synthesize_stereo
 from .temporal import TemporalState, apply_temporal
 from .triton_runtime import probe_triton_runtime
@@ -342,13 +345,20 @@ def openxr_result_from_stereo_result(
     cuda_events = dict(getattr(stereo_result, "cuda_timing_events", None) or {})
     display_size = _runtime_frame_size(left_eye)
     stereo_output_format = getattr(stereo_result, "output_format", None) or debug.get("runtime_output_format")
+    eyes_filtered_from_sbs = False
     if stereo_output_format == "half_sbs" and _should_split_half_sbs_for_openxr(debug):
         split_eyes = _split_half_sbs_frame(stereo_result.sbs)
         if split_eyes is not None:
             left_eye, right_eye = split_eyes
+            eyes_filtered_from_sbs = True
             display_size = _runtime_frame_size(stereo_result.sbs)
             debug.setdefault("runtime_output_pack_backend", "split_half_sbs")
 
+    if output_edge_aa_enabled() and not eyes_filtered_from_sbs:
+        from .display_antialias import antialias_eye
+
+        left_eye, right_eye = antialias_eye(left_eye), antialias_eye(right_eye)
+        debug["edge_aa_backend"] = "output_fxaa"
     pack_start = time.perf_counter()
     _record_cuda_event(cuda_events, "openxr_pack_start", left_eye if isinstance(left_eye, torch.Tensor) else None)
     if _openxr_runtime_output_uint8_enabled():
@@ -508,7 +518,13 @@ def _try_openxr_no_fill_fused_rgba_u8(
     _record_cuda_event(cuda_events, "synth_start", rgb)
     depth_shift_start = time.perf_counter()
     processed_depth = postprocess_depth(
-        match_depth(depth, rgb.shape[-2], rgb.shape[-1]),
+        match_depth(
+            depth,
+            rgb.shape[-2],
+            rgb.shape[-1],
+            rgb=rgb,
+            edge_aware=True,
+        ),
         depth_pop=float(getattr(config, "depth_pop", 0.0)),
         antialias_strength=float(getattr(config, "depth_antialias_strength", 0.0)),
     )
@@ -527,18 +543,24 @@ def _try_openxr_no_fill_fused_rgba_u8(
     _record_cuda_event(cuda_events, "synth_depth_shift", rgb)
     depth_shift_ms = (time.perf_counter() - depth_shift_start) * 1000.0
 
-    if not can_use_triton_warp_composite2(
-        rgb,
-        processed_depth,
-        base_shift,
-        layers=2,
-        symmetric=True,
-    ):
-        return None, "unsupported_tensor"
-
     warp_start = time.perf_counter()
     _record_cuda_event(cuda_events, "openxr_pack_start", rgb)
-    left, right = warp_composite2_rgba_u8(rgb, processed_depth, base_shift)
+    try:
+        if not can_use_triton_warp_composite2(
+            rgb,
+            processed_depth,
+            base_shift,
+            layers=2,
+            symmetric=True,
+        ):
+            return None, "unsupported_tensor"
+        left, right = warp_composite2_rgba_u8(rgb, processed_depth, base_shift)
+    except Exception as exc:
+        return None, f"triton_output_failed:{type(exc).__name__}"
+    if output_edge_aa_enabled():
+        from .display_antialias import antialias_eye
+
+        left, right = antialias_eye(left), antialias_eye(right)
     _record_cuda_event(cuda_events, "synth_warp", left)
     _record_cuda_event(cuda_events, "synth_occlusion", left)
     _record_cuda_event(cuda_events, "synth_hole_fill", left)
@@ -1044,6 +1066,8 @@ class StereoRuntime:
         self.depth_provider = depth_provider if depth_provider is not None else create_depth_provider(self.depth_config)
         self.temporal_state = temporal_state if temporal_state is not None else TemporalState()
         self._openxr_depth_temporal: torch.Tensor | None = None
+        self._fused_depth_prev: torch.Tensor | None = None
+        self._fused_rgb_prev: torch.Tensor | None = None
         self._openxr_rgb_depth_dumped = False
         self._loaded = False
         self._active = True
@@ -1095,13 +1119,21 @@ class StereoRuntime:
             "leia",
         }:
             return False
+        # Local Viewer can keep Output Quality enabled while capping its
+        # requested upscale back to the native display size. In that case
+        # there is no eye-image postprocess for the native path to skip.
+        # Retain the Python fallback only when the resolved output plan really
+        # needs completed eye images.
+        if output_quality_requires_eye_images(
+            self.stereo_config, int(size[0]), int(size[1])
+        ):
+            return False
         if any(
             bool(getattr(self.stereo_config, field_name, False))
             for field_name in (
                 "temporal",
                 "refine",
                 "cross_eyed",
-                "output_quality_enabled",
                 "dynamic_convergence_enabled",
             )
         ):
@@ -1166,32 +1198,51 @@ class StereoRuntime:
         if _TEMPORAL_RESET_HOT_RELOAD_FIELDS.intersection(changed_fields):
             self.temporal_state.reset_stereo()
             self._openxr_depth_temporal = None
+            self._fused_depth_prev = None
+            self._fused_rgb_prev = None
             self._pending_temporal_reset_reasons = (*self._pending_temporal_reset_reasons, "settings_changed")
 
         if change_class is SnapshotChangeClass.PIPELINE_REBUILD and _DEPTH_PROVIDER_REBUILD_FIELDS.intersection(changed_fields):
             self._rebuild_depth_provider()
         return change_class
 
-    def _temporal_stabilize_depth(self, depth):
-        """EMA-smooth the shipped warp depth across frames (fused leg only).
+    def _temporal_stabilize_depth(self, depth, rgb):
+        """Stabilize fused warp depth only at same-color, same-pixel locations.
 
-        Kills frame-to-frame dither (ANE fp16 quantization, ViT global
-        attention sensitivity) that the native-resolution warp converts
-        into visible edge shimmer. Kill switch: D2S_DEPTH_TEMPORAL=0.
+        Color mismatch marks motion/disocclusion and takes current depth
+        immediately, so a moved silhouette cannot leave a stale depth edge.
+        Kill switch: D2S_DEPTH_TEMPORAL=0.
         """
         if os.environ.get("D2S_DEPTH_TEMPORAL", "1") in {"0", "false", "off"}:
+            self._fused_depth_prev = None
+            self._fused_rgb_prev = None
             return depth
+        if not isinstance(rgb, torch.Tensor) or rgb.shape[-2:] != depth.shape[-2:]:
+            self._fused_depth_prev = depth.detach().clone()
+            self._fused_rgb_prev = None
+            return depth
+        rgb = rgb.detach().contiguous().float()
         prev = getattr(self, "_fused_depth_prev", None)
+        prev_rgb = getattr(self, "_fused_rgb_prev", None)
         if (
             prev is None
             or prev.shape != depth.shape
             or prev.device != depth.device
+            or prev_rgb is None
+            or prev_rgb.shape != rgb.shape
+            or prev_rgb.device != rgb.device
         ):
             self._fused_depth_prev = depth.detach().clone()
+            self._fused_rgb_prev = rgb
             return depth
+        current = depth.detach()
+        history_valid = (
+            (rgb - prev_rgb).abs().amax(dim=1, keepdim=True) <= (2.0 / 255.0)
+        )
         # Out-of-place: the previous state must never be mutated while the
         # packer thread may still be reading the tensor we shipped last frame.
-        st = self._fused_depth_prev.mul(0.35).add_(depth.detach(), alpha=0.65)
+        smoothed = prev.mul(0.35).add(current, alpha=0.65)
+        st = torch.where(history_valid, smoothed, current)
         # One poisoned fp16 frame must not poison the EMA forever; sanitize
         # the blended state and reseed on non-finite input.
         if st.is_floating_point() and not torch.isfinite(st).all():
@@ -1199,6 +1250,7 @@ class StereoRuntime:
             self._fused_depth_prev = st.detach().clone()
         else:
             self._fused_depth_prev = st
+        self._fused_rgb_prev = rgb
         return st
 
     def _rebuild_depth_provider(self) -> None:
@@ -1817,7 +1869,7 @@ class StereoRuntime:
                 # Temporal stabilize damps ANE-fp16 / model dither that
                 # native-res warp otherwise amplifies into edge shimmer.
                 viewer_depth = _rz_ship(
-                    self._temporal_stabilize_depth(_vd_post), raw=depth
+                    self._temporal_stabilize_depth(_vd_post, output_rgb), raw=depth
                 )
             else:
                 viewer_depth = _rz_ship(
@@ -1989,6 +2041,10 @@ class StereoRuntime:
                 if vulkan_stereo is not None:
                     left_eye = vulkan_stereo.left_eye
                     right_eye = vulkan_stereo.right_eye
+                    if output_edge_aa_enabled():
+                        from .display_antialias import antialias_eye
+
+                        left_eye, right_eye = antialias_eye(left_eye), antialias_eye(right_eye)
                     if bool(getattr(openxr_stereo_config, "cross_eyed", False)):
                         left_eye, right_eye = right_eye, left_eye
                     output_format = "openxr_eye_views"
@@ -2047,6 +2103,10 @@ class StereoRuntime:
 
                         left_eye = triton_stereo.left_eye
                         right_eye = triton_stereo.right_eye
+                        if output_edge_aa_enabled():
+                            from .display_antialias import antialias_eye
+
+                            left_eye, right_eye = antialias_eye(left_eye), antialias_eye(right_eye)
                         if os.environ.get("D2S_FRAME_SHAPE_DIAG"):
                             print("[FrameShape] branch=synthesize eye=" + str(tuple(left_eye.shape)), flush=True)
                         output_format = "openxr_eye_views"
@@ -2085,6 +2145,7 @@ class StereoRuntime:
                     right_eye = openxr.right_eye
                     if bool(getattr(openxr_stereo_config, "cross_eyed", False)):
                         left_eye, right_eye = right_eye, left_eye
+                    edge_aa_debug = {"edge_aa_backend": "disabled"}
                     if not os.environ.get("D2S_OPENXR_NO_EYE_QUALITY"):
                         left_eye, right_eye, quality_debug = apply_output_quality(
                             left_eye,
@@ -2093,6 +2154,12 @@ class StereoRuntime:
                         )
                     else:
                         quality_debug = {"output_quality_mode": "skipped_openxr_env"}
+                    if output_edge_aa_enabled():
+                        from .display_antialias import antialias_eye
+
+                        left_eye, right_eye = antialias_eye(left_eye), antialias_eye(right_eye)
+                        edge_aa_debug = {"edge_aa_backend": "output_fxaa"}
+                    quality_debug.update(edge_aa_debug)
                     _record_cuda_event(cuda_events, "openxr_pack_start", left_eye)
                     if _openxr_runtime_output_uint8_enabled():
                         packed_left, left_pack_backend = _pack_openxr_eye_rgba_u8_with_backend(left_eye)
@@ -2264,7 +2331,13 @@ class StereoRuntime:
             return None, f"selected={self._resolved_stereo_compute_backend}"
         try:
             processed_depth = postprocess_depth(
-                match_depth(depth, rgb_frame.shape[-2], rgb_frame.shape[-1]),
+                match_depth(
+                    depth,
+                    rgb_frame.shape[-2],
+                    rgb_frame.shape[-1],
+                    rgb=rgb_frame,
+                    edge_aware=True,
+                ),
                 depth_pop=float(getattr(stereo_config, "depth_pop", 0.0)),
                 antialias_strength=float(getattr(stereo_config, "depth_antialias_strength", 0.0)),
             )
@@ -2445,6 +2518,9 @@ class StereoRuntime:
             return None, "hole_fill_disabled"
         if stereo_config.output_format != "half_sbs":
             return None, f"format={stereo_config.output_format}"
+        if output_edge_aa_enabled():
+            # This shortcut emits reduced eyes; AA needs the complete eyes first.
+            return None, "output_antialias_requires_full_eyes"
         if not _runtime_output_uint8_enabled():
             return None, "runtime_uint8_off"
         if bool(getattr(stereo_config, "cross_eyed", False)):
@@ -2464,7 +2540,13 @@ class StereoRuntime:
             from .output import match_depth
         except Exception as exc:
             return None, f"import_failed:{type(exc).__name__}"
-        depth = match_depth(depth, rgb_frame.shape[-2], rgb_frame.shape[-1])
+        depth = match_depth(
+            depth,
+            rgb_frame.shape[-2],
+            rgb_frame.shape[-1],
+            rgb=rgb_frame,
+            edge_aware=True,
+        )
         if not can_use_fast_plus_fused_half_sbs_uint8(rgb_frame, depth):
             return None, f"unsupported_tensor:rgb={tuple(rgb_frame.shape)}/{rgb_frame.dtype}/{rgb_frame.device};depth={tuple(depth.shape)}/{depth.dtype}/{depth.device}"
         budget = resolve_parallax_budget(
@@ -2596,7 +2678,13 @@ class StereoRuntime:
 
                 self._vulkan_stereo_backend = VulkanStereoComputeBackend()
             processed_depth = postprocess_depth(
-                match_depth(depth, rgb_frame.shape[-2], rgb_frame.shape[-1]),
+                match_depth(
+                    depth,
+                    rgb_frame.shape[-2],
+                    rgb_frame.shape[-1],
+                    rgb=rgb_frame,
+                    edge_aware=True,
+                ),
                 depth_pop=float(getattr(stereo_config, "depth_pop", 0.0)),
                 antialias_strength=float(getattr(stereo_config, "depth_antialias_strength", 0.0)),
             )
@@ -2706,7 +2794,13 @@ class StereoRuntime:
 
                 self._vulkan_stereo_backend = VulkanStereoComputeBackend()
             processed_depth = postprocess_depth(
-                match_depth(depth, rgb_frame.shape[-2], rgb_frame.shape[-1]),
+                match_depth(
+                    depth,
+                    rgb_frame.shape[-2],
+                    rgb_frame.shape[-1],
+                    rgb=rgb_frame,
+                    edge_aware=True,
+                ),
                 depth_pop=float(getattr(stereo_config, "depth_pop", 0.0)),
                 antialias_strength=float(getattr(stereo_config, "depth_antialias_strength", 0.0)),
             )
@@ -2897,6 +2991,7 @@ def _configure_native_coreml_warp(
             "antialias_strength": float(
                 getattr(config, "depth_antialias_strength", 0.0)
             ),
+            "edge_aa_enabled": int(output_edge_aa_enabled()),
             "anaglyph_method": str(
                 getattr(config, "anaglyph_method", "red_cyan")
             ),
@@ -2908,6 +3003,10 @@ def _configure_native_coreml_warp(
             "native_coreml_occlusion_enabled": values["occlusion_enabled"],
             "native_coreml_hole_fill_mode": values["hole_fill_mode"],
             "native_coreml_max_disparity_px": values["max_disparity_px"],
+            "native_coreml_edge_aa_enabled": values["edge_aa_enabled"],
+            "native_coreml_edge_aa_backend": (
+                "fxaa" if values["edge_aa_enabled"] else "disabled"
+            ),
         }
     except Exception as exc:
         LOGGER.warning("Native CoreML stereo configuration failed: %s", exc)

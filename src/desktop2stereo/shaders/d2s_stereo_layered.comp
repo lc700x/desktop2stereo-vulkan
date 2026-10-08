@@ -42,6 +42,7 @@ layout(push_constant) uniform LayeredStereoParams {
     uint screen_edge_suppression;
     uint hole_fill_mode;
     uint occlusion_enabled;
+    uint edge_aa_enabled;
 } params;
 
 const uint HOLE_FILL_BALANCED = 0u;
@@ -66,6 +67,26 @@ uint pixel_index(int x, int y) {
 
 float depth_at(int x, int y) {
     return clamp(depth[pixel_index(x, y)], 0.0, 1.0);
+}
+
+float sampled_depth(float x, float y) {
+    float sx = clamp(x, 0.0, float(params.width - 1u));
+    float sy = clamp(y, 0.0, float(params.height - 1u));
+    ivec2 p0 = ivec2(floor(vec2(sx, sy)));
+    ivec2 p1 = min(p0 + ivec2(1), ivec2(params.width - 1u, params.height - 1u));
+    vec2 f = fract(vec2(sx, sy));
+    float a = mix(depth_at(p0.x, p0.y), depth_at(p1.x, p0.y), f.x);
+    float b = mix(depth_at(p0.x, p1.y), depth_at(p1.x, p1.y), f.x);
+    return mix(a, b, f.y);
+}
+
+float nearest_sampled_depth(float x, float y) {
+    vec2 point = clamp(vec2(x, y), vec2(0.0),
+                       vec2(float(params.width - 1u), float(params.height - 1u)));
+    int x0 = int(floor(point.x));
+    int x1 = min(x0 + 1, int(params.width - 1u));
+    int iy = int(floor(point.y + 0.5));
+    return max(depth_at(x0, iy), depth_at(x1, iy));
 }
 
 float layered_depth_scale(float value) {
@@ -99,6 +120,26 @@ float layer_shift_scale(uint layer_index) {
     return 0.75 + 0.25 * float(layer_index + 1u) / float(count);
 }
 
+float effective_layer_shift_scale(float value) {
+    uint count = clamp(params.layers, 1u, 4u);
+    if (count == 1u) return 1.0;
+    if (count == 2u) {
+        float normalized = clamp(value, 0.0, 1.0);
+        float foreground_weight = 1.0 / (1.0 + exp((1.0 - 2.0 * normalized)
+            / max(params.softness, 1.0e-4)));
+        return 0.875 + 0.125 * foreground_weight;
+    }
+    float weighted_scale = 0.0;
+    float total_weight = 0.0;
+    for (uint layer_index = 0u; layer_index < 4u; ++layer_index) {
+        if (layer_index >= count) break;
+        float weight = layer_weight(value, layer_index);
+        weighted_scale += weight * layer_shift_scale(layer_index);
+        total_weight += weight;
+    }
+    return weighted_scale / max(total_weight, 1.0e-6);
+}
+
 float clamp_coordinate(float coordinate, float extent) {
     return clamp(coordinate, 0.0, max(extent - 1.0, 0.0));
 }
@@ -122,21 +163,173 @@ vec3 sample_rgb(float x, float y) {
     return mix(top, bottom, ty);
 }
 
-vec3 layered_warp_at(int x, int y, float eye_sign) {
-    float value = depth_at(x, y);
-    float shift = base_shift_at(x, y);
-    uint count = clamp(params.layers, 1u, 4u);
+float forward_shift(float value) {
+    return -(value - params.convergence) * layered_depth_scale(value)
+        * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5
+        * effective_layer_shift_scale(value);
+}
+
+int dibr_search_radius() {
+    float scale = max(max(params.foreground_scale, params.midground_scale),
+                      max(params.background_scale, 1.0));
+    float span = max(abs(params.convergence), abs(1.0 - params.convergence));
+    float bound = span * max(params.depth_strength, 0.0)
+        * params.max_disparity_px * 0.5 * scale;
+    return min(int(ceil(bound)) + 1, int(params.width));
+}
+
+vec3 sample_rgb_depth_class(float x, float y, float class_depth) {
+    float sx = clamp_coordinate(x, float(params.width));
+    float sy = clamp_coordinate(y, float(params.height));
+    int x0 = int(floor(sx));
+    int y0 = int(floor(sy));
+    int x1 = min(x0 + 1, int(params.width) - 1);
+    int y1 = min(y0 + 1, int(params.height) - 1);
+    float fx = sx - float(x0);
+    float fy = sy - float(y0);
+    float w00 = (1.0 - fx) * (1.0 - fy);
+    float w10 = fx * (1.0 - fy);
+    float w01 = (1.0 - fx) * fy;
+    float w11 = fx * fy;
     vec3 total = vec3(0.0);
-    float total_weight = 0.0;
-    for (uint layer_index = 0u; layer_index < 4u; ++layer_index) {
-        if (layer_index >= count) {
-            break;
-        }
-        float weight = layer_weight(value, layer_index);
-        total += sample_rgb(float(x) + shift * layer_shift_scale(layer_index) * eye_sign, float(y)) * weight;
-        total_weight += weight;
+    float weight = 0.0;
+    float d = sampled_depth(float(x0), float(y0));
+    if (abs(d - class_depth) <= params.edge_threshold) {
+        total += sample_rgb(float(x0), float(y0)) * w00; weight += w00;
     }
-    return total / max(total_weight, 1.0e-6);
+    d = sampled_depth(float(x1), float(y0));
+    if (abs(d - class_depth) <= params.edge_threshold) {
+        total += sample_rgb(float(x1), float(y0)) * w10; weight += w10;
+    }
+    d = sampled_depth(float(x0), float(y1));
+    if (abs(d - class_depth) <= params.edge_threshold) {
+        total += sample_rgb(float(x0), float(y1)) * w01; weight += w01;
+    }
+    d = sampled_depth(float(x1), float(y1));
+    if (abs(d - class_depth) <= params.edge_threshold) {
+        total += sample_rgb(float(x1), float(y1)) * w11; weight += w11;
+    }
+    return weight > 1.0e-6 ? total / weight : sample_rgb(x, y);
+}
+
+vec3 dibr_gather_at(float target_x, float target_y, float eye_sign) {
+    int radius = dibr_search_radius();
+    // Conservative depth 0..1 projection bounds, padded for bilinear splats.
+    float maximum_scale = max(max(params.foreground_scale, params.midground_scale),
+                              max(params.background_scale, 1.0));
+    float disparity_bound = max(params.depth_strength, 0.0)
+        * params.max_disparity_px * 0.5 * maximum_scale;
+    float at_zero = target_x + params.convergence * disparity_bound * eye_sign;
+    float at_one = target_x - (1.0 - params.convergence) * disparity_bound * eye_sign;
+    float search_min = max(min(at_zero, at_one) - 1.0,
+                           target_x - float(radius));
+    float search_max = min(max(at_zero, at_one) + 1.0,
+                           target_x + float(radius));
+    // Keep the source lattice fixed at source-pixel centers while the target
+    // is subpixel sampled. target_x + integer offsets slide the source grid
+    // with each AA tap and makes silhouettes shimmer as the target moves.
+    int first_source_x = int(ceil(search_min));
+    int last_source_x = int(floor(search_max));
+    float best_depth = -1.0;
+    float best_coverage = 0.0;
+    float best_x = target_x;
+    float left_error = 1.0e6;
+    float right_error = 1.0e6;
+    float left_depth = -1.0;
+    float right_depth = -1.0;
+    float left_x = target_x;
+    float right_x = target_x;
+    for (int source_ix = first_source_x; source_ix <= last_source_x; ++source_ix) {
+        float source_x = float(source_ix);
+        if (source_x >= 0.0 && source_x < float(params.width)) {
+            float value = sampled_depth(source_x, target_y);
+            float error = source_x - forward_shift(value) * eye_sign - target_x;
+            float coverage = max(0.0, 1.0 - abs(error));
+            if (coverage > 0.0 && (value > best_depth ||
+                (value == best_depth && coverage > best_coverage))) {
+                best_depth = value;
+                best_coverage = coverage;
+                best_x = source_x;
+            }
+            if (error <= 0.0 && abs(error) < left_error) {
+                left_error = abs(error); left_depth = value; left_x = source_x;
+            }
+            if (error >= 0.0 && error < right_error) {
+                right_error = error; right_depth = value; right_x = source_x;
+            }
+        }
+    }
+    if (left_error >= 1.0e5) {
+        left_error = right_error; left_depth = right_depth; left_x = right_x;
+    }
+    if (right_error >= 1.0e5) {
+        right_error = left_error; right_depth = left_depth; right_x = left_x;
+    }
+    if (best_depth < 0.0) {
+        return left_depth <= right_depth
+            ? sample_rgb(left_x, target_y) : sample_rgb(right_x, target_y);
+    }
+
+    vec3 foreground = vec3(0.0);
+    float foreground_coverage = 0.0;
+    for (int offset = -1; offset <= 1; ++offset) {
+        float source_x = best_x + float(offset);
+        if (source_x >= 0.0 && source_x < float(params.width)) {
+            float value = sampled_depth(source_x, target_y);
+            if (value >= best_depth - params.edge_threshold) {
+                float error = source_x - forward_shift(value) * eye_sign - target_x;
+                float coverage = max(0.0, 1.0 - abs(error));
+                if (coverage > 0.0) {
+                    foreground += sample_rgb_depth_class(source_x, target_y, best_depth) * coverage;
+                    foreground_coverage += coverage;
+                }
+            }
+        }
+    }
+    foreground /= max(foreground_coverage, 1.0e-6);
+    bool has_background = min(left_depth, right_depth)
+        < best_depth - params.edge_threshold;
+    if (!has_background) return foreground;
+    vec3 background = left_depth <= right_depth
+        ? sample_rgb_depth_class(left_x, target_y, left_depth)
+        : sample_rgb_depth_class(right_x, target_y, right_depth);
+    return mix(background, foreground, clamp(foreground_coverage, 0.0, 1.0));
+}
+
+vec3 dibr_warp_at(float target_x, float target_y, float eye_sign) {
+    float target_depth = sampled_depth(target_x, target_y);
+    float target_shift = -(target_depth - params.convergence) * layered_depth_scale(target_depth)
+        * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5
+        * effective_layer_shift_scale(target_depth);
+    float source_x = clamp(target_x + target_shift * eye_sign, 0.0,
+                           float(params.width - 1u));
+    float source_depth = sampled_depth(source_x, target_y);
+    float source_shift = -(source_depth - params.convergence) * layered_depth_scale(source_depth)
+        * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5
+        * effective_layer_shift_scale(source_depth);
+    float refined_x = clamp(target_x + source_shift * eye_sign, 0.0,
+                            float(params.width - 1u));
+    float source_residual = abs(refined_x - source_x);
+    bool foreground_candidate = false;
+    // No depth can occlude a sample already within the visibility threshold of 1.
+    if (source_depth < 1.0 - params.edge_threshold) {
+        float front_shift = -(1.0 - params.convergence) * max(params.foreground_scale, 0.0)
+            * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5;
+        float front_x = clamp(target_x + front_shift * eye_sign, 0.0,
+                              float(params.width - 1u));
+        foreground_candidate = nearest_sampled_depth(front_x, target_y)
+            > source_depth + params.edge_threshold;
+    }
+
+    bool source_depth_edge = abs(source_depth - target_depth) > params.edge_threshold;
+    if (source_depth_edge || source_residual > 0.5 || foreground_candidate) {
+        return dibr_gather_at(target_x, target_y, eye_sign);
+    }
+    return sample_rgb(refined_x, target_y);
+}
+
+vec3 layered_warp_at(int x, int y, float eye_sign) {
+    return dibr_warp_at(float(x), float(y), eye_sign);
 }
 
 float max_shift_magnitude() {
@@ -155,6 +348,37 @@ float edge_at(int x, int y) {
     return (depth_edge > params.edge_threshold || shift_edge / max_shift_magnitude() > 0.05)
         ? 1.0
         : 0.0;
+}
+
+vec3 layered_color_subpixel(float x, float y, float eye_sign) {
+    return dibr_warp_at(x, y, eye_sign);
+}
+
+bool antialias_edge_at(int x, int y) {
+    float center_depth = depth_at(x, y);
+    float center_shift = base_shift_at(x, y);
+    float depth_edge = max(
+        max(abs(depth_at(x - 1, y) - center_depth), abs(depth_at(x + 1, y) - center_depth)),
+        max(abs(depth_at(x, y - 1) - center_depth), abs(depth_at(x, y + 1) - center_depth))
+    );
+    float shift_edge = max(
+        max(abs(base_shift_at(x - 1, y) - center_shift), abs(base_shift_at(x + 1, y) - center_shift)),
+        max(abs(base_shift_at(x, y - 1) - center_shift), abs(base_shift_at(x, y + 1) - center_shift))
+    );
+    return depth_edge > clamp(params.edge_threshold, 0.01, 0.025)
+        || shift_edge / max_shift_magnitude() > 0.025;
+}
+
+vec3 edge_adaptive_supersample(int x, int y, float eye_sign, vec3 center) {
+    if (params.edge_aa_enabled == 0u || !antialias_edge_at(x, y)) {
+        return center;
+    }
+    return (
+        layered_color_subpixel(float(x) - 0.25, float(y) - 0.25, eye_sign)
+        + layered_color_subpixel(float(x) + 0.25, float(y) - 0.25, eye_sign)
+        + layered_color_subpixel(float(x) - 0.25, float(y) + 0.25, eye_sign)
+        + layered_color_subpixel(float(x) + 0.25, float(y) + 0.25, eye_sign)
+    ) * 0.25;
 }
 
 float dilated_occlusion_at(int x, int y) {
@@ -281,9 +505,13 @@ void main() {
         ? 0.0 : feathered_mask_at(ix, iy);
     uint pixel = pixel_index(ix, iy);
     uint plane = pixel_count();
-    vec3 left = fill_eye(ix, iy, 1.0, fill_mask);
+    vec3 left = edge_adaptive_supersample(
+        ix, iy, 1.0, fill_eye(ix, iy, 1.0, fill_mask)
+    );
     float right_sign = params.symmetric != 0u ? -1.0 : -0.9;
-    vec3 right = fill_eye(ix, iy, right_sign, fill_mask);
+    vec3 right = edge_adaptive_supersample(
+        ix, iy, right_sign, fill_eye(ix, iy, right_sign, fill_mask)
+    );
     left_eye[pixel] = left.r;
     left_eye[plane + pixel] = left.g;
     left_eye[2 * plane + pixel] = left.b;

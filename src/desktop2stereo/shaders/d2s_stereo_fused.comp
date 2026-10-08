@@ -97,8 +97,53 @@ vec3 sample_rgb(float x, float y) {
     return mix(top, bottom, ty);
 }
 
+// Keep bilinear RGB sampling from averaging the two sides of a depth edge.
+// This is the fused-pass equivalent of the layered DIBR visibility resolve:
+// only taps belonging to the source pixel's depth class contribute to the
+// displaced color.  Flat regions take the regular bilinear path.
+vec3 sample_rgb_depth_class(float x, float y, float class_depth) {
+    vec2 point = clamp(vec2(x, y), vec2(0.0),
+                       vec2(float(params.width - 1u), float(params.height - 1u)));
+    int x0 = int(floor(point.x));
+    int y0 = int(floor(point.y));
+    int x1 = min(x0 + 1, int(params.width) - 1);
+    int y1 = min(y0 + 1, int(params.height) - 1);
+    float tx = point.x - float(x0);
+    float ty = point.y - float(y0);
+    float w00 = (1.0 - tx) * (1.0 - ty);
+    float w10 = tx * (1.0 - ty);
+    float w01 = (1.0 - tx) * ty;
+    float w11 = tx * ty;
+    vec3 total = vec3(0.0);
+    float weight = 0.0;
+    float d = depth_at(x0, y0);
+    if (abs(d - class_depth) <= params.edge_threshold) {
+        total += rgb_at(pixel_index(x0, y0)) * w00;
+        weight += w00;
+    }
+    d = depth_at(x1, y0);
+    if (abs(d - class_depth) <= params.edge_threshold) {
+        total += rgb_at(pixel_index(x1, y0)) * w10;
+        weight += w10;
+    }
+    d = depth_at(x0, y1);
+    if (abs(d - class_depth) <= params.edge_threshold) {
+        total += rgb_at(pixel_index(x0, y1)) * w01;
+        weight += w01;
+    }
+    d = depth_at(x1, y1);
+    if (abs(d - class_depth) <= params.edge_threshold) {
+        total += rgb_at(pixel_index(x1, y1)) * w11;
+        weight += w11;
+    }
+    return weight > 1.0e-6 ? total / weight : sample_rgb(x, y);
+}
+
 vec3 warp_at(int x, int y, float eye_sign) {
-    return sample_rgb(float(x) + shift_at(x, y) * eye_sign, float(y));
+    float depth_value = depth_at(x, y);
+    return sample_rgb_depth_class(
+        float(x) + shift_at(x, y) * eye_sign, float(y), depth_value
+    );
 }
 
 float edge_at(int x, int y) {

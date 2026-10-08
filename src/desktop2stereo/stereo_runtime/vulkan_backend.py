@@ -261,6 +261,8 @@ class VulkanStereoImageComputeBackend:
             "vulkan_compute_input_color_space": "srgb",
             "vulkan_compute_output_image_format": "R8G8B8A8_UNORM",
             "vulkan_compute_output_image_encoding": "linear",
+            "vulkan_edge_aa_enabled": bool(self._pass.edge_aa_enabled),
+            "vulkan_edge_aa_pattern": "fxaa_image_linear_resolve" if self._pass.edge_aa_enabled else "disabled",
             "vulkan_output_sync": "vulkan_compute_external_semaphore",
             "vulkan_input_path": input_mode,
             "vulkan_input_ring_slot": slot_index,

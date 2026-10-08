@@ -58,6 +58,10 @@ def _save_eye_pair(output_dir: Path, prefix: str, left: torch.Tensor, right: tor
     save_rgb(left, output_dir / f"{prefix}_left_eye.png")
     save_rgb(right, output_dir / f"{prefix}_right_eye.png")
     save_rgb(
+        make_sbs(left, right, "full_sbs", fused=False),
+        output_dir / f"{prefix}_full_sbs.png",
+    )
+    save_rgb(
         make_sbs(left, right, "half_sbs", fused=False),
         output_dir / f"{prefix}_half_sbs.png",
     )
@@ -108,7 +112,12 @@ def _load_reference_pair(reference_dir: str | Path) -> tuple[torch.Tensor, torch
 
 
 def _rgba_to_tensor(rgba: Any) -> torch.Tensor:
-    value = torch.from_numpy(rgba[..., :3].copy()).permute(2, 0, 1).float() / 255.0
+    linear = torch.from_numpy(rgba[..., :3].copy()).permute(2, 0, 1).float() / 255.0
+    value = torch.where(
+        linear <= 0.0031308,
+        linear * 12.92,
+        1.055 * torch.pow(linear.clamp_min(0.0031308), 1.0 / 2.4) - 0.055,
+    )
     return value.unsqueeze(0)
 
 
@@ -119,34 +128,34 @@ def _run_vulkan_output_image_stage(
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Run and read back the same storage-image shader used by zero-copy output."""
     from viewer.vulkan_context import VulkanContext, VulkanContextConfig
-    from viewer.vulkan_resources import VulkanExportableImage, VulkanHostImage
+    from viewer.vulkan_descriptors import VulkanStorageImage
+    from viewer.vulkan_resources import VulkanHostImage
     from .vulkan_backend import VulkanStereoImageComputeBackend
 
-    context = VulkanContext.create(
-        VulkanContextConfig(
-            frame_context_count=3,
-            required_device_extensions=VulkanExportableImage.required_device_extensions(),
-        )
-    )
+    context = VulkanContext.create(VulkanContextConfig(frame_context_count=3))
     left_image = right_image = left_readback = right_readback = None
     try:
         vk = context.vk
-        left_image = VulkanExportableImage(
+        output_usage = (
+            vk.VK_IMAGE_USAGE_STORAGE_BIT | vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+        )
+        left_image = VulkanStorageImage(
             context,
             int(rgb.shape[-1]),
             int(rgb.shape[-2]),
-            label="visual-regression-zero-copy-left",
             format=vk.VK_FORMAT_R8G8B8A8_UNORM,
+            usage=output_usage,
         )
-        right_image = VulkanExportableImage(
+        right_image = VulkanStorageImage(
             context,
             int(rgb.shape[-1]),
             int(rgb.shape[-2]),
-            label="visual-regression-zero-copy-right",
             format=vk.VK_FORMAT_R8G8B8A8_UNORM,
+            usage=output_usage,
         )
-        context.prepare_external_image_for_producer(left_image.resource)
-        context.prepare_external_image_for_producer(right_image.resource)
+        left_ready = left_image.transition_to_general(role="compute")
+        right_ready = right_image.transition_to_general(role="compute")
+        context.wait_for_timeline(max(left_ready, right_ready))
         left_readback = VulkanHostImage(
             context,
             int(rgb.shape[-1]),
@@ -170,12 +179,12 @@ def _run_vulkan_output_image_stage(
                 params=params,
             )
         left_copy_timeline = context.copy_image(
-            left_image.resource,
+            left_image,
             left_readback.resource,
             wait_for_timeline=timeline,
         )
         right_copy_timeline = context.copy_image(
-            right_image.resource,
+            right_image,
             right_readback.resource,
             wait_for_timeline=timeline,
         )
@@ -239,7 +248,7 @@ def run_stage_visual_regression(
     save_depth(prepared_depth, output / "02_prepared_depth.png")
 
     vulkan_hole_fill_mode = resolve_vulkan_hole_fill_mode(
-        config.hole_fill,
+        config.hole_fill_mode,
         config.hole_fill_mode,
     )
     fill_radius, fill_strength = resolve_vulkan_hole_fill_parameters(

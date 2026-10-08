@@ -12,6 +12,8 @@ from viewer.vulkan_descriptors import (
     VulkanDescriptorArena,
 )
 
+from .output import output_edge_aa_enabled
+from .vulkan_edge_aa import VulkanEyeEdgeAA
 
 VULKAN_HOLE_FILL_BALANCED = 0
 VULKAN_HOLE_FILL_QUALITY = 1
@@ -114,7 +116,7 @@ class VulkanLayeredStereoParams:
     hole_fill_mode: int = 0
     occlusion_enabled: bool = True
 
-    def pack(self, width: int, height: int) -> bytes:
+    def _pack_base(self, width: int, height: int) -> bytes:
         if int(width) < 1 or int(height) < 1:
             raise ValueError("Vulkan stereo dimensions must be positive")
         if int(self.layers) < 1 or int(self.layers) > 4:
@@ -144,10 +146,26 @@ class VulkanLayeredStereoParams:
             1 if self.occlusion_enabled else 0,
         )
 
-    def pack_image(self, width: int, height: int, *, packed_output: bool = False) -> bytes:
-        """Pack the image-output variant, including the packed SBS flag."""
-        return self.pack(width, height) + struct.pack(
-            "<I", 1 if packed_output else 0
+    def pack(self, width: int, height: int, *, edge_aa_enabled: bool | None = None) -> bytes:
+        if edge_aa_enabled is None:
+            edge_aa_enabled = output_edge_aa_enabled()
+        return self._pack_base(width, height) + struct.pack(
+            "<I", 1 if edge_aa_enabled else 0
+        )
+
+    def pack_image(
+        self,
+        width: int,
+        height: int,
+        *,
+        packed_output: bool = False,
+        edge_aa_enabled: bool | None = None,
+    ) -> bytes:
+        """Pack image output flags after the shared layered parameters."""
+        if edge_aa_enabled is None:
+            edge_aa_enabled = output_edge_aa_enabled()
+        return self._pack_base(width, height) + struct.pack(
+            "<II", 1 if packed_output else 0, 1 if edge_aa_enabled else 0
         )
 
 
@@ -182,6 +200,8 @@ class VulkanStereoFusedPass:
         self._descriptor_index = 0
         self._active_descriptor_set: Any | None = None
         self._active_push_constants: bytes | None = None
+        self._edge_aa: VulkanEyeEdgeAA | None = None
+        self._active_edge_aa = False
         storage_buffer = context.vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
         try:
             bindings = [
@@ -245,6 +265,8 @@ class VulkanStereoFusedPass:
     def _record_active(self, command_buffer: Any) -> None:
         if self.pipeline is None or self._active_descriptor_set is None:
             raise RuntimeError("Vulkan stereo pass is not ready")
+        if self._active_edge_aa:
+            self._edge_aa.barrier(command_buffer, before_render=True)
         self.pipeline.record_dispatch(
             command_buffer,
             group_count_x=self.group_counts[0],
@@ -253,6 +275,8 @@ class VulkanStereoFusedPass:
             descriptor_set=self._active_descriptor_set,
             push_constants=self._active_push_constants,
         )
+        if self._active_edge_aa:
+            self._edge_aa.record(command_buffer)
 
     def submit(
         self,
@@ -266,25 +290,44 @@ class VulkanStereoFusedPass:
         frame_id: int,
         config_version: int,
         ready_timeline: int | None = None,
+        apply_edge_aa: bool = False,
     ) -> int:
         if self.descriptor_arena is None or self.pipeline is None:
             raise RuntimeError("Vulkan stereo pass is closed")
         buffers = (rgb, depth, left_eye, right_eye, occlusion_mask)
         self._validate_buffers(buffers)
-        descriptor_set = self.descriptor_sets[self._descriptor_index]
+        slot = self._descriptor_index
+        descriptor_set = self.descriptor_sets[slot]
         self._descriptor_index = (self._descriptor_index + 1) % len(self.descriptor_sets)
-        for binding, buffer in enumerate(buffers):
+        self._active_edge_aa = bool(apply_edge_aa)
+        if self._active_edge_aa:
+            if self._edge_aa is None:
+                self._edge_aa = VulkanEyeEdgeAA(self.context, self.width, self.height, images=False)
+            scratch = self._edge_aa.prepare(slot, left_eye, right_eye)
+            render_buffers = (rgb, depth, *scratch, occlusion_mask)
+        else:
+            render_buffers = buffers
+        for binding, buffer in enumerate(render_buffers):
             self.descriptor_arena.update_storage_buffer(descriptor_set, binding, buffer)
         self._active_descriptor_set = descriptor_set
-        self._active_push_constants = (params or VulkanStereoFusedParams()).pack(
-            self.width, self.height
-        )
+        effective_params = params or VulkanStereoFusedParams()
+        # Generic synthesis anti-aliases completed full eyes before SBS
+        # packing. Standalone eye consumers can opt into this GPU pass.
+        if isinstance(effective_params, VulkanLayeredStereoParams):
+            self._active_push_constants = effective_params.pack(
+                self.width, self.height, edge_aa_enabled=False)
+        else:
+            self._active_push_constants = effective_params.pack(self.width, self.height)
         submit_kwargs = {}
         if ready_timeline is not None:
             submit_kwargs["wait_for_timeline"] = int(ready_timeline)
         return self.context.submit_on("compute", self._record_active, **submit_kwargs)
 
     def close(self) -> None:
+        if self._edge_aa is not None:
+            self._edge_aa.close()
+        self._edge_aa = None
+        self._active_edge_aa = False
         if self.pipeline is not None:
             self.pipeline.close()
         if self.descriptor_arena is not None:
@@ -305,7 +348,7 @@ class VulkanStereoFusedPass:
 class VulkanLayeredStereoPass(VulkanStereoFusedPass):
     """Layered stereo synthesis pass for quality_4k and hq_4k modes."""
 
-    PUSH_CONSTANTS_SIZE = 76
+    PUSH_CONSTANTS_SIZE = 80
 
     def __init__(
         self,
@@ -329,6 +372,7 @@ class VulkanLayeredStereoPass(VulkanStereoFusedPass):
         frame_id: int,
         config_version: int,
         ready_timeline: int | None = None,
+        apply_edge_aa: bool = False,
     ) -> int:
         return super().submit(
             rgb,
@@ -340,4 +384,5 @@ class VulkanLayeredStereoPass(VulkanStereoFusedPass):
             frame_id=frame_id,
             config_version=config_version,
             ready_timeline=ready_timeline,
+            apply_edge_aa=apply_edge_aa,
         )

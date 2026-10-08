@@ -8,10 +8,8 @@ from .triton_runtime import triton_runtime_available
 
 
 @triton.jit
-def _lanczos2_half4(value_m1, value_0, value_1, value_2):
-    # Lanczos2 sampled at the center of a 2x reduction has the exact normalized
-    # weights [-1, 9, 9, -1] / 16.
-    return (-value_m1 + 9.0 * value_0 + 9.0 * value_1 - value_2) * 0.0625
+def _area_half2(value_0, value_1):
+    return (value_0 + value_1) * 0.5
 
 
 @triton.jit
@@ -23,6 +21,7 @@ def _half_sbs_kernel(
     width: tl.constexpr,
     half_width: tl.constexpr,
     pixels: tl.constexpr,
+    LINEAR_SRGB: tl.constexpr,
     block: tl.constexpr,
 ):
     offsets = tl.program_id(0) * block + tl.arange(0, block)
@@ -35,21 +34,31 @@ def _half_sbs_kernel(
     use_left = x < half_width
     src_x_out = tl.where(use_left, x, x - half_width)
     x0 = src_x_out * 2
-    xm1 = tl.maximum(x0 - 1, 0)
     x1 = x0 + 1
-    x2 = tl.minimum(x0 + 2, width - 1)
     base = channel * pixels + y * width
 
-    left_vm1 = tl.load(left + base + xm1, mask=active & use_left, other=0.0)
     left_v0 = tl.load(left + base + x0, mask=active & use_left, other=0.0)
     left_v1 = tl.load(left + base + x1, mask=active & use_left, other=0.0)
-    left_v2 = tl.load(left + base + x2, mask=active & use_left, other=0.0)
-    right_vm1 = tl.load(right + base + xm1, mask=active & ~use_left, other=0.0)
     right_v0 = tl.load(right + base + x0, mask=active & ~use_left, other=0.0)
     right_v1 = tl.load(right + base + x1, mask=active & ~use_left, other=0.0)
-    right_v2 = tl.load(right + base + x2, mask=active & ~use_left, other=0.0)
-    left_value = _lanczos2_half4(left_vm1, left_v0, left_v1, left_v2)
-    right_value = _lanczos2_half4(right_vm1, right_v0, right_v1, right_v2)
+    if LINEAR_SRGB:
+        left_linear0 = tl.where(left_v0 <= 0.04045, left_v0 / 12.92,
+            tl.exp2(2.4 * tl.log2(tl.maximum((left_v0 + 0.055) / 1.055, 1.0e-20))))
+        left_linear1 = tl.where(left_v1 <= 0.04045, left_v1 / 12.92,
+            tl.exp2(2.4 * tl.log2(tl.maximum((left_v1 + 0.055) / 1.055, 1.0e-20))))
+        right_linear0 = tl.where(right_v0 <= 0.04045, right_v0 / 12.92,
+            tl.exp2(2.4 * tl.log2(tl.maximum((right_v0 + 0.055) / 1.055, 1.0e-20))))
+        right_linear1 = tl.where(right_v1 <= 0.04045, right_v1 / 12.92,
+            tl.exp2(2.4 * tl.log2(tl.maximum((right_v1 + 0.055) / 1.055, 1.0e-20))))
+        left_mean = (left_linear0 + left_linear1) * 0.5
+        right_mean = (right_linear0 + right_linear1) * 0.5
+        left_value = tl.where(left_mean <= 0.0031308, left_mean * 12.92,
+            1.055 * tl.exp2(tl.log2(tl.maximum(left_mean, 1.0e-20)) / 2.4) - 0.055)
+        right_value = tl.where(right_mean <= 0.0031308, right_mean * 12.92,
+            1.055 * tl.exp2(tl.log2(tl.maximum(right_mean, 1.0e-20)) / 2.4) - 0.055)
+    else:
+        left_value = _area_half2(left_v0, left_v1)
+        right_value = _area_half2(right_v0, right_v1)
     value = tl.where(use_left, left_value, right_value)
     tl.store(out + offsets, value, mask=active)
 
@@ -156,21 +165,15 @@ def _half_sbs_uint8_kernel(
     use_left = x < half_width
     src_x_out = tl.where(use_left, x, x - half_width)
     x0 = src_x_out * 2
-    xm1 = tl.maximum(x0 - 1, 0)
     x1 = x0 + 1
-    x2 = tl.minimum(x0 + 2, width - 1)
     base = channel * pixels + y * width
 
-    left_vm1 = tl.load(left + base + xm1, mask=active & use_left, other=0.0)
     left_v0 = tl.load(left + base + x0, mask=active & use_left, other=0.0)
     left_v1 = tl.load(left + base + x1, mask=active & use_left, other=0.0)
-    left_v2 = tl.load(left + base + x2, mask=active & use_left, other=0.0)
-    right_vm1 = tl.load(right + base + xm1, mask=active & ~use_left, other=0.0)
     right_v0 = tl.load(right + base + x0, mask=active & ~use_left, other=0.0)
     right_v1 = tl.load(right + base + x1, mask=active & ~use_left, other=0.0)
-    right_v2 = tl.load(right + base + x2, mask=active & ~use_left, other=0.0)
-    left_value = _lanczos2_half4(left_vm1, left_v0, left_v1, left_v2)
-    right_value = _lanczos2_half4(right_vm1, right_v0, right_v1, right_v2)
+    left_value = _area_half2(left_v0, left_v1)
+    right_value = _area_half2(right_v0, right_v1)
     value = tl.where(use_left, left_value, right_value)
     value = tl.minimum(tl.maximum(value, 0.0), 1.0) * 255.0
     tl.store(out + offsets, value.to(tl.uint8), mask=active)
@@ -220,7 +223,7 @@ def make_chw_rgb_to_hwc_rgba_u8(tensor: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def make_half_sbs(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+def make_half_sbs(left: torch.Tensor, right: torch.Tensor, *, linear_srgb: bool = False) -> torch.Tensor:
     left = left.contiguous()
     right = right.contiguous()
     out = torch.empty_like(left)
@@ -230,7 +233,8 @@ def make_half_sbs(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     total = left.numel()
     block = 256
     grid = (triton.cdiv(total, block),)
-    _half_sbs_kernel[grid](left, right, out, total, width, half_width, pixels, block)
+    _half_sbs_kernel[grid](left, right, out, total, width, half_width, pixels,
+                           bool(linear_srgb), block)
     return out
 
 

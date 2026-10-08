@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D src_left;
+layout(set = 0, binding = 1, rgba8) uniform readonly image2D src_right;
+layout(set = 0, binding = 2, rgba8) uniform writeonly image2D out_left;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D out_right;
+layout(push_constant) uniform EdgeAAParams { uint width; uint height; uint packed_output; } params;
+vec3 aa_fetch(ivec2 p, uint eye) {
+    p = clamp(p, ivec2(0), ivec2(params.width - 1u, params.height - 1u));
+    if (params.packed_output != 0u && eye != 0u) p.x += int(params.width);
+    return eye == 0u ? imageLoad(src_left, p).rgb : imageLoad(src_right, p).rgb;
+}
+#define AA_LINEAR_SOURCE 1
+#include "d2s_edge_aa.glsl"
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+    if (gid.x >= params.width || gid.y >= params.height || gid.z >= 2u) return;
+    vec3 color = aa_resolve(ivec2(gid.xy), gid.z);
+    ivec2 p = ivec2(gid.xy);
+    if (params.packed_output != 0u && gid.z != 0u) p.x += int(params.width);
+    if (gid.z == 0u) imageStore(out_left, p, vec4(color, 1.0));
+    else imageStore(out_right, p, vec4(color, 1.0));
+}

@@ -1,0 +1,28 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer LeftSource { float src_left[]; };
+layout(set = 0, binding = 1, std430) readonly buffer RightSource { float src_right[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer LeftOutput { float out_left[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer RightOutput { float out_right[]; };
+layout(push_constant) uniform EdgeAAParams { uint width; uint height; uint packed_output; } params;
+vec3 aa_fetch(ivec2 p, uint eye) {
+    p = clamp(p, ivec2(0), ivec2(params.width - 1u, params.height - 1u));
+    uint plane = params.width * params.height;
+    uint pixel = uint(p.y) * params.width + uint(p.x);
+    return eye == 0u ? vec3(src_left[pixel], src_left[plane + pixel], src_left[2u * plane + pixel])
+                     : vec3(src_right[pixel], src_right[plane + pixel], src_right[2u * plane + pixel]);
+}
+#define AA_LINEAR_SOURCE 0
+#include "d2s_edge_aa.glsl"
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+    if (gid.x >= params.width || gid.y >= params.height || gid.z >= 2u) return;
+    vec3 color = aa_resolve(ivec2(gid.xy), gid.z);
+    uint plane = params.width * params.height, pixel = gid.y * params.width + gid.x;
+    if (gid.z == 0u) {
+        out_left[pixel] = color.r; out_left[plane + pixel] = color.g; out_left[2u * plane + pixel] = color.b;
+    } else {
+        out_right[pixel] = color.r; out_right[plane + pixel] = color.g; out_right[2u * plane + pixel] = color.b;
+    }
+}

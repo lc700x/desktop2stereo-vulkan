@@ -581,6 +581,7 @@ def _capture_debug_fields(captured_frame: CapturedFrame | None, frame_rgb) -> di
         fields.update(
             capture_tool=captured_frame.capture_tool,
             capture_mode=captured_frame.capture_mode,
+            capture_timestamp_source=metadata.get("capture_timestamp_source"),
             capture_frame_status=metadata.get("capture_frame_status"),
             capture_frame_raw_device=captured_frame.frame_raw_device,
             capture_frame_raw_type=captured_frame.frame_raw_type,
@@ -1380,6 +1381,23 @@ class RuntimePipelineLoop:
     def _publish_runtime_item(self, item) -> None:
         ctx = self.context
         runtime_result, capture_start_time, process_latency, runtime_latency, pending_since = item
+        debug_info = getattr(runtime_result, "debug_info", None)
+        capture_timestamp_source = (
+            debug_info.get("capture_timestamp_source")
+            if isinstance(debug_info, dict)
+            else None
+        )
+        try:
+            object.__setattr__(runtime_result, "capture_timestamp", float(capture_start_time))
+            if capture_timestamp_source:
+                object.__setattr__(
+                    runtime_result,
+                    "capture_timestamp_source",
+                    str(capture_timestamp_source),
+                )
+        except (AttributeError, TypeError, ValueError):
+            if isinstance(debug_info, dict):
+                debug_info["capture_timestamp"] = float(capture_start_time)
         queue_put_start_time = time.perf_counter()
         _add_cuda_event_timings(ctx, runtime_result)
         try:

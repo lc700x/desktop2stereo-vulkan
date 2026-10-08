@@ -97,7 +97,7 @@ def render_openxr_stereo(
     # shift are identical and can be reused.
     rgb_bchw = ensure_bchw(rgb, name="rgb").float()
     _, _, h, w = rgb_bchw.shape
-    depth_matched = match_depth(depth, h, w)
+    depth_matched = match_depth(depth, h, w, rgb=rgb_bchw, edge_aware=True)
     params = _shift_params(config)
     base_shift = compute_shift_px(depth_matched, w, params)
     left = _render_eye_from_matched(rgb_bchw, depth_matched, eye_sign=-1.0, config=config, base_shift=base_shift)
@@ -124,7 +124,7 @@ def render_openxr_eye(
     config = config or OpenXRRenderConfig()
     rgb = ensure_bchw(rgb, name="rgb").float()
     _, _, h, w = rgb.shape
-    depth_matched = match_depth(depth, h, w)
+    depth_matched = match_depth(depth, h, w, rgb=rgb, edge_aware=True)
     return _render_eye_from_matched(rgb, depth_matched, eye_sign=eye_sign, config=config)
 
 

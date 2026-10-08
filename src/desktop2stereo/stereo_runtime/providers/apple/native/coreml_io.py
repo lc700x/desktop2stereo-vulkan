@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import logging
 import os
 from pathlib import Path
 import platform
@@ -19,10 +20,14 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
+from ....output import output_edge_aa_enabled
+
 
 _NATIVE_DIR = Path(__file__).resolve().parent
 _SOURCE = _NATIVE_DIR / "macos_coreml_io.mm"
 _HEADER = _NATIVE_DIR / "macos_coreml_io.h"
+_FXAA_HEADER = _NATIVE_DIR / "sbs_fxaa_msl.h"
+_LOGGER = logging.getLogger(__name__)
 
 _NATIVE_OUTPUT_FORMATS = {
     "half_sbs": 0,
@@ -62,6 +67,9 @@ class _NativeResult(ctypes.Structure):
         ("preprocess_ms", ctypes.c_double),
         ("model_ms", ctypes.c_double),
         ("postprocess_ms", ctypes.c_double),
+        ("raw_normalize_lo", ctypes.c_float),
+        ("raw_normalize_hi", ctypes.c_float),
+        ("normalization_history_reset", ctypes.c_int32),
     ]
 
 
@@ -87,6 +95,7 @@ class _NativeWarpConfig(ctypes.Structure):
         ("depth_pop", ctypes.c_float),
         ("antialias_strength", ctypes.c_float),
         ("anaglyph_method", ctypes.c_int32),
+        ("edge_aa_enabled", ctypes.c_int32),
     ]
 
 
@@ -124,7 +133,9 @@ def _cache_path() -> Path:
         if override
         else Path.home() / "Library" / "Caches" / "desktop2stereo" / "coreml_io"
     )
-    digest = hashlib.sha256(_SOURCE.read_bytes() + _HEADER.read_bytes()).hexdigest()[:16]
+    digest = hashlib.sha256(
+        _SOURCE.read_bytes() + _HEADER.read_bytes() + _FXAA_HEADER.read_bytes()
+    ).hexdigest()[:16]
     return root / f"libd2s_coreml_io-{platform.machine()}-{digest}.dylib"
 
 
@@ -143,7 +154,7 @@ def _sdk_path() -> str | None:
 
 
 def _build_library() -> tuple[Path | None, str | None]:
-    if not _SOURCE.is_file() or not _HEADER.is_file():
+    if not all(path.is_file() for path in (_SOURCE, _HEADER, _FXAA_HEADER)):
         return None, "native CoreML bridge source is missing"
     clang = shutil.which("clang++")
     if clang is None:
@@ -226,6 +237,9 @@ class NativeCoreMLFrame:
     output_zero_copy: bool
     normalize_lo: float = 0.0
     normalize_hi: float = 1.0
+    raw_normalize_lo: float = 0.0
+    raw_normalize_hi: float = 1.0
+    normalization_history_reset: bool = False
     warp_config: dict[str, float | int | str] | None = None
     released: bool = False
 
@@ -341,6 +355,9 @@ class NativeCoreMLIOBridge:
         self.input_width = int(input_width)
         self.input_height = int(input_height)
         self.last_error = ""
+        # Keep native CoreML output on the same fast FXAA path as Vulkan and
+        # CUDA/ROCm. Inference and its synchronization remain untouched.
+        self.smaa_enabled = False
 
     @classmethod
     def try_create(cls, model_path: str | Path, input_width: int, input_height: int):
@@ -431,6 +448,9 @@ class NativeCoreMLIOBridge:
                 output_zero_copy=bool(result.output_zero_copy),
                 normalize_lo=float(result.normalize_lo),
                 normalize_hi=float(result.normalize_hi),
+                raw_normalize_lo=float(result.raw_normalize_lo),
+                raw_normalize_hi=float(result.raw_normalize_hi),
+                normalization_history_reset=bool(result.normalization_history_reset),
             )
             condition = self._ensure_lifetime_state()
             with condition:
@@ -487,6 +507,12 @@ class NativeCoreMLIOBridge:
             float(values.get("depth_pop", 0.0)),
             float(values.get("antialias_strength", 0.0)),
             native_anaglyph_method_id(values.get("anaglyph_method", "red_cyan")),
+            int(
+                values.get(
+                    "edge_aa_enabled",
+                    output_edge_aa_enabled(),
+                )
+            ),
         )
         handle = self._begin_call(allow_closing=True)
         try:

@@ -129,7 +129,7 @@ class DepthProviderConfig:
     use_cuda_graph: bool = False
     profile_sync: bool = False
     execution_slot_count: int = 1
-    depth_upsample: DepthUpsampleMode = "bilinear"
+    depth_upsample: DepthUpsampleMode = "joint_bilateral"
     depth_upsample_edge_strength: float = 0.35
     use_coreml: bool = False
     recompile_coreml: bool = False

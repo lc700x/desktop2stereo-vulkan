@@ -17,7 +17,15 @@ from .hole_fill import (
 )
 from .layers import composite_layers, make_depth_layers
 from .occlusion import make_occlusion_mask, occlusion_backend
-from .output import AnaglyphMethod, OutputFormat, ensure_bchw, make_sbs, match_depth, sbs_backend
+from .output import (
+    AnaglyphMethod,
+    OutputFormat,
+    ensure_bchw,
+    make_sbs,
+    match_depth,
+    output_edge_aa_enabled,
+    sbs_backend,
+)
 from .output_quality import (
     apply_output_quality,
     output_quality_requires_eye_images,
@@ -118,7 +126,13 @@ def _layered_synthesis(
     )
     rgb = ensure_bchw(rgb, name="rgb").float()
     depth = postprocess_depth(
-        match_depth(depth, rgb.shape[-2], rgb.shape[-1]),
+        match_depth(
+            depth,
+            rgb.shape[-2],
+            rgb.shape[-1],
+            rgb=rgb,
+            edge_aware=True,
+        ),
         depth_pop=config.depth_pop,
         antialias_strength=config.depth_antialias_strength,
     )
@@ -164,7 +178,7 @@ def _layered_synthesis(
                 direct_start = time.perf_counter()
                 direct_sbs = (
                     warp_composite2_half_sbs(rgb, depth, base_shift)
-                    if config.output_format == "half_sbs"
+                    if config.output_format == "half_sbs" and not output_edge_aa_enabled()
                     else warp_composite2_full_sbs(rgb, depth, base_shift)
                 )
                 direct_sbs_backend = (
@@ -200,7 +214,8 @@ def _layered_synthesis(
             from ._fused_warp_mps import mps_warp_composite2_u8
 
             direct_sbs = mps_warp_composite2_u8(
-                rgb, depth, base_shift, config.output_format
+                rgb, depth, base_shift,
+                "full_sbs" if config.output_format == "half_sbs" and output_edge_aa_enabled() else config.output_format,
             )
             if direct_sbs is not None:
                 direct_sbs_backend = "metal_mps_warp_composite2_u8"
@@ -210,6 +225,7 @@ def _layered_synthesis(
     if direct_sbs is not None:
         left, right = rgb, rgb
         warp_composite_backend = direct_sbs_backend
+        edge_aa_backend = "disabled"
     else:
         fused = _try_fused_warp_composite2(
             rgb,
@@ -232,7 +248,12 @@ def _layered_synthesis(
         if fused is not None:
             left, right = fused
         else:
-            weights = make_depth_layers(depth, layers=layer_count)
+            weights = make_depth_layers(
+                depth,
+                layers=layer_count,
+                rgb=rgb,
+                edge_threshold=config.edge_threshold,
+            )
             left_layers: list[torch.Tensor] = []
             right_layers: list[torch.Tensor] = []
             for idx in range(layer_count):
@@ -243,6 +264,7 @@ def _layered_synthesis(
 
             left = composite_layers(left_layers, weights)
             right = composite_layers(right_layers, weights)
+        edge_aa_backend = "disabled"
     _record_cuda_event(cuda_events, "synth_warp", rgb)
     stage_times["warp_composite_ms"] = direct_sbs_ms if direct_sbs is not None else (time.perf_counter() - stage_start) * 1000.0
     stage_start = time.perf_counter()
@@ -341,6 +363,7 @@ def _layered_synthesis(
         "shift_px": base_shift,
         "occlusion_mask": mask,
         "warp_composite_backend": warp_composite_backend,
+        "edge_aa_backend": edge_aa_backend,
         "direct_sbs_backend": direct_sbs_backend or "none",
         "direct_sbs_ms": float(direct_sbs_ms),
         "direct_sbs": direct_sbs,
@@ -387,9 +410,16 @@ def _try_fused_warp_composite2(
         from .warp_composite_triton import can_use_triton_warp_composite2, warp_composite2
     except Exception:
         return None
-    if not can_use_triton_warp_composite2(rgb, depth, base_shift, layers=layers, symmetric=symmetric):
+    try:
+        if not can_use_triton_warp_composite2(
+            rgb, depth, base_shift, layers=layers, symmetric=symmetric
+        ):
+            return None
+        return warp_composite2(rgb, depth, base_shift)
+    except Exception:
+        # Optional output acceleration may fail to compile on a device/runtime;
+        # keep stereo synthesis on its PyTorch fallback instead of aborting inference.
         return None
-    return warp_composite2(rgb, depth, base_shift)
 
 
 def _triton_disabled_by_env() -> bool:
@@ -445,6 +475,7 @@ def synthesize_stereo(
 
         stage_start = time.perf_counter()
         left, right, shift_px = synthesize_baseline(rgb, depth, params)
+        edge_aa_backend = "disabled"
         _record_cuda_event(cuda_events, "synth_warp", rgb)
         stage_times["fast_baseline_ms"] = (time.perf_counter() - stage_start) * 1000.0
         if config.backend == "fast_plus":
@@ -455,7 +486,13 @@ def synthesize_stereo(
                 or bool(config.debug_output)
             )
             if fast_plus_mask_needed:
-                depth_for_mask = match_depth(depth, left.shape[-2], left.shape[-1])
+                depth_for_mask = match_depth(
+                    depth,
+                    left.shape[-2],
+                    left.shape[-1],
+                    rgb=rgb,
+                    edge_aware=True,
+                )
                 mask = make_occlusion_mask(
                     depth_for_mask,
                     shift_px,
@@ -514,6 +551,7 @@ def synthesize_stereo(
             stage_start = time.perf_counter()
             debug = {
                 "backend": config.backend,
+                "edge_aa_backend": edge_aa_backend,
                 "shift_px": shift_px,
                 "occlusion_mask": mask,
                 "occlusion_mask_backend": occlusion_mask_backend,
@@ -529,7 +567,7 @@ def synthesize_stereo(
         else:
             mask = None
             stage_start = time.perf_counter()
-            debug = {"backend": config.backend, "shift_px": shift_px, **shift_debug_info(depth, left.shape[-1], params)}
+            debug = {"backend": config.backend, "edge_aa_backend": edge_aa_backend, "shift_px": shift_px, **shift_debug_info(depth, left.shape[-1], params)}
             stage_times["fast_debug_ms"] = (time.perf_counter() - stage_start) * 1000.0
     else:
         if config.backend == "hq_4k" and config.layers < 3:
@@ -557,7 +595,13 @@ def synthesize_stereo(
     output_depth = None
     if needs_output_depth:
         output_depth = postprocess_depth(
-            match_depth(depth, left.shape[-2], left.shape[-1]),
+            match_depth(
+                depth,
+                left.shape[-2],
+                left.shape[-1],
+                rgb=rgb,
+                edge_aware=True,
+            ),
             depth_pop=config.depth_pop,
             antialias_strength=config.depth_antialias_strength,
         )
@@ -616,7 +660,16 @@ def synthesize_stereo(
         debug["sbs_backend"] = debug.get("direct_sbs_backend", "triton_direct_sbs")
         stage_times["sbs_backend_ms"] = 0.0
         sbs = direct_sbs
-        stage_times["make_sbs_ms"] = 0.0
+        if output_edge_aa_enabled() and config.output_format in {"half_sbs", "full_sbs"}:
+            if config.output_format == "half_sbs":
+                from .display_antialias import antialias_sbs_half
+
+                sbs = antialias_sbs_half(sbs)
+            else:
+                from .display_antialias import antialias_sbs
+
+                sbs = antialias_sbs(sbs, "full_sbs")
+        stage_times["make_sbs_ms"] = (time.perf_counter() - stage_start) * 1000.0
     else:
         debug["sbs_backend"] = sbs_backend(
             left,
@@ -639,6 +692,10 @@ def synthesize_stereo(
         )
         stage_times["make_sbs_ms"] = (time.perf_counter() - stage_start) * 1000.0
 
+    debug["edge_aa_backend"] = (
+        "output_fxaa" if output_edge_aa_enabled() and config.output_format in {"half_sbs", "full_sbs"}
+        else "disabled"
+    )
     _record_cuda_event(cuda_events, "synth_sbs", rgb)
     synthesis_total_ms = (time.perf_counter() - synthesis_start) * 1000.0
     stage_accounted_ms = sum(stage_times.values())

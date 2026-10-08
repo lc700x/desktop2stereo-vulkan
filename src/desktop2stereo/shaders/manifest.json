@@ -118,6 +118,38 @@
       "precision": "fp32"
     },
     {
+      "name": "d2s_edge_aa_buffer",
+      "source": "d2s_edge_aa_buffer.comp",
+      "spirv": "d2s_edge_aa_buffer.spv",
+      "stage": "compute",
+      "entry": "main",
+      "workgroup": [16, 16, 1],
+      "descriptor_bindings": [
+        {"set": 0, "binding": 0, "kind": "storage_buffer", "access": "read_only", "format": null},
+        {"set": 0, "binding": 1, "kind": "storage_buffer", "access": "read_only", "format": null},
+        {"set": 0, "binding": 2, "kind": "storage_buffer", "access": "write_only", "format": null},
+        {"set": 0, "binding": 3, "kind": "storage_buffer", "access": "write_only", "format": null}
+      ],
+      "push_constants_size": 12,
+      "precision": "fp32"
+    },
+    {
+      "name": "d2s_edge_aa_image",
+      "source": "d2s_edge_aa_image.comp",
+      "spirv": "d2s_edge_aa_image.spv",
+      "stage": "compute",
+      "entry": "main",
+      "workgroup": [16, 16, 1],
+      "descriptor_bindings": [
+        {"set": 0, "binding": 0, "kind": "storage_image", "access": "read_only", "format": "rgba8"},
+        {"set": 0, "binding": 1, "kind": "storage_image", "access": "read_only", "format": "rgba8"},
+        {"set": 0, "binding": 2, "kind": "storage_image", "access": "write_only", "format": "rgba8"},
+        {"set": 0, "binding": 3, "kind": "storage_image", "access": "write_only", "format": "rgba8"}
+      ],
+      "push_constants_size": 12,
+      "precision": "fp32"
+    },
+    {
       "name": "d2s_msdf_quad",
       "source": "d2s_msdf_quad.comp",
       "spirv": "d2s_msdf_quad.spv",

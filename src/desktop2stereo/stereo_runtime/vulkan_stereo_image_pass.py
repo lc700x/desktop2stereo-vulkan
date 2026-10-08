@@ -10,6 +10,8 @@ from viewer.vulkan_descriptors import (
     VulkanDescriptorArena,
 )
 
+from .output import output_edge_aa_enabled
+from .vulkan_edge_aa import VulkanEyeEdgeAA
 from .vulkan_stereo_pass import VulkanLayeredStereoParams
 
 
@@ -17,7 +19,7 @@ class VulkanStereoImagePass:
     """Write stereo eyes directly into presenter-owned storage images."""
 
     WORKGROUP_SIZE = 16
-    PUSH_CONSTANTS_SIZE = 80
+    PUSH_CONSTANTS_SIZE = 84
     BUFFER_COUNT = 4
 
     def __init__(
@@ -28,6 +30,7 @@ class VulkanStereoImagePass:
         height: int,
         shader_path: str | Path = Path(__file__).resolve().parents[1] / "shaders" / "d2s_stereo_layered_output.spv",
         packed_output: bool = False,
+        edge_aa_enabled: bool | None = None,
     ) -> None:
         if int(width) < 1 or int(height) < 1:
             raise ValueError("Vulkan stereo image dimensions must be positive")
@@ -35,12 +38,14 @@ class VulkanStereoImagePass:
         self.width = int(width)
         self.height = int(height)
         self.packed_output = bool(packed_output)
+        self.edge_aa_enabled = output_edge_aa_enabled() if edge_aa_enabled is None else bool(edge_aa_enabled)
         self.pipeline: VulkanComputePipeline | None = None
         self.descriptor_arena: VulkanDescriptorArena | None = None
         self.descriptor_sets: list[Any] = []
         self._descriptor_index = 0
         self._active_descriptor_set: Any | None = None
         self._active_push_constants: bytes | None = None
+        self._edge_aa: VulkanEyeEdgeAA | None = None
         try:
             vk = context.vk
             self.pipeline = VulkanComputePipeline(
@@ -87,6 +92,8 @@ class VulkanStereoImagePass:
     def _record_active(self, command_buffer: Any) -> None:
         if self.pipeline is None or self._active_descriptor_set is None:
             raise RuntimeError("Vulkan stereo image pass is not ready")
+        if self._edge_aa is not None:
+            self._edge_aa.barrier(command_buffer, before_render=True)
         self.pipeline.record_dispatch(
             command_buffer,
             group_count_x=self.group_counts[0],
@@ -95,6 +102,8 @@ class VulkanStereoImagePass:
             descriptor_set=self._active_descriptor_set,
             push_constants=self._active_push_constants,
         )
+        if self._edge_aa is not None:
+            self._edge_aa.record(command_buffer)
 
     def submit(
         self,
@@ -130,17 +139,29 @@ class VulkanStereoImagePass:
             if state.layout != self.context.vk.VK_IMAGE_LAYOUT_GENERAL:
                 raise ValueError("stereo output image must be in GENERAL layout before dispatch")
 
-        descriptor_set = self.descriptor_sets[self._descriptor_index]
+        slot = self._descriptor_index
+        descriptor_set = self.descriptor_sets[slot]
         self._descriptor_index = (self._descriptor_index + 1) % len(self.descriptor_sets)
+        if self.edge_aa_enabled:
+            if self._edge_aa is None:
+                self._edge_aa = VulkanEyeEdgeAA(
+                    self.context, self.width, self.height,
+                    images=True, packed_output=self.packed_output,
+                )
+            render_images = self._edge_aa.prepare(slot, *images)
+        else:
+            render_images = images
         self.descriptor_arena.update_storage_buffer(descriptor_set, 0, buffers[0])
         self.descriptor_arena.update_storage_buffer(descriptor_set, 1, buffers[1])
-        self.descriptor_arena.update_storage_image(descriptor_set, 2, images[0])
-        self.descriptor_arena.update_storage_image(descriptor_set, 3, images[1])
+        self.descriptor_arena.update_storage_image(descriptor_set, 2, render_images[0])
+        self.descriptor_arena.update_storage_image(descriptor_set, 3, render_images[1])
         self._active_descriptor_set = descriptor_set
         self._active_push_constants = params.pack_image(
             self.width,
             self.height,
             packed_output=self.packed_output,
+            # Visibility is resolved once. Anti-alias the finished eye pixels.
+            edge_aa_enabled=False,
         )
         submit_kwargs = {}
         if ready_timeline is not None:
@@ -152,6 +173,9 @@ class VulkanStereoImagePass:
         return self.context.submit_on("compute", self._record_active, **submit_kwargs)
 
     def close(self) -> None:
+        if self._edge_aa is not None:
+            self._edge_aa.close()
+        self._edge_aa = None
         if self.pipeline is not None:
             self.pipeline.close()
         if self.descriptor_arena is not None:

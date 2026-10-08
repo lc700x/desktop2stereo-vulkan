@@ -1,4 +1,5 @@
 #import "macos_coreml_io.h"
+#include "sbs_fxaa_msl.h"
 
 #import <CoreML/CoreML.h>
 #import <CoreVideo/CoreVideo.h>
@@ -9,6 +10,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <pthread.h>
 #include <time.h>
 
@@ -18,6 +20,8 @@ enum {
     D2S_COREML_BUSY = -2,
     D2S_COREML_UNSUPPORTED = -3,
     D2S_COREML_OUTPUT_BACKING = -4,
+    // Private warp-only mode; the public output API remains formats 0..8.
+    D2S_OUTPUT_FULL_SBS_FROM_HALF = 9,
 };
 
 typedef struct {
@@ -51,9 +55,31 @@ typedef struct {
     D2SCoreMLIOWarpConfig stereo;
 } D2SWarpParams;
 
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t channels;
+    uint32_t layout;
+    uint32_t eye_width;
+    uint32_t batches;
+} D2SFxaaParams;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t channels;
+    uint32_t layout;
+    uint32_t eye_width;
+    uint32_t batches;
+    uint32_t half_sbs;
+    uint32_t reserved;
+} D2SSmaaParams;
+
 static const char *D2SMetalSource = R"D2S(
 #include <metal_stdlib>
 using namespace metal;
+
+constant uint D2S_OUTPUT_FULL_SBS_FROM_HALF = 9u;
 
 struct PreprocessParams {
     uint source_width;
@@ -103,6 +129,7 @@ struct WarpParams {
     float depth_pop;
     float antialias_strength;
     int anaglyph_method;
+    int edge_aa_enabled;
 };
 
 kernel void d2s_preprocess(
@@ -191,6 +218,24 @@ static inline float depth_pop(float value, constant WarpParams& p) {
     return clamp(0.5f + (centered < 0.0f ? -magnitude : magnitude), 0.0f, 1.0f);
 }
 
+static inline float conservative_depth_at(device float *depth, float x, float y,
+                                         constant WarpParams& p) {
+    float sx = clamp(x, 0.0f, float(p.source_width) - 1.0f);
+    float sy = clamp(y, 0.0f, float(p.source_height) - 1.0f);
+    float dx = clamp((sx + 0.5f) * float(p.depth_width) /
+                     float(p.source_width) - 0.5f,
+                     0.0f, float(p.depth_width - 1u));
+    float dy = clamp((sy + 0.5f) * float(p.depth_height) /
+                     float(p.source_height) - 0.5f,
+                     0.0f, float(p.depth_height - 1u));
+    uint x0 = uint(floor(dx));
+    uint x1 = min(x0 + 1u, p.depth_width - 1u);
+    uint iy = min(uint(floor(dy + 0.5f)), p.depth_height - 1u);
+    float a = depth_pop(depth[iy * p.depth_width + x0], p);
+    float b = depth_pop(depth[iy * p.depth_width + x1], p);
+    return max(a, b);
+}
+
 static inline float processed_depth_at(device float *depth, float x, float y,
                                        constant WarpParams& p) {
     // The native output is already percentile-normalized. Apply the same
@@ -256,6 +301,28 @@ static inline float layer_shift_scale(int layer_index, constant WarpParams& p) {
     return 0.75f + 0.25f * float(layer_index + 1) / float(count);
 }
 
+static inline float effective_layer_shift_scale(float value,
+                                                 constant WarpParams& p) {
+    int count = clamp(p.layers, 1, 4);
+    if (count == 1) return 1.0f;
+    if (count == 2) {
+        float depth = clamp(value, 0.0f, 1.0f);
+        float foreground_weight = 1.0f /
+            (1.0f + exp((1.0f - 2.0f * depth) /
+                        max(p.softness, 1.0e-4f)));
+        return 0.875f + 0.125f * foreground_weight;
+    }
+    float weighted_scale = 0.0f;
+    float total_weight = 0.0f;
+    for (int layer_index = 0; layer_index < 4; ++layer_index) {
+        if (layer_index >= count) break;
+        float weight = layer_weight(value, layer_index, p);
+        weighted_scale += weight * layer_shift_scale(layer_index, p);
+        total_weight += weight;
+    }
+    return weighted_scale / max(total_weight, 1.0e-6f);
+}
+
 static inline float2 clamp_source(float2 point, constant WarpParams& p) {
     return clamp(point, float2(0.0f),
                  float2(max(float(p.source_width) - 1.0f, 0.0f),
@@ -271,23 +338,284 @@ static inline float3 sample_color(texture2d<float, access::sample> color,
     return color.sample(s, uv).rgb;
 }
 
+static inline float projected_target_x(float source_x, float depth_value,
+                                       float eye_sign,
+                                       constant WarpParams& p) {
+    return source_x - shift_from_depth(depth_value, p) *
+                       effective_layer_shift_scale(depth_value, p) * eye_sign;
+}
+
+static inline float dibr_depth_at(
+    texture2d<float, access::sample> color, device float *depth,
+    float x, float y, constant WarpParams& p) {
+    float sx = clamp(x, 0.0f, float(p.source_width) - 1.0f);
+    float sy = clamp(y, 0.0f, float(p.source_height) - 1.0f);
+    float dx = clamp((sx + 0.5f) * float(p.depth_width) /
+                     float(p.source_width) - 0.5f,
+                     0.0f, float(p.depth_width - 1u));
+    float dy = clamp((sy + 0.5f) * float(p.depth_height) /
+                     float(p.source_height) - 0.5f,
+                     0.0f, float(p.depth_height - 1u));
+    uint x0 = uint(floor(dx));
+    uint x1 = min(x0 + 1u, p.depth_width - 1u);
+    uint y0 = uint(floor(dy));
+    uint y1 = min(y0 + 1u, p.depth_height - 1u);
+    float fx = dx - float(x0);
+    float fy = dy - float(y0);
+    uint i00 = y0 * p.depth_width + x0;
+    uint i10 = y0 * p.depth_width + x1;
+    uint i01 = y1 * p.depth_width + x0;
+    uint i11 = y1 * p.depth_width + x1;
+    float d00 = depth[i00];
+    float d10 = depth[i10];
+    float d01 = depth[i01];
+    float d11 = depth[i11];
+    float minimum = min(min(d00, d10), min(d01, d11));
+    float maximum = max(max(d00, d10), max(d01, d11));
+    float w00 = (1.0f - fy) * (1.0f - fx);
+    float w10 = (1.0f - fy) * fx;
+    float w01 = fy * (1.0f - fx);
+    float w11 = fy * fx;
+    float bilinear = w00 * d00 + w10 * d10 + w01 * d01 + w11 * d11;
+    if (maximum - minimum <= max(p.edge_threshold, 0.02f)) return bilinear;
+
+    float source_y0 = (float(y0) + 0.5f) * float(p.source_height) /
+                      float(p.depth_height) - 0.5f;
+    float source_y1 = (float(y1) + 0.5f) * float(p.source_height) /
+                      float(p.depth_height) - 0.5f;
+    float source_x0 = (float(x0) + 0.5f) * float(p.source_width) /
+                      float(p.depth_width) - 0.5f;
+    float source_x1 = (float(x1) + 0.5f) * float(p.source_width) /
+                      float(p.depth_width) - 0.5f;
+    float3 target_color = sample_color(color, sx, sy, p);
+    float delta00 = dot(abs(target_color - sample_color(color, source_x0, source_y0, p)),
+                        float3(1.0f / 3.0f));
+    float delta10 = dot(abs(target_color - sample_color(color, source_x1, source_y0, p)),
+                        float3(1.0f / 3.0f));
+    float delta01 = dot(abs(target_color - sample_color(color, source_x0, source_y1, p)),
+                        float3(1.0f / 3.0f));
+    float delta11 = dot(abs(target_color - sample_color(color, source_x1, source_y1, p)),
+                        float3(1.0f / 3.0f));
+    float q00 = w00 * exp(-delta00 / 0.12f);
+    float q10 = w10 * exp(-delta10 / 0.12f);
+    float q01 = w01 * exp(-delta01 / 0.12f);
+    float q11 = w11 * exp(-delta11 / 0.12f);
+    float midpoint = (minimum + maximum) * 0.5f;
+    bool high00 = d00 >= midpoint;
+    bool high10 = d10 >= midpoint;
+    bool high01 = d01 >= midpoint;
+    bool high11 = d11 >= midpoint;
+    float nearest_delta = min(min(delta00, delta10), min(delta01, delta11));
+    bool choose_high = (delta00 == nearest_delta) ? high00 :
+                       ((delta10 == nearest_delta) ? high10 :
+                       ((delta01 == nearest_delta) ? high01 : high11));
+    float s00 = q00 * ((choose_high == high00) ? 1.0f : 0.0f);
+    float s10 = q10 * ((choose_high == high10) ? 1.0f : 0.0f);
+    float s01 = q01 * ((choose_high == high01) ? 1.0f : 0.0f);
+    float s11 = q11 * ((choose_high == high11) ? 1.0f : 0.0f);
+    float selected_total = s00 + s10 + s01 + s11;
+    float selected = (s00 * d00 + s10 * d10 + s01 * d01 + s11 * d11) /
+                     max(selected_total, 1.0e-6f);
+    float color_min = min(min(delta00, delta10), min(delta01, delta11));
+    float color_max = max(max(delta00, delta10), max(delta01, delta11));
+    bool use_class = (maximum - minimum >= max(p.edge_threshold, 0.02f)) &&
+                     (selected_total > 1.0e-6f) &&
+                     (color_max - color_min >= 0.005f);
+    return use_class ? selected : bilinear;
+}
+
+static inline int dibr_search_radius(constant WarpParams& p) {
+    float maximum_scale = max(max(p.foreground_scale, p.midground_scale),
+                              max(p.background_scale, 1.0f));
+    float depth_span = max(abs(p.convergence), abs(1.0f - p.convergence));
+    float shift_bound = depth_span * max(p.depth_strength, 0.0f) *
+                        p.max_disparity_px * 0.5f * maximum_scale;
+    return min(int(ceil(shift_bound)) + 1, int(p.source_width));
+}
+
+static inline float3 sample_color_depth_class(
+    texture2d<float, access::sample> color, device float *depth,
+    float x, float y, float class_depth, constant WarpParams& p) {
+    float sx = clamp(x, 0.0f, float(p.source_width) - 1.0f);
+    float sy = clamp(y, 0.0f, float(p.source_height) - 1.0f);
+    int x0 = int(floor(sx));
+    int y0 = int(floor(sy));
+    int x1 = min(x0 + 1, int(p.source_width) - 1);
+    int y1 = min(y0 + 1, int(p.source_height) - 1);
+    float fx = sx - float(x0);
+    float fy = sy - float(y0);
+    float w00 = (1.0f - fx) * (1.0f - fy);
+    float w10 = fx * (1.0f - fy);
+    float w01 = (1.0f - fx) * fy;
+    float w11 = fx * fy;
+    float3 total = float3(0.0f);
+    float weight = 0.0f;
+    float d = dibr_depth_at(color, depth, float(x0), float(y0), p);
+    if (abs(d - class_depth) <= p.edge_threshold) {
+        total += sample_color(color, float(x0), float(y0), p) * w00;
+        weight += w00;
+    }
+    d = dibr_depth_at(color, depth, float(x1), float(y0), p);
+    if (abs(d - class_depth) <= p.edge_threshold) {
+        total += sample_color(color, float(x1), float(y0), p) * w10;
+        weight += w10;
+    }
+    d = dibr_depth_at(color, depth, float(x0), float(y1), p);
+    if (abs(d - class_depth) <= p.edge_threshold) {
+        total += sample_color(color, float(x0), float(y1), p) * w01;
+        weight += w01;
+    }
+    d = dibr_depth_at(color, depth, float(x1), float(y1), p);
+    if (abs(d - class_depth) <= p.edge_threshold) {
+        total += sample_color(color, float(x1), float(y1), p) * w11;
+        weight += w11;
+    }
+    return weight > 1.0e-6f
+        ? total / weight
+        : sample_color(color, x, y, p);
+}
+
+static inline float3 dibr_gather_at(
+    texture2d<float, access::sample> color, device float *depth,
+    float target_x, float target_y, float eye_sign,
+    constant WarpParams& p) {
+    int radius = dibr_search_radius(p);
+    // Depth 0..1 projects inside these conservative endpoints; the one-pixel
+    // margin covers bilinear splat support and radius caps the search globally.
+    float maximum_scale = max(max(p.foreground_scale, p.midground_scale),
+                              max(p.background_scale, 1.0f));
+    float disparity_bound = max(p.depth_strength, 0.0f) *
+                            p.max_disparity_px * 0.5f * maximum_scale;
+    float at_zero = target_x + p.convergence * disparity_bound * eye_sign;
+    float at_one = target_x - (1.0f - p.convergence) * disparity_bound * eye_sign;
+    float search_min = max(min(at_zero, at_one) - 1.0f,
+                           target_x - float(radius));
+    float search_max = min(max(at_zero, at_one) + 1.0f,
+                           target_x + float(radius));
+    // Use fixed source-pixel centers for all target subpixel samples. Sliding
+    // this lattice with target_x makes the selected depth/color jump over time.
+    int first_source_x = int(ceil(search_min));
+    int last_source_x = int(floor(search_max));
+    float best_depth = -1.0f;
+    float best_coverage = 0.0f;
+    float best_x = target_x;
+    float left_error = 1.0e6f;
+    float right_error = 1.0e6f;
+    float left_depth = -1.0f;
+    float right_depth = -1.0f;
+    float left_x = target_x;
+    float right_x = target_x;
+    for (int source_ix = first_source_x; source_ix <= last_source_x; ++source_ix) {
+        float source_x = float(source_ix);
+        if (source_x >= 0.0f && source_x < float(p.source_width)) {
+            float value = dibr_depth_at(color, depth, source_x, target_y, p);
+            float projected_x = projected_target_x(source_x, value, eye_sign, p);
+            float error = projected_x - target_x;
+            float coverage = max(0.0f, 1.0f - abs(error));
+            if (coverage > 0.0f &&
+                (value > best_depth ||
+                 (value == best_depth && coverage > best_coverage))) {
+                best_depth = value;
+                best_coverage = coverage;
+                best_x = source_x;
+            }
+            if (error <= 0.0f && abs(error) < left_error) {
+                left_error = abs(error);
+                left_depth = value;
+                left_x = source_x;
+            }
+            if (error >= 0.0f && error < right_error) {
+                right_error = error;
+                right_depth = value;
+                right_x = source_x;
+            }
+        }
+    }
+
+    if (left_error >= 1.0e5f) {
+        left_error = right_error;
+        left_depth = right_depth;
+        left_x = right_x;
+    }
+    if (right_error >= 1.0e5f) {
+        right_error = left_error;
+        right_depth = left_depth;
+        right_x = left_x;
+    }
+
+    if (best_depth < 0.0f) {
+        float3 left = sample_color(color, left_x, target_y, p);
+        float3 right = sample_color(color, right_x, target_y, p);
+        return left_depth <= right_depth ? left : right;
+    }
+
+    float3 foreground = float3(0.0f);
+    float foreground_coverage = 0.0f;
+    for (int offset = -1; offset <= 1; ++offset) {
+        float source_x = best_x + float(offset);
+        if (source_x >= 0.0f && source_x < float(p.source_width)) {
+            float value = dibr_depth_at(color, depth, source_x, target_y, p);
+            if (value >= best_depth - p.edge_threshold) {
+                float projected_x = projected_target_x(source_x, value,
+                                                       eye_sign, p);
+                float coverage = max(0.0f, 1.0f - abs(projected_x - target_x));
+                if (coverage > 0.0f) {
+                    foreground += sample_color_depth_class(
+                        color, depth, source_x, target_y, best_depth, p
+                    ) * coverage;
+                    foreground_coverage += coverage;
+                }
+            }
+        }
+    }
+    foreground /= max(foreground_coverage, 1.0e-6f);
+    bool has_background = min(left_depth, right_depth) <
+                          best_depth - p.edge_threshold;
+    if (!has_background) return foreground;
+    float3 background = left_depth <= right_depth
+        ? sample_color_depth_class(color, depth, left_x, target_y, left_depth, p)
+        : sample_color_depth_class(color, depth, right_x, target_y, right_depth, p);
+    return mix(background, foreground, clamp(foreground_coverage, 0.0f, 1.0f));
+}
+
+static inline float3 dibr_warp_at(
+    texture2d<float, access::sample> color, device float *depth,
+    float target_x, float target_y, float eye_sign,
+    constant WarpParams& p) {
+    float target_depth = dibr_depth_at(color, depth, target_x, target_y, p);
+    float target_shift = shift_from_depth(target_depth, p) *
+                         effective_layer_shift_scale(target_depth, p);
+    float source_x = clamp(target_x + target_shift * eye_sign, 0.0f,
+                           float(p.source_width) - 1.0f);
+    float source_depth = dibr_depth_at(color, depth, source_x, target_y, p);
+    float source_shift = shift_from_depth(source_depth, p) *
+                         effective_layer_shift_scale(source_depth, p);
+    float refined_x = clamp(target_x + source_shift * eye_sign, 0.0f,
+                            float(p.source_width) - 1.0f);
+    float source_residual = abs(refined_x - source_x);
+    bool foreground_candidate = false;
+    // No depth can occlude a sample already within the visibility threshold of 1.
+    if (source_depth < 1.0f - p.edge_threshold) {
+        float front_shift = shift_from_depth(1.0f, p);
+        float front_x = clamp(target_x + front_shift * eye_sign, 0.0f,
+                              float(p.source_width) - 1.0f);
+        float front_depth = p.antialias_strength > 0.0f
+            ? dibr_depth_at(color, depth, front_x, target_y, p)
+            : conservative_depth_at(depth, front_x, target_y, p);
+        foreground_candidate = front_depth > source_depth + p.edge_threshold;
+    }
+
+    bool source_depth_edge = abs(source_depth - target_depth) > p.edge_threshold;
+    if (source_depth_edge || source_residual > 0.5f || foreground_candidate) {
+        return dibr_gather_at(color, depth, target_x, target_y, eye_sign, p);
+    }
+    return sample_color(color, refined_x, target_y, p);
+}
+
 static inline float3 layered_warp_at(
     texture2d<float, access::sample> color, device float *depth,
     float x, float y, float eye_sign, constant WarpParams& p) {
-    float value = processed_depth_at(depth, x, y, p);
-    float shift = shift_from_depth(value, p);
-    int count = clamp(p.layers, 1, 4);
-    float3 total = float3(0.0f);
-    float total_weight = 0.0f;
-    for (int layer_index = 0; layer_index < 4; ++layer_index) {
-        if (layer_index >= count) break;
-        float weight = layer_weight(value, layer_index, p);
-        total += sample_color(color,
-                              x + shift * layer_shift_scale(layer_index, p) * eye_sign,
-                              y, p) * weight;
-        total_weight += weight;
-    }
-    return total / max(total_weight, 1.0e-6f);
+    return dibr_warp_at(color, depth, x, y, eye_sign, p);
 }
 
 static inline float max_shift_magnitude(constant WarpParams& p) {
@@ -306,6 +634,24 @@ static inline float edge_at(device float *depth, float x, float y,
                        abs(abs(shift_from_depth(processed_depth_at(depth, x, y + 1.0f, p), p)) - center_shift);
     return (depth_edge > p.edge_threshold ||
             shift_edge / max_shift_magnitude(p) > 0.05f) ? 1.0f : 0.0f;
+}
+
+static inline bool antialias_edge_at(device float *depth, float x, float y,
+                                     constant WarpParams& p) {
+    float center_depth = processed_depth_at(depth, x, y, p);
+    float center_shift = shift_from_depth(center_depth, p);
+    float depth_edge = max(
+        max(abs(processed_depth_at(depth, x - 1.0f, y, p) - center_depth),
+            abs(processed_depth_at(depth, x + 1.0f, y, p) - center_depth)),
+        max(abs(processed_depth_at(depth, x, y - 1.0f, p) - center_depth),
+            abs(processed_depth_at(depth, x, y + 1.0f, p) - center_depth)));
+    float shift_edge = max(
+        max(abs(shift_from_depth(processed_depth_at(depth, x - 1.0f, y, p), p) - center_shift),
+            abs(shift_from_depth(processed_depth_at(depth, x + 1.0f, y, p), p) - center_shift)),
+        max(abs(shift_from_depth(processed_depth_at(depth, x, y - 1.0f, p), p) - center_shift),
+            abs(shift_from_depth(processed_depth_at(depth, x, y + 1.0f, p), p) - center_shift)));
+    return depth_edge > clamp(p.edge_threshold, 0.01f, 0.025f) ||
+           shift_edge / max_shift_magnitude(p) > 0.025f;
 }
 
 static inline float occlusion_at(device float *depth, float x, float y,
@@ -408,27 +754,33 @@ static inline float3 eye_pixel(texture2d<float, access::sample> color,
     bool fill_enabled = p.hole_fill_mode != 2 && p.fill_strength > 1.0e-5f;
     float mask = (!fill_enabled || screen_edge)
         ? 0.0f : feathered_mask_at(depth, x, y, p);
-    return clamp(fill_eye(color, depth, x, y, eye_sign, mask, p),
-                 float3(0.0f), float3(1.0f));
+    float3 center = fill_eye(color, depth, x, y, eye_sign, mask, p);
+    if (p.edge_aa_enabled == 0 ||
+        (p.output_format != 0u && p.output_format != 1u) ||
+        !antialias_edge_at(depth, x, y, p)) {
+        return clamp(center, float3(0.0f), float3(1.0f));
+    }
+    float3 covered = (
+        fill_eye(color, depth, x - 0.25f, y - 0.25f, eye_sign, mask, p) +
+        fill_eye(color, depth, x + 0.25f, y - 0.25f, eye_sign, mask, p) +
+        fill_eye(color, depth, x - 0.25f, y + 0.25f, eye_sign, mask, p) +
+        fill_eye(color, depth, x + 0.25f, y + 0.25f, eye_sign, mask, p)
+    ) * 0.25f;
+    return clamp(covered, float3(0.0f), float3(1.0f));
 }
 
 static inline float3 output_eye_pixel(
     texture2d<float, access::sample> color, device float *depth,
     float x, float y, float eye_sign, bool screen_edge,
     constant WarpParams& p) {
-    // half-SBS uses the same four-tap Lanczos2 reduction as make_sbs after
-    // full-resolution layered warping. This avoids a second, mismatched
-    // bilinear reduction at silhouettes.
-    uint eye_width = p.output_width / 2u;
-    if (p.output_format != 0u || p.source_width != eye_width * 2u) {
+    // Half-SBS averages two complete eye pixels with positive weights.
+    if (p.output_format != 0u || p.source_width != p.output_width) {
         return eye_pixel(color, depth, x, y, eye_sign, screen_edge, p);
     }
     float base = floor(x);
-    float3 xm1 = eye_pixel(color, depth, base - 1.0f, y, eye_sign, screen_edge, p);
-    float3 x0 = eye_pixel(color, depth, base, y, eye_sign, screen_edge, p);
-    float3 x1 = eye_pixel(color, depth, base + 1.0f, y, eye_sign, screen_edge, p);
-    float3 x2 = eye_pixel(color, depth, base + 2.0f, y, eye_sign, screen_edge, p);
-    return (-xm1 + 9.0f * x0 + 9.0f * x1 - x2) * 0.0625f;
+    float3 left = eye_pixel(color, depth, base, y, eye_sign, screen_edge, p);
+    float3 right = eye_pixel(color, depth, base + 1.0f, y, eye_sign, screen_edge, p);
+    return (left + right) * 0.5f;
 }
 
 static inline float3 output_eye_pixel_vertical(
@@ -533,11 +885,16 @@ kernel void d2s_warp_pack(
         float source_x = (float(eye_x) + 0.5f) *
                              (float(p.source_width) / float(eye_width)) - 0.5f;
         float source_y = float(y);
+        bool from_half = p.output_format == D2S_OUTPUT_FULL_SBS_FROM_HALF;
+        uint display_eye_width = from_half ? eye_width / 2u : eye_width;
         uint edge = min(uint(max(p.screen_edge_suppression, 0)),
-                        min(eye_width, p.output_height));
+                        min(display_eye_width, p.output_height));
+        // Half-SBS border suppression is measured in packed display pixels:
+        // full-eye AA doubles only x coordinates; y keeps its original units.
+        uint horizontal_edge = from_half ? edge * 2u : edge;
         bool screen_edge = edge > 0u &&
-            (eye_x < edge || y < edge || eye_x >= eye_width - edge ||
-             y >= p.output_height - edge);
+            (eye_x < horizontal_edge || y < edge ||
+             eye_x >= eye_width - horizontal_edge || y >= p.output_height - edge);
         pixel = output_eye_pixel(
             color, depth, source_x, source_y,
             left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f),
@@ -558,6 +915,9 @@ typedef struct {
     __strong id<MTLBuffer> normalized_depth_buffer;
     __strong id<MTLBuffer> status_buffer;
     __strong id<MTLBuffer> packed_buffer;
+    __strong id<MTLBuffer> raw_packed_buffer;
+    __strong id<MTLBuffer> smaa_edges_buffer;
+    __strong id<MTLBuffer> smaa_weights_buffer;
     __strong id<MTLTexture> color_texture;
     __strong MLMultiArray *input_array;
     __strong MLMultiArray *output_array;
@@ -582,6 +942,13 @@ typedef struct {
     __strong id<MTLComputePipelineState> normalize_half_pipeline;
     __strong id<MTLComputePipelineState> normalize_float_pipeline;
     __strong id<MTLComputePipelineState> warp_pipeline;
+    __strong id<MTLComputePipelineState> fxaa_pipeline;
+    __strong id<MTLComputePipelineState> fxaa_half_pipeline;
+    __strong id<MTLComputePipelineState> smaa_edges_pipeline;
+    __strong id<MTLComputePipelineState> smaa_weights_pipeline;
+    __strong id<MTLComputePipelineState> smaa_resolve_pipeline;
+    __strong id<MTLBuffer> smaa_area_buffer;
+    __strong id<MTLBuffer> smaa_search_buffer;
     CVMetalTextureCacheRef texture_cache;
     __strong NSString *input_name;
     __strong NSString *output_name;
@@ -596,6 +963,10 @@ typedef struct {
     D2SSlot slots[3];
     pthread_mutex_t mutex;
     int32_t mutex_initialized;
+    uint64_t depth_range_frame_id;
+    float depth_range_lo;
+    float depth_range_hi;
+    int32_t depth_range_initialized;
     char error[512];
 } D2SCoreMLIO;
 
@@ -675,6 +1046,9 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     for (int i = 0; i < 3; ++i) {
         d2s_release_slot(&ctx->slots[i]);
         ctx->slots[i].packed_buffer = nil;
+        ctx->slots[i].raw_packed_buffer = nil;
+        ctx->slots[i].smaa_edges_buffer = nil;
+        ctx->slots[i].smaa_weights_buffer = nil;
     }
     if (ctx->texture_cache != NULL) {
         CFRelease(ctx->texture_cache);
@@ -688,6 +1062,13 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     ctx->normalize_half_pipeline = nil;
     ctx->normalize_float_pipeline = nil;
     ctx->warp_pipeline = nil;
+    ctx->fxaa_pipeline = nil;
+    ctx->fxaa_half_pipeline = nil;
+    ctx->smaa_edges_pipeline = nil;
+    ctx->smaa_weights_pipeline = nil;
+    ctx->smaa_resolve_pipeline = nil;
+    ctx->smaa_area_buffer = nil;
+    ctx->smaa_search_buffer = nil;
     ctx->input_name = nil;
     ctx->output_name = nil;
     ctx->input_shape = nil;
@@ -702,7 +1083,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
 
 static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     id<MTLLibrary> library = [ctx->device newLibraryWithSource:
-                                                          [NSString stringWithUTF8String:D2SMetalSource]
+                                                          [NSString stringWithFormat:@"%s\n%s", D2SMetalSource, D2S_FXAA_MSL]
                                                           options:nil
                                                             error:error];
     if (library == nil) return NO;
@@ -710,13 +1091,22 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     id<MTLFunction> norm_half = [library newFunctionWithName:@"d2s_normalize_half"];
     id<MTLFunction> norm_float = [library newFunctionWithName:@"d2s_normalize_float"];
     id<MTLFunction> warp = [library newFunctionWithName:@"d2s_warp_pack"];
-    if (!preprocess || !norm_half || !norm_float || !warp) return NO;
+    id<MTLFunction> fxaa = [library newFunctionWithName:@"d2s_sbs_fxaa"];
+    id<MTLFunction> fxaa_half = [library newFunctionWithName:@"d2s_sbs_fxaa_half"];
+    if (!preprocess || !norm_half || !norm_float || !warp || !fxaa || !fxaa_half) return NO;
     ctx->preprocess_pipeline = [ctx->device newComputePipelineStateWithFunction:preprocess error:error];
     ctx->normalize_half_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_half error:error];
     ctx->normalize_float_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_float error:error];
     ctx->warp_pipeline = [ctx->device newComputePipelineStateWithFunction:warp error:error];
-    return ctx->preprocess_pipeline && ctx->normalize_half_pipeline &&
-           ctx->normalize_float_pipeline && ctx->warp_pipeline;
+    ctx->fxaa_pipeline = [ctx->device newComputePipelineStateWithFunction:fxaa error:error];
+    ctx->fxaa_half_pipeline = [ctx->device newComputePipelineStateWithFunction:fxaa_half error:error];
+    if (!(ctx->preprocess_pipeline && ctx->normalize_half_pipeline &&
+           ctx->normalize_float_pipeline && ctx->warp_pipeline &&
+           ctx->fxaa_pipeline && ctx->fxaa_half_pipeline)) return NO;
+
+    // All runtime backends use the shared single-pass FXAA display filter.
+    // Leave the dormant SMAA fields nil so native packing follows its FXAA path.
+    return YES;
 }
 
 static BOOL d2s_get_model_contract(D2SCoreMLIO *ctx, NSError **error) {
@@ -840,6 +1230,35 @@ void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
         for (int i = 0; i < 3; ++i) ctx->slots[i].state = 0;
         return ctx;
     }
+}
+
+int32_t d2s_coreml_io_set_smaa_luts(void *handle,
+                                    const void *area, size_t area_size,
+                                    const void *search, size_t search_size) {
+    D2SCoreMLIO *ctx = (D2SCoreMLIO *)handle;
+    if (ctx == NULL || area == NULL || search == NULL ||
+        area_size != 160u * 560u * 2u || search_size != 64u * 16u) {
+        return D2S_COREML_UNSUPPORTED;
+    }
+    D2SLockGuard lock(&ctx->mutex);
+    if (ctx->smaa_edges_pipeline == nil || ctx->smaa_weights_pipeline == nil ||
+        ctx->smaa_resolve_pipeline == nil) {
+        d2s_set_error(ctx, @"Metal SMAA pipelines are unavailable");
+        return D2S_COREML_UNSUPPORTED;
+    }
+    ctx->smaa_area_buffer = [ctx->device newBufferWithBytes:area
+                                                     length:area_size
+                                                    options:MTLResourceStorageModeShared];
+    ctx->smaa_search_buffer = [ctx->device newBufferWithBytes:search
+                                                       length:search_size
+                                                      options:MTLResourceStorageModeShared];
+    if (ctx->smaa_area_buffer == nil || ctx->smaa_search_buffer == nil) {
+        ctx->smaa_area_buffer = nil;
+        ctx->smaa_search_buffer = nil;
+        d2s_set_error(ctx, @"Metal SMAA lookup table allocation failed");
+        return D2S_COREML_ERROR;
+    }
+    return D2S_COREML_OK;
 }
 
 static int32_t d2s_find_slot(D2SCoreMLIO *ctx) {
@@ -984,6 +1403,51 @@ static uint32_t d2s_depth_range(D2SCoreMLIO *ctx, D2SSlot *slot,
     return nonfinite;
 }
 
+static int32_t d2s_stabilize_depth_range(D2SCoreMLIO *ctx, uint64_t frame_id,
+                                         float *lo, float *hi) {
+    const char *disabled = getenv("D2S_DEPTH_RANGE_TEMPORAL");
+    if (disabled != NULL && (strcmp(disabled, "0") == 0 ||
+                             strcasecmp(disabled, "false") == 0 ||
+                             strcasecmp(disabled, "off") == 0)) {
+        return 1;
+    }
+    if (!isfinite(*lo) || !isfinite(*hi) || *hi <= *lo) return 1;
+
+    D2SLockGuard lock(&ctx->mutex);
+    if (ctx->depth_range_initialized && frame_id <= ctx->depth_range_frame_id) {
+        return 1;
+    }
+    if (!ctx->depth_range_initialized ||
+        frame_id - ctx->depth_range_frame_id > 2) {
+        ctx->depth_range_lo = *lo;
+        ctx->depth_range_hi = *hi;
+        ctx->depth_range_frame_id = frame_id;
+        ctx->depth_range_initialized = 1;
+        return 1;
+    }
+
+    const float previous_span = fmaxf(ctx->depth_range_hi - ctx->depth_range_lo, 1e-6f);
+    const float current_span = fmaxf(*hi - *lo, 1e-6f);
+    const float scale = fmaxf(previous_span, current_span);
+    const float range_jump = fmaxf(fabsf(*lo - ctx->depth_range_lo),
+                                   fabsf(*hi - ctx->depth_range_hi));
+    if (range_jump > 0.50f * scale) {
+        // Large model-range discontinuity is treated like a scene cut: reset
+        // immediately rather than carrying stale normalization into the new scene.
+        ctx->depth_range_lo = *lo;
+        ctx->depth_range_hi = *hi;
+    } else {
+        // Light one-frame damping suppresses quantile shimmer without adding
+        // image history or delaying the RGB frame.
+        ctx->depth_range_lo = ctx->depth_range_lo * 0.35f + *lo * 0.65f;
+        ctx->depth_range_hi = ctx->depth_range_hi * 0.35f + *hi * 0.65f;
+    }
+    ctx->depth_range_frame_id = frame_id;
+    *lo = ctx->depth_range_lo;
+    *hi = ctx->depth_range_hi;
+    return range_jump > 0.50f * scale;
+}
+
 int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
                               uint64_t frame_id, D2SCoreMLIOResult *result) {
     @autoreleasepool {
@@ -1115,6 +1579,10 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
         double postprocess_start = d2s_now_ms();
         float lo = 0.0f, hi = 1.0f;
         uint32_t nonfinite = d2s_depth_range(ctx, slot, &lo, &hi);
+        const float raw_lo = lo;
+        const float raw_hi = hi;
+        const int32_t range_history_reset =
+            d2s_stabilize_depth_range(ctx, frame_id, &lo, &hi);
         slot->normalize_lo = lo;
         slot->normalize_hi = hi;
         double postprocess_ms = d2s_now_ms() - postprocess_start;
@@ -1141,6 +1609,9 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
         result->nonfinite_count = nonfinite;
         result->normalize_lo = lo;
         result->normalize_hi = hi;
+        result->raw_normalize_lo = raw_lo;
+        result->raw_normalize_hi = raw_hi;
+        result->normalization_history_reset = range_history_reset;
         result->preprocess_ms = preprocess_ms;
         result->model_ms = model_ms;
         result->postprocess_ms = postprocess_ms;
@@ -1210,7 +1681,7 @@ static int32_t d2s_coreml_io_pack_internal(
         D2SCoreMLIOWarpConfig default_stereo = {
             1.0f, 48.0f, 0.0f, 0.04f, 0.0f,
             0, 0, 1, 2, 0.08f,
-            1.0f, 1.0f, 1.0f, 2, 0, 2, 1, 0.0f, 0.0f, 0,
+            1.0f, 1.0f, 1.0f, 2, 0, 2, 1, 0.0f, 0.0f, 0, 1,
         };
         D2SWarpParams params = {
             source_width,
@@ -1223,19 +1694,118 @@ static int32_t d2s_coreml_io_pack_internal(
             output_channels,
             warp_config != NULL ? *warp_config : default_stereo,
         };
+        BOOL filter_sbs = params.stereo.edge_aa_enabled != 0 &&
+            (output_format == D2S_OUTPUT_HALF_SBS || output_format == D2S_OUTPUT_FULL_SBS);
+        BOOL filter_half = filter_sbs && output_format == D2S_OUTPUT_HALF_SBS;
+        // Image-space AA sees full eye colour edges before any horizontal
+        // reduction. Keep DIBR single-sampled and its depth/visibility intact.
+        params.stereo.edge_aa_enabled = 0;
+        uint32_t raw_width = filter_half ? (uint32_t)output_width * 2u : (uint32_t)output_width;
+        if (filter_half) {
+            params.output_width = raw_width;
+            params.output_format = D2S_OUTPUT_FULL_SBS_FROM_HALF;
+        }
+        id<MTLBuffer> warp_destination = destination_buffer;
+        if (filter_sbs) {
+            size_t raw_bytes = (size_t)raw_width * output_height * output_channels;
+            if (slot->raw_packed_buffer == nil || slot->raw_packed_buffer.length < raw_bytes) {
+                slot->raw_packed_buffer = [ctx->device newBufferWithLength:(NSUInteger)raw_bytes
+                                                                  options:MTLResourceStorageModePrivate];
+            }
+            warp_destination = slot->raw_packed_buffer;
+            if (warp_destination == nil) {
+                d2s_set_error(ctx, @"Metal edge-AA input buffer allocation failed");
+                return D2S_COREML_ERROR;
+            }
+        }
         id<MTLCommandBuffer> command = [ctx->pack_queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
         d2s_encode_normalize(ctx, slot, encoder, slot->normalize_lo, slot->normalize_hi);
         [encoder setComputePipelineState:ctx->warp_pipeline];
         [encoder setTexture:slot->color_texture atIndex:0];
         [encoder setBuffer:slot->normalized_depth_buffer offset:0 atIndex:0];
-        [encoder setBuffer:destination_buffer offset:0 atIndex:1];
+        [encoder setBuffer:warp_destination offset:0 atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         NSUInteger threads = 64;
-        MTLSize grid = MTLSizeMake((NSUInteger)output_width * output_height, 1, 1);
+        MTLSize grid = MTLSizeMake((NSUInteger)raw_width * output_height, 1, 1);
         [encoder dispatchThreads:grid
           threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         [encoder endEncoding];
+        if (filter_sbs) {
+            BOOL use_smaa = ctx->smaa_edges_pipeline != nil &&
+                ctx->smaa_weights_pipeline != nil && ctx->smaa_resolve_pipeline != nil &&
+                ctx->smaa_area_buffer != nil && ctx->smaa_search_buffer != nil;
+            size_t raw_pixels = (size_t)raw_width * output_height;
+            size_t edge_bytes = raw_pixels * 2u;
+            size_t weight_bytes = raw_pixels * 4u;
+            if (use_smaa) {
+                if (slot->smaa_edges_buffer == nil || slot->smaa_edges_buffer.length < edge_bytes) {
+                    slot->smaa_edges_buffer = [ctx->device newBufferWithLength:edge_bytes
+                        options:MTLResourceStorageModePrivate];
+                }
+                if (slot->smaa_weights_buffer == nil || slot->smaa_weights_buffer.length < weight_bytes) {
+                    slot->smaa_weights_buffer = [ctx->device newBufferWithLength:weight_bytes
+                        options:MTLResourceStorageModePrivate];
+                }
+                use_smaa = slot->smaa_edges_buffer != nil && slot->smaa_weights_buffer != nil;
+            }
+            if (use_smaa) {
+                // SMAA runs on complete eyes at warp resolution. The final
+                // resolve also performs the positive-weight Half-SBS shrink.
+                D2SSmaaParams aa_params = {
+                    raw_width, (uint32_t)output_height, output_channels, 0u,
+                    raw_width / 2u, 1u, filter_half ? 1u : 0u, 0u,
+                };
+                MTLSize aa_grid = MTLSizeMake(raw_width, output_height, 1);
+                MTLSize aa_group = MTLSizeMake(16, 8, 1);
+                encoder = [command computeCommandEncoder];
+                [encoder setComputePipelineState:ctx->smaa_edges_pipeline];
+                [encoder setBuffer:warp_destination offset:0 atIndex:0];
+                [encoder setBuffer:warp_destination offset:0 atIndex:1];
+                [encoder setBuffer:slot->smaa_edges_buffer offset:0 atIndex:2];
+                [encoder setBytes:&aa_params length:sizeof(aa_params) atIndex:3];
+                [encoder dispatchThreads:aa_grid threadsPerThreadgroup:aa_group];
+                [encoder endEncoding];
+
+                encoder = [command computeCommandEncoder];
+                [encoder setComputePipelineState:ctx->smaa_weights_pipeline];
+                [encoder setBuffer:slot->smaa_edges_buffer offset:0 atIndex:0];
+                [encoder setBuffer:ctx->smaa_area_buffer offset:0 atIndex:1];
+                [encoder setBuffer:ctx->smaa_search_buffer offset:0 atIndex:2];
+                [encoder setBuffer:slot->smaa_weights_buffer offset:0 atIndex:3];
+                [encoder setBytes:&aa_params length:sizeof(aa_params) atIndex:4];
+                [encoder dispatchThreads:aa_grid threadsPerThreadgroup:aa_group];
+                [encoder endEncoding];
+
+                encoder = [command computeCommandEncoder];
+                [encoder setComputePipelineState:ctx->smaa_resolve_pipeline];
+                [encoder setBuffer:warp_destination offset:0 atIndex:0];
+                [encoder setBuffer:warp_destination offset:0 atIndex:1];
+                [encoder setBuffer:slot->smaa_weights_buffer offset:0 atIndex:2];
+                [encoder setBuffer:destination_buffer offset:0 atIndex:3];
+                [encoder setBuffer:destination_buffer offset:0 atIndex:4];
+                [encoder setBytes:&aa_params length:sizeof(aa_params) atIndex:5];
+                [encoder dispatchThreads:MTLSizeMake(output_width, output_height, 1)
+                  threadsPerThreadgroup:aa_group];
+                [encoder endEncoding];
+            } else {
+                // Optional-SMAA setup failures retain the tested legacy path.
+                encoder = [command computeCommandEncoder];
+                [encoder setComputePipelineState:filter_half ? ctx->fxaa_half_pipeline : ctx->fxaa_pipeline];
+                [encoder setBuffer:warp_destination offset:0 atIndex:0];
+                [encoder setBuffer:warp_destination offset:0 atIndex:1];
+                [encoder setBuffer:destination_buffer offset:0 atIndex:2];
+                [encoder setBuffer:destination_buffer offset:0 atIndex:3];
+                D2SFxaaParams aa_params = {
+                    raw_width, (uint32_t)output_height,
+                    output_channels, 0u, raw_width / 2u, 1u,
+                };
+                [encoder setBytes:&aa_params length:sizeof(aa_params) atIndex:4];
+                [encoder dispatchThreads:MTLSizeMake(output_width, output_height, 1)
+                  threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+                [encoder endEncoding];
+            }
+        }
         [command commit];
         [command waitUntilCompleted];
         if (command.status != MTLCommandBufferStatusCompleted) {

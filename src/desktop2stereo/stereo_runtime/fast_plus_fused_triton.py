@@ -59,7 +59,23 @@ def _sample_eye(
     base = channel * pixels + y * width
     v0 = tl.load(rgb + base + x0)
     v1 = tl.load(rgb + base + x1)
-    return v0 * (1.0 - frac) + v1 * frac
+    # A bilinear tap straddling a low-resolution depth step contains both
+    # sides of the source contour.  Reusing that mixed color after shifting
+    # it creates the second, displaced edge seen in SBS.  Keep the source
+    # pixel's depth class when the two taps are a real edge; flat regions use
+    # the original linear sample.
+    left_depth = _load_depth_at(depth, y, x0, width, height)
+    right_depth = _load_depth_at(depth, y, x1, width, height)
+    depth_edge = tl.abs(left_depth - right_depth) > 0.04
+    keep_left = tl.abs(left_depth - depth_value) <= 0.04
+    keep_right = tl.abs(right_depth - depth_value) <= 0.04
+    class_weight = tl.where(keep_left, 1.0 - frac, 0.0) + tl.where(keep_right, frac, 0.0)
+    class_value = (
+        v0 * tl.where(keep_left, 1.0 - frac, 0.0)
+        + v1 * tl.where(keep_right, frac, 0.0)
+    ) / tl.maximum(class_weight, 1.0e-6)
+    linear_value = v0 * (1.0 - frac) + v1 * frac
+    return tl.where(depth_edge & (class_weight > 1.0e-6), class_value, linear_value)
 
 
 @triton.jit

@@ -38,6 +38,9 @@ typedef struct {
     double preprocess_ms;
     double model_ms;
     double postprocess_ms;
+    float raw_normalize_lo;
+    float raw_normalize_hi;
+    int32_t normalization_history_reset;
 } D2SCoreMLIOResult;
 
 typedef struct {
@@ -61,11 +64,16 @@ typedef struct {
     float depth_pop;
     float antialias_strength;
     int32_t anaglyph_method;
+    int32_t edge_aa_enabled;
 } D2SCoreMLIOWarpConfig;
 
 void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
                            int32_t input_height, int32_t compute_units,
                            char *error_buffer, size_t error_capacity);
+
+int32_t d2s_coreml_io_set_smaa_luts(void *handle,
+                                    const void *area, size_t area_size,
+                                    const void *search, size_t search_size);
 
 int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
                              uint64_t frame_id, D2SCoreMLIOResult *result);

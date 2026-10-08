@@ -55,7 +55,7 @@ class StereoRuntimeConfig:
     parallel_inference_workers: int = 1
     # Optional program-controlled OpenXR visual regression output directory.
     openxr_visual_regression_dir: str | Path | None = None
-    depth_upsample: DepthUpsampleMode = "bilinear"
+    depth_upsample: DepthUpsampleMode = "joint_bilateral"
     depth_upsample_edge_strength: float = 0.35
     depth_strength: float = 2.0
     convergence: float = 0.0

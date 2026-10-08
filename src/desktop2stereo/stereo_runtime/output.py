@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from typing import Literal
 
@@ -31,6 +32,13 @@ OUTPUT_FORMAT_CHOICES = (
 )
 
 
+def output_edge_aa_enabled() -> bool:
+    """Shared display-only edge-AA switch for renderer backends."""
+    return os.environ.get("D2S_SBS_AA", "1").strip().lower() not in {
+        "0", "false", "off", "no"
+    }
+
+
 def ensure_bchw(x: torch.Tensor, *, name: str) -> torch.Tensor:
     if x.ndim == 3:
         return x.unsqueeze(0)
@@ -49,10 +57,21 @@ def ensure_b1hw(depth: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"depth must be HW, BHW, or B1HW, got shape {tuple(depth.shape)}")
 
 
-def match_depth(depth: torch.Tensor, height: int, width: int) -> torch.Tensor:
+def match_depth(
+    depth: torch.Tensor,
+    height: int,
+    width: int,
+    *,
+    rgb: torch.Tensor | None = None,
+    edge_aware: bool = False,
+) -> torch.Tensor:
     depth = ensure_b1hw(depth).float()
     if depth.shape[-2:] == (height, width):
         return depth
+    if edge_aware and rgb is not None:
+        from .depth_upsample import upsample_depth
+
+        return upsample_depth(depth, height, width, rgb=rgb, mode="joint_bilateral")
     return F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
 
 
@@ -110,6 +129,92 @@ def downsample_horizontal_lanczos2(
     ) * (1.0 / 16.0)
 
 
+def downsample_horizontal_area(
+    image: torch.Tensor,
+    target_width: int | None = None,
+) -> torch.Tensor:
+    """Reduce SBS eye width with non-negative pixel-area weights."""
+    image = ensure_bchw(image, name="image")
+    width = int(image.shape[-1])
+    target_width = width // 2 if target_width is None else int(target_width)
+    if target_width <= 0 or target_width > width:
+        raise ValueError("area target width must be between 1 and the source width")
+    source = image.float() if image.dtype == torch.uint8 else image
+    reduced = _horizontal_area_reduce(source, target_width)
+    if image.dtype == torch.uint8:
+        return reduced.round().clamp(0, 255).to(torch.uint8)
+    return reduced.to(image.dtype)
+
+
+def _horizontal_area_reduce(image: torch.Tensor, target_width: int) -> torch.Tensor:
+    """Exact box-area reduction; integer ratios use the native area kernel."""
+    source_width = int(image.shape[-1])
+    if target_width == source_width:
+        return image
+    if source_width % target_width == 0:
+        return F.interpolate(
+            image,
+            size=(int(image.shape[-2]), target_width),
+            mode="area",
+        )
+
+    scale = source_width / target_width
+    output_x = torch.arange(target_width, device=image.device, dtype=torch.float32)
+    source_begin = output_x * scale
+    source_end = (output_x + 1.0) * scale
+    first = torch.floor(source_begin).to(torch.long)
+    taps = math.ceil(scale) + 1
+    reduced = torch.zeros(
+        (*image.shape[:-1], target_width),
+        dtype=image.dtype,
+        device=image.device,
+    )
+    for tap in range(taps):
+        source_x = first + tap
+        weight = (
+            torch.minimum(source_end, source_x.to(torch.float32) + 1.0)
+            - torch.maximum(source_begin, source_x.to(torch.float32))
+        ).clamp_min(0.0)
+        sample = image.index_select(-1, source_x.clamp_max(source_width - 1))
+        reduced = reduced + sample * weight.view(*([1] * (image.ndim - 1)), target_width)
+    return reduced / scale
+
+
+def downsample_horizontal_area_srgb(
+    image: torch.Tensor,
+    target_width: int | None = None,
+) -> torch.Tensor:
+    """Area-reduce encoded RGB in linear light and preserve alpha coverage."""
+    image = ensure_bchw(image, name="image")
+    if image.shape[1] not in (3, 4):
+        raise ValueError("sRGB area sampling expects RGB or RGBA")
+    scale = 255.0 if image.dtype == torch.uint8 else 1.0
+    source = image.float() / scale
+    rgb = source[:, :3].clamp(0.0, 1.0)
+    linear = torch.where(
+        rgb <= 0.04045,
+        rgb / 12.92,
+        ((rgb + 0.055) / 1.055).clamp_min(0.0).pow(2.4),
+    )
+    width = int(source.shape[-1])
+    target_width = width // 2 if target_width is None else int(target_width)
+    if target_width <= 0 or target_width > width:
+        raise ValueError("area target width must be between 1 and the source width")
+    reduced_rgb = _horizontal_area_reduce(linear, target_width).clamp(0.0, 1.0)
+    encoded = torch.where(
+        reduced_rgb <= 0.0031308,
+        reduced_rgb * 12.92,
+        1.055 * reduced_rgb.pow(1.0 / 2.4) - 0.055,
+    )
+    if image.shape[1] == 4:
+        alpha = _horizontal_area_reduce(source[:, 3:4], target_width)
+        encoded = torch.cat((encoded, alpha), dim=1)
+    encoded = encoded * scale
+    if image.dtype == torch.uint8:
+        return encoded.round().clamp(0.0, 255.0).to(torch.uint8)
+    return encoded.clamp(0.0, 1.0).to(image.dtype)
+
+
 def downsample_vertical_lanczos2(
     image: torch.Tensor,
     target_height: int | None = None,
@@ -123,6 +228,33 @@ def downsample_vertical_lanczos2(
 
 
 def make_sbs(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    output_format: OutputFormat,
+    fused: bool = True,
+    depth: torch.Tensor | None = None,
+    anaglyph_method: AnaglyphMethod = "red_cyan",
+) -> torch.Tensor:
+    if output_edge_aa_enabled() and output_format in {"half_sbs", "full_sbs"}:
+        left_bchw = ensure_bchw(left, name="left")
+        right_bchw = ensure_bchw(right, name="right")
+        if left_bchw.shape != right_bchw.shape:
+            raise ValueError(
+                f"left and right shapes must match, got {left_bchw.shape} and {right_bchw.shape}"
+            )
+        if left_bchw.shape[1] in (3, 4):
+            from .display_antialias import antialias_sbs, antialias_sbs_half
+
+            packed = torch.cat((left_bchw, right_bchw), dim=-1)
+            if output_format == "half_sbs":
+                # One device dispatch performs both eye-local FXAA and the
+                # positive-weight linear-light Half-SBS reduction.
+                return antialias_sbs_half(packed)
+            return antialias_sbs(packed, output_format)
+    return _make_sbs_unfiltered(left, right, output_format, fused, depth, anaglyph_method)
+
+
+def _make_sbs_unfiltered(
     left: torch.Tensor,
     right: torch.Tensor,
     output_format: OutputFormat,
@@ -186,10 +318,15 @@ def make_sbs(
         if sbs_backend(left, right, output_format, fused=fused) == "triton_half_sbs":
             from .output_triton import make_half_sbs
 
-            return make_half_sbs(left, right)
+            return make_half_sbs(left, right, linear_srgb=output_edge_aa_enabled())
         width = int(left.shape[-1])
-        left_half = downsample_horizontal_lanczos2(left, width // 2)
-        right_half = downsample_horizontal_lanczos2(right, width - width // 2)
+        downsample = (
+            downsample_horizontal_area_srgb
+            if output_edge_aa_enabled() and left.shape[1] in (3, 4)
+            else downsample_horizontal_area
+        )
+        left_half = downsample(left, width // 2)
+        right_half = downsample(right, width - width // 2)
         return torch.cat([left_half, right_half], dim=-1)
 
     if output_format == "full_tab":
