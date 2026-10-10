@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import struct
+import time
 from typing import Any, Callable
 
 from viewer.vulkan_compute_pipeline import read_spirv_words
@@ -34,6 +35,7 @@ _PANEL_PADDING = 14
 _PANEL_RADIUS = 10
 _FONT_SIZE = 26
 _MAX_PANEL_WIDTH = 560
+_PANEL_TEXTURE_HEIGHT = 256
 
 
 def _load_panel_font(size: int):
@@ -103,7 +105,11 @@ def build_fps_panel_rgba(
     spacing = 6
     panel_w = min(_MAX_PANEL_WIDTH, max(widths) + _PANEL_PADDING * 2)
     panel_h = sum(heights) + spacing * (len(rows) - 1) + _PANEL_PADDING * 2
-    panel = Image.new("RGBA", (panel_w, panel_h), (0, 0, 0, 0))
+    # Keep the sampled image extent stable as FPS/latency values gain or lose
+    # digits. A transparent canvas preserves the visible panel size while
+    # avoiding a device-local image allocation on every metrics refresh.
+    texture_h = max(_PANEL_TEXTURE_HEIGHT, panel_h)
+    panel = Image.new("RGBA", (_MAX_PANEL_WIDTH, texture_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(panel)
     draw.rounded_rectangle(
         [0, 0, panel_w - 1, panel_h - 1],
@@ -152,10 +158,10 @@ class VulkanFpsOverlay:
         self.enabled = False
         self.available = False
         self.reason = ""
-        self._panel = None
         self._panel_size: tuple[int, int] = (0, 0)
         self._panel_dirty = False
         self._pending_panel = None
+        self.last_upload_ms = 0.0
         self._staging = None
         self._staging_capacity = 0
         self._staging_mapped = None
@@ -487,23 +493,33 @@ class VulkanFpsOverlay:
     # ── panel texture ──
 
     def set_panel(self, panel: Any) -> None:
-        """Queue a freshly rasterized panel for upload on the present thread."""
+        """Queue preconverted RGBA bytes for upload on the present thread."""
         if panel is None:
             return
         width, height = panel.size
         if width <= 0 or height <= 0:
             return
-        self._pending_panel = panel
+        try:
+            rgba = panel if getattr(panel, "mode", None) == "RGBA" else panel.convert("RGBA")
+            self._pending_panel = (rgba.tobytes(), (int(width), int(height)))
+        except Exception as exc:
+            print(
+                "[VulkanLocalViewer] FPS overlay raster conversion failed: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return
         self._panel_dirty = True
 
     def _upload_panel(self, cmd: Any) -> bool:
-        panel = self._pending_panel
-        if panel is None or not self._panel_dirty:
+        self.last_upload_ms = 0.0
+        pending_panel = self._pending_panel
+        if pending_panel is None or not self._panel_dirty:
             return False
+        upload_started = time.perf_counter()
+        data, (width, height) = pending_panel
         vk = self.vk
         try:
-            data = panel.convert("RGBA").tobytes()
-            width, height = panel.size
             capacity = width * height * 4
             if self._staging is None or self._staging_capacity < capacity:
                 self._destroy_staging()
@@ -653,7 +669,6 @@ class VulkanFpsOverlay:
                 0,
                 None,
             )
-            self._panel = panel
             self._pending_panel = None
             self._panel_dirty = False
             return True
@@ -666,6 +681,8 @@ class VulkanFpsOverlay:
             self._pending_panel = None
             self._panel_dirty = False
             return False
+        finally:
+            self.last_upload_ms = (time.perf_counter() - upload_started) * 1000.0
 
     def _transition(self, cmd: Any, image: Any, old: int, new: int) -> None:
         if old == new:

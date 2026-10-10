@@ -97,6 +97,18 @@ _TIMING_SAMPLE_NAMES = {
 }
 
 
+def fps_breakdown_default(settings: dict, run_mode: str) -> str:
+    """Default detailed FPS logs on for an FPS-enabled Local Viewer run."""
+    if "D2S_OPENXR_DEBUG" in os.environ:
+        return os.environ["D2S_OPENXR_DEBUG"]
+    selected_mode = str(settings.get("Run Mode", "")).strip().casefold()
+    show_fps = settings.get("Show FPS", False)
+    if not isinstance(show_fps, bool):
+        show_fps = str(show_fps).strip().casefold() in {"1", "true", "yes", "on"}
+    enabled = run_mode == "Viewer" and selected_mode == "local viewer" and show_fps
+    return "1" if enabled else "0"
+
+
 def _percentile(values: tuple[float, ...], quantile: float) -> float:
     """Return a deterministic interpolated percentile without NumPy."""
     if not values:

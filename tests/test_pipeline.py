@@ -231,6 +231,84 @@ def test_parallel_adaptive_backoff_can_be_disabled(monkeypatch):
     assert events == []
 
 
+def test_coreml_viewer_parallel_pending_defaults_to_two_on_macos(monkeypatch):
+    monkeypatch.setattr("stereo_runtime.pipeline.sys.platform", "darwin")
+    monkeypatch.delenv("D2S_RUNTIME_PENDING_CUDA_DEPTH", raising=False)
+    monkeypatch.delenv("D2S_RUNTIME_PARALLEL_MPS", raising=False)
+    runtime = SimpleNamespace(
+        depth_provider=SimpleNamespace(pipeline_slot_count=2),
+        config=SimpleNamespace(profile_sync=False),
+        _resolved_stereo_compute_backend="",
+    )
+    context = SimpleNamespace(
+        run_mode="Viewer",
+        runtime_config=SimpleNamespace(
+            parallel_inference=True,
+            parallel_inference_workers=2,
+            use_coreml=True,
+        ),
+        stereo_runtime=runtime,
+    )
+
+    assert _runtime_pending_depth_limit(context) == 2
+
+
+def test_coreml_viewer_parallel_pending_respects_explicit_mps_disable(monkeypatch):
+    monkeypatch.setattr("stereo_runtime.pipeline.sys.platform", "darwin")
+    monkeypatch.delenv("D2S_RUNTIME_PENDING_CUDA_DEPTH", raising=False)
+    monkeypatch.setenv("D2S_RUNTIME_PARALLEL_MPS", "0")
+    runtime = SimpleNamespace(
+        depth_provider=SimpleNamespace(pipeline_slot_count=2),
+        config=SimpleNamespace(profile_sync=False),
+        _resolved_stereo_compute_backend="",
+    )
+    context = SimpleNamespace(
+        run_mode="Viewer",
+        runtime_config=SimpleNamespace(
+            parallel_inference=True,
+            parallel_inference_workers=2,
+            use_coreml=True,
+        ),
+        stereo_runtime=runtime,
+    )
+
+    assert _runtime_pending_depth_limit(context) == 1
+
+
+def test_coreml_viewer_parallel_enables_adaptive_backoff_by_default(monkeypatch):
+    monkeypatch.delenv("D2S_RUNTIME_PARALLEL_ADAPTIVE_BACKOFF", raising=False)
+    context = SimpleNamespace(
+        run_mode="Viewer",
+        runtime_config=SimpleNamespace(
+            parallel_inference=True,
+            parallel_inference_workers=2,
+            use_coreml=True,
+        ),
+        stereo_runtime=SimpleNamespace(
+            depth_provider=SimpleNamespace(pipeline_slot_count=2)
+        ),
+    )
+
+    assert _runtime_parallel_adaptive_backoff_enabled(context) is True
+
+
+def test_coreml_viewer_parallel_adaptive_backoff_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("D2S_RUNTIME_PARALLEL_ADAPTIVE_BACKOFF", "0")
+    context = SimpleNamespace(
+        run_mode="Viewer",
+        runtime_config=SimpleNamespace(
+            parallel_inference=True,
+            parallel_inference_workers=2,
+            use_coreml=True,
+        ),
+        stereo_runtime=SimpleNamespace(
+            depth_provider=SimpleNamespace(pipeline_slot_count=2)
+        ),
+    )
+
+    assert _runtime_parallel_adaptive_backoff_enabled(context) is False
+
+
 def test_presenter_pressure_temporarily_limits_parallel_depth_and_recovers(monkeypatch):
     monkeypatch.delenv("D2S_RUNTIME_PRESENTER_BACKPRESSURE", raising=False)
     pressure = {"active": True}

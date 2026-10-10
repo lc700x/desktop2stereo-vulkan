@@ -810,7 +810,8 @@ def _runtime_supports_parallel_cuda_pending(ctx: RuntimePipelineContext) -> bool
         # On macOS the "vulkan" label just means "not triton": synthesis runs
         # the torch-fast backend on MPS (the Vulkan fused kernel path is
         # unavailable without a GLSL compiler), so the presenter-side consumer
-        # lease concern does not apply. Opt in via D2S_RUNTIME_PARALLEL_MPS=1.
+        # lease concern does not apply. A two-worker CoreML setting opts in;
+        # D2S_RUNTIME_PARALLEL_MPS can explicitly override it.
         import sys as _sys
 
         # "" is the steady state on the torch-fast path: the resolver only
@@ -818,7 +819,19 @@ def _runtime_supports_parallel_cuda_pending(ctx: RuntimePipelineContext) -> bool
         if not resolved_backend and _sys.platform == "darwin":
             resolved_backend = "vulkan"
         is_mps_mac = _sys.platform == "darwin" and resolved_backend == "vulkan"
-        if not (is_mps_mac and os.environ.get("D2S_RUNTIME_PARALLEL_MPS", "0") == "1"):
+        mps_parallel_setting = os.environ.get("D2S_RUNTIME_PARALLEL_MPS")
+        if mps_parallel_setting is None:
+            runtime_config = getattr(ctx, "runtime_config", None)
+            coreml_parallel_requested = bool(
+                getattr(runtime_config, "use_coreml", False)
+                and getattr(runtime_config, "parallel_inference", False)
+                and int(getattr(runtime_config, "parallel_inference_workers", 1) or 1) > 1
+            )
+            mps_parallel_setting = "1" if coreml_parallel_requested else "0"
+        if not (
+            is_mps_mac
+            and mps_parallel_setting.strip().lower() in {"1", "true", "yes", "on"}
+        ):
             # Vulkan deferred stereo has a separate presenter-side consumer lease;
             # keep its depth queue single-pending until that path is made safe.
             return False
@@ -885,8 +898,21 @@ def _runtime_motion_gate_enabled(ctx: RuntimePipelineContext) -> bool:
     }
 
 
-def _runtime_parallel_adaptive_backoff_enabled() -> bool:
-    value = str(os.environ.get("D2S_RUNTIME_PARALLEL_ADAPTIVE_BACKOFF", "0") or "0").strip().lower()
+def _runtime_parallel_adaptive_backoff_enabled(ctx=None) -> bool:
+    value = os.environ.get("D2S_RUNTIME_PARALLEL_ADAPTIVE_BACKOFF")
+    if value is None:
+        runtime_config = getattr(ctx, "runtime_config", None)
+        provider = getattr(getattr(ctx, "stereo_runtime", None), "depth_provider", None)
+        enabled_by_coreml_profile = bool(
+            ctx is not None
+            and getattr(ctx, "run_mode", "") in {"Viewer", "Local Viewer"}
+            and getattr(runtime_config, "use_coreml", False)
+            and getattr(runtime_config, "parallel_inference", False)
+            and int(getattr(runtime_config, "parallel_inference_workers", 1) or 1) > 1
+            and int(getattr(provider, "pipeline_slot_count", 1) or 1) > 1
+        )
+        value = "1" if enabled_by_coreml_profile else "0"
+    value = str(value or "0").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 
@@ -1238,8 +1264,13 @@ class RuntimePipelineLoop:
             return 1.5
 
     def _parallel_reduce_for_pressure(self, reason: str) -> None:
+        ctx = self.context
         scheduler = getattr(self, "_parallel_depth_scheduler", None)
-        if scheduler is None or scheduler.effective_limit <= 1 or not _runtime_parallel_adaptive_backoff_enabled():
+        if (
+            scheduler is None
+            or scheduler.effective_limit <= 1
+            or not _runtime_parallel_adaptive_backoff_enabled(ctx)
+        ):
             return
         now = time.perf_counter()
         changed = scheduler.set_effective_limit(scheduler.effective_limit - 1)
@@ -1259,8 +1290,13 @@ class RuntimePipelineLoop:
             )
 
     def _parallel_recover_if_ready(self) -> None:
+        ctx = self.context
         scheduler = getattr(self, "_parallel_depth_scheduler", None)
-        if scheduler is None or scheduler.effective_limit >= scheduler.worker_count or not _runtime_parallel_adaptive_backoff_enabled():
+        if (
+            scheduler is None
+            or scheduler.effective_limit >= scheduler.worker_count
+            or not _runtime_parallel_adaptive_backoff_enabled(ctx)
+        ):
             return
         now = time.perf_counter()
         if now < self._parallel_recovery_after:
@@ -1907,7 +1943,7 @@ class RuntimePipelineLoop:
                             < self._parallel_depth_scheduler.worker_count
                         )
                         debug_info["parallel_inference_adaptive_backoff"] = int(
-                            _runtime_parallel_adaptive_backoff_enabled()
+                            _runtime_parallel_adaptive_backoff_enabled(ctx)
                         )
                         debug_info["parallel_inference_presenter_backpressure"] = int(
                             self._presenter_backpressure_active

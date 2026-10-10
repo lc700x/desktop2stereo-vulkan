@@ -1,4 +1,26 @@
-from utils.breakdown import FPSBreakdown
+from utils.breakdown import FPSBreakdown, fps_breakdown_default
+
+
+def test_fps_breakdown_defaults_on_for_fps_enabled_local_viewer(monkeypatch):
+    monkeypatch.delenv("D2S_OPENXR_DEBUG", raising=False)
+
+    assert fps_breakdown_default(
+        {"Run Mode": "Local Viewer", "Show FPS": True}, "Viewer"
+    ) == "1"
+    assert fps_breakdown_default(
+        {"Run Mode": "Local Viewer", "Show FPS": False}, "Viewer"
+    ) == "0"
+    assert fps_breakdown_default(
+        {"Run Mode": "RTMP Streamer", "Show FPS": True}, "Viewer"
+    ) == "0"
+
+
+def test_fps_breakdown_preserves_openxr_debug_default(monkeypatch):
+    monkeypatch.setenv("D2S_OPENXR_DEBUG", "0")
+
+    assert fps_breakdown_default(
+        {"Run Mode": "Local Viewer", "Show FPS": True}, "Viewer"
+    ) == "0"
 
 
 def test_fps_breakdown_logs_five_times_at_fifteen_second_intervals(capsys):

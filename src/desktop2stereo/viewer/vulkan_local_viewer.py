@@ -2325,11 +2325,18 @@ class _TransferSource:
                 vk.VK_FILTER_LINEAR,
             )
         overlay_drawn = False
+        overlay_ms = 0.0
+        overlay_upload_ms = 0.0
         if o._fps_overlay is not None and o._fps_overlay.enabled and o._fps_overlay.available:
             eye_rects = tuple(
                 destination_rect for _source_rect, destination_rect in blit_regions
             )
+            overlay_started = time.perf_counter()
             overlay_drawn = o._fps_overlay.record(cmd, target, index, eye_rects)
+            overlay_ms = (time.perf_counter() - overlay_started) * 1000.0
+            overlay_upload_ms = float(
+                getattr(o._fps_overlay, "last_upload_ms", 0.0) or 0.0
+            )
         if not overlay_drawn:
             self._transition(
                 cmd,
@@ -2370,6 +2377,8 @@ class _TransferSource:
                     f"fence_result={fence_result} acquire={acquire_ms:.1f}ms "
                     f"acquire_result={acquire_result} "
                     f"upload={upload_ms:.1f}ms record={record_ms:.1f}ms "
+                    f"overlay={overlay_ms:.1f}ms "
+                    f"overlay_upload={overlay_upload_ms:.1f}ms "
                     f"submit={submit_ms:.1f}ms submit_result={submit_result} "
                     f"present={present_ms:.1f}ms present_result={result} "
                     f"gpu={gpu_source} rocm={self._rocm_interop} fit={fit_mode}",

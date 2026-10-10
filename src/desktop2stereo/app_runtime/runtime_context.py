@@ -16,7 +16,7 @@ from stereo_runtime.pipeline import RuntimePipelineContext
 from stereo_runtime.presets import normalize_preset
 from stereo_runtime.render_size import RenderSizeConfig
 from stereo_runtime.session_helpers import StereoRuntimeLogger, StereoWarmupTracker
-from utils.breakdown import FPSBreakdown
+from utils.breakdown import FPSBreakdown, fps_breakdown_default
 from utils.run_mode import resolve_run_mode
 
 
@@ -161,10 +161,9 @@ def create_runtime_context(
         render_active=openxr_state.render_active.is_set,
         idle_active=openxr_state.wait_idle_active.is_set,
     )
-    fps_breakdown_default = os.environ.get("D2S_OPENXR_DEBUG", "0")
     fps_breakdown_log = env_flag(
         "D2S_FPS_BREAKDOWN",
-        fps_breakdown_default,
+        fps_breakdown_default(settings, run_mode),
     )
 
     return AppRuntimeContext(
