@@ -219,6 +219,33 @@ def test_direct_stream_output_uses_uint8_nvenc_and_fps_provider() -> None:
     assert "observe_sbs_fps if adaptive_capture_rate.enabled else None" in stream_branch
 
 
+def test_macos_local_viewer_defaults_coreml_to_ane_without_overriding_user_choice() -> None:
+    source = RUNTIME_ENTRY.read_text(encoding="utf-8")
+    local_viewer_branch = source[
+        source.index('if configured_run_mode in {"Local Viewer", "Viewer"} and platform.system() == "Darwin":'):
+        source.index("configured_target_fps = target_fps_for_run_mode(settings)")
+    ]
+
+    assert 'if bool(settings.get("CoreML", False)):' in local_viewer_branch
+    assert 'os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")' in local_viewer_branch
+    assert 'os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")' in local_viewer_branch
+
+
+def test_stream_compute_units_are_not_changed_by_local_viewer_default() -> None:
+    source = RUNTIME_ENTRY.read_text(encoding="utf-8")
+    local_viewer_branch = source[
+        source.index('if configured_run_mode in {"Local Viewer", "Viewer"} and platform.system() == "Darwin":'):
+        source.index("configured_target_fps = target_fps_for_run_mode(settings)")
+    ]
+    stream_branch = source[
+        source.index("if direct_stream_mode:"):
+        source.index("configured_target_fps = target_fps_for_run_mode(settings)")
+    ]
+
+    assert "D2S_COREML_COMPUTE_UNITS" in local_viewer_branch
+    assert "D2S_COREML_COMPUTE_UNITS" not in stream_branch
+
+
 def test_local_viewer_uses_v25_source_size_without_changing_4k_io(monkeypatch) -> None:
     import app_runtime.runtime_entry as runtime_entry
 

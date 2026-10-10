@@ -630,6 +630,12 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         # therefore skips its CPU base-address read; it re-materializes only
         # if the bridge capability preflight fails.
         if bool(settings.get("CoreML", False)):
+            # Keep Core ML depth inference off the Apple GPU by default. A
+            # warmed 60 Hz Local Viewer comparison found CPU+ANE slightly
+            # improved throughput and reduced pack/latency outliers while
+            # leaving Metal available for stereo synthesis and presentation.
+            # setdefault preserves an explicit user-selected compute unit.
+            os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")
             os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")
     elif configured_run_mode in {"Local Viewer", "Viewer"}:
         # The Vulkan local viewer consumes GPU RGBA8 directly.  Pack on the

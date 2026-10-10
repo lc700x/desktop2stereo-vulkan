@@ -1104,6 +1104,7 @@ class RuntimePipelineLoop:
         self._consecutive_runtime_errors = 0
         self._dual_pending_cooldown_until = 0.0
         self._parallel_depth_scheduler = None
+        self._parallel_mps_serial_notice_emitted = False
         self._parallel_backoff_until = 0.0
         self._parallel_recovery_after = 0.0
         self._presenter_backpressure_active = False
@@ -1390,6 +1391,27 @@ class RuntimePipelineLoop:
             3,
             int(getattr(runtime_config, "parallel_inference_workers", 2) or 2),
         ))
+        # Local Viewer CoreML inference and the native Metal SBS packer share
+        # the Apple GPU/ANE budget. A warmed 60 Hz 1080p test showed that two
+        # concurrent inference workers reduced throughput and raised pack p95
+        # from ~12 ms to ~23 ms. Keep this path serial by default; retain an
+        # explicit opt-in for machines where parallel CoreML is faster.
+        if (
+            requested_workers > 1
+            and ctx.run_mode == "Local Viewer"
+            and str(platform.system()).lower() == "darwin"
+            and bool(getattr(runtime_config, "use_coreml", False))
+            and not _env_flag("D2S_RUNTIME_PARALLEL_MPS")
+        ):
+            requested_workers = 1
+            if not self._parallel_mps_serial_notice_emitted:
+                print(
+                    "[RuntimePipeline] Local Viewer CoreML uses one depth worker "
+                    "to preserve Metal SBS throughput; set "
+                    "D2S_RUNTIME_PARALLEL_MPS=1 to opt into parallel inference.",
+                    flush=True,
+                )
+                self._parallel_mps_serial_notice_emitted = True
         if (
             not _runtime_parallel_depth_mode_supported(ctx)
             or not bool(getattr(runtime_config, "parallel_inference", False))

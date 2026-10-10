@@ -353,71 +353,75 @@ class VulkanFpsOverlay:
                     | vk.VK_COLOR_COMPONENT_A_BIT
                 ),
             )
+            # Keep the stage array alive across vkCreateGraphicsPipelines.
+            # The Python Vulkan binding stores pStages in an auxiliary CFFI
+            # array; an inline list can be collected before MoltenVK converts
+            # the SPIR-V entry points.
+            shader_stages = [
+                vk.VkPipelineShaderStageCreateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    stage=vk.VK_SHADER_STAGE_VERTEX_BIT,
+                    module=vertex_module,
+                    pName="main",
+                ),
+                vk.VkPipelineShaderStageCreateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    stage=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                    module=fragment_module,
+                    pName="main",
+                ),
+            ]
+            pipeline_info = vk.VkGraphicsPipelineCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                stageCount=len(shader_stages),
+                pStages=shader_stages,
+                pVertexInputState=vk.VkPipelineVertexInputStateCreateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+                ),
+                pInputAssemblyState=vk.VkPipelineInputAssemblyStateCreateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                    topology=vk.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                ),
+                pViewportState=vk.VkPipelineViewportStateCreateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                    viewportCount=1,
+                    scissorCount=1,
+                ),
+                pRasterizationState=vk.VkPipelineRasterizationStateCreateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                    polygonMode=vk.VK_POLYGON_MODE_FILL,
+                    cullMode=vk.VK_CULL_MODE_NONE,
+                    frontFace=vk.VK_FRONT_FACE_COUNTER_CLOCKWISE,
+                    lineWidth=1.0,
+                ),
+                pMultisampleState=vk.VkPipelineMultisampleStateCreateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                    rasterizationSamples=vk.VK_SAMPLE_COUNT_1_BIT,
+                ),
+                pDepthStencilState=None,
+                pColorBlendState=vk.VkPipelineColorBlendStateCreateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                    attachmentCount=1,
+                    pAttachments=[blend],
+                ),
+                pDynamicState=vk.VkPipelineDynamicStateCreateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                    dynamicStateCount=2,
+                    pDynamicStates=[
+                        vk.VK_DYNAMIC_STATE_VIEWPORT,
+                        vk.VK_DYNAMIC_STATE_SCISSOR,
+                    ],
+                ),
+                layout=self._pipeline_layout,
+                renderPass=self._render_pass,
+                subpass=0,
+                basePipelineIndex=-1,
+            )
             self._pipeline = vk.vkCreateGraphicsPipelines(
                 self.device,
                 None,
                 1,
-                [
-                    vk.VkGraphicsPipelineCreateInfo(
-                        sType=vk.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-                        stageCount=2,
-                        pStages=[
-                            vk.VkPipelineShaderStageCreateInfo(
-                                sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                stage=vk.VK_SHADER_STAGE_VERTEX_BIT,
-                                module=vertex_module,
-                                pName="main",
-                            ),
-                            vk.VkPipelineShaderStageCreateInfo(
-                                sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                stage=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
-                                module=fragment_module,
-                                pName="main",
-                            ),
-                        ],
-                        pVertexInputState=vk.VkPipelineVertexInputStateCreateInfo(
-                            sType=vk.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-                        ),
-                        pInputAssemblyState=vk.VkPipelineInputAssemblyStateCreateInfo(
-                            sType=vk.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-                            topology=vk.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-                        ),
-                        pViewportState=vk.VkPipelineViewportStateCreateInfo(
-                            sType=vk.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-                            viewportCount=1,
-                            scissorCount=1,
-                        ),
-                        pRasterizationState=vk.VkPipelineRasterizationStateCreateInfo(
-                            sType=vk.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-                            polygonMode=vk.VK_POLYGON_MODE_FILL,
-                            cullMode=vk.VK_CULL_MODE_NONE,
-                            frontFace=vk.VK_FRONT_FACE_COUNTER_CLOCKWISE,
-                            lineWidth=1.0,
-                        ),
-                        pMultisampleState=vk.VkPipelineMultisampleStateCreateInfo(
-                            sType=vk.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                            rasterizationSamples=vk.VK_SAMPLE_COUNT_1_BIT,
-                        ),
-                        pDepthStencilState=None,
-                        pColorBlendState=vk.VkPipelineColorBlendStateCreateInfo(
-                            sType=vk.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-                            attachmentCount=1,
-                            pAttachments=[blend],
-                        ),
-                        pDynamicState=vk.VkPipelineDynamicStateCreateInfo(
-                            sType=vk.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-                            dynamicStateCount=2,
-                            pDynamicStates=[
-                                vk.VK_DYNAMIC_STATE_VIEWPORT,
-                                vk.VK_DYNAMIC_STATE_SCISSOR,
-                            ],
-                        ),
-                        layout=self._pipeline_layout,
-                        renderPass=self._render_pass,
-                        subpass=0,
-                        basePipelineIndex=-1,
-                    )
-                ],
+                [pipeline_info],
                 None,
             )[0]
             self._pipeline_format = int(surface_format)

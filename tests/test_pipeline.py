@@ -524,11 +524,11 @@ def test_openxr_safe_dual_slot_defaults_to_two_pending(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("run_mode", "platform", "use_coreml"),
-    [("Viewer", "linux", False), ("Local Viewer", "darwin", True)],
+    ("run_mode", "platform", "use_coreml", "expected_workers"),
+    [("Viewer", "linux", False, 2), ("Local Viewer", "darwin", True, 1)],
 )
-def test_viewer_creates_two_worker_depth_scheduler(
-    monkeypatch, run_mode, platform, use_coreml
+def test_viewer_depth_scheduler_uses_measured_worker_policy(
+    monkeypatch, run_mode, platform, use_coreml, expected_workers
 ) -> None:
     monkeypatch.setattr(sys_module, "platform", platform)
     monkeypatch.setattr(
@@ -536,6 +536,7 @@ def test_viewer_creates_two_worker_depth_scheduler(
         "system",
         lambda: "Darwin" if platform == "darwin" else "Linux",
     )
+    monkeypatch.delenv("D2S_RUNTIME_PARALLEL_MPS", raising=False)
     events = []
     runtime = SimpleNamespace(
         depth_provider=SimpleNamespace(pipeline_slot_count=2),
@@ -549,6 +550,44 @@ def test_viewer_creates_two_worker_depth_scheduler(
                 parallel_inference=True,
                 parallel_inference_workers=2,
                 use_coreml=use_coreml,
+            ),
+            stereo_runtime=runtime,
+            source_stat_inc=lambda name, **values: events.append((name, values)),
+        )
+    )
+
+    loop._ensure_parallel_depth_scheduler()
+
+    if expected_workers == 1:
+        assert loop._parallel_depth_scheduler is None
+        assert events == []
+        assert loop._parallel_mps_serial_notice_emitted is True
+    else:
+        assert loop._parallel_depth_scheduler is not None
+        assert loop._parallel_depth_scheduler.worker_count == expected_workers
+        assert events == [
+            ("runtime_parallel_workers", {"active_workers": expected_workers})
+        ]
+        loop._parallel_depth_scheduler.close()
+
+
+def test_local_viewer_coreml_parallel_can_be_explicitly_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(sys_module, "platform", "darwin")
+    monkeypatch.setattr(pipeline_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setenv("D2S_RUNTIME_PARALLEL_MPS", "1")
+    events = []
+    runtime = SimpleNamespace(
+        depth_provider=SimpleNamespace(pipeline_slot_count=2),
+        config=SimpleNamespace(profile_sync=False),
+        predict_openxr_depth=lambda _frame: None,
+    )
+    loop = RuntimePipelineLoop(
+        SimpleNamespace(
+            run_mode="Local Viewer",
+            runtime_config=SimpleNamespace(
+                parallel_inference=True,
+                parallel_inference_workers=2,
+                use_coreml=True,
             ),
             stereo_runtime=runtime,
             source_stat_inc=lambda name, **values: events.append((name, values)),
