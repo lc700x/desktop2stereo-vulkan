@@ -2,17 +2,6 @@ name: Build Intel Windows Native Bridges
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "native/desktop_duplication/**"
-      - "native/d3d11_sbs_surface/**"
-      - "native/onevpl_d3d11_encoder/**"
-      - "native/openvino_d3d11_bridge/**"
-      - "src/desktop2stereo/stereo_runtime/providers/intel/**"
-      - "src/desktop2stereo/stereo_runtime/intel_vulkan_sbs.py"
-      - "src/desktop2stereo/stereo_runtime/runtime.py"
-      - "src/desktop2stereo/streaming/direct_sbs.py"
-      - ".github/workflows/intel-windows-native.yml"
 
 permissions:
   contents: write

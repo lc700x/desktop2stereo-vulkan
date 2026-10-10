@@ -2,14 +2,6 @@ name: Build Windows NVENC CUDAARRAY Bridge
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "native/nvenc_cudaarray_bridge/**"
-      - "src/desktop2stereo/streaming/nvenc_cudaarray_bridge.py"
-      - ".github/workflows/nvenc-cudaarray-bridge.yml"
-      - "src/desktop2stereo/streaming/native_rtsp_output.py"
 
 permissions:
   contents: write

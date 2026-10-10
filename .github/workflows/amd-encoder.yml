@@ -2,11 +2,6 @@ name: Build Windows AMD Encoder Bridge
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "native/amd_encoder/**"
-      - "src/desktop2stereo/streaming/amd_encoder.py"
-      - ".github/workflows/amd-encoder.yml"
 
 permissions:
   contents: read

@@ -19,6 +19,7 @@ from utils.display_info import resolve_glfw_monitor_index
 from utils.queue_utils import _release_item
 from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
 from viewer.direct_sink import DIRECT_SINK, direct_staging_enabled
+from viewer.vulkan_fps_overlay import VulkanFpsOverlay, build_fps_panel_rgba
 from viewer.vulkan_resources import (
     VulkanExportableBuffer,
     VulkanExportableImage,
@@ -756,6 +757,21 @@ class VulkanLocalViewer:
         self._capture_refresh_warning_reported = False
         self._presentation_geometry_reported = False
         self._last_presentation_geometry = None
+        self._fps_overlay: VulkanFpsOverlay | None = None
+        self._fps_overlay_reported = False
+        self._fps_overlay_swapchain_supported = False
+        # Latency is capture start -> present submission, using the same
+        # perf_counter clock as the runtime queue timestamp.
+        self._last_latency_ms = 0.0
+        self._latency_history: list[float] = []
+        self._latency_history_max = 300
+        self._present_total = 0
+        self._present_reused = 0
+        self._present_cumulative_total = 0
+        self._reuse_cumulative_total = 0
+        self._present_window_start = time.perf_counter()
+        self._content_fps = 0.0
+        self._reuse_ratio = 0.0
 
     def initialize(self) -> None:
         # Without DPI awareness the OS scales the fullscreen window's
@@ -857,8 +873,12 @@ class VulkanLocalViewer:
             set_window_mouse_passthrough(self.window, True)
         glfw.set_key_callback(self.window, self._on_key)
         self._create_device()
+        self._init_fps_overlay()
         self._create_swapchain()
         self._create_sync()
+        # Do not include Vulkan setup time in the first measured FPS window.
+        self._fps_started = time.perf_counter()
+        self._present_window_start = self._fps_started
         if self._exclusive_fullscreen:
             mode = glfw.get_video_mode(self._target_monitor)
             print(
@@ -867,6 +887,35 @@ class VulkanLocalViewer:
                 "(Alt+Enter)",
                 flush=True,
             )
+
+    def _init_fps_overlay(self) -> None:
+        """Prepare an optional panel without making Vulkan setup fatal."""
+        if self._fps_overlay is not None:
+            return
+        provider = self.config.show_fps_provider
+        show_fps = bool(provider()) if provider is not None else self.config.show_fps
+        # Keep it prepared when a live provider exists so toggling Show FPS
+        # later can enable the panel without rebuilding the swapchain.
+        if not show_fps and provider is None:
+            return
+        try:
+            self._fps_overlay = VulkanFpsOverlay(self)
+        except Exception as exc:
+            self._fps_overlay = None
+            print(
+                "[VulkanLocalViewer] On-screen FPS overlay unavailable: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return
+        if not self._fps_overlay.available:
+            print(
+                "[VulkanLocalViewer] On-screen FPS overlay unavailable: "
+                f"{self._fps_overlay.reason}",
+                flush=True,
+            )
+            self._fps_overlay.close()
+            self._fps_overlay = None
 
     def _on_key(self, _window: Any, key: int, _scancode: int, action: int, mods: int) -> None:
         if is_exclusive_fullscreen_toggle(key, action, mods, self.glfw):
@@ -1063,6 +1112,10 @@ class VulkanLocalViewer:
             if self.config.show_fps_provider is not None
             else self.config.show_fps
         )
+        if self._fps_overlay is not None:
+            self._fps_overlay.set_enabled(
+                show_fps and self._fps_overlay_swapchain_supported
+            )
         benchmark_fps = os.environ.get("D2S_BENCHMARK", "0").strip().lower() in {
             "1",
             "true",
@@ -1070,6 +1123,7 @@ class VulkanLocalViewer:
             "on",
         }
         if not show_fps and not benchmark_fps:
+            self._refresh_content_rate()
             return capture_target
         target_text = (
             f" capture_target={capture_target}" if capture_target is not None else ""
@@ -1078,11 +1132,117 @@ class VulkanLocalViewer:
             f"[VulkanLocalViewer] Present FPS: {fps:.1f}{target_text}",
             flush=True,
         )
+        self._refresh_content_rate()
+        if show_fps:
+            self._refresh_fps_overlay(fps, capture_target)
+            self._log_present_metrics(fps, capture_target)
         if not self._exclusive_fullscreen:
             self.glfw.set_window_title(
                 self.window, f"{self.config.title} | {fps:.1f} FPS"
             )
         return capture_target
+
+    def _log_present_metrics(
+        self, fps: float, capture_target: int | None
+    ) -> None:
+        """Emit stable key/value playback metrics for offline analysis."""
+        parts = [
+            f"present_fps={float(fps):.2f}",
+            f"content_fps={self.content_fps():.2f}",
+            f"reuse={self.reuse_ratio():.4f}",
+            f"latency_ms={self.latency_ms():.2f}",
+            f"avg_latency_ms={self.avg_latency_ms():.2f}",
+            f"latency_samples={len(self._latency_history)}",
+            f"display_hz={int(self._output_refresh_hz)}",
+        ]
+        if capture_target is not None:
+            parts.append(f"capture_target={int(capture_target)}")
+        parts.extend(
+            (
+                f"present_total={self._present_cumulative_total}",
+                f"reuse_total={self._reuse_cumulative_total}",
+            )
+        )
+        print(f"[D2S_METRICS] {' '.join(parts)}", flush=True)
+
+    def record_frame_latency(self, capture_start_time: float | None) -> None:
+        """Record capture-to-present age for a newly delivered frame."""
+        if capture_start_time is None:
+            return
+        try:
+            started = float(capture_start_time)
+        except (TypeError, ValueError):
+            return
+        if not (started > 0.0) or started != started or started == float("inf"):
+            return
+        now = time.perf_counter()
+        if now < started:
+            return
+        latency_ms = (now - started) * 1000.0
+        if not (latency_ms > 0.0) or latency_ms > 10_000.0:
+            return
+        self._last_latency_ms = latency_ms
+        self._latency_history.append(latency_ms)
+        if len(self._latency_history) > self._latency_history_max:
+            del self._latency_history[0]
+
+    def record_present(self, reused: bool) -> None:
+        """Count successful submissions and those that replay cached content."""
+        self._present_total += 1
+        self._present_cumulative_total += 1
+        if reused:
+            self._present_reused += 1
+            self._reuse_cumulative_total += 1
+
+    def content_fps(self) -> float:
+        """Return the rate of presents carrying new content."""
+        return self._content_fps
+
+    def reuse_ratio(self) -> float:
+        """Return the recent fraction of presents that reused a cached frame."""
+        return self._reuse_ratio
+
+    def _refresh_content_rate(self) -> None:
+        now = time.perf_counter()
+        elapsed = now - self._present_window_start
+        if elapsed < 0.5:
+            return
+        total = self._present_total
+        fresh = total - self._present_reused
+        self._content_fps = fresh / elapsed
+        self._reuse_ratio = self._present_reused / total if total else 0.0
+        self._present_total = 0
+        self._present_reused = 0
+        self._present_window_start = now
+
+    def latency_ms(self) -> float:
+        return self._last_latency_ms
+
+    def avg_latency_ms(self) -> float:
+        if not self._latency_history:
+            return 0.0
+        return sum(self._latency_history) / len(self._latency_history)
+
+    def _refresh_fps_overlay(
+        self, fps: float, capture_target: int | None
+    ) -> None:
+        overlay = self._fps_overlay
+        if overlay is None or not overlay.available or not overlay.enabled:
+            return
+        panel = build_fps_panel_rgba(
+            present_fps=fps,
+            capture_target=capture_target,
+            latency_ms=self.latency_ms(),
+            avg_latency_ms=self.avg_latency_ms(),
+            content_fps=self.content_fps(),
+            reuse_ratio=self.reuse_ratio(),
+        )
+        if panel is None:
+            return
+        overlay.set_panel(panel)
+        if not self._fps_overlay_reported:
+            self._fps_overlay_reported = True
+            print("[VulkanLocalViewer] On-screen FPS overlay active", flush=True)
 
     def _create_device(self) -> None:
         vk, glfw = self.vk, self.glfw
@@ -1383,6 +1543,22 @@ class VulkanLocalViewer:
         count = max(2, caps.minImageCount + 1)
         if caps.maxImageCount:
             count = min(count, caps.maxImageCount)
+        image_usage = vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        overlay_supported = True
+        overlay = self._fps_overlay
+        if overlay is not None and overlay.available:
+            supported_usage = int(getattr(caps, "supportedUsageFlags", 0))
+            if supported_usage & int(vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT):
+                image_usage |= int(vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+            else:
+                overlay_supported = False
+                overlay.set_enabled(False)
+                print(
+                    "[VulkanLocalViewer] On-screen FPS unavailable: surface "
+                    "lacks COLOR_ATTACHMENT usage",
+                    flush=True,
+                )
+        self._fps_overlay_swapchain_supported = False
         info = vk.VkSwapchainCreateInfoKHR(
             sType=vk.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
             pNext=exclusive_chain,
@@ -1392,7 +1568,7 @@ class VulkanLocalViewer:
             imageColorSpace=fmt.colorSpace,
             imageExtent=extent,
             imageArrayLayers=1,
-            imageUsage=vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            imageUsage=image_usage,
             imageSharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
             preTransform=caps.currentTransform,
             compositeAlpha=vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
@@ -1416,6 +1592,20 @@ class VulkanLocalViewer:
         self.swap_images = list(images)
         self._swap_image_initialized = [False] * len(self.swap_images)
         self.extent = int(extent.width), int(extent.height)
+        if overlay is not None:
+            if overlay.available and overlay_supported:
+                overlay.on_swapchain_recreated(self.swap_images, int(fmt.format))
+                self._fps_overlay_swapchain_supported = overlay.available
+            if self._fps_overlay_swapchain_supported:
+                provider = self.config.show_fps_provider
+                show_fps = bool(provider()) if provider is not None else self.config.show_fps
+                overlay.set_enabled(show_fps)
+            elif not overlay.available:
+                print(
+                    "[VulkanLocalViewer] On-screen FPS overlay disabled: "
+                    f"{overlay.reason}",
+                    flush=True,
+                )
         self._acquire_full_screen_exclusive()
 
     def _acquire_full_screen_exclusive(self) -> bool:
@@ -1473,6 +1663,8 @@ class VulkanLocalViewer:
 
     def _destroy_swapchain(self) -> None:
         if self.swapchain is not None:
+            if self._fps_overlay is not None:
+                self._fps_overlay.on_swapchain_destroyed()
             self._release_full_screen_exclusive()
             self._device_function(
                 b"vkDestroySwapchainKHR",
@@ -1674,6 +1866,9 @@ class VulkanLocalViewer:
         try:
             if self.device is not None:
                 self.vk.vkDeviceWaitIdle(self.device)
+                if self._fps_overlay is not None:
+                    self._fps_overlay.close()
+                    self._fps_overlay = None
                 for source in [self._source, *self._direct_sources]:
                     if source is not None:
                         source.close()
@@ -2129,7 +2324,19 @@ class _TransferSource:
                 )],
                 vk.VK_FILTER_LINEAR,
             )
-        self._transition(cmd, target, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+        overlay_drawn = False
+        if o._fps_overlay is not None and o._fps_overlay.enabled and o._fps_overlay.available:
+            eye_rects = tuple(
+                destination_rect for _source_rect, destination_rect in blit_regions
+            )
+            overlay_drawn = o._fps_overlay.record(cmd, target, index, eye_rects)
+        if not overlay_drawn:
+            self._transition(
+                cmd,
+                target,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            )
         if gpu_source:
             self._transition(cmd, source_image, vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.VK_IMAGE_LAYOUT_GENERAL)
         vk.vkEndCommandBuffer(cmd)
@@ -2334,6 +2541,10 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                         f"{type(exc).__name__}: {exc}",
                         flush=True,
                     )
+            if not reused:
+                record_latency = getattr(viewer, "record_frame_latency", None)
+                if callable(record_latency):
+                    record_latency(_started)
             present_started = time.perf_counter()
             presented = viewer.present(frame)
             presented_at = time.perf_counter()
@@ -2356,6 +2567,10 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     config.on_breakdown_inc("local_native_presented", 1)
                 else:
                     config.on_breakdown_inc("local_host_presented", 1)
+            if presented is not False:
+                record_present = getattr(viewer, "record_present", None)
+                if callable(record_present):
+                    record_present(reused)
             if (
                 presented is not False
                 and config.on_breakdown_add_time is not None

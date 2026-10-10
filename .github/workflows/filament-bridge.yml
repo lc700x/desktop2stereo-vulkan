@@ -2,18 +2,6 @@ name: Build Filament Bridge
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'native/filament/bridge/**'
-      - 'native/filament/patches/**'
-      - 'native/filament/version.json'
-      - '.github/workflows/filament-bridge.yml'
-  pull_request:
-    paths:
-      - 'native/filament/bridge/**'
-      - 'native/filament/patches/**'
-      - 'native/filament/version.json'
-      - '.github/workflows/filament-bridge.yml'
 
 permissions:
   contents: write

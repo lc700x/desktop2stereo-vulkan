@@ -2,16 +2,6 @@ name: Build Vulkan FFmpeg Bridge
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'native/vulkan_ffmpeg_bridge/**'
-      - 'src/desktop2stereo/streaming/vulkan_bridge.py'
-      - '.github/workflows/vulkan-ffmpeg-bridge.yml'
-  pull_request:
-    paths:
-      - 'native/vulkan_ffmpeg_bridge/**'
-      - 'src/desktop2stereo/streaming/vulkan_bridge.py'
-      - '.github/workflows/vulkan-ffmpeg-bridge.yml'
 
 permissions:
   contents: write

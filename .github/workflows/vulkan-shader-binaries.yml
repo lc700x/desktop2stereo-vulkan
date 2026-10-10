@@ -2,10 +2,6 @@ name: Build Vulkan Shader Binaries
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "src/desktop2stereo/shaders/d2s_stereo_layered_output.comp"
-      - ".github/workflows/vulkan-shader-binaries.yml"
 
 permissions:
   contents: write
