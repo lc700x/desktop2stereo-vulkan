@@ -155,6 +155,25 @@ def overlay_rect_for_eye(
     return px, py, panel_w, panel_h
 
 
+def overlay_size_for_display_mode(
+    panel_size: tuple[int, int], display_mode: str
+) -> tuple[int, int]:
+    """Compensate overlay pixels for half-resolution stereo packing.
+
+    Half-SBS expands each eye horizontally when decoded, so the overlay must
+    be encoded at half width to keep glyphs square in the displayed eye.
+    Half-TAB has the same issue vertically. Cross-eyed/reversed variants retain
+    the same packing and are covered by matching the layout token anywhere.
+    """
+    width, height = (max(1, int(value)) for value in panel_size)
+    mode = str(display_mode or "").strip().casefold().replace("_", "-")
+    if "half-sbs" in mode and "full-sbs" not in mode:
+        width = max(1, (width + 1) // 2)
+    elif "half-tab" in mode and "full-tab" not in mode:
+        height = max(1, (height + 1) // 2)
+    return width, height
+
+
 class VulkanFpsOverlay:
     """Blit-preserving overlay pass drawn on top of the presented frame."""
 
@@ -752,10 +771,14 @@ class VulkanFpsOverlay:
             return False
         if swap_image_index >= len(self._framebuffers):
             return False
+        display_size = overlay_size_for_display_mode(
+            self._panel_size,
+            getattr(getattr(self.viewer, "config", None), "display_mode", "Half-SBS"),
+        )
         rects = [
-            overlay_rect_for_eye(eye_rect, self._panel_size)
+            overlay_rect_for_eye(eye_rect, display_size)
             for eye_rect in eye_rects
-        ] or [overlay_rect_for_eye((0, 0) + self.viewer.extent, self._panel_size)]
+        ] or [overlay_rect_for_eye((0, 0) + self.viewer.extent, display_size)]
         try:
             vk = self.vk
             self._transition(
