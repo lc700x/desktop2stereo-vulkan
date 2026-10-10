@@ -2343,8 +2343,12 @@ class _TransferSource:
         overlay_ms = 0.0
         overlay_upload_ms = 0.0
         if o._fps_overlay is not None and o._fps_overlay.enabled and o._fps_overlay.available:
+            # A packed-image blit is only a transfer optimization. Keep the
+            # overlay geometry based on the original per-eye presentation
+            # regions so SBS stays split into left/right half-width areas and
+            # TAB stays split into top/bottom areas.
             eye_rects = tuple(
-                destination_rect for _source_rect, destination_rect in blit_regions
+                destination_rect for _source_rect, destination_rect in regions
             )
             overlay_started = time.perf_counter()
             overlay_drawn = o._fps_overlay.record(cmd, target, index, eye_rects)

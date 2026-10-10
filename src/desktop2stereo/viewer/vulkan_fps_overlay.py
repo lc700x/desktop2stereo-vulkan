@@ -141,8 +141,15 @@ def overlay_rect_for_eye(
     panel_w, panel_h = (int(v) for v in panel_size)
     width = x1 - x0
     height = y1 - y0
-    panel_w = min(panel_w, max(1, width - margin))
-    panel_h = min(panel_h, max(1, height - margin))
+    available_w = max(1, width - margin)
+    available_h = max(1, height - margin)
+    scale = min(
+        1.0,
+        available_w / max(panel_w, 1),
+        available_h / max(panel_h, 1),
+    )
+    panel_w = max(1, int(round(panel_w * scale)))
+    panel_h = max(1, int(round(panel_h * scale)))
     px = min(x0 + margin, max(x0, x1 - panel_w))
     py = min(y0 + margin, max(y0, y1 - panel_h))
     return px, py, panel_w, panel_h
