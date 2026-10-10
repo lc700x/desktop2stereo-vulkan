@@ -83,6 +83,13 @@ typedef struct {
     uint32_t reserved;
 } D2SSmaaParams;
 
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t channels;
+    uint32_t eye_width;
+} D2SHalfDownsampleParams;
+
 static const char *D2SMetalSource = R"D2S(
 #include <metal_stdlib>
 using namespace metal;
@@ -915,7 +922,57 @@ kernel void d2s_warp_pack(
     output[offset + 2u] = uchar(clamp(pixel.b * 255.0f + 0.5f, 0.0f, 255.0f));
     if (p.output_channels == 4u) output[offset + 3u] = 255u;
 }
+
+
 )D2S";
+
+static const char *D2SHalfDownsampleMetalSource = R"D2S_DOWNSAMPLE(
+#include <metal_stdlib>
+using namespace metal;
+
+struct HalfDownsampleParams {
+    uint width;
+    uint height;
+    uint channels;
+    uint eye_width;
+};
+
+kernel void d2s_sbs_downsample_half(
+    device const uchar *source [[buffer(0)]],
+    device uchar *output [[buffer(1)]],
+    constant HalfDownsampleParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint output_width = p.width / 2u;
+    if (gid.x >= output_width || gid.y >= p.height) return;
+    uint left_output_width = p.eye_width / 2u;
+    bool right_eye = gid.x >= left_output_width;
+    uint output_eye_x = right_eye ? gid.x - left_output_width : gid.x;
+    uint eye_source_x = right_eye ? p.eye_width : 0u;
+    uint source_x = eye_source_x + output_eye_x * 2u;
+    uint source_offset = (gid.y * p.width + source_x) * p.channels;
+    uint output_offset = (gid.y * output_width + gid.x) * p.channels;
+    float3 left = float3(source[source_offset], source[source_offset + 1u],
+                         source[source_offset + 2u]) / 255.0f;
+    float3 right = float3(source[source_offset + p.channels],
+                          source[source_offset + p.channels + 1u],
+                          source[source_offset + p.channels + 2u]) / 255.0f;
+    float3 left_linear = select(pow((left + 0.055f) / 1.055f, float3(2.4f)),
+                                left / 12.92f, left <= 0.04045f);
+    float3 right_linear = select(pow((right + 0.055f) / 1.055f, float3(2.4f)),
+                                 right / 12.92f, right <= 0.04045f);
+    float3 linear = (left_linear + right_linear) * 0.5f;
+    float3 encoded = select(1.055f * pow(linear, float3(1.0f / 2.4f)) - 0.055f,
+                            linear * 12.92f, linear <= 0.0031308f);
+    output[output_offset] = uchar(clamp(encoded.r * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[output_offset + 1u] = uchar(clamp(encoded.g * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[output_offset + 2u] = uchar(clamp(encoded.b * 255.0f + 0.5f, 0.0f, 255.0f));
+    if (p.channels == 4u) {
+        uint alpha = uint(source[source_offset + 3u]) +
+                     uint(source[source_offset + p.channels + 3u]);
+        output[output_offset + 3u] = uchar((alpha + 1u) / 2u);
+    }
+}
+)D2S_DOWNSAMPLE";
 
 // Optional model-grid edge-aware smoothing. Keeping this in a separate
 // library lets the existing CoreML inference and warp pipelines initialize
@@ -1012,6 +1069,7 @@ typedef struct {
     __strong id<MTLBuffer> status_buffer;
     __strong id<MTLBuffer> packed_buffer;
     __strong id<MTLBuffer> raw_packed_buffer;
+    __strong id<MTLBuffer> half_packed_buffer;
     __strong id<MTLBuffer> smaa_edges_buffer;
     __strong id<MTLBuffer> smaa_weights_buffer;
     __strong id<MTLTexture> color_texture;
@@ -1041,6 +1099,7 @@ typedef struct {
     __strong id<MTLComputePipelineState> warp_pipeline;
     __strong id<MTLComputePipelineState> fxaa_pipeline;
     __strong id<MTLComputePipelineState> fxaa_half_pipeline;
+    __strong id<MTLComputePipelineState> downsample_half_pipeline;
     __strong id<MTLComputePipelineState> smaa_edges_pipeline;
     __strong id<MTLComputePipelineState> smaa_weights_pipeline;
     __strong id<MTLComputePipelineState> smaa_resolve_pipeline;
@@ -1144,6 +1203,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
         d2s_release_slot(&ctx->slots[i]);
         ctx->slots[i].packed_buffer = nil;
         ctx->slots[i].raw_packed_buffer = nil;
+        ctx->slots[i].half_packed_buffer = nil;
         ctx->slots[i].smaa_edges_buffer = nil;
         ctx->slots[i].smaa_weights_buffer = nil;
         ctx->slots[i].filtered_depth_buffer = nil;
@@ -1163,6 +1223,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     ctx->warp_pipeline = nil;
     ctx->fxaa_pipeline = nil;
     ctx->fxaa_half_pipeline = nil;
+    ctx->downsample_half_pipeline = nil;
     ctx->smaa_edges_pipeline = nil;
     ctx->smaa_weights_pipeline = nil;
     ctx->smaa_resolve_pipeline = nil;
@@ -1214,6 +1275,24 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
             ctx->depth_filter_pipeline = [ctx->device
                 newComputePipelineStateWithFunction:filter_function error:&filter_error];
         }
+    }
+
+    NSError *downsample_error = nil;
+    id<MTLLibrary> downsample_library = [ctx->device newLibraryWithSource:
+        [NSString stringWithUTF8String:D2SHalfDownsampleMetalSource]
+        options:nil error:&downsample_error];
+    if (downsample_library != nil) {
+        id<MTLFunction> downsample_function =
+            [downsample_library newFunctionWithName:@"d2s_sbs_downsample_half"];
+        if (downsample_function != nil) {
+            ctx->downsample_half_pipeline = [ctx->device
+                newComputePipelineStateWithFunction:downsample_function
+                error:&downsample_error];
+        }
+    }
+    if (ctx->downsample_half_pipeline == nil) {
+        fprintf(stderr, "[CoreML] Reduced-resolution Half-SBS FXAA unavailable: %s\n",
+                downsample_error.localizedDescription.UTF8String ?: "Metal kernel unavailable");
     }
 
     // All runtime backends use the shared single-pass FXAA display filter.
@@ -1809,15 +1888,16 @@ static int32_t d2s_coreml_io_pack_internal(
         BOOL filter_sbs = params.stereo.edge_aa_enabled != 0 &&
             (output_format == D2S_OUTPUT_HALF_SBS || output_format == D2S_OUTPUT_FULL_SBS);
         BOOL filter_half = filter_sbs && output_format == D2S_OUTPUT_HALF_SBS;
-        // Image-space AA sees full eye colour edges before any horizontal
-        // reduction. Keep DIBR single-sampled and its depth/visibility intact.
+        // Keep the DIBR warp single-sampled; SBS color AA runs in a separate pass.
         params.stereo.edge_aa_enabled = 0;
-        uint32_t raw_width = filter_half ? (uint32_t)output_width * 2u : (uint32_t)output_width;
+        uint32_t raw_width = filter_half
+            ? (uint32_t)output_width * 2u : (uint32_t)output_width;
         if (filter_half) {
             params.output_width = raw_width;
             params.output_format = D2S_OUTPUT_FULL_SBS_FROM_HALF;
         }
         id<MTLBuffer> warp_destination = destination_buffer;
+        BOOL use_reduced_half_aa = filter_half && ctx->downsample_half_pipeline != nil;
         if (filter_sbs) {
             size_t raw_bytes = (size_t)raw_width * output_height * output_channels;
             if (slot->raw_packed_buffer == nil || slot->raw_packed_buffer.length < raw_bytes) {
@@ -1830,6 +1910,12 @@ static int32_t d2s_coreml_io_pack_internal(
                 return D2S_COREML_ERROR;
             }
         }
+        if (use_reduced_half_aa &&
+            (slot->half_packed_buffer == nil || slot->half_packed_buffer.length < output_bytes)) {
+            slot->half_packed_buffer = [ctx->device newBufferWithLength:(NSUInteger)output_bytes
+                                                               options:MTLResourceStorageModePrivate];
+        }
+        use_reduced_half_aa = use_reduced_half_aa && slot->half_packed_buffer != nil;
         id<MTLCommandBuffer> command = [ctx->pack_queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
         d2s_encode_normalize(ctx, slot, encoder, slot->normalize_lo, slot->normalize_hi);
@@ -1886,7 +1972,36 @@ static int32_t d2s_coreml_io_pack_internal(
         [encoder dispatchThreads:grid
           threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         [encoder endEncoding];
-        if (filter_sbs) {
+        if (filter_sbs && use_reduced_half_aa) {
+            D2SHalfDownsampleParams downsample_params = {
+                raw_width, (uint32_t)output_height, output_channels,
+                raw_width / 2u,
+            };
+            encoder = [command computeCommandEncoder];
+            [encoder setComputePipelineState:ctx->downsample_half_pipeline];
+            [encoder setBuffer:warp_destination offset:0 atIndex:0];
+            [encoder setBuffer:slot->half_packed_buffer offset:0 atIndex:1];
+            [encoder setBytes:&downsample_params
+                length:sizeof(downsample_params) atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(output_width, output_height, 1)
+              threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+            [encoder endEncoding];
+
+            D2SFxaaParams aa_params = {
+                (uint32_t)output_width, (uint32_t)output_height,
+                output_channels, 0u, (uint32_t)output_width / 2u, 1u,
+            };
+            encoder = [command computeCommandEncoder];
+            [encoder setComputePipelineState:ctx->fxaa_pipeline];
+            [encoder setBuffer:slot->half_packed_buffer offset:0 atIndex:0];
+            [encoder setBuffer:slot->half_packed_buffer offset:0 atIndex:1];
+            [encoder setBuffer:destination_buffer offset:0 atIndex:2];
+            [encoder setBuffer:destination_buffer offset:0 atIndex:3];
+            [encoder setBytes:&aa_params length:sizeof(aa_params) atIndex:4];
+            [encoder dispatchThreads:MTLSizeMake(output_width, output_height, 1)
+              threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+            [encoder endEncoding];
+        } else if (filter_sbs) {
             BOOL use_smaa = ctx->smaa_edges_pipeline != nil &&
                 ctx->smaa_weights_pipeline != nil && ctx->smaa_resolve_pipeline != nil &&
                 ctx->smaa_area_buffer != nil && ctx->smaa_search_buffer != nil;

@@ -24,12 +24,23 @@ static inline uint aa_index(int2 point, uint batch, uint channel,
         : (batch * p.channels + channel) * plane + pixel;
 }
 
+static inline uint aa_pixel_index(int2 point, uint batch,
+                                  constant FxaaParams& p) {
+    return batch * p.width * p.height + uint(point.y) * p.width + uint(point.x);
+}
+
 static inline float3 aa_read_rgb(device const uchar *image,
                                   device const float *image_float, int2 point,
                                   uint batch, int eye_first, int eye_last,
                                   constant FxaaParams& p) {
     point.x = clamp(point.x, eye_first, eye_last);
     point.y = clamp(point.y, 0, int(p.height) - 1);
+    if (p.layout == 0u && p.channels == 4u) {
+        // CoreML's native packer emits interleaved RGBA8. Load all channels
+        // once so the many FXAA luma taps do not issue three byte loads.
+        device const uchar4 *pixels = reinterpret_cast<device const uchar4 *>(image);
+        return float3(pixels[aa_pixel_index(point, batch, p)].xyz) / 255.0f;
+    }
     uint r = aa_index(point, batch, 0u, p);
     uint g = aa_index(point, batch, 1u, p);
     uint b = aa_index(point, batch, 2u, p);
@@ -83,7 +94,8 @@ static inline float3 aa_fxaa_pixel(
     int eye_width = int(p.eye_width > 0u && p.eye_width < p.width ? p.eye_width : p.width);
     int eye_first = point.x < eye_width ? 0 : eye_width;
     int eye_last = eye_first == 0 ? eye_width - 1 : int(p.width) - 1;
-    float M = aa_luma(aa_read_rgb(source, source_float, point, batch, eye_first, eye_last, p));
+    float3 center_rgb = aa_read_rgb(source, source_float, point, batch, eye_first, eye_last, p);
+    float M = aa_luma(center_rgb);
     float N = aa_luma(aa_read_rgb(source, source_float, point + int2(0, -1), batch, eye_first, eye_last, p));
     float S = aa_luma(aa_read_rgb(source, source_float, point + int2(0, 1), batch, eye_first, eye_last, p));
     float W = aa_luma(aa_read_rgb(source, source_float, point + int2(-1, 0), batch, eye_first, eye_last, p));
@@ -92,7 +104,7 @@ static inline float3 aa_fxaa_pixel(
     float maximum = max(M, max(max(N, S), max(W, E)));
     float range = maximum - minimum;
     if (range < max(0.0312f, maximum * 0.125f) + 1.0e-5f) {
-        return aa_read_rgb(source, source_float, point, batch, eye_first, eye_last, p);
+        return center_rgb;
     }
     float NW = aa_luma(aa_read_rgb(source, source_float, point + int2(-1, -1), batch, eye_first, eye_last, p));
     float NE = aa_luma(aa_read_rgb(source, source_float, point + int2(1, -1), batch, eye_first, eye_last, p));
@@ -229,4 +241,6 @@ kernel void d2s_sbs_fxaa_half(
         else output[index] = uchar(clamp(alpha * 255.0f + 0.5f, 0.0f, 255.0f));
     }
 }
+
+
 )MSL";

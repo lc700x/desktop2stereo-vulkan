@@ -204,7 +204,7 @@ def antialias_sbs(image: torch.Tensor, output_format: str) -> torch.Tensor:
 
 
 def antialias_sbs_half(image: torch.Tensor) -> torch.Tensor:
-    """Antialias each full eye, then area-reduce in linear light to Half-SBS."""
+    """Area-reduce each eye in linear light, then FXAA the Half-SBS output."""
     channels_last = image.ndim == 3 and image.shape[0] not in (3, 4) and image.shape[-1] in (3, 4)
     tensor = image.permute(2, 0, 1) if channels_last else image
     single = tensor.ndim == 3
@@ -213,24 +213,14 @@ def antialias_sbs_half(image: torch.Tensor) -> torch.Tensor:
         return image
     source = source.contiguous()
     batch, channels, height, width = map(int, source.shape)
-    half = None
-    key = (source.device.type, str(source.device))
-    if (source.device.type == "mps" and key not in _FAILED_BACKENDS
-            and source.dtype in (torch.float32, torch.uint8)):
-        try:
-            half = _mps_filter(source, width // 2, half_sbs=True)
-        except Exception as exc:
-            _FAILED_BACKENDS.add(key)
-            _LOGGER.warning("Display FXAA Half-SBS Metal kernel unavailable; using shared fallback: %s", exc)
-    if half is None:
-        eye_width = width // 2
-        full = _filter(source, eye_width)
-        from .output import downsample_horizontal_area_srgb
+    eye_width = width // 2
+    from .output import downsample_horizontal_area_srgb
 
-        left_target = eye_width // 2
-        right_target = eye_width - left_target
-        left = downsample_horizontal_area_srgb(full[..., :eye_width], left_target)
-        right = downsample_horizontal_area_srgb(full[..., eye_width:], right_target)
-        half = torch.cat((left, right), dim=-1)
+    left_target = eye_width // 2
+    right_target = eye_width - left_target
+    left = downsample_horizontal_area_srgb(source[..., :eye_width], left_target)
+    right = downsample_horizontal_area_srgb(source[..., eye_width:], right_target)
+    half = torch.cat((left, right), dim=-1)
+    half = _filter(half, left_target)
     result = half.squeeze(0) if single else half
     return result.permute(1, 2, 0).contiguous() if channels_last else result
