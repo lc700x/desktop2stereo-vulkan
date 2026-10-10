@@ -1916,6 +1916,7 @@ class _TransferSource:
         self._rocm_interop = False
         self._cuda_active = False
         self._slow_present_count = 0
+        self._input_monitor_size_cache: tuple[int, float, tuple[int, int]] | None = None
         self._direct_enabled = bool(direct_enabled)
         self._direct_lock = threading.Lock()
         self._direct_state = "available"
@@ -2228,9 +2229,9 @@ class _TransferSource:
         elif o.config.display_fit_enabled:
             fit_mode = o.config.display_fit_mode
         fit_mode = normalize_display_fit_mode(fit_mode)
-        # Dynamic tex_w,tex_h: query current window/monitor size per frame
-        # so input aspect changes (e.g., window resized) are reflected.
+        # Refresh source geometry so monitor/window size changes are reflected.
         dyn_input_size = o.config.input_size
+        monitor_size_ms = 0.0
         try:
             cap_mode = str(getattr(o.config, "capture_mode", "") or "").strip()
             if cap_mode.casefold() == "window":
@@ -2249,15 +2250,29 @@ class _TransferSource:
             elif cap_mode:
                 # Monitor mode: use current monitor size (may change with resolution)
                 try:
-                    from utils.display import get_monitor_size
-
                     # o.config.monitor_index is the stereo output monitor; input monitor
                     # is preview_monitor_index or monitor_index depending on config
                     inp_idx = int(getattr(o.config, "preview_monitor_index", 0) or 0)
                     if inp_idx <= 0:
                         inp_idx = int(getattr(o.config, "monitor_index", 0) or 0)
                     if inp_idx > 0:
-                        dyn_input_size = get_monitor_size(inp_idx)
+                        now = time.monotonic()
+                        cached_size = self._input_monitor_size_cache
+                        if (
+                            cached_size is not None
+                            and cached_size[0] == inp_idx
+                            and now - cached_size[1] < 2.0
+                        ):
+                            dyn_input_size = cached_size[2]
+                        else:
+                            from utils.display import get_monitor_size
+
+                            monitor_started = time.perf_counter()
+                            dyn_input_size = get_monitor_size(inp_idx)
+                            monitor_size_ms = (time.perf_counter() - monitor_started) * 1000.0
+                            self._input_monitor_size_cache = (
+                                inp_idx, now, dyn_input_size
+                            )
                 except Exception:
                     pass
         except Exception:
@@ -2377,6 +2392,7 @@ class _TransferSource:
                     f"fence_result={fence_result} acquire={acquire_ms:.1f}ms "
                     f"acquire_result={acquire_result} "
                     f"upload={upload_ms:.1f}ms record={record_ms:.1f}ms "
+                    f"monitor_size={monitor_size_ms:.1f}ms "
                     f"overlay={overlay_ms:.1f}ms "
                     f"overlay_upload={overlay_upload_ms:.1f}ms "
                     f"submit={submit_ms:.1f}ms submit_result={submit_result} "
