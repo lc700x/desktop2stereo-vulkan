@@ -145,7 +145,7 @@ static inline float3 aa_fxaa_pixel(
     float neighborhood = (2.0f * (N + S + W + E) + NW + NE + SW + SE) / 12.0f;
     float subpixel = clamp(abs(neighborhood - M) / max(range, 1.0e-6f), 0.0f, 1.0f);
     subpixel = subpixel * subpixel * (3.0f - 2.0f * subpixel);
-    subpixel = subpixel * subpixel * 0.75f;
+    subpixel = subpixel * subpixel * 1.25f;
     float offset = max(edge_offset, subpixel);
     float3 rgb = aa_sample_linear_rgb(source, source_float, float2(point) + normal * offset, batch,
                                        eye_first, eye_last, p);

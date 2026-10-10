@@ -118,7 +118,7 @@ def _fxaa_kernel(image, output, W: tl.constexpr, H: tl.constexpr, C: tl.constexp
         neighborhood = (2 * (n + s + w + e) + nw + ne + sw + se) / 12.0
         subpixel = tl.minimum(tl.maximum(tl.abs(neighborhood - m) / tl.maximum(contrast, 1e-6), 0), 1)
         subpixel = subpixel * subpixel * (3 - 2 * subpixel)
-        final_offset = tl.maximum(coverage, subpixel * subpixel * 0.75)
+        final_offset = tl.maximum(coverage, subpixel * subpixel * 1.25)
     for channel in tl.static_range(C):
         original = tl.load(image + (batch * C + channel) * W * H + pixel, mask=active, other=0)
         value = original

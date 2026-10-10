@@ -118,7 +118,9 @@ def fxaa_reference(image: torch.Tensor) -> torch.Tensor:
     coverage = torch.where(valid_span, coverage, 0.0)
     neighborhood = (2.0 * (north + south + west + east) + nw + ne + sw + se) / 12.0
     subpixel = ((neighborhood - center).abs() / contrast.clamp_min(1e-6)).clamp(0.0, 1.0)
-    subpixel = (subpixel * subpixel * (3.0 - 2.0 * subpixel)).square() * 0.75
+    # Slightly over-unity coverage softens stair steps from the 336-grid depth
+    # silhouette; the same factor is mirrored by the GPU implementations.
+    subpixel = (subpixel * subpixel * (3.0 - 2.0 * subpixel)).square() * 1.25
     offset = torch.maximum(coverage, subpixel)
     covered = sample(_decode_srgb(rgb), xx + normal_x * offset, yy + normal_y * offset)
     result = torch.where(edge.expand_as(rgb), _encode_srgb(covered), source[:, :3])

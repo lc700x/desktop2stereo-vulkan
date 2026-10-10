@@ -83,7 +83,7 @@ vec3 aa_resolve(ivec2 p, uint eye) {
     float mean_luma = (2.0 * (n + s + e + w) + nw + ne + sw + se) / 12.0;
     float subpixel = clamp(abs(mean_luma - m) / max(range, 1.0e-6), 0.0, 1.0);
     subpixel = subpixel * subpixel * (3.0 - 2.0 * subpixel);
-    subpixel = subpixel * subpixel * 0.75;
+    subpixel = subpixel * subpixel * 1.25;
     float offset = max(edge_offset, subpixel);
     if (offset <= 0.0) return original;
     return aa_sample_color(vec2(p) + normal * offset, eye);
