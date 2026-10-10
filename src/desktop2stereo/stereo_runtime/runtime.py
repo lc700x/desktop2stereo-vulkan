@@ -20,6 +20,7 @@ from .depth_postprocess import (
     postprocess_depth,
 )
 from .depth_provider import DepthProfileResult, create_depth_provider
+from .depth_upsample import filter_model_depth, model_depth_antialiasing
 from .openxr_render import OpenXRRenderConfig, render_openxr_stereo
 from .parallax import parallax_debug_info, resolve_parallax_budget
 from .render_size import runtime_output_size_text
@@ -154,6 +155,37 @@ class DepthRuntime:
         )
 
     def _predict_depth_profile(
+        self,
+        rgb_frame: torch.Tensor,
+        *,
+        native_capture: Any | None = None,
+        capture_frame_id: int | None = None,
+    ) -> DepthProfileResult:
+        strength = float(getattr(self.config, "depth_antialias_strength", 0.0) or 0.0)
+        with model_depth_antialiasing(strength) as antialias_state:
+            result = self._predict_depth_profile_impl(
+                rgb_frame,
+                native_capture=native_capture,
+                capture_frame_id=capture_frame_id,
+            )
+        filtered = antialias_state.applied or result.model_depth_antialias_applied
+        if strength > 0.0 and not filtered and isinstance(result.depth, torch.Tensor):
+            try:
+                result = replace(
+                    result,
+                    depth=filter_model_depth(result.depth, rgb_frame, strength),
+                )
+                filtered = True
+            except Exception:
+                # Optional AA must not turn a valid backend result into a
+                # failed inference frame.
+                pass
+        return replace(
+            result,
+            model_depth_antialias_applied=filtered,
+        )
+
+    def _predict_depth_profile_impl(
         self,
         rgb_frame: torch.Tensor,
         *,
@@ -1591,6 +1623,9 @@ class StereoRuntime:
         cuda_events.update(getattr(profile, "cuda_timing_events", None) or {})
         _record_cuda_event(cuda_events, "depth", rgb_frame)
         stereo_config, convergence_debug = _dynamic_convergence_config_for_depth(self, depth, self.stereo_config)
+        requested_depth_antialias = float(stereo_config.depth_antialias_strength)
+        if profile.model_depth_antialias_applied:
+            stereo_config = replace(stereo_config, depth_antialias_strength=0.0)
 
         synth_start = time.perf_counter()
         deferred_vulkan_request = None
@@ -1842,7 +1877,7 @@ class StereoRuntime:
                     f" pack_ms={pack_ms:.1f}"
                     f" backend={debug.get('backend', stereo_config.backend)}"
                     f" depth_pop={stereo_config.depth_pop:.3f}"
-                    f" antialias={stereo_config.depth_antialias_strength:.3f}"
+                    f" antialias={requested_depth_antialias:.3f}"
                     f" output_dtype={debug.get('runtime_output_dtype', sbs.dtype)}"
                     f" pack_backend={debug.get('runtime_output_pack_backend', 'n/a')}"
                     f" sbs_backend={debug.get('sbs_backend', 'n/a')}"
@@ -1954,6 +1989,8 @@ class StereoRuntime:
             self.stereo_config,
             prefer_gpu_tensor=prewarp_eyes,
         )
+        if profile.model_depth_antialias_applied:
+            stereo_config = replace(stereo_config, depth_antialias_strength=0.0)
         convergence = stereo_config.convergence
         if openxr_config is not None:
             openxr_config_for_frame = replace(
@@ -2177,7 +2214,12 @@ class StereoRuntime:
                     render_backend["openxr_grid_sample_fallback"] = 1
                     render_backend["openxr_grid_sample_fallback_reason"] = str(vulkan_skip)
         else:
-            depth = self._prepare_openxr_rgb_depth(depth)
+            depth = self._prepare_openxr_rgb_depth(
+                depth,
+                antialias_strength=float(
+                    getattr(stereo_config, "depth_antialias_strength", 0.0)
+                ),
+            )
             _record_cuda_event(cuda_events, "openxr_depth_prepare", rgb_frame)
             visual_regression_dir = self._maybe_dump_openxr_rgb_depth(
                 source_rgb=source_rgb,
@@ -2385,7 +2427,12 @@ class StereoRuntime:
         except Exception as exc:
             return None, f"request_failed:{type(exc).__name__}"
 
-    def _prepare_openxr_rgb_depth(self, depth: torch.Tensor) -> torch.Tensor:
+    def _prepare_openxr_rgb_depth(
+        self,
+        depth: torch.Tensor,
+        *,
+        antialias_strength: float | None = None,
+    ) -> torch.Tensor:
         depth = depth.detach().contiguous().float().clamp(0.0, 1.0)
         depth = _openxr_rgb_depth_percentile_normalize(depth, percentile=_openxr_rgb_depth_percentile())
         gamma = _openxr_rgb_depth_gamma()
@@ -2394,7 +2441,11 @@ class StereoRuntime:
         depth = postprocess_depth(
             depth,
             depth_pop=float(getattr(self.stereo_config, "depth_pop", 0.0)),
-            antialias_strength=float(getattr(self.stereo_config, "depth_antialias_strength", 0.0)),
+            antialias_strength=(
+                float(getattr(self.stereo_config, "depth_antialias_strength", 0.0))
+                if antialias_strength is None
+                else float(antialias_strength)
+            ),
         )
         return self._stabilize_openxr_rgb_depth(
             depth,
@@ -2453,6 +2504,37 @@ class StereoRuntime:
         return out
 
     def _predict_depth_profile(
+        self,
+        rgb_frame: torch.Tensor,
+        *,
+        native_capture: Any | None = None,
+        capture_frame_id: int | None = None,
+    ) -> DepthProfileResult:
+        strength = float(getattr(self.config, "depth_antialias_strength", 0.0) or 0.0)
+        with model_depth_antialiasing(strength) as antialias_state:
+            result = self._predict_depth_profile_impl(
+                rgb_frame,
+                native_capture=native_capture,
+                capture_frame_id=capture_frame_id,
+            )
+        filtered = antialias_state.applied or result.model_depth_antialias_applied
+        if strength > 0.0 and not filtered and isinstance(result.depth, torch.Tensor):
+            try:
+                result = replace(
+                    result,
+                    depth=filter_model_depth(result.depth, rgb_frame, strength),
+                )
+                filtered = True
+            except Exception:
+                # Optional AA must not turn a valid backend result into a
+                # failed inference frame.
+                pass
+        return replace(
+            result,
+            model_depth_antialias_applied=filtered,
+        )
+
+    def _predict_depth_profile_impl(
         self,
         rgb_frame: torch.Tensor,
         *,

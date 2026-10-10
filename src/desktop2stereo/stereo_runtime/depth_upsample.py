@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -8,6 +11,67 @@ import torch.nn.functional as F
 from .output import ensure_b1hw, ensure_bchw
 
 DepthUpsampleMode = Literal["bilinear", "guided", "joint_bilateral"]
+
+
+@dataclass
+class _ModelDepthAntialiasState:
+    strength: float
+    applied: bool = False
+
+
+_MODEL_DEPTH_ANTIALIAS_STATE: ContextVar[_ModelDepthAntialiasState | None] = ContextVar(
+    "d2s_model_depth_antialias_state", default=None
+)
+
+
+@contextmanager
+def model_depth_antialiasing(strength: float):
+    """Apply the configured spatial depth filter before provider upsampling.
+
+    Providers share ``upsample_depth`` but own their model execution. A
+    context-local setting lets the runtime enable identical postprocessing for
+    PyTorch, TensorRT, ONNX, ROCm, and MPS providers without changing their
+    inference code or constructor contracts.
+    """
+    state = _ModelDepthAntialiasState(max(0.0, float(strength)))
+    token = _MODEL_DEPTH_ANTIALIAS_STATE.set(state)
+    try:
+        yield state
+    finally:
+        _MODEL_DEPTH_ANTIALIAS_STATE.reset(token)
+
+
+def filter_model_depth(
+    depth: torch.Tensor,
+    rgb: torch.Tensor | None,
+    strength: float,
+) -> torch.Tensor:
+    if strength <= 0.0:
+        return depth
+    # v2.5 maps the 0..2 GUI choice to AA_STRENGTH=0..4. Keep that mapping
+    # while filtering on the model grid instead of the much larger RGB grid.
+    model_strength = min(4.0, 2.0 * float(strength))
+    from .depth_postprocess import anti_alias_depth, anti_alias_depth_guided
+
+    if rgb is None:
+        return anti_alias_depth(depth, model_strength)
+    guide = ensure_bchw(rgb, name="rgb").to(device=depth.device, dtype=torch.float32)
+    guide = F.interpolate(
+        guide[:, :3],
+        size=depth.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    ).clamp(0.0, 1.0)
+    # The smooth Gaussian removes depth-grid stair steps; the RGB edge mask
+    # retains 35% of the original depth at strong image edges to limit contour
+    # widening. Both constants are mirrored by the native Metal kernel.
+    return anti_alias_depth_guided(
+        depth,
+        guide,
+        model_strength,
+        sigma_color=0.1,
+        max_keep=0.35,
+    )
 
 
 def _gather_depth_samples(depth: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -139,6 +203,10 @@ def upsample_depth(
     """
 
     depth = ensure_b1hw(depth).float()
+    antialias_state = _MODEL_DEPTH_ANTIALIAS_STATE.get()
+    if antialias_state is not None and antialias_state.strength > 0.0:
+        depth = filter_model_depth(depth, rgb, antialias_state.strength)
+        antialias_state.applied = True
     if depth.shape[-2:] == (height, width):
         return depth
 

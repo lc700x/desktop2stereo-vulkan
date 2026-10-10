@@ -44,6 +44,14 @@ typedef struct {
 } D2SNormalizeParams;
 
 typedef struct {
+    uint32_t depth_width;
+    uint32_t depth_height;
+    float strength;
+    float sigma_color;
+    float max_keep;
+} D2SDepthFilterParams;
+
+typedef struct {
     uint32_t source_width;
     uint32_t source_height;
     uint32_t depth_width;
@@ -909,10 +917,98 @@ kernel void d2s_warp_pack(
 }
 )D2S";
 
+// Optional model-grid edge-aware smoothing. Keeping this in a separate
+// library lets the existing CoreML inference and warp pipelines initialize
+// even if a device cannot compile this optional filter.
+static const char *D2SDepthFilterMetalSource = R"D2S_FILTER(
+#include <metal_stdlib>
+using namespace metal;
+
+struct DepthFilterParams {
+    uint depth_width;
+    uint depth_height;
+    float strength;
+    float sigma_color;
+    float max_keep;
+};
+
+static inline float3 d2s_depth_guide_at(
+    texture2d<float, access::sample> source, int x, int y,
+    constant DepthFilterParams& p) {
+    constexpr sampler s(address::clamp_to_edge, filter::linear);
+    float2 uv = (float2(float(x), float(y)) + 0.5f) /
+                float2(p.depth_width, p.depth_height);
+    return source.sample(s, uv).rgb;
+}
+
+kernel void d2s_filter_depth_guided(
+    texture2d<float, access::sample> source_rgb [[texture(0)]],
+    device const float *source_depth [[buffer(0)]],
+    device float *filtered_depth [[buffer(1)]],
+    constant DepthFilterParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.depth_width || gid.y >= p.depth_height) return;
+    uint output_index = gid.y * p.depth_width + gid.x;
+    float center = source_depth[output_index];
+    int kernel_size = int(3.0f * p.strength) | 1;
+    int radius = min(max((kernel_size - 1) / 2, 0), 6);
+    if (radius <= 0) {
+        filtered_depth[output_index] = center;
+        return;
+    }
+
+    float sigma = max(0.5f * p.strength, 1.0e-4f);
+    float inverse_two_sigma_sq = 0.5f / (sigma * sigma);
+    float smooth_sum = 0.0f;
+    float weight_sum = 0.0f;
+    for (int oy = -6; oy <= 6; ++oy) {
+        if (abs(oy) > radius) continue;
+        float dy = float(oy);
+        float wy = exp(-(dy * dy) * inverse_two_sigma_sq);
+        for (int ox = -6; ox <= 6; ++ox) {
+            if (abs(ox) > radius) continue;
+            float dx = float(ox);
+            float weight = wy * exp(-(dx * dx) * inverse_two_sigma_sq);
+            int sx = int(gid.x) + ox;
+            int sy = int(gid.y) + oy;
+            float sample_depth = 0.0f;
+            if (sx >= 0 && sy >= 0 && sx < int(p.depth_width) &&
+                sy < int(p.depth_height)) {
+                sample_depth = source_depth[uint(sy) * p.depth_width + uint(sx)];
+            }
+            smooth_sum += sample_depth * weight;
+            weight_sum += weight;
+        }
+    }
+    float smooth = clamp(smooth_sum / max(weight_sum, 1.0e-6f), 0.0f, 1.0f);
+
+    float3 guide_center = d2s_depth_guide_at(source_rgb, int(gid.x), int(gid.y), p);
+    float3 guide_sum = float3(0.0f);
+    for (int oy = -1; oy <= 1; ++oy) {
+        for (int ox = -1; ox <= 1; ++ox) {
+            int sx = int(gid.x) + ox;
+            int sy = int(gid.y) + oy;
+            if (sx >= 0 && sy >= 0 && sx < int(p.depth_width) &&
+                sy < int(p.depth_height)) {
+                guide_sum += d2s_depth_guide_at(source_rgb, sx, sy, p);
+            }
+        }
+    }
+    float3 guide_blur = guide_sum / 9.0f;
+    float edge = clamp(dot(abs(guide_center - guide_blur), float3(1.0f)) /
+                       max(p.sigma_color * 3.0f, 1.0e-6f), 0.0f, 1.0f);
+    float keep = clamp(p.max_keep * edge, 0.0f, 1.0f);
+    filtered_depth[output_index] = clamp(
+        keep * center + (1.0f - keep) * smooth, 0.0f, 1.0f);
+}
+)D2S_FILTER";
+
 typedef struct {
     __strong id<MTLBuffer> input_buffer;
     __strong id<MTLBuffer> raw_depth_buffer;
     __strong id<MTLBuffer> normalized_depth_buffer;
+    // Retained across slot release so each model-depth allocation is reused.
+    __strong id<MTLBuffer> filtered_depth_buffer;
     __strong id<MTLBuffer> status_buffer;
     __strong id<MTLBuffer> packed_buffer;
     __strong id<MTLBuffer> raw_packed_buffer;
@@ -941,6 +1037,7 @@ typedef struct {
     __strong id<MTLComputePipelineState> preprocess_pipeline;
     __strong id<MTLComputePipelineState> normalize_half_pipeline;
     __strong id<MTLComputePipelineState> normalize_float_pipeline;
+    __strong id<MTLComputePipelineState> depth_filter_pipeline;
     __strong id<MTLComputePipelineState> warp_pipeline;
     __strong id<MTLComputePipelineState> fxaa_pipeline;
     __strong id<MTLComputePipelineState> fxaa_half_pipeline;
@@ -1049,6 +1146,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
         ctx->slots[i].raw_packed_buffer = nil;
         ctx->slots[i].smaa_edges_buffer = nil;
         ctx->slots[i].smaa_weights_buffer = nil;
+        ctx->slots[i].filtered_depth_buffer = nil;
     }
     if (ctx->texture_cache != NULL) {
         CFRelease(ctx->texture_cache);
@@ -1061,6 +1159,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     ctx->preprocess_pipeline = nil;
     ctx->normalize_half_pipeline = nil;
     ctx->normalize_float_pipeline = nil;
+    ctx->depth_filter_pipeline = nil;
     ctx->warp_pipeline = nil;
     ctx->fxaa_pipeline = nil;
     ctx->fxaa_half_pipeline = nil;
@@ -1103,6 +1202,19 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     if (!(ctx->preprocess_pipeline && ctx->normalize_half_pipeline &&
            ctx->normalize_float_pipeline && ctx->warp_pipeline &&
            ctx->fxaa_pipeline && ctx->fxaa_half_pipeline)) return NO;
+
+    NSError *filter_error = nil;
+    id<MTLLibrary> filter_library = [ctx->device newLibraryWithSource:
+        [NSString stringWithUTF8String:D2SDepthFilterMetalSource]
+        options:nil error:&filter_error];
+    if (filter_library != nil) {
+        id<MTLFunction> filter_function =
+            [filter_library newFunctionWithName:@"d2s_filter_depth_guided"];
+        if (filter_function != nil) {
+            ctx->depth_filter_pipeline = [ctx->device
+                newComputePipelineStateWithFunction:filter_function error:&filter_error];
+        }
+    }
 
     // All runtime backends use the shared single-pass FXAA display filter.
     // Leave the dormant SMAA fields nil so native packing follows its FXAA path.
@@ -1723,10 +1835,50 @@ static int32_t d2s_coreml_io_pack_internal(
         d2s_encode_normalize(ctx, slot, encoder, slot->normalize_lo, slot->normalize_hi);
         [encoder endEncoding];
 
+        id<MTLBuffer> warp_depth_buffer = slot->normalized_depth_buffer;
+        if (params.stereo.antialias_strength > 0.0f &&
+            ctx->depth_filter_pipeline != nil) {
+            size_t depth_bytes = ctx->depth_count * sizeof(float);
+            if (slot->filtered_depth_buffer == nil ||
+                slot->filtered_depth_buffer.length < depth_bytes) {
+                slot->filtered_depth_buffer = [ctx->device
+                    newBufferWithLength:(NSUInteger)depth_bytes
+                    options:MTLResourceStorageModePrivate];
+            }
+            if (slot->filtered_depth_buffer != nil) {
+                D2SDepthFilterParams filter_params = {
+                    (uint32_t)ctx->depth_width,
+                    (uint32_t)ctx->depth_height,
+                    fminf(4.0f, fmaxf(0.0f, 2.0f * params.stereo.antialias_strength)),
+                    0.1f,
+                    0.35f,
+                };
+                id<MTLComputeCommandEncoder> filter_encoder =
+                    [command computeCommandEncoder];
+                if (filter_encoder != nil) {
+                    [filter_encoder setComputePipelineState:ctx->depth_filter_pipeline];
+                    [filter_encoder setTexture:slot->color_texture atIndex:0];
+                    [filter_encoder setBuffer:slot->normalized_depth_buffer offset:0 atIndex:0];
+                    [filter_encoder setBuffer:slot->filtered_depth_buffer offset:0 atIndex:1];
+                    [filter_encoder setBytes:&filter_params
+                        length:sizeof(filter_params) atIndex:2];
+                    MTLSize filter_grid = MTLSizeMake(
+                        (NSUInteger)ctx->depth_width,
+                        (NSUInteger)ctx->depth_height, 1);
+                    [filter_encoder dispatchThreads:filter_grid
+                        threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                    [filter_encoder endEncoding];
+                    warp_depth_buffer = slot->filtered_depth_buffer;
+                    // The model-grid filter now owns depth AA for this frame.
+                    params.stereo.antialias_strength = 0.0f;
+                }
+            }
+        }
+
         encoder = [command computeCommandEncoder];
         [encoder setComputePipelineState:ctx->warp_pipeline];
         [encoder setTexture:slot->color_texture atIndex:0];
-        [encoder setBuffer:slot->normalized_depth_buffer offset:0 atIndex:0];
+        [encoder setBuffer:warp_depth_buffer offset:0 atIndex:0];
         [encoder setBuffer:warp_destination offset:0 atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         NSUInteger threads = 64;

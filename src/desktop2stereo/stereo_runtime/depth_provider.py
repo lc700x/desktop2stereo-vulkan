@@ -83,6 +83,9 @@ class DepthProfileResult:
     native_depth: Any | None = None
     native_resource_handle: Any | None = None
     native_zero_copy: bool = False
+    # True when the runtime applied its shared model-grid depth filter before
+    # provider upsampling. This prevents a second, output-resolution blur.
+    model_depth_antialias_applied: bool = False
 
     @property
     def total_ms(self) -> float:
