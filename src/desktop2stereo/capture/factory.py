@@ -119,6 +119,8 @@ def create_capture_source(config: CaptureConfig | None = None):
         "capture_mode": config.capture_mode,
         "monitor_index": config.monitor_index,
     }
+    if config.os_name == "Darwin" and config.capture_tool == "ScreenCaptureKit":
+        kwargs["fps_provider"] = config.fps_provider
     return source_cls(**kwargs)
 
 

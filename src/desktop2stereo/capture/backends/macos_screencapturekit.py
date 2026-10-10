@@ -426,13 +426,15 @@ class _SCKFrameReceiver(NSObject):
 
 class DesktopGrabber:
     def __init__(self, output_resolution=1080, fps=60, window_title=None,
-                capture_mode="Monitor", monitor_index=1, with_cursor=True):
+                capture_mode="Monitor", monitor_index=1, with_cursor=True,
+                fps_provider=None):
         # OUTPUT_RESOLUTION may be an int or a (width, height) tuple when
         # "Processing Resolution: Auto"; the grabber needs a target height.
         if isinstance(output_resolution, (tuple, list)):
             output_resolution = int(output_resolution[1])
         self.scaled_height = int(output_resolution)
-        self.fps = fps
+        self.fps = max(1, min(240, int(fps)))
+        self._fps_provider = fps_provider
         self.with_cursor = with_cursor
         # Native ScreenCaptureKit pixel format handed to consumers by grab().
         self.frame_format = "bgra"
@@ -440,6 +442,9 @@ class DesktopGrabber:
         self.capture_mode = capture_mode
         self._stream = None
         self._receiver = None
+        self._stream_config = None
+        self._last_fps_update_request = self.fps
+        self._fps_update_error_logged = False
         self._last_frame = None
         self._display = None
         self._window = None
@@ -544,6 +549,7 @@ class DesktopGrabber:
         self._receiver = _SCKFrameReceiver.alloc().init()
         self._stream = SCK.SCStream.alloc().initWithFilter_configuration_delegate_(
             filt, config, self._receiver)
+        self._stream_config = config
 
         success, error = self._stream.addStreamOutput_type_sampleHandlerQueue_error_(
             self._receiver, 0, None, None)
@@ -563,6 +569,64 @@ class DesktopGrabber:
             raise RuntimeError(f"Failed to start capture: {start_result['error']}")
 
         self._receiver.get_latest_frame(timeout=2.0)
+
+    def _sync_capture_fps(self):
+        provider = self._fps_provider
+        if not callable(provider):
+            return
+        try:
+            target_fps = max(1, min(240, int(provider())))
+        except (TypeError, ValueError, RuntimeError):
+            return
+        if target_fps == self._last_fps_update_request:
+            return
+        self._last_fps_update_request = target_fps
+        stream = self._stream
+        if stream is None:
+            return
+        config = SCK.SCStreamConfiguration.alloc().init()
+        config.setWidth_(self.width)
+        config.setHeight_(self.height)
+        config.setShowsCursor_(self.with_cursor)
+        config.setPixelFormat_(CV.kCVPixelFormatType_32BGRA)
+        config.setMinimumFrameInterval_(CMTimeMake(1, target_fps))
+        try:
+            if hasattr(config, "setQueueDepth_"):
+                try:
+                    queue_depth = max(
+                        1,
+                        min(8, int(os.environ.get("D2S_SCK_QUEUE_DEPTH", "3"))),
+                    )
+                except (TypeError, ValueError):
+                    queue_depth = 3
+                config.setQueueDepth_(queue_depth)
+            self._stream_config = config
+
+            def _on_update(error):
+                if error is not None:
+                    if not self._fps_update_error_logged:
+                        self._fps_update_error_logged = True
+                        print(
+                            "[ScreenCaptureKit] Adaptive frame interval update failed; "
+                            f"continuing with the previous capture rate: {error}",
+                            flush=True,
+                        )
+                    return
+                self.fps = target_fps
+                print(
+                    f"[ScreenCaptureKit] Adaptive capture target applied: {target_fps} FPS",
+                    flush=True,
+                )
+
+            stream.updateConfiguration_completionHandler_(config, _on_update)
+        except Exception as exc:
+            if not self._fps_update_error_logged:
+                self._fps_update_error_logged = True
+                print(
+                    "[ScreenCaptureKit] Adaptive frame interval update unavailable; "
+                    f"continuing with the previous capture rate: {exc}",
+                    flush=True,
+                )
 
     def _update_window_filter(self):
         if self.capture_mode != "Window":
@@ -634,6 +698,7 @@ class DesktopGrabber:
 
     def grab_native_zero_copy(self, timeout=0.0):
         """Atomically wait for and take the newest retained IOSurface."""
+        self._sync_capture_fps()
         self._update_window_filter()
         receiver = self._receiver
         if receiver is None:

@@ -794,6 +794,9 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             capture_fps=capture_fps,
             frame_count=frame_count,
         )
+        callbacks.breakdown_set_latest(
+            "adaptive_capture_target_fps", capture_target
+        )
         if nvfruc_calibration is not None:
             previous_target = nvfruc_calibration.current_target_fps
             monitored_target = nvfruc_calibration.monitor_submission(sbs_fps)

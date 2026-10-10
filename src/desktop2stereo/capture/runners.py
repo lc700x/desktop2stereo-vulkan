@@ -13,6 +13,15 @@ class PollingCaptureRunner:
         self._source = None
         self._frame_id = 0
 
+    def _target_fps(self) -> int:
+        provider = self.config.fps_provider
+        if callable(provider):
+            try:
+                return max(1, min(240, int(provider())))
+            except (TypeError, ValueError, RuntimeError):
+                pass
+        return max(1, min(240, int(self.config.fps)))
+
     @property
     def source(self):
         return self._source
@@ -60,7 +69,7 @@ class PollingCaptureRunner:
                         # producer lock; separate grab/take calls can miss a
                         # callback edge and halve the effective frame rate.
                         zero_copy, size = native_grab(
-                            timeout=1.0 / max(1, self.config.fps)
+                            timeout=1.0 / self._target_fps()
                         )
                         frame_raw = None
                     else:

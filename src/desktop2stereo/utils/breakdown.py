@@ -16,6 +16,7 @@ class OpenXRAsyncValidation:
 
 
 LATEST_KEYS = {
+    "adaptive_capture_target_fps",
     "rt_backend",
     "rt_depth_backend",
     "rt_depth_slot",
