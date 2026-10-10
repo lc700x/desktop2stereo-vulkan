@@ -44,6 +44,13 @@ typedef struct {
 } D2SNormalizeParams;
 
 typedef struct {
+    uint32_t width;
+    uint32_t height;
+    float radius_x;
+    float radius_y;
+} D2SDepthDilationParams;
+
+typedef struct {
     uint32_t source_width;
     uint32_t source_height;
     uint32_t depth_width;
@@ -98,6 +105,13 @@ struct NormalizeParams {
     uint count;
     float lo;
     float hi;
+};
+
+struct DepthDilationParams {
+    uint width;
+    uint height;
+    float radius_x;
+    float radius_y;
 };
 
 struct WarpParams {
@@ -178,6 +192,43 @@ kernel void d2s_normalize_float(
         atomic_fetch_add_explicit(status, 1u, memory_order_relaxed);
     }
     output[gid] = clamp((value - p.lo) / max(p.hi - p.lo, 1.0e-6f), 0.0f, 1.0f);
+}
+
+// Refine low-resolution model silhouettes before DIBR. This follows Oku3D's
+// near-only radial dilation: foreground depth expands toward farther neighbors
+// with a linear falloff, while background values never pull foreground edges.
+kernel void d2s_refine_depth_edges(
+    device float *source [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant DepthDilationParams& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint count = p.width * p.height;
+    if (gid >= count) return;
+    uint x = gid % p.width;
+    uint y = gid / p.width;
+    float center = source[gid];
+    float result = center;
+    int radius_x = min(int(ceil(p.radius_x)), 8);
+    int radius_y = min(int(ceil(p.radius_y)), 8);
+    float inv_radius_x = 1.0f / max(p.radius_x, 1.0e-3f);
+    float inv_radius_y = 1.0f / max(p.radius_y, 1.0e-3f);
+    for (int dy = -radius_y; dy <= radius_y; ++dy) {
+        int sample_y = int(y) + dy;
+        if (sample_y < 0 || sample_y >= int(p.height)) continue;
+        for (int dx = -radius_x; dx <= radius_x; ++dx) {
+            int sample_x = int(x) + dx;
+            if (sample_x < 0 || sample_x >= int(p.width)) continue;
+            float nx = float(dx) * inv_radius_x;
+            float ny = float(dy) * inv_radius_y;
+            float distance = sqrt(nx * nx + ny * ny);
+            if (distance >= 1.0f) continue;
+            float difference = source[uint(sample_y) * p.width + uint(sample_x)] - center;
+            if (difference > 0.02f) {
+                result = max(result, center + difference * (1.0f - distance));
+            }
+        }
+    }
+    output[gid] = clamp(result, 0.0f, 1.0f);
 }
 
 static inline float depth_sample(device float *depth, uint width, uint height,
@@ -913,6 +964,7 @@ typedef struct {
     __strong id<MTLBuffer> input_buffer;
     __strong id<MTLBuffer> raw_depth_buffer;
     __strong id<MTLBuffer> normalized_depth_buffer;
+    __strong id<MTLBuffer> refined_depth_buffer;
     __strong id<MTLBuffer> status_buffer;
     __strong id<MTLBuffer> packed_buffer;
     __strong id<MTLBuffer> raw_packed_buffer;
@@ -941,6 +993,7 @@ typedef struct {
     __strong id<MTLComputePipelineState> preprocess_pipeline;
     __strong id<MTLComputePipelineState> normalize_half_pipeline;
     __strong id<MTLComputePipelineState> normalize_float_pipeline;
+    __strong id<MTLComputePipelineState> depth_dilation_pipeline;
     __strong id<MTLComputePipelineState> warp_pipeline;
     __strong id<MTLComputePipelineState> fxaa_pipeline;
     __strong id<MTLComputePipelineState> fxaa_half_pipeline;
@@ -1047,6 +1100,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
         d2s_release_slot(&ctx->slots[i]);
         ctx->slots[i].packed_buffer = nil;
         ctx->slots[i].raw_packed_buffer = nil;
+        ctx->slots[i].refined_depth_buffer = nil;
         ctx->slots[i].smaa_edges_buffer = nil;
         ctx->slots[i].smaa_weights_buffer = nil;
     }
@@ -1061,6 +1115,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     ctx->preprocess_pipeline = nil;
     ctx->normalize_half_pipeline = nil;
     ctx->normalize_float_pipeline = nil;
+    ctx->depth_dilation_pipeline = nil;
     ctx->warp_pipeline = nil;
     ctx->fxaa_pipeline = nil;
     ctx->fxaa_half_pipeline = nil;
@@ -1090,18 +1145,20 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     id<MTLFunction> preprocess = [library newFunctionWithName:@"d2s_preprocess"];
     id<MTLFunction> norm_half = [library newFunctionWithName:@"d2s_normalize_half"];
     id<MTLFunction> norm_float = [library newFunctionWithName:@"d2s_normalize_float"];
+    id<MTLFunction> depth_dilation = [library newFunctionWithName:@"d2s_refine_depth_edges"];
     id<MTLFunction> warp = [library newFunctionWithName:@"d2s_warp_pack"];
     id<MTLFunction> fxaa = [library newFunctionWithName:@"d2s_sbs_fxaa"];
     id<MTLFunction> fxaa_half = [library newFunctionWithName:@"d2s_sbs_fxaa_half"];
-    if (!preprocess || !norm_half || !norm_float || !warp || !fxaa || !fxaa_half) return NO;
+    if (!preprocess || !norm_half || !norm_float || !depth_dilation || !warp || !fxaa || !fxaa_half) return NO;
     ctx->preprocess_pipeline = [ctx->device newComputePipelineStateWithFunction:preprocess error:error];
     ctx->normalize_half_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_half error:error];
     ctx->normalize_float_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_float error:error];
+    ctx->depth_dilation_pipeline = [ctx->device newComputePipelineStateWithFunction:depth_dilation error:error];
     ctx->warp_pipeline = [ctx->device newComputePipelineStateWithFunction:warp error:error];
     ctx->fxaa_pipeline = [ctx->device newComputePipelineStateWithFunction:fxaa error:error];
     ctx->fxaa_half_pipeline = [ctx->device newComputePipelineStateWithFunction:fxaa_half error:error];
     if (!(ctx->preprocess_pipeline && ctx->normalize_half_pipeline &&
-           ctx->normalize_float_pipeline && ctx->warp_pipeline &&
+           ctx->normalize_float_pipeline && ctx->depth_dilation_pipeline && ctx->warp_pipeline &&
            ctx->fxaa_pipeline && ctx->fxaa_half_pipeline)) return NO;
 
     // All runtime backends use the shared single-pass FXAA display filter.
@@ -1499,13 +1556,19 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
             slot->normalized_depth_buffer = [ctx->device newBufferWithLength:normalized_bytes
                                                                        options:MTLResourceStorageModeShared];
         }
+        if (slot->refined_depth_buffer == nil ||
+            slot->refined_depth_buffer.length < normalized_bytes) {
+            slot->refined_depth_buffer = [ctx->device newBufferWithLength:normalized_bytes
+                                                                     options:MTLResourceStorageModeShared];
+        }
         if (slot->status_buffer == nil || slot->status_buffer.length < sizeof(uint32_t)) {
             slot->status_buffer = [ctx->device newBufferWithLength:sizeof(uint32_t)
                                                                options:MTLResourceStorageModeShared];
         }
         slot->output_is_float16 = ctx->output_type == MLMultiArrayDataTypeFloat16;
         if (!slot->color_texture || !slot->input_buffer || !slot->raw_depth_buffer ||
-            !slot->normalized_depth_buffer || !slot->status_buffer) {
+            !slot->normalized_depth_buffer || !slot->refined_depth_buffer ||
+            !slot->status_buffer) {
             d2s_set_error(ctx, @"native CoreML Metal buffer allocation failed");
             d2s_release_slot(slot);
             return D2S_COREML_ERROR;
@@ -1721,9 +1784,30 @@ static int32_t d2s_coreml_io_pack_internal(
         id<MTLCommandBuffer> command = [ctx->pack_queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
         d2s_encode_normalize(ctx, slot, encoder, slot->normalize_lo, slot->normalize_hi);
+        [encoder endEncoding];
+
+        // Distill Small produces depth at 336 px wide. Refine silhouette edges
+        // at model resolution before DIBR, matching the reference renderer's
+        // one-percent, near-only radial expansion without changing GUI options.
+        encoder = [command computeCommandEncoder];
+        [encoder setComputePipelineState:ctx->depth_dilation_pipeline];
+        [encoder setBuffer:slot->normalized_depth_buffer offset:0 atIndex:0];
+        [encoder setBuffer:slot->refined_depth_buffer offset:0 atIndex:1];
+        D2SDepthDilationParams dilation_params = {
+            (uint32_t)ctx->depth_width,
+            (uint32_t)ctx->depth_height,
+            fminf((float)ctx->depth_width * 0.01f, 8.0f),
+            fminf((float)ctx->depth_height * 0.01f, 8.0f),
+        };
+        [encoder setBytes:&dilation_params length:sizeof(dilation_params) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake((NSUInteger)ctx->depth_count, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [encoder endEncoding];
+
+        encoder = [command computeCommandEncoder];
         [encoder setComputePipelineState:ctx->warp_pipeline];
         [encoder setTexture:slot->color_texture atIndex:0];
-        [encoder setBuffer:slot->normalized_depth_buffer offset:0 atIndex:0];
+        [encoder setBuffer:slot->refined_depth_buffer offset:0 atIndex:0];
         [encoder setBuffer:warp_destination offset:0 atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         NSUInteger threads = 64;
