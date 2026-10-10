@@ -1,5 +1,6 @@
 import json
 import queue
+import sys as sys_module
 import threading
 from types import SimpleNamespace
 from pathlib import Path
@@ -265,6 +266,7 @@ def test_parallel_adaptive_backoff_can_be_disabled(monkeypatch):
 
 @pytest.mark.parametrize("run_mode", ["Viewer", "Local Viewer"])
 def test_coreml_viewer_parallel_pending_defaults_to_two_on_macos(monkeypatch, run_mode):
+    monkeypatch.setattr(sys_module, "platform", "darwin")
     monkeypatch.setattr(pipeline_module.platform, "system", lambda: "Darwin")
     monkeypatch.delenv("D2S_RUNTIME_PENDING_CUDA_DEPTH", raising=False)
     monkeypatch.delenv("D2S_RUNTIME_PARALLEL_MPS", raising=False)
@@ -287,6 +289,7 @@ def test_coreml_viewer_parallel_pending_defaults_to_two_on_macos(monkeypatch, ru
 
 
 def test_local_viewer_parallel_requires_native_coreml_on_macos(monkeypatch):
+    monkeypatch.setattr(sys_module, "platform", "darwin")
     monkeypatch.setattr(pipeline_module.platform, "system", lambda: "Darwin")
     monkeypatch.delenv("D2S_RUNTIME_PENDING_CUDA_DEPTH", raising=False)
     monkeypatch.delenv("D2S_RUNTIME_PARALLEL_MPS", raising=False)
@@ -308,6 +311,7 @@ def test_local_viewer_parallel_requires_native_coreml_on_macos(monkeypatch):
 
 
 def test_coreml_viewer_parallel_pending_respects_explicit_mps_disable(monkeypatch):
+    monkeypatch.setattr(sys_module, "platform", "darwin")
     monkeypatch.setattr(pipeline_module.platform, "system", lambda: "Darwin")
     monkeypatch.delenv("D2S_RUNTIME_PENDING_CUDA_DEPTH", raising=False)
     monkeypatch.setenv("D2S_RUNTIME_PARALLEL_MPS", "0")
@@ -526,6 +530,7 @@ def test_openxr_safe_dual_slot_defaults_to_two_pending(monkeypatch):
 def test_viewer_creates_two_worker_depth_scheduler(
     monkeypatch, run_mode, platform, use_coreml
 ) -> None:
+    monkeypatch.setattr(sys_module, "platform", platform)
     monkeypatch.setattr(
         pipeline_module.platform,
         "system",
