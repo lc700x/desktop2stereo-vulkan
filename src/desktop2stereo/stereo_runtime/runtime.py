@@ -2501,12 +2501,22 @@ class StereoRuntime:
         elapsed = (time.perf_counter() - start) * 1000.0
         return DepthProfileResult(depth=depth, preprocess_ms=0.0, model_ms=float(elapsed), postprocess_ms=0.0)
 
-    def predict_openxr_depth(self, rgb_frame: torch.Tensor) -> DepthProfileResult:
+    def predict_openxr_depth(
+        self,
+        rgb_frame: torch.Tensor,
+        *,
+        native_capture: Any | None = None,
+        capture_frame_id: int | None = None,
+    ) -> DepthProfileResult:
         """Run only depth inference for the bounded parallel scheduler."""
         if not self._active:
             raise RuntimeError("StereoRuntime inference is paused")
         self.load()
-        return self._predict_depth_profile(_validate_runtime_rgb_frame(rgb_frame))
+        return self._predict_depth_profile(
+            _validate_runtime_rgb_frame(rgb_frame),
+            native_capture=native_capture,
+            capture_frame_id=capture_frame_id,
+        )
 
 
     def _try_fast_plus_fused_sbs(self, rgb_frame: torch.Tensor, depth: torch.Tensor, stereo_config: Any) -> tuple[torch.Tensor | None, str]:

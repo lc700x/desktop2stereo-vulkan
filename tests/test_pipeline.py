@@ -13,6 +13,7 @@ from path_config import APP_ROOT
 
 from capture.types import CapturedFrame
 from stereo_runtime.render_size import RenderSizeConfig
+import stereo_runtime.pipeline as pipeline_module
 
 from stereo_runtime.pipeline import (
     _ParallelDepthScheduler,
@@ -169,6 +170,37 @@ def test_parallel_depth_scheduler_enforces_effective_submission_limit():
     assert scheduler.effective_limit == 1
 
 
+def test_parallel_depth_scheduler_passes_native_capture_to_coreml_worker():
+    class Runtime:
+        def predict_openxr_depth(
+            self, frame, *, native_capture=None, capture_frame_id=None
+        ):
+            return frame, native_capture, capture_frame_id
+
+    scheduler = _ParallelDepthScheduler(Runtime(), max_workers=1)
+    native_capture = object()
+    try:
+        job = scheduler.submit(
+            "meta-frame",
+            native_capture=native_capture,
+            capture_frame_id=42,
+            frame_rgb=None,
+            frame_raw=None,
+            size=(1920, 1080),
+            capture_start_time=1.0,
+            captured_frame=None,
+            render_size=(1920, 1080),
+            process_latency=0.0,
+        )
+        assert job.future.result(timeout=1.0) == (
+            "meta-frame",
+            native_capture,
+            42,
+        )
+    finally:
+        scheduler.close()
+
+
 def test_parallel_scheduler_backoff_and_recovery_supports_three_workers(monkeypatch):
     monkeypatch.setenv("D2S_RUNTIME_PARALLEL_ADAPTIVE_BACKOFF", "1")
     class Scheduler:
@@ -231,8 +263,9 @@ def test_parallel_adaptive_backoff_can_be_disabled(monkeypatch):
     assert events == []
 
 
-def test_coreml_viewer_parallel_pending_defaults_to_two_on_macos(monkeypatch):
-    monkeypatch.setattr("stereo_runtime.pipeline.sys.platform", "darwin")
+@pytest.mark.parametrize("run_mode", ["Viewer", "Local Viewer"])
+def test_coreml_viewer_parallel_pending_defaults_to_two_on_macos(monkeypatch, run_mode):
+    monkeypatch.setattr(pipeline_module.platform, "system", lambda: "Darwin")
     monkeypatch.delenv("D2S_RUNTIME_PENDING_CUDA_DEPTH", raising=False)
     monkeypatch.delenv("D2S_RUNTIME_PARALLEL_MPS", raising=False)
     runtime = SimpleNamespace(
@@ -241,7 +274,7 @@ def test_coreml_viewer_parallel_pending_defaults_to_two_on_macos(monkeypatch):
         _resolved_stereo_compute_backend="",
     )
     context = SimpleNamespace(
-        run_mode="Viewer",
+        run_mode=run_mode,
         runtime_config=SimpleNamespace(
             parallel_inference=True,
             parallel_inference_workers=2,
@@ -253,8 +286,29 @@ def test_coreml_viewer_parallel_pending_defaults_to_two_on_macos(monkeypatch):
     assert _runtime_pending_depth_limit(context) == 2
 
 
+def test_local_viewer_parallel_requires_native_coreml_on_macos(monkeypatch):
+    monkeypatch.setattr(pipeline_module.platform, "system", lambda: "Darwin")
+    monkeypatch.delenv("D2S_RUNTIME_PENDING_CUDA_DEPTH", raising=False)
+    monkeypatch.delenv("D2S_RUNTIME_PARALLEL_MPS", raising=False)
+    context = SimpleNamespace(
+        run_mode="Local Viewer",
+        runtime_config=SimpleNamespace(
+            parallel_inference=True,
+            parallel_inference_workers=2,
+            use_coreml=False,
+        ),
+        stereo_runtime=SimpleNamespace(
+            depth_provider=SimpleNamespace(pipeline_slot_count=2),
+            config=SimpleNamespace(profile_sync=False),
+            _resolved_stereo_compute_backend="",
+        ),
+    )
+
+    assert _runtime_pending_depth_limit(context) == 1
+
+
 def test_coreml_viewer_parallel_pending_respects_explicit_mps_disable(monkeypatch):
-    monkeypatch.setattr("stereo_runtime.pipeline.sys.platform", "darwin")
+    monkeypatch.setattr(pipeline_module.platform, "system", lambda: "Darwin")
     monkeypatch.delenv("D2S_RUNTIME_PENDING_CUDA_DEPTH", raising=False)
     monkeypatch.setenv("D2S_RUNTIME_PARALLEL_MPS", "0")
     runtime = SimpleNamespace(
@@ -465,7 +519,18 @@ def test_openxr_safe_dual_slot_defaults_to_two_pending(monkeypatch):
     assert _runtime_pending_depth_limit(_dual_pending_context()) == 2
 
 
-def test_viewer_creates_two_worker_depth_scheduler() -> None:
+@pytest.mark.parametrize(
+    ("run_mode", "platform", "use_coreml"),
+    [("Viewer", "linux", False), ("Local Viewer", "darwin", True)],
+)
+def test_viewer_creates_two_worker_depth_scheduler(
+    monkeypatch, run_mode, platform, use_coreml
+) -> None:
+    monkeypatch.setattr(
+        pipeline_module.platform,
+        "system",
+        lambda: "Darwin" if platform == "darwin" else "Linux",
+    )
     events = []
     runtime = SimpleNamespace(
         depth_provider=SimpleNamespace(pipeline_slot_count=2),
@@ -474,10 +539,11 @@ def test_viewer_creates_two_worker_depth_scheduler() -> None:
     )
     loop = RuntimePipelineLoop(
         SimpleNamespace(
-            run_mode="Viewer",
+            run_mode=run_mode,
             runtime_config=SimpleNamespace(
                 parallel_inference=True,
                 parallel_inference_workers=2,
+                use_coreml=use_coreml,
             ),
             stereo_runtime=runtime,
             source_stat_inc=lambda name, **values: events.append((name, values)),

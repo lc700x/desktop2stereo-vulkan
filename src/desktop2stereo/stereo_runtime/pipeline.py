@@ -56,10 +56,27 @@ class _ParallelDepthScheduler:
         self.trim(resolved)
         return True
 
-    def submit(self, runtime_rgb, **metadata) -> _ParallelDepthJob:
+    def submit(
+        self,
+        runtime_rgb,
+        *,
+        native_capture=None,
+        capture_frame_id=None,
+        **metadata,
+    ) -> _ParallelDepthJob:
         frame_id = self.next_frame_id
         self.next_frame_id += 1
-        future = self.executor.submit(self.runtime.predict_openxr_depth, runtime_rgb)
+        if native_capture is None:
+            future = self.executor.submit(
+                self.runtime.predict_openxr_depth, runtime_rgb
+            )
+        else:
+            future = self.executor.submit(
+                self.runtime.predict_openxr_depth,
+                runtime_rgb,
+                native_capture=native_capture,
+                capture_frame_id=capture_frame_id,
+            )
         job = _ParallelDepthJob(frame_id=frame_id, future=future, runtime_rgb=runtime_rgb, **metadata)
         self.pending.append(job)
         return job
@@ -795,7 +812,7 @@ def _runtime_supports_parallel_cuda_pending(ctx: RuntimePipelineContext) -> bool
         getattr(runtime_config, "parallel_inference", False)
     ):
         return False
-    if ctx.run_mode not in {"OpenXR", "Viewer"}:
+    if not _runtime_parallel_depth_mode_supported(ctx):
         return False
     runtime = ctx.stereo_runtime
     provider = getattr(runtime, "depth_provider", None)
@@ -845,6 +862,19 @@ def _runtime_supports_parallel_cuda_pending(ctx: RuntimePipelineContext) -> bool
         if str(getattr(type(convergence), "__module__", "")).startswith("torch"):
             return False
     return True
+
+
+def _runtime_parallel_depth_mode_supported(ctx: RuntimePipelineContext) -> bool:
+    """Gate bounded depth workers to paths with a safe presenter handoff."""
+    if ctx.run_mode in {"OpenXR", "Viewer"}:
+        return True
+    if ctx.run_mode != "Local Viewer" or str(platform.system()).lower() != "darwin":
+        return False
+    # The macOS Local Viewer passes native CoreML frames directly to Vulkan and
+    # releases each CoreML slot as soon as the synchronous pack completes.
+    # Other Local Viewer backends still use deferred paths with a presenter
+    # consumer lease that is not safe for this overlapping scheduler.
+    return bool(getattr(getattr(ctx, "runtime_config", None), "use_coreml", False))
 
 
 def _runtime_pending_depth_limit(ctx: RuntimePipelineContext | None = None) -> int:
@@ -1361,7 +1391,7 @@ class RuntimePipelineLoop:
             int(getattr(runtime_config, "parallel_inference_workers", 2) or 2),
         ))
         if (
-            ctx.run_mode not in {"OpenXR", "Viewer"}
+            not _runtime_parallel_depth_mode_supported(ctx)
             or not bool(getattr(runtime_config, "parallel_inference", False))
             or min(int(getattr(provider, "pipeline_slot_count", 1)), requested_workers) < 2
             or bool(getattr(getattr(ctx.stereo_runtime, "config", None), "profile_sync", False))
@@ -1790,8 +1820,20 @@ class RuntimePipelineLoop:
                     self._parallel_recover_if_ready()
                     admission_limit = self._pending_depth_limit()
                     if scheduler.can_submit() and len(scheduler.pending) < admission_limit:
+                        native_capture = (
+                            getattr(captured_frame, "sck_zero_copy", None)
+                            if native_sck
+                            else None
+                        )
+                        capture_frame_id = None
+                        if native_capture is not None and captured_frame is not None:
+                            metadata = getattr(captured_frame, "metadata", None)
+                            if isinstance(metadata, dict):
+                                capture_frame_id = metadata.get("capture_frame_id")
                         scheduler.submit(
                             runtime_rgb,
+                            native_capture=native_capture,
+                            capture_frame_id=capture_frame_id,
                             frame_rgb=frame_rgb,
                             frame_raw=frame_raw,
                             size=size,
