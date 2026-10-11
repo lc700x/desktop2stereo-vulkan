@@ -1,17 +1,17 @@
 Capture Mode: Monitor
-Monitor Index: 1
+Monitor Index: 2
 Monitor Identity:
-  stable_id: DISPLAY\DELF017\7&34414894&e&UID1536
-  name: Dell U2410(DP)
-  manufacturer: DEL
-  model: DELL U2410
-  serial: J257M0CR0TUL
-  left: 0
+  stable_id: DISPLAY\TUP0270\7&34414894&e&UID1540
+  name: D270H
+  manufacturer: TUP
+  model: D270H
+  serial: '808728147'
+  left: -3840
   top: 0
-  width: 1920
-  height: 1200
+  width: 3840
+  height: 2160
 Window Title: ''
-Show FPS: false
+Show FPS: true
 Model List:
   Distill-Any-Depth-Small:
     resolutions:
@@ -418,17 +418,17 @@ Fill 16:9: true
 Fix Viewer Aspect: true
 Stereo Output: 2
 Stereo Output Identity:
-  stable_id: DISPLAY\MTT1337\1&15ecd195&d&UID256
-  name: VITURE
-  manufacturer: MTT
-  model: VITURE
-  serial: '2290649088'
-  left: 1920
+  stable_id: DISPLAY\TUP0270\7&34414894&e&UID1540
+  name: D270H
+  manufacturer: TUP
+  model: D270H
+  serial: '808728147'
+  left: -3840
   top: 0
   width: 3840
-  height: 1080
+  height: 2160
 Show Log Panel: true
-Input Display Resolution Tier: 1K
+Input Display Resolution Tier: 4K
 Synthetic View: quality_4k
 OpenVINO: null
 OpenXR Screen States:
@@ -438,7 +438,7 @@ OpenXR Screen States:
     - 0.0
     - -20.0
     width: 23.09
-    height: 14.431249999999999
+    height: 12.988125
     rotation_deg:
     - 0.0
     - 0.0

@@ -176,12 +176,19 @@ vec3 sample_easu(vec2 uv) {
 }
 
 void main() {
+    // Fade only the outermost projected pixel. Global screen UVs keep the
+    // curved screen's internal triangle-strip boundaries fully opaque.
+    vec2 edge_distance = min(texture_uv, vec2(1.0) - texture_uv);
+    vec2 pixel_width = max(fwidth(texture_uv), vec2(1e-6));
+    vec2 edge_coverage = clamp(edge_distance / pixel_width, vec2(0.0), vec2(1.0));
+    float coverage = edge_coverage.x * edge_coverage.y;
     vec4 color = params.center.w < 0.0
         ? vec4(sample_easu(texture_uv), 1.0)
         : (params.size_curve.w > 0.5
             ? sample_pixel_area(texture_uv)
             : texture(screen_texture, crop_source_uv(texture_uv)));
-    output_color = vec4(color.rgb, params.size_curve.w < -0.5
+    float opacity = params.size_curve.w < -0.5
         ? clamp(dot(color.rgb, vec3(0.299, 0.587, 0.114)) * 0.35, 0.0, 0.35)
-        : 1.0);
+        : 1.0;
+    output_color = vec4(color.rgb, opacity * coverage);
 }

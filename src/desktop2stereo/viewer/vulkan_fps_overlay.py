@@ -717,29 +717,50 @@ class VulkanFpsOverlay:
     def _transition(self, cmd: Any, image: Any, old: int, new: int) -> None:
         if old == new:
             return
+        vk = self.vk
+        if old == vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            source_stage = vk.VK_PIPELINE_STAGE_TRANSFER_BIT
+            source_access = vk.VK_ACCESS_TRANSFER_WRITE_BIT
+        elif old == vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            source_stage = vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+            source_access = vk.VK_ACCESS_SHADER_READ_BIT
+        else:
+            source_stage = vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+            source_access = 0
+
+        if new == vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            destination_stage = vk.VK_PIPELINE_STAGE_TRANSFER_BIT
+            destination_access = vk.VK_ACCESS_TRANSFER_WRITE_BIT
+        elif new == vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+            destination_stage = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+            destination_access = (
+                vk.VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                | vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+            )
+        else:
+            destination_stage = vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+            destination_access = vk.VK_ACCESS_SHADER_READ_BIT
         barrier = self.vk.VkImageMemoryBarrier(
-            sType=self.vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             oldLayout=old,
             newLayout=new,
-            srcQueueFamilyIndex=self.vk.VK_QUEUE_FAMILY_IGNORED,
-            dstQueueFamilyIndex=self.vk.VK_QUEUE_FAMILY_IGNORED,
+            srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+            dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
             image=image,
-            subresourceRange=self.vk.VkImageSubresourceRange(
-                aspectMask=self.vk.VK_IMAGE_ASPECT_COLOR_BIT,
+            subresourceRange=vk.VkImageSubresourceRange(
+                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
                 baseMipLevel=0,
                 levelCount=1,
                 baseArrayLayer=0,
                 layerCount=1,
             ),
-            srcAccessMask=0,
-            dstAccessMask=self.vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
-            if new == self.vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-            else self.vk.VK_ACCESS_SHADER_READ_BIT,
+            srcAccessMask=source_access,
+            dstAccessMask=destination_access,
         )
-        self.vk.vkCmdPipelineBarrier(
+        vk.vkCmdPipelineBarrier(
             cmd,
-            self.vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            self.vk.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            source_stage,
+            destination_stage,
             0,
             0,
             None,

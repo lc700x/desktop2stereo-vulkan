@@ -539,7 +539,11 @@ def _try_openxr_no_fill_fused_rgba_u8(
         return None, "triton_disabled"
 
     try:
-        from .warp_composite_triton import can_use_triton_warp_composite2, warp_composite2_rgba_u8
+        from .warp_composite_triton import (
+            can_use_triton_warp_composite2,
+            warp_composite2,
+            warp_composite2_rgba_u8,
+        )
     except Exception as exc:
         return None, f"import_failed:{type(exc).__name__}"
 
@@ -583,7 +587,33 @@ def _try_openxr_no_fill_fused_rgba_u8(
             symmetric=True,
         ):
             return None, "unsupported_tensor"
-        left, right = warp_composite2_rgba_u8(rgb, processed_depth, base_shift)
+        rgba_u8_error = None
+        use_float_warp_pack = False
+        try:
+            left, right = warp_composite2_rgba_u8(rgb, processed_depth, base_shift)
+        except Exception as exc:
+            rgba_u8_error = type(exc).__name__
+            use_float_warp_pack = True
+
+        if use_float_warp_pack:
+            left_float, right_float = warp_composite2(rgb, processed_depth, base_shift)
+            left, left_pack_backend = _pack_openxr_eye_rgba_u8_with_backend(left_float)
+            right, right_pack_backend = _pack_openxr_eye_rgba_u8_with_backend(right_float)
+            warp_backend = "triton_warp_composite2_float"
+            output_pack_backend = (
+                left_pack_backend
+                if left_pack_backend == right_pack_backend
+                else f"{left_pack_backend}/{right_pack_backend}"
+            )
+            sbs_backend = "openxr_triton_float_warp_pack"
+            prewarp_backend = "triton_warp_composite2_float_pack"
+            route_reason = f"rgba_u8_failed:{rgba_u8_error};float_pack"
+        else:
+            warp_backend = "triton_warp_composite2_rgba_u8"
+            output_pack_backend = warp_backend
+            sbs_backend = "openxr_triton_no_fill_fused_rgba_u8"
+            prewarp_backend = "triton_no_fill_fused_rgba_u8"
+            route_reason = "used"
     except Exception as exc:
         return None, f"triton_output_failed:{type(exc).__name__}"
     _record_cuda_event(cuda_events, "synth_warp", left)
@@ -600,7 +630,10 @@ def _try_openxr_no_fill_fused_rgba_u8(
         "backend": "quality_4k",
         "layers": 2,
         "shift_px": base_shift,
-        "warp_composite_backend": "triton_warp_composite2_rgba_u8",
+        "warp_composite_backend": warp_backend,
+        "output_pack_backend": output_pack_backend,
+        "sbs_backend": sbs_backend,
+        "openxr_prewarp_backend": prewarp_backend,
         "occlusion_mask_backend": "skipped_no_consumer",
         "hole_fill_backend": "none",
         "hole_fill_mode": "none",
@@ -616,7 +649,7 @@ def _try_openxr_no_fill_fused_rgba_u8(
         "make_sbs_ms": 0.0,
         **shift_debug_info(processed_depth, int(rgb.shape[-1]), params),
     }
-    return (left, right, debug), "used"
+    return (left, right, debug), route_reason
 
 
 def _apply_color_adjustment(rgb_frame: torch.Tensor, config: StereoRuntimeConfig) -> torch.Tensor:
@@ -2107,14 +2140,22 @@ class StereoRuntime:
                             left_eye, right_eye = right_eye, left_eye
                         output_format = "openxr_eye_views"
                         render_backend = dict(fused_debug)
-                        render_backend["sbs_backend"] = "openxr_triton_no_fill_fused_rgba_u8"
+                        render_backend.setdefault(
+                            "sbs_backend", "openxr_triton_no_fill_fused_rgba_u8"
+                        )
                         render_backend["stereo_compute_backend"] = str(
                             self._resolved_stereo_compute_backend or "cuda_triton"
                         )
-                        render_backend["openxr_prewarp_backend"] = "triton_no_fill_fused_rgba_u8"
+                        render_backend.setdefault(
+                            "openxr_prewarp_backend", "triton_no_fill_fused_rgba_u8"
+                        )
                         render_backend["openxr_no_fill_fused_reason"] = no_fill_fused_reason
                         render_backend["openxr_grid_sample_fallback"] = 0
-                        pack_backend = "triton_warp_composite2_rgba_u8"
+                        pack_backend = str(
+                            render_backend.get(
+                                "output_pack_backend", "triton_warp_composite2_rgba_u8"
+                            )
+                        )
                     else:
                         # Reuse the canonical synthesis path when the dedicated
                         # no-fill kernel cannot preserve the selected behavior.

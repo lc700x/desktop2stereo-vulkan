@@ -80,7 +80,7 @@ def _edge_depth_class(rgb, depth, pixel, x, y, width: tl.constexpr,
     use_class = active & (high_depth - low_depth > 0.025) & (low_count > 0.0) \
         & (high_count > 0.0) & (color_contrast >= 0.02)
     choose_high = tl.abs(center_luma - high_luma) <= tl.abs(center_luma - low_luma)
-    return tl.where(use_class, choose_high.to(tl.int32), tl.full_like(x, -1))
+    return tl.where(use_class, choose_high.to(tl.int32), tl.full(x.shape, -1, tl.int32))
 
 
 @triton.jit
@@ -347,9 +347,15 @@ def _warp_composite2_half_sbs_kernel(
     left1 = _sample_composite_at(rgb, depth, base_shift, channel, y, x1, 0.875, 1.0, width, pixels, softness, active)
     right0 = _sample_composite_at(rgb, depth, base_shift, channel, y, x0, -0.875, -1.0, width, pixels, softness, active)
     right1 = _sample_composite_at(rgb, depth, base_shift, channel, y, x1, -0.875, -1.0, width, pixels, softness, active)
-    left_value = (left0 + left1) * 0.5
-    right_value = (right0 + right1) * 0.5
-    value = tl.where(use_left, left_value, right_value)
+    value0 = tl.where(use_left, left0, right0)
+    value1 = tl.where(use_left, left1, right1)
+    linear0 = tl.where(value0 <= 0.04045, value0 / 12.92,
+        tl.exp2(2.4 * tl.log2(tl.maximum((value0 + 0.055) / 1.055, 1.0e-20))))
+    linear1 = tl.where(value1 <= 0.04045, value1 / 12.92,
+        tl.exp2(2.4 * tl.log2(tl.maximum((value1 + 0.055) / 1.055, 1.0e-20))))
+    linear_mean = (linear0 + linear1) * 0.5
+    value = tl.where(linear_mean <= 0.0031308, linear_mean * 12.92,
+        1.055 * tl.exp2(tl.log2(tl.maximum(linear_mean, 1.0e-20)) / 2.4) - 0.055)
     tl.store(out + offsets, value, mask=active)
 
 

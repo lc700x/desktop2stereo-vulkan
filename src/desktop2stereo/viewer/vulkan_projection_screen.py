@@ -727,7 +727,13 @@ class VulkanProjectionScreenPass:
                         attachmentCount=1,
                         pAttachments=[
                             vk.VkPipelineColorBlendAttachmentState(
-                                blendEnable=vk.VK_FALSE,
+                                blendEnable=vk.VK_TRUE,
+                                srcColorBlendFactor=vk.VK_BLEND_FACTOR_SRC_ALPHA,
+                                dstColorBlendFactor=vk.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                                colorBlendOp=vk.VK_BLEND_OP_ADD,
+                                srcAlphaBlendFactor=vk.VK_BLEND_FACTOR_ONE,
+                                dstAlphaBlendFactor=vk.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                                alphaBlendOp=vk.VK_BLEND_OP_ADD,
                                 colorWriteMask=(
                                     vk.VK_COLOR_COMPONENT_R_BIT
                                     | vk.VK_COLOR_COMPONENT_G_BIT
