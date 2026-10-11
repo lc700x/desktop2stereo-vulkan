@@ -22,6 +22,7 @@ DISTILL_ANY_DEPTH_BASE_MODEL_ID = "lc700x/Distill-Any-Depth-Base-hf"
 DISTILL_ANY_DEPTH_BASE_RESOLUTION = 518
 DISTILL_ANY_DEPTH_PATCH_SIZE = 14
 INFINIDEPTH_PATCH_SIZE = 16
+ZIPDEPTH_PATCH_SIZE = 32
 HF_ENDPOINT_DEFAULTS = ("https://hf-mirror.com", "https://huggingface.co")
 HF_DOWNLOAD_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -134,6 +135,7 @@ class DepthProviderConfig:
     execution_slot_count: int = 1
     depth_upsample: DepthUpsampleMode = "joint_bilateral"
     depth_upsample_edge_strength: float = 0.35
+    use_torch_compile: bool = False
     use_coreml: bool = False
     recompile_coreml: bool = False
 
@@ -160,16 +162,40 @@ def _nearest_multiple(value: int, patch: int) -> int:
     return max(1, up if abs(up - value) <= abs(value - down) else down)
 
 
-def _model_input_size(height: int, width: int, target: int, patch: int) -> tuple[int, int]:
-    longest = max(height, width)
-    scale = target / float(longest) if longest != target else 1.0
+def _model_input_size(
+    height: int,
+    width: int,
+    target: int,
+    patch: int,
+    *,
+    short_side: bool = False,
+) -> tuple[int, int]:
+    reference = min(height, width) if short_side else max(height, width)
+    scale = target / float(reference) if reference != target else 1.0
     resized_h = max(1, int(round(height * scale)))
     resized_w = max(1, int(round(width * scale)))
     return _nearest_multiple(resized_h, patch), _nearest_multiple(resized_w, patch)
 
 
+def _is_zipdepth_model(model_id: str) -> bool:
+    return "zipdepth" in str(model_id).lower()
+
+
+def _model_input_size_for_model(
+    height: int, width: int, target: int, patch: int, model_id: str
+) -> tuple[int, int]:
+    return _model_input_size(
+        height,
+        width,
+        target,
+        patch,
+        short_side=_is_zipdepth_model(model_id),
+    )
+
+
 def _normalize_depth(depth: torch.Tensor, subsample_cap: int = 6_144) -> torch.Tensor:
     depth = ensure_b1hw(depth).float()
+    depth = torch.nan_to_num(depth, nan=0.0)
     flat = depth.flatten(start_dim=2)
     count = flat.shape[-1]
     if count <= 1:
@@ -736,44 +762,58 @@ class GenericAutoDepthProvider:
         return self.predict_profile(rgb).depth
 
     def predict_profile(self, rgb: torch.Tensor) -> DepthProfileResult:
-        def sync() -> None:
-            if self.device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.synchronize()
+        cuda_events: dict[str, Any] = {}
 
-        sync()
+        def record(name: str) -> None:
+            if self.device.type != "cuda":
+                return
+            try:
+                event = torch.cuda.Event(blocking=False, enable_timing=True)
+                event.record(torch.cuda.current_stream(self.device))
+                cuda_events[name] = event
+            except Exception:
+                pass
+
+        record("depth_pre_start")
         start = time.perf_counter()
         rgb = ensure_bchw(rgb, name="rgb").to(self.device).float().clamp(0, 1)
         _, _, height, width = rgb.shape
-        input_h, input_w = _model_input_size(
+        input_h, input_w = _model_input_size_for_model(
             height,
             width,
             self.depth_resolution,
             self.patch_size or 1,
+            self.model_id,
         )
 
+        use_bicubic = self.device.type == "cuda" and not _is_zipdepth_model(self.model_id)
         tensor = F.interpolate(
             rgb,
             size=(input_h, input_w),
-            mode="bicubic" if self.device.type == "cuda" else "bilinear",
+            mode="bicubic" if use_bicubic else "bilinear",
             align_corners=False,
-            antialias=True if self.device.type == "cuda" else False,
+            antialias=use_bicubic,
         ).to(self.dtype)
 
         mean, std = _normalization_tensors_for_model(self.model_id, self.device, self.dtype)
         tensor = (tensor - mean) / std
-        sync()
+        record("depth_pre_end")
         preprocess_ms = (time.perf_counter() - start) * 1000.0
 
-        sync()
+        record("depth_model_start")
         start = time.perf_counter()
         output = self._run_depth_model(tensor)
         predicted = _extract_depth_output(output)
-        sync()
+        record("depth_model_end")
         model_ms = (time.perf_counter() - start) * 1000.0
 
         start = time.perf_counter()
+        record("depth_post_start")
+        record("depth_norm_start")
         depth = ensure_b1hw(predicted)
         depth = _postprocess_generic_depth(depth, self.model_id)
+        record("depth_norm_end")
+        record("depth_upsample_start")
         depth = upsample_depth(
             depth,
             height,
@@ -782,9 +822,16 @@ class GenericAutoDepthProvider:
             mode=self.depth_upsample,
             edge_strength=self.depth_upsample_edge_strength,
         )
-        sync()
+        record("depth_upsample_end")
+        record("depth_post_end")
         postprocess_ms = (time.perf_counter() - start) * 1000.0
-        return DepthProfileResult(depth, preprocess_ms, model_ms, postprocess_ms)
+        return DepthProfileResult(
+            depth,
+            preprocess_ms,
+            model_ms,
+            postprocess_ms,
+            cuda_timing_events=cuda_events,
+        )
 
 
 class InfiniDepthProvider:
@@ -895,6 +942,126 @@ class InfiniDepthProvider:
         return DepthProfileResult(depth, preprocess_ms, model_ms, postprocess_ms)
 
 
+class ZipDepthProvider(GenericAutoDepthProvider):
+    """ZipDepth Base and NPU checkpoint runner for CPU and PyTorch accelerators."""
+
+    def __init__(self, *, use_torch_compile: bool = False, **kwargs) -> None:
+        kwargs.setdefault("depth_resolution", 384)
+        kwargs.setdefault("patch_size", ZIPDEPTH_PATCH_SIZE)
+        super().__init__(**kwargs)
+        self.use_torch_compile = bool(use_torch_compile)
+        self._eager_model = None
+        self._compiled_model = None
+        self._compile_failure_logged = False
+        self.info = replace(
+            self.info,
+            provider="stereo_runtime.model_impl.zipdepth.ZipDepth",
+            runtime="zipdepth",
+        )
+
+    def predict_profile(self, rgb: torch.Tensor) -> DepthProfileResult:
+        rgb = ensure_bchw(rgb, name="rgb").to(device=self.device, dtype=torch.float32)
+        rgb = torch.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+        return super().predict_profile(rgb)
+
+    def load(self):
+        if self._model is not None:
+            return self._model
+
+        from .model_artifacts import ZIPDEPTH_CHECKPOINT_FILENAMES, ensure_model_downloaded
+        from .model_registry import ModelRegistry, resolve_model_dir
+        from stereo_runtime.model_impl.zipdepth import create_model
+
+        registry = ModelRegistry.default()
+        try:
+            spec = registry.get(self.model_name)
+        except KeyError:
+            spec = None
+        if spec is None or spec.family not in ZIPDEPTH_CHECKPOINT_FILENAMES:
+            spec = registry.get(self.model_id)
+        ensure_model_downloaded(
+            spec,
+            cache_dir=self.cache_dir,
+            local_files_only=self.local_files_only,
+            force_download=self.force_download,
+        )
+        checkpoint_path = (
+            resolve_model_dir(self.model_id, self.cache_dir)
+            / ZIPDEPTH_CHECKPOINT_FILENAMES[spec.family]
+        )
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
+        if isinstance(checkpoint, dict):
+            for key in ("model_state_dict", "state_dict", "model"):
+                if isinstance(checkpoint.get(key), dict):
+                    checkpoint = checkpoint[key]
+                    break
+        if not isinstance(checkpoint, dict):
+            raise RuntimeError(f"unsupported ZipDepth checkpoint format: {checkpoint_path}")
+        state_dict = {}
+        for key, value in checkpoint.items():
+            normalized_key = str(key)
+            while normalized_key.startswith(("module.", "_orig_mod.")):
+                normalized_key = normalized_key.split(".", 1)[1]
+            state_dict[normalized_key] = value
+
+        model = create_model(variant="base", upsample_unfold=spec.family == "zipdepth")
+        model.load_state_dict(state_dict, strict=True)
+        model.fuse_for_inference()
+        self._eager_model = model.to(device=self.device, dtype=self.dtype).eval()
+        self._model = self._eager_model
+        if self.use_torch_compile:
+            try:
+                self._compiled_model = torch.compile(self._eager_model)
+                self._model = self._compiled_model
+                print("[ZipDepth] torch.compile enabled", flush=True)
+            except Exception as exc:
+                self._compile_fallback(exc)
+        return self._model
+
+    def _compile_fallback(self, exc: Exception) -> None:
+        self._compiled_model = None
+        self._model = self._eager_model
+        if not self._compile_failure_logged:
+            print(
+                f"[ZipDepth] torch.compile failed; using eager PyTorch: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            self._compile_failure_logged = True
+
+    def _run_depth_model(self, tensor: torch.Tensor):
+        model = self.load()
+        use_autocast = self.device.type == "cuda" and self.dtype == torch.float16
+        try:
+            with torch.inference_mode(), torch.autocast(
+                device_type=self.device.type, enabled=use_autocast
+            ):
+                return model(tensor)
+        except Exception as exc:
+            if self._compiled_model is None:
+                raise
+            self._compile_fallback(exc)
+            with torch.inference_mode(), torch.autocast(
+                device_type=self.device.type, enabled=use_autocast
+            ):
+                return self._eager_model(tensor)
+
+
+def _zipdepth_provider_for_config(config: DepthProviderConfig, device) -> ZipDepthProvider:
+    return ZipDepthProvider(
+        model_id=config.model_id,
+        model_name=config.model_name,
+        device=device,
+        cache_dir=config.cache_dir,
+        depth_resolution=config.depth_resolution,
+        patch_size=config.patch_size,
+        local_files_only=config.local_files_only,
+        force_download=config.force_download,
+        depth_upsample=config.depth_upsample,
+        depth_upsample_edge_strength=config.depth_upsample_edge_strength,
+        use_torch_compile=config.use_torch_compile,
+    )
+
+
 TorchDepthProvider = DistillAnyDepthBase518
 GenericTorchDepthProvider = GenericAutoDepthProvider
 InfiniDepthTorchProvider = InfiniDepthProvider
@@ -902,7 +1069,10 @@ InfiniDepthTorchProvider = InfiniDepthProvider
 
 def _normalization_tensors_for_model(model_id: str, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
     model_lower = model_id.lower()
-    if any(key in model_lower for key in ("depthpro", "zoedepth", "dpt")):
+    if _is_zipdepth_model(model_id):
+        mean_values = [0.0, 0.0, 0.0]
+        std_values = [1.0, 1.0, 1.0]
+    elif any(key in model_lower for key in ("depthpro", "zoedepth", "dpt")):
         mean_values = [0.5, 0.5, 0.5]
         std_values = [0.5, 0.5, 0.5]
     else:
@@ -934,7 +1104,7 @@ def _is_metric_model(model_id: str) -> bool:
 
 def _postprocess_generic_depth(depth: torch.Tensor, model_id: str) -> torch.Tensor:
     depth = ensure_b1hw(depth).float()
-    if _is_metric_model(model_id):
+    if _is_metric_model(model_id) or _is_zipdepth_model(model_id):
         depth = depth.clamp_min(5e-3).reciprocal()
     return _normalize_depth(depth)
 
@@ -953,7 +1123,9 @@ def _prepare_accelerated_artifacts(
     if input_size is not None:
         kwargs["export_height"], kwargs["export_width"] = int(input_size[0]), int(input_size[1])
     result = prepare_model_artifacts(
-        cfg.model_id,
+        cfg.model_name
+        if _is_zipdepth_model(cfg.model_id) and cfg.model_name.casefold() in {"zipdepth-base", "zipdepth-small"}
+        else cfg.model_id,
         cache_dir=cache_dir,
         model_dir=model_dir,
         local_files_only=cfg.local_files_only,
@@ -1010,6 +1182,8 @@ class AutoDepthProvider:
             "depth_upsample": cfg.depth_upsample,
             "depth_upsample_edge_strength": cfg.depth_upsample_edge_strength,
         }
+        if _is_zipdepth_model(cfg.model_id):
+            return _zipdepth_provider_for_config(cfg, device)
         if cfg.model_id != DISTILL_ANY_DEPTH_BASE_MODEL_ID:
             if _is_infinidepth_model(cfg.model_id):
                 return InfiniDepthProvider(
@@ -1066,7 +1240,7 @@ class AutoDepthProvider:
 
             factories.append((
                 "PyTorch ROCm",
-                lambda: create_pytorch_rocm_provider(
+                lambda: self._torch_provider(cfg.device) if _is_zipdepth_model(cfg.model_id) else create_pytorch_rocm_provider(
                     model_id=cfg.model_id,
                     model_name=cfg.model_name,
                     device=cfg.device,
@@ -1084,7 +1258,7 @@ class AutoDepthProvider:
 
             factories.append((
                 "DirectML",
-                lambda: create_directml_provider(
+                lambda: self._torch_provider(cfg.device) if _is_zipdepth_model(cfg.model_id) else create_directml_provider(
                     model_id=cfg.model_id,
                     model_name=cfg.model_name,
                     device=cfg.device,
@@ -1102,7 +1276,7 @@ class AutoDepthProvider:
 
             factories.append((
                 "PyTorch XPU",
-                lambda: create_pytorch_xpu_provider(
+                lambda: self._torch_provider(cfg.device) if _is_zipdepth_model(cfg.model_id) else create_pytorch_xpu_provider(
                     model_id=cfg.model_id,
                     model_name=cfg.model_name,
                     device=cfg.device,
@@ -1133,6 +1307,7 @@ class AutoDepthProvider:
                     depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
                     use_coreml=cfg.use_coreml,
                     recompile_coreml=cfg.recompile_coreml,
+                    use_torch_compile=cfg.use_torch_compile,
                 ),
             ))
         if os.name == "nt":
@@ -1141,7 +1316,7 @@ class AutoDepthProvider:
             if is_directml_available() and not any(name == "DirectML" for name, _ in factories):
                 factories.append((
                     "DirectML",
-                    lambda: create_directml_provider(
+                    lambda: self._torch_provider(cfg.device) if _is_zipdepth_model(cfg.model_id) else create_directml_provider(
                         model_id=cfg.model_id,
                         model_name=cfg.model_name,
                         cache_dir=cfg.cache_dir,
@@ -1300,11 +1475,14 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
             patch_size=cfg.patch_size,
             depth_upsample=cfg.depth_upsample,
             depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
+            use_torch_compile=cfg.use_torch_compile,
         )
         provider.profile_sync = bool(cfg.profile_sync)
         return provider
 
     if backend in {"pytorch_rocm", "rocm", "amd_rocm"}:
+        if _is_zipdepth_model(cfg.model_id):
+            return _zipdepth_provider_for_config(cfg, device)
         from .providers.amd import create_pytorch_rocm_provider
 
         return create_pytorch_rocm_provider(
@@ -1321,6 +1499,8 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
         )
 
     if backend in {"pytorch_xpu", "xpu", "intel_xpu"}:
+        if _is_zipdepth_model(cfg.model_id):
+            return _zipdepth_provider_for_config(cfg, device)
         from .providers.intel import create_pytorch_xpu_provider
 
         return create_pytorch_xpu_provider(
@@ -1337,6 +1517,8 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
         )
 
     if backend in {"directml", "pytorch_directml", "dml"}:
+        if _is_zipdepth_model(cfg.model_id):
+            return _zipdepth_provider_for_config(cfg, device)
         from .providers.directml import create_directml_provider
 
         return create_directml_provider(
@@ -1368,6 +1550,7 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
             depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
             use_coreml=cfg.use_coreml,
             recompile_coreml=cfg.recompile_coreml,
+            use_torch_compile=cfg.use_torch_compile,
         )
 
     if backend in {"tensorrt_native", "native_tensorrt", "tensorrt_native_graph"} or (
@@ -1457,7 +1640,10 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
                 depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
                 use_coreml=cfg.use_coreml,
                 recompile_coreml=cfg.recompile_coreml,
+                use_torch_compile=cfg.use_torch_compile,
             )
+        if _is_zipdepth_model(cfg.model_id):
+            return _zipdepth_provider_for_config(cfg, device)
         if cfg.model_id != DISTILL_ANY_DEPTH_BASE_MODEL_ID:
             if _is_infinidepth_model(cfg.model_id):
                 return InfiniDepthProvider(

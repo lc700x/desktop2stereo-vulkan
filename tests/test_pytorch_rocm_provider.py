@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -208,7 +209,7 @@ def test_create_migraphx_rocm_provider_resolves_missing_onnx_before_rebuild(monk
     assert provider.graph_path == graph_path
 
 
-def test_build_migraphx_graph_uses_fp8_then_saves(monkeypatch, tmp_path):
+def test_build_migraphx_graph_uses_fp8_then_saves(monkeypatch, tmp_path, capsys):
     calls = []
 
     class Program:
@@ -231,6 +232,19 @@ def test_build_migraphx_graph_uses_fp8_then_saves(monkeypatch, tmp_path):
     assert "fp8" in calls
     assert "fp16" not in calls
     assert ("compile", "gpu", False) in calls
+
+    events = [
+        json.loads(line.removeprefix("[D2S_PROGRESS] "))
+        for line in capsys.readouterr().out.splitlines() if line.startswith("[D2S_PROGRESS] ")
+    ]
+    assert list(dict.fromkeys(event["desc"] for event in events if event["state"] == "running")) == [
+        "Parsing ONNX for MIGraphX: model.onnx",
+        "Optimizing MIGraphX graph: model.mgx",
+        "Building MIGraphX graph: model.mgx",
+        "Saving MIGraphX graph: model.mgx",
+    ]
+    assert events[-1]["state"] == "complete"
+    assert events[-1]["percent"] == 100.0
 
 
 def test_build_migraphx_graph_falls_back_to_fp16(monkeypatch, tmp_path):
@@ -285,3 +299,38 @@ def test_build_migraphx_graph_force_fp32_skips_quantization(monkeypatch, tmp_pat
     assert "fp8" not in calls
     assert "fp16" not in calls
     assert ("compile", "gpu", False) in calls
+
+
+def test_build_migraphx_graph_cached_graph_skips_build_progress(monkeypatch, tmp_path, capsys):
+    monkeypatch.setitem(sys.modules, "migraphx", None)
+    graph_path = tmp_path / "model.mgx"
+    graph_path.write_bytes(b"cached")
+
+    assert migraphx_provider.build_migraphx_graph(tmp_path / "missing.onnx", graph_path) == graph_path
+    assert "[D2S_PROGRESS]" not in capsys.readouterr().out
+    assert graph_path.read_bytes() == b"cached"
+
+
+def test_build_migraphx_graph_compile_failure_stops_progress_and_skips_save(monkeypatch, tmp_path, capsys):
+    class Program:
+        def compile(self, target, offload_copy=False):
+            raise RuntimeError("compile failed")
+
+    fake_mx = SimpleNamespace(
+        parse_onnx=lambda path: Program(), get_target=lambda name: name,
+        save=lambda *args: pytest.fail("failed graph must not be saved"),
+    )
+    monkeypatch.setitem(sys.modules, "migraphx", fake_mx)
+    onnx_path = tmp_path / "model.onnx"
+    onnx_path.write_bytes(b"onnx")
+
+    with pytest.raises(RuntimeError, match="compile failed"):
+        migraphx_provider.build_migraphx_graph(onnx_path, tmp_path / "model.mgx", force_fp32=True)
+
+    events = [
+        json.loads(line.removeprefix("[D2S_PROGRESS] "))
+        for line in capsys.readouterr().out.splitlines() if line.startswith("[D2S_PROGRESS] ")
+    ]
+    assert events[-1]["desc"] == "Building MIGraphX graph: model.mgx"
+    assert events[-1]["state"] == "failed"
+    assert events[-1]["percent"] is None

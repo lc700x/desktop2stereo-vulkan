@@ -1054,10 +1054,25 @@ def _cuda_elapsed_ms(events: dict, start: str, end: str) -> float | None:
         return None
 
 
-def _add_cuda_event_timings(ctx: RuntimePipelineContext, runtime_result) -> None:
+def _cuda_event_complete(event) -> bool:
+    query = getattr(event, "query", None)
+    if not callable(query):
+        return True
+    try:
+        return bool(query())
+    except Exception:
+        return False
+
+
+def _add_cuda_event_timings(ctx: RuntimePipelineContext, runtime_result) -> bool:
     events = getattr(runtime_result, "cuda_timing_events", None)
     if not isinstance(events, dict) or not events:
-        return
+        return True
+    ready_event = getattr(runtime_result, "cuda_ready_event", None)
+    if ready_event is not None and not _cuda_event_complete(ready_event):
+        return False
+    if not all(_cuda_event_complete(event) for event in events.values() if event is not None):
+        return False
     for name, start, end in (
         ("rt_gpu_depth", "start", "depth"),
         ("rt_gpu_depth_preprocess", "depth_pre_start", "depth_pre_end"),
@@ -1084,6 +1099,7 @@ def _add_cuda_event_timings(ctx: RuntimePipelineContext, runtime_result) -> None
         elapsed_ms = _cuda_elapsed_ms(events, start, end)
         if elapsed_ms is not None:
             ctx.breakdown_add_time(name, elapsed_ms / 1000.0)
+    return True
 
 
 class RuntimePipelineLoop:
@@ -1098,6 +1114,8 @@ class RuntimePipelineLoop:
         self._has_source_target_key = False
         self._last_cuda_ready_event = None
         self._pending_runtime_items = []
+        self._pending_cuda_timing_results = []
+        self._pending_cuda_poll_interval_s = 0.001
         self._last_runtime_motion_sample = None
         self._last_algorithm_output_time = 0.0
         self._prepared = False
@@ -1468,6 +1486,7 @@ class RuntimePipelineLoop:
 
     def _publish_runtime_item(self, item) -> None:
         ctx = self.context
+        self._pending_cuda_poll_interval_s = 0.001
         runtime_result, capture_start_time, process_latency, runtime_latency, pending_since = item
         debug_info = getattr(runtime_result, "debug_info", None)
         capture_timestamp_source = (
@@ -1487,7 +1506,8 @@ class RuntimePipelineLoop:
             if isinstance(debug_info, dict):
                 debug_info["capture_timestamp"] = float(capture_start_time)
         queue_put_start_time = time.perf_counter()
-        _add_cuda_event_timings(ctx, runtime_result)
+        if not _add_cuda_event_timings(ctx, runtime_result):
+            self._pending_cuda_timing_results.append(runtime_result)
         try:
             runtime_q_was_full = ctx.runtime_q.full()
         except Exception:
@@ -1515,6 +1535,19 @@ class RuntimePipelineLoop:
             last_runtime_latency=runtime_latency,
         )
         ctx.breakdown_inc("runtime")
+
+    def _publish_ready_cuda_timing_results(self) -> int:
+        if not self._pending_cuda_timing_results:
+            return 0
+        pending = self._pending_cuda_timing_results
+        self._pending_cuda_timing_results = []
+        completed = 0
+        for runtime_result in pending:
+            if _add_cuda_event_timings(self.context, runtime_result):
+                completed += 1
+            else:
+                self._pending_cuda_timing_results.append(runtime_result)
+        return completed
 
     def _publish_ready_pending_items(self) -> int:
         if not self._pending_runtime_items:
@@ -1552,7 +1585,11 @@ class RuntimePipelineLoop:
             remaining = deadline - time.perf_counter()
             if remaining <= 0.0:
                 break
-            time.sleep(min(max(remaining, 0.0), max(float(ctx.time_sleep), 0.0005), 0.0005))
+            interval = min(self._pending_cuda_poll_interval_s, remaining)
+            ctx.shutdown_event.wait(interval)
+            if ctx.shutdown_event.is_set():
+                break
+            self._pending_cuda_poll_interval_s = min(interval + 0.001, 0.002)
             published = self._publish_ready_pending_items()
             if published:
                 ctx.source_stat_inc("runtime_pending_cuda_wait")
@@ -1572,11 +1609,15 @@ class RuntimePipelineLoop:
         # replace it with newer content while preserving low-latency semantics.
         ctx.source_stat_inc("runtime_pending_cuda_inflight")
         ctx.breakdown_inc("runtime_pending_cuda_inflight")
-        time.sleep(min(max(float(ctx.time_sleep), 0.0005), 0.001))
+        interval = self._pending_cuda_poll_interval_s
+        ctx.shutdown_event.wait(interval)
+        if not ctx.shutdown_event.is_set():
+            self._pending_cuda_poll_interval_s = min(interval + 0.001, 0.002)
 
     def run(self) -> None:
         ctx = self.context
         while not ctx.shutdown_event.is_set():
+            self._publish_ready_cuda_timing_results()
             ctx.log_source_health()
             native_sck = False
             try:

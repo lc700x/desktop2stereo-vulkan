@@ -13,13 +13,15 @@ from .depth_provider import (
     DISTILL_ANY_DEPTH_BASE_RESOLUTION,
     DISTILL_ANY_DEPTH_PATCH_SIZE,
     INFINIDEPTH_PATCH_SIZE,
+    ZIPDEPTH_PATCH_SIZE,
     DepthProfileResult,
     DepthProviderInfo,
     DepthProviderConfig,
     TorchDepthProvider,
     _prepare_accelerated_artifacts,
     _is_infinidepth_model,
-    _model_input_size,
+    _is_zipdepth_model,
+    _model_input_size_for_model,
     _normalization_tensors_for_model,
     _normalize_depth,
     default_lab_cache_dir,
@@ -57,11 +59,12 @@ def _dtype_from_onnx_name(path: Path, fallback: torch.dtype) -> torch.dtype:
 def _preprocess_distill_rgb(rgb: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     rgb = ensure_bchw(rgb, name="rgb").to(device).float().clamp(0, 1)
     _, _, height, width = rgb.shape
-    input_h, input_w = _model_input_size(
+    input_h, input_w = _model_input_size_for_model(
         height,
         width,
         DISTILL_ANY_DEPTH_BASE_RESOLUTION,
         DISTILL_ANY_DEPTH_PATCH_SIZE,
+        DISTILL_ANY_DEPTH_BASE_MODEL_ID,
     )
     tensor = F.interpolate(
         rgb,
@@ -93,10 +96,17 @@ class ModelOnnxPreprocessor:
         self._target_resolution = max(1, int(target_resolution))
         self._shape_cache: dict[tuple[int, int], tuple[int, int]] = {}
         self._is_infinidepth = _is_infinidepth_model(model_id)
+        self._is_zipdepth = _is_zipdepth_model(model_id)
         self._patch_size = int(
             patch_size
             if patch_size is not None
-            else INFINIDEPTH_PATCH_SIZE if self._is_infinidepth else DISTILL_ANY_DEPTH_PATCH_SIZE
+            else (
+                ZIPDEPTH_PATCH_SIZE
+                if self._is_zipdepth
+                else INFINIDEPTH_PATCH_SIZE
+                if self._is_infinidepth
+                else DISTILL_ANY_DEPTH_PATCH_SIZE
+            )
         )
         self._mean, self._std = _normalization_tensors_for_model(model_id, device, dtype)
 
@@ -107,11 +117,12 @@ class ModelOnnxPreprocessor:
         cached = self._shape_cache.get(key)
         if cached is not None:
             return cached
-        size = _model_input_size(
+        size = _model_input_size_for_model(
             height,
             width,
             self._target_resolution,
             self._patch_size,
+            self.model_id,
         )
         self._shape_cache[key] = size
         return size
@@ -120,14 +131,15 @@ class ModelOnnxPreprocessor:
         rgb = ensure_bchw(rgb, name="rgb").to(self.device).float().clamp(0, 1)
         _, _, height, width = rgb.shape
         input_h, input_w = self.input_size(height, width)
+        use_bicubic = self.device.type == "cuda" and not self._is_zipdepth
         tensor = F.interpolate(
             rgb,
             size=(input_h, input_w),
-            mode="bicubic" if self.device.type == "cuda" else "bilinear",
+            mode="bicubic" if use_bicubic else "bilinear",
             align_corners=False,
-            antialias=True if self.device.type == "cuda" else False,
+            antialias=use_bicubic,
         ).to(self.dtype)
-        if self._is_infinidepth:
+        if self._is_infinidepth or self._is_zipdepth:
             return tensor
         return (tensor - self._mean) / self._std
 
@@ -140,14 +152,15 @@ class ModelOnnxPreprocessor:
         input size computation.
         """
         rgb = ensure_bchw(rgb, name="rgb").to(self.device).float().clamp(0, 1)
+        use_bicubic = self.device.type == "cuda" and not self._is_zipdepth
         tensor = F.interpolate(
             rgb,
             size=(height, width),
-            mode="bicubic" if self.device.type == "cuda" else "bilinear",
+            mode="bicubic" if use_bicubic else "bilinear",
             align_corners=False,
-            antialias=True if self.device.type == "cuda" else False,
+            antialias=use_bicubic,
         ).to(self.dtype)
-        if self._is_infinidepth:
+        if self._is_infinidepth or self._is_zipdepth:
             return tensor
         return (tensor - self._mean) / self._std
 
@@ -330,6 +343,8 @@ class DistillAnyDepthBaseOnnxCuda:
         start = time.perf_counter()
         depth = predicted.float()
         depth = ensure_b1hw(depth)
+        if self._is_zipdepth:
+            depth = depth.clamp_min(5e-3).reciprocal()
         depth = _normalize_depth(depth)
         depth = upsample_depth(
             depth,

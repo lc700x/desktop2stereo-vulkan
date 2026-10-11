@@ -211,22 +211,38 @@ class DownloadProgress(_NullProgress):
 
 @contextmanager
 def activity_progress(desc: str, *, interval_s: float = 0.2):
-    """Show a live activity line for long operations without real percent callbacks."""
+    """Report activity and elapsed time for operations without percent callbacks."""
     print(f"[Main] {desc}...", flush=True)
     stop_event = threading.Event()
     progress = _NullProgress(desc)
 
+    def _emit(state: str = "running") -> None:
+        payload = {
+            "desc": progress.desc,
+            "percent": 100.0 if state == "complete" else None,
+            "elapsed": _format_duration(time.perf_counter() - progress._started_at),
+            "unit": "activity",
+            "state": state,
+        }
+        progress_write("[D2S_PROGRESS] " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+    _emit()
+
     def _pulse() -> None:
         while not stop_event.wait(interval_s):
             progress.update(1)
+            _emit()
 
     thread = threading.Thread(target=_pulse, name=f"Progress:{desc}", daemon=True)
     thread.start()
+    complete = False
     try:
         yield progress
+        complete = True
     finally:
         stop_event.set()
         thread.join(timeout=1.0)
+        _emit("complete" if complete else "failed")
 
 
 @contextmanager

@@ -68,7 +68,8 @@ def _extract_depth_output(output):
 def probe_model_dtype(model, *, device, dtype, height: int, width: int) -> tuple[bool, str]:
     import torch
 
-    dummy = torch.randn(1, 3, height, width, device=device, dtype=dtype)
+    dummy_factory = torch.rand if getattr(model, "zipdepth_rgb_input", False) else torch.randn
+    dummy = dummy_factory(1, 3, height, width, device=device, dtype=dtype)
     try:
         model.eval()
         with torch.no_grad():
@@ -113,6 +114,33 @@ class InfiniDepthOnnxExportWrapper(torch.nn.Module):
 
     def forward(self, pixel_values):
         return self.model(pixel_values, fp32=self.fp32)
+
+
+class ZipDepthOnnxExportWrapper(torch.nn.Module):
+    zipdepth_rgb_input = True
+
+    def __init__(self, model) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, pixel_values):
+        return self.model(pixel_values)
+
+
+class ZipDepthEncoderOnnxExportWrapper(torch.nn.Module):
+    zipdepth_rgb_input = True
+
+    def __init__(self, model) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, pixel_values):
+        pixel_values = (pixel_values - self.model.mean) / self.model.std
+        s_half, s_quarter, features = self.model.encoder(
+            pixel_values,
+            return_s_quarter=True,
+        )
+        return (s_half, s_quarter, *features)
 
 
 class VideoDepthAnythingOnnxExportWrapper(torch.nn.Module):
@@ -213,10 +241,54 @@ def _quiet_onnx_export_warnings():
         yield
 
 
+def export_zipdepth_encoder_onnx(
+    model,
+    output_path: str | Path,
+    *,
+    height: int,
+    width: int,
+) -> Path:
+    output_path = Path(output_path)
+    parameter = next(model.parameters())
+    dummy_input = torch.rand(
+        1,
+        3,
+        int(height),
+        int(width),
+        device=parameter.device,
+        dtype=parameter.dtype,
+    )
+    wrapper = ZipDepthEncoderOnnxExportWrapper(model).eval()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with activity_progress(f"Exporting ZipDepth encoder ONNX: {output_path.name}"):
+        with torch.no_grad(), _quiet_onnx_export_warnings():
+            torch.onnx.export(
+                wrapper,
+                dummy_input,
+                str(output_path),
+                input_names=["pixel_values"],
+                output_names=[
+                    "s_half",
+                    "s_quarter",
+                    "feature_0",
+                    "feature_1",
+                    "feature_2",
+                    "feature_3",
+                ],
+                do_constant_folding=True,
+                export_params=True,
+                verbose=False,
+                training=torch.onnx.TrainingMode.EVAL,
+                dynamo=False,
+            )
+    return output_path
+
+
 def load_model_for_dtype(
     auto_model_cls,
     model_id: str,
     *,
+    model_name: str | None = None,
     dtype,
     device,
     cache_dir: Path,
@@ -224,6 +296,22 @@ def load_model_for_dtype(
     force_download: bool,
 ):
     import torch
+
+    if "zipdepth" in str(model_id).lower():
+        from .depth_provider import ZipDepthProvider, ZIPDEPTH_PATCH_SIZE
+
+        provider = ZipDepthProvider(
+            model_id=model_id,
+            model_name=model_name or model_id,
+            device=device,
+            cache_dir=cache_dir,
+            dtype=dtype,
+            depth_resolution=384,
+            patch_size=ZIPDEPTH_PATCH_SIZE,
+            local_files_only=local_files_only,
+            force_download=force_download,
+        )
+        return ZipDepthOnnxExportWrapper(provider.load()).to(device=device, dtype=dtype).eval()
 
     if _is_infinidepth_model(model_id):
         from stereo_runtime.model_impl.InfiniDepth.api import InfiniDepthModel
@@ -308,6 +396,7 @@ def export_depth_model_onnx(
     model_id: str,
     output_path: str | Path,
     cache_dir: str | Path,
+    model_name: str | None = None,
     device: str = "cuda",
     height: int = 294,
     width: int = 518,
@@ -332,6 +421,7 @@ def export_depth_model_onnx(
         model = load_model_for_dtype(
             auto_model_cls,
             model_id,
+            model_name=model_name,
             dtype=dtype_obj,
             device=device_obj,
             cache_dir=cache_dir,
@@ -353,6 +443,7 @@ def export_depth_model_onnx(
             model = load_model_for_dtype(
                 auto_model_cls,
                 model_id,
+                model_name=model_name,
                 dtype=dtype_obj,
                 device=device_obj,
                 cache_dir=cache_dir,
@@ -364,7 +455,8 @@ def export_depth_model_onnx(
     if not ok:
         raise RuntimeError(f"export dtype probe failed for {dtype_name}: {probe_reason}")
 
-    dummy_input = torch.randn(1, 3, height, width, device=device_obj, dtype=dtype_obj)
+    dummy_factory = torch.rand if "zipdepth" in model_id.lower() else torch.randn
+    dummy_input = dummy_factory(1, 3, height, width, device=device_obj, dtype=dtype_obj)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     status_write(f"正在导出 ONNX：{output_path.name}。这个步骤可能需要一段时间，进度请看上方进度条。")
     with activity_progress(f"Exporting ONNX: {output_path.name}"):

@@ -1,4 +1,17 @@
-from stereo_runtime.progress import DownloadProgress, file_size_progress, progress_write, status_write, write_bytes_with_progress
+import json
+import threading
+
+import pytest
+
+import stereo_runtime.progress as progress_module
+from stereo_runtime.progress import (
+    DownloadProgress,
+    activity_progress,
+    file_size_progress,
+    progress_write,
+    status_write,
+    write_bytes_with_progress,
+)
 from tqdm.contrib.concurrent import thread_map
 
 
@@ -82,3 +95,41 @@ def test_download_progress_works_with_thread_map(capsys):
     assert '"desc":"files"' in out
     assert '"percent":100.0' in out
     assert '"unit":"steps"' in out
+
+
+def test_activity_progress_emits_live_updates_and_stops_when_complete(monkeypatch):
+    events = []
+    pulsed = threading.Event()
+    desc = "Building MIGraphX graph: model.mgx"
+
+    def record(message):
+        events.append(json.loads(message.removeprefix("[D2S_PROGRESS] ")))
+        if len(events) >= 2 and events[-1]["state"] == "running":
+            pulsed.set()
+
+    monkeypatch.setattr(progress_module, "progress_write", record)
+    with activity_progress(desc, interval_s=0.001):
+        assert events[0]["desc"] == desc
+        assert events[0]["percent"] is None
+        assert events[0]["unit"] == "activity"
+        assert pulsed.wait(timeout=5.0)
+
+    assert events[-1]["state"] == "complete"
+    assert events[-1]["percent"] == 100.0
+    assert all(event["percent"] is None for event in events[:-1])
+    assert not any(thread.name == f"Progress:{desc}" for thread in threading.enumerate())
+
+
+def test_activity_progress_reports_failure_without_claiming_completion(capsys):
+    desc = "Building MIGraphX graph: failed.mgx"
+    with pytest.raises(RuntimeError, match="compile failed"):
+        with activity_progress(desc, interval_s=999):
+            raise RuntimeError("compile failed")
+
+    events = [
+        json.loads(line.removeprefix("[D2S_PROGRESS] "))
+        for line in capsys.readouterr().out.splitlines() if line.startswith("[D2S_PROGRESS] ")
+    ]
+    assert [event["state"] for event in events] == ["running", "failed"]
+    assert all(event["percent"] is None for event in events)
+    assert not any(thread.name == f"Progress:{desc}" for thread in threading.enumerate())

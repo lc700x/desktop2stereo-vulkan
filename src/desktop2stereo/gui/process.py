@@ -84,7 +84,7 @@ _BACKEND_STATUS_PREFIX = "[D2S_BACKEND_STATUS] "
 _DISPLAY_REFRESH_WARNING_PREFIX = "[D2S_DISPLAY_REFRESH_WARNING] "
 _TCL_SHUTDOWN_NOISE_MARKER = "tcl_asyncdelete: async handler deleted by the wrong thread"
 _MIGRAPHX_QUICK_TUNING_WARNING = (
-    "per-problem quick tuning does not represent the current problem's output_fusions"
+    "per-problem quick tuning does not represent the current problem's "
 )
 _TCL_SHUTDOWN_STACK_RE = re.compile(r"^0x[0-9a-f]+(?:,|\s)", re.IGNORECASE)
 _ASYNCIO_SHUTDOWN_UNRAISABLE_MODULES = (
@@ -1712,7 +1712,9 @@ class GUIProcessMixin:
             return
         lower = text.lower()
         mediamtx_level = _MEDIAMTX_LEVEL_RE.match(text)
-        if text.startswith(_DISPLAY_REFRESH_WARNING_PREFIX):
+        if text.startswith(_PROGRESS_PREFIX):
+            child_logger.info(text)
+        elif text.startswith(_DISPLAY_REFRESH_WARNING_PREFIX):
             payload_text = text[len(_DISPLAY_REFRESH_WARNING_PREFIX):].strip()
             try:
                 self._show_display_refresh_warning(json.loads(payload_text))
@@ -2165,19 +2167,27 @@ class GUIProcessMixin:
         total = translate_status(data.get("size"), locale)
         speed = translate_status(data.get("speed"), locale)
         eta = translate_status(data.get("eta"), locale)
-        value = 0.0 if percent is None else max(0.0, min(1.0, float(percent) / 100.0))
+        failed = data.get("state") == "failed"
+        value = 0.0 if failed else None if percent is None else max(0.0, min(1.0, float(percent) / 100.0))
         done = percent is not None and float(percent) >= 100.0
-        color = ft.Colors.GREEN if done else ft.Colors.BLUE
+        color = ft.Colors.RED if failed else ft.Colors.GREEN if done else ft.Colors.BLUE
         panel.visible = True
         self.download_progress_title.value = desc
         self.download_progress_title.color = color
-        self.download_progress_percent.value = "?" if percent is None else f"{float(percent):.1f}%"
+        self.download_progress_percent.value = (
+            translate_status("Operation failed", locale)
+            if failed else "" if percent is None else f"{float(percent):.1f}%"
+        )
         self.download_progress_percent.color = color
         self.download_progress_bar.value = value
         self.download_progress_bar.color = color
         eta_label = translate_status("ETA", locale)
-        self.download_progress_detail.value = f"{completed} / {total}  {speed}  {eta_label} {eta}".strip()
-        self.download_progress_detail.color = ft.Colors.GREEN if done else ft.Colors.GREY
+        self.download_progress_detail.value = (
+            translate_status(f"Elapsed {data.get('elapsed') or '00:00'}", locale)
+            if data.get("unit") == "activity"
+            else f"{completed} / {total}  {speed}  {eta_label} {eta}".strip()
+        )
+        self.download_progress_detail.color = color if done or failed else ft.Colors.GREY
 
     def _progress_log_line(self, item):
         levelno, name, _, formatted = item

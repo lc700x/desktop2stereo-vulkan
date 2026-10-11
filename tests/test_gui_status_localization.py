@@ -1,7 +1,10 @@
+import json
+import logging
 from types import SimpleNamespace
 from string import Formatter
 
 import pytest
+import flet as ft
 
 from gui.localization import MESSAGE_CATALOGS, _STATUS_MESSAGES, translate_status
 from gui.process import GUIProcessMixin
@@ -77,3 +80,39 @@ def test_progress_refresh_translates_labels_and_preserves_measurements():
     gui._update_download_progress(gui._download_progress_payload)
     assert gui.download_progress_title.value == "Exporting ONNX: model.onnx"
     assert "ETA 00:05" in gui.download_progress_detail.value
+
+
+@pytest.mark.parametrize("state,percent,value,color", [
+    ("running", None, None, ft.Colors.BLUE),
+    ("complete", 100.0, 1.0, ft.Colors.GREEN),
+    ("failed", None, 0.0, ft.Colors.RED),
+])
+def test_migraphx_activity_reaches_progress_panel_and_translates(state, percent, value, color, caplog):
+    gui = GUIProcessMixin()
+    gui.locale = "CN"
+    for name in ("panel", "title", "percent", "bar", "detail"):
+        setattr(gui, f"download_progress_{name}", SimpleNamespace(value="", visible=False))
+    payload = {
+        "desc": "Building MIGraphX graph: model.mgx", "percent": percent,
+        "elapsed": "00:12", "unit": "activity", "state": state,
+    }
+
+    with caplog.at_level(logging.INFO, logger="child"):
+        gui._log_child_line("[D2S_PROGRESS] " + json.dumps(payload))
+    record = next(record for record in reversed(caplog.records) if record.name == "child")
+    assert record.levelno == logging.INFO
+    event = gui._progress_event((record.levelno, record.name, "", record.getMessage()))
+    gui._update_download_progress(event)
+
+    assert gui.download_progress_panel.visible is True
+    assert gui.download_progress_bar.value == value
+    assert gui.download_progress_bar.color == color
+    assert gui.download_progress_title.value == "正在编译 MIGraphX 模型：model.mgx"
+    assert gui.download_progress_detail.value == "已用时间 00:12"
+    assert gui.download_progress_percent.value == (
+        "操作失败" if state == "failed" else "100.0%" if state == "complete" else ""
+    )
+    gui.locale = "EN"
+    gui._update_download_progress(gui._download_progress_payload)
+    assert gui.download_progress_title.value == "Building MIGraphX graph: model.mgx"
+    assert gui.download_progress_detail.value == "Elapsed 00:12"

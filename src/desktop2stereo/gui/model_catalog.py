@@ -8,6 +8,8 @@ V25_GUI_MODEL_NAMES = (
     "InfiniDepth-SmallPlus",
     "InfiniDepth-Base",
     "InfiniDepth-Large",
+    "ZipDepth-Base",
+    "ZipDepth-Small",
     "Depth-Anything-V2-Small",
     "Depth-Anything-V2-Base",
     "Depth-Anything-V2-Large",
@@ -40,6 +42,8 @@ V25_GUI_MODEL_NAMES = (
 
 
 def _resolutions_for_model(name):
+    if name in {"ZipDepth-Base", "ZipDepth-Small"}:
+        return [192, 224, 288, 352, 384, 448, 512]
     if name.startswith("InfiniDepth-"):
         return [192, 240, 304, 336, 384, 448, 512]
     if name.startswith("DA3"):

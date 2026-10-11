@@ -23,11 +23,17 @@ VIDEO_WEIGHT_FILENAMES = (
     "metric_video_depth_anything_vitb.pth",
     "metric_video_depth_anything_vitl.pth",
 )
+ZIPDEPTH_CHECKPOINT_FILENAMES = {
+    "zipdepth": "zipdepth_base.pth",
+    "zipdepth-npu": "zipdepth_base_npu.pth",
+}
 MODEL_CONFIG_FILENAMES = ("config.json",)
 # These model families build their network from the bundled implementation.
 # Their Hugging Face repositories provide weights, not the runtime structure.
 LOCAL_CONFIG_MODEL_FAMILIES = frozenset({
     "infinidepth",
+    "zipdepth",
+    "zipdepth-npu",
     "da3",
     "video-depth-anything",
     "metric-video-depth-anything",
@@ -102,7 +108,7 @@ def _nearest_multiple(value: int, patch: int) -> int:
 
 def export_size_for_model(model_id: str, export_height: int = 294, export_width: int = 518) -> tuple[int, int]:
     model_lower = str(model_id).lower()
-    patch = 16 if "infinidepth" in model_lower else 14
+    patch = 32 if "zipdepth" in model_lower else 16 if "infinidepth" in model_lower else 14
     return _nearest_multiple(int(export_height), patch), _nearest_multiple(int(export_width), patch)
 
 
@@ -117,16 +123,24 @@ def artifact_paths_for_model(
 ) -> ModelArtifactPaths:
     registry = registry or ModelRegistry.default()
     spec = registry.get(model_name_or_id)
+    if spec.family in ZIPDEPTH_CHECKPOINT_FILENAMES and (export_height, export_width) == (294, 518):
+        export_height = 384
+        export_width = int(round(export_height * 518 / 294))
     export_height, export_width = export_size_for_model(spec.model_id, export_height, export_width)
     root = Path(model_dir) if model_dir is not None else resolve_model_dir(spec.model_id, cache_dir)
+    artifact_prefix = (
+        f"{spec.name.lower().replace('-', '_')}_"
+        if spec.family in ZIPDEPTH_CHECKPOINT_FILENAMES
+        else ""
+    )
     return ModelArtifactPaths(
         model_id=spec.model_id,
         model_name=spec.name,
         model_dir=root,
-        onnx_fp16_path=root / f"model_fp16_{export_height}x{export_width}.onnx",
-        onnx_fp32_path=root / f"model_fp32_{export_height}x{export_width}.onnx",
-        trt_fp16_path=root / f"model_fp16_{export_height}x{export_width}.trt",
-        migraphx_fp16_path=root / f"model_fp16_{export_height}x{export_width}.mgx",
+        onnx_fp16_path=root / f"{artifact_prefix}model_fp16_{export_height}x{export_width}.onnx",
+        onnx_fp32_path=root / f"{artifact_prefix}model_fp32_{export_height}x{export_width}.onnx",
+        trt_fp16_path=root / f"{artifact_prefix}model_fp16_{export_height}x{export_width}.trt",
+        migraphx_fp16_path=root / f"{artifact_prefix}model_fp16_{export_height}x{export_width}.mgx",
         export_height=int(export_height),
         export_width=int(export_width),
     )
@@ -155,6 +169,29 @@ def ensure_model_downloaded(
         if not model_dir.exists():
             raise FileNotFoundError(f"model weights resolved but model directory was not found: {model_dir}")
         return model_dir
+
+    if model_spec.family in ZIPDEPTH_CHECKPOINT_FILENAMES:
+        filename = ZIPDEPTH_CHECKPOINT_FILENAMES[model_spec.family]
+        if local_files_only:
+            raise FileNotFoundError(f"local ZipDepth checkpoint is missing: {model_dir / filename}")
+        from .depth_provider import _download_hf_file_direct, _reachable_hf_endpoints
+
+        last_error: Exception | None = None
+        for endpoint in _reachable_hf_endpoints(model_spec.model_id):
+            try:
+                _download_hf_file_direct(
+                    model_spec.model_id,
+                    filename,
+                    cache_dir,
+                    endpoint,
+                )
+                if _model_cache_is_complete(model_spec, model_dir):
+                    return model_dir
+            except Exception as exc:
+                last_error = exc
+        raise FileNotFoundError(
+            f"ZipDepth checkpoint download failed: {model_dir / filename}"
+        ) from last_error
 
     from .depth_provider import (
         _download_hf_file_direct,
@@ -216,6 +253,9 @@ def ensure_model_downloaded(
 def _model_cache_is_complete(model_spec: DepthModelSpec, model_dir: str | Path) -> bool:
     """Require model metadata as well as weights before allowing ONNX export."""
     root = Path(model_dir)
+    if model_spec.family in ZIPDEPTH_CHECKPOINT_FILENAMES:
+        weight = root / ZIPDEPTH_CHECKPOINT_FILENAMES[model_spec.family]
+        return weight.is_file() and weight.stat().st_size > 0
     if find_local_model_weight(root) is None:
         return False
     if model_spec.family in LOCAL_CONFIG_MODEL_FAMILIES:
@@ -230,6 +270,12 @@ def _model_cache_is_complete(model_spec: DepthModelSpec, model_dir: str | Path) 
 def find_local_model_weight(model_dir: str | Path) -> Path | None:
     root = Path(model_dir)
     if not root.exists():
+        return None
+    for filename in ZIPDEPTH_CHECKPOINT_FILENAMES.values():
+        checkpoint = root / filename
+        if checkpoint.is_file() and checkpoint.stat().st_size > 0:
+            return checkpoint
+    if root.name.lower() == "models--pablovela5620--zipdepth":
         return None
     for filename in MODEL_WEIGHT_FILENAMES:
         direct = root / filename
@@ -300,7 +346,7 @@ def ensure_onnx_exported(
     export_if_missing: bool = False,
 ) -> Path:
     paths = artifact_paths_for_model(
-        model_spec.model_id,
+        model_spec.name,
         cache_dir=cache_dir,
         model_dir=model_dir,
         export_height=height,
@@ -317,6 +363,7 @@ def ensure_onnx_exported(
     output_path = paths.onnx_fp16_path if dtype in ("auto", "fp16") else paths.onnx_fp32_path
     result = export_depth_model_onnx(
         model_id=model_spec.model_id,
+        model_name=model_spec.name,
         output_path=output_path,
         cache_dir=cache_dir,
         # Use the same patch-aligned dimensions used in the artifact filename.
@@ -402,7 +449,7 @@ def prepare_model_artifacts(
     registry = ModelRegistry.default()
     spec = registry.get(model_name_or_id)
     paths = artifact_paths_for_model(
-        spec.model_id,
+        spec.name,
         cache_dir=cache_dir,
         model_dir=model_dir,
         export_height=export_height,

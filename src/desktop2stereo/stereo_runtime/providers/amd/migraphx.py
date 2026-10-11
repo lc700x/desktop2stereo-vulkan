@@ -11,12 +11,23 @@ from stereo_runtime.depth_provider import (
     DISTILL_ANY_DEPTH_BASE_MODEL_ID,
     DepthProfileResult,
     DepthProviderInfo,
+    _is_zipdepth_model,
+    ZipDepthProvider,
     _postprocess_generic_depth,
 )
 from stereo_runtime.depth_upsample import DepthUpsampleMode, upsample_depth
 from stereo_runtime.output import ensure_bchw
+from stereo_runtime.progress import activity_progress
 
 from .pytorch_rocm import create_pytorch_rocm_provider, is_rocm_torch_available
+
+ZIPDEPTH_MIGRAPHX_MAX_ABS_DIFF = 0.05
+ZIPDEPTH_MIGRAPHX_RAW_MAX_ABS_DIFF = 0.005
+
+
+def _migraphx_output_index(name: str) -> int:
+    suffix = name.rsplit("#output_", 1)[-1].lstrip(":0")
+    return int(suffix or 0)
 
 
 def is_migraphx_available() -> bool:
@@ -46,17 +57,21 @@ def build_migraphx_graph(
     import migraphx as mx
 
     graph_path.parent.mkdir(parents=True, exist_ok=True)
-    prog = mx.parse_onnx(str(onnx_path))
+    with activity_progress(f"Parsing ONNX for MIGraphX: {onnx_path.name}"):
+        prog = mx.parse_onnx(str(onnx_path))
     if fp16 and not force_fp32:
-        if fp8 and hasattr(mx, "autocast_fp8"):
-            try:
-                mx.autocast_fp8(prog)
-            except Exception:
+        with activity_progress(f"Optimizing MIGraphX graph: {graph_path.name}"):
+            if fp8 and hasattr(mx, "autocast_fp8"):
+                try:
+                    mx.autocast_fp8(prog)
+                except Exception:
+                    mx.quantize_fp16(prog)
+            else:
                 mx.quantize_fp16(prog)
-        else:
-            mx.quantize_fp16(prog)
-    prog.compile(mx.get_target("gpu"), offload_copy=False)
-    mx.save(prog, str(graph_path))
+    with activity_progress(f"Building MIGraphX graph: {graph_path.name}"):
+        prog.compile(mx.get_target("gpu"), offload_copy=False)
+    with activity_progress(f"Saving MIGraphX graph: {graph_path.name}"):
+        mx.save(prog, str(graph_path))
     return graph_path
 
 
@@ -67,7 +82,8 @@ class MIGraphXEngine:
         self.mx = mx
         self.graph_path = Path(graph_path)
         self.device = torch.device(device)
-        self.prog = mx.load(str(self.graph_path))
+        with activity_progress(f"Loading MIGraphX graph: {self.graph_path.name}"):
+            self.prog = mx.load(str(self.graph_path))
         self._logged_zero_copy = False
         param_shapes = self.prog.get_parameter_shapes()
         self.input_name = None
@@ -86,11 +102,15 @@ class MIGraphXEngine:
                 "MIGraphX graph has no output parameter buffers. "
                 "Recompile it with offload_copy=False or delete the cached .mgx file."
             )
-        self._out_name = next(iter(self._out_params))
+        self._out_names = tuple(sorted(self._out_params, key=_migraphx_output_index))
+        self._out_name = self._out_names[0]
         self._out_lens = list(self._out_params[self._out_name].lens())
         mx_to_torch = {1: torch.float16, 2: torch.float32, 3: torch.float64}
         self._mgx_in_dtype = mx_to_torch.get(int(self._in_shape.type()), torch.float32)
-        self._mgx_out_dtype = mx_to_torch.get(int(self._out_params[self._out_name].type()), torch.float32)
+        self._mgx_out_dtypes = {
+            name: mx_to_torch.get(int(shape.type()), torch.float32)
+            for name, shape in self._out_params.items()
+        }
 
     @property
     def input_shape(self) -> tuple[int, ...]:
@@ -103,7 +123,7 @@ class MIGraphXEngine:
             return None
         return int(shape[-2]), int(shape[-1])
 
-    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
         tensor = tensor.to(device=self.device)
         if len(self.input_shape) == 5 and tensor.ndim == 4:
             # Video models are exported with a singleton temporal dimension;
@@ -116,17 +136,36 @@ class MIGraphXEngine:
         if tensor.dtype != self._mgx_in_dtype or not tensor.is_contiguous():
             tensor = tensor.contiguous().to(dtype=self._mgx_in_dtype)
         in_arg = self.mx.argument_from_pointer(self._in_shape, tensor.data_ptr())
-        out = torch.empty(tuple(self._out_lens), dtype=self._mgx_out_dtype, device=self.device)
-        out_arg = self.mx.argument_from_pointer(self._out_params[self._out_name], out.data_ptr())
+        outputs = {
+            name: torch.empty(
+                tuple(self._out_params[name].lens()),
+                dtype=self._mgx_out_dtypes[name],
+                device=self.device,
+            )
+            for name in self._out_names
+        }
+        output_args = {
+            name: self.mx.argument_from_pointer(self._out_params[name], output.data_ptr())
+            for name, output in outputs.items()
+        }
         stream = torch.cuda.current_stream(self.device)
-        self.prog.run_async({self.input_name: in_arg, self._out_name: out_arg}, stream.cuda_stream, "ihipStream_t")
+        self.prog.run_async(
+            {self.input_name: in_arg, **output_args},
+            stream.cuda_stream,
+            "ihipStream_t",
+        )
         if not self._logged_zero_copy:
+            output_summary = (
+                f"{len(outputs)} GPU outputs" if len(outputs) > 1 else str(tuple(outputs[self._out_name].shape))
+            )
             print(
                 f"[MIGraphX] Zero-copy GPU path active | input={tuple(tensor.shape)} {tensor.dtype} "
-                f"-> output={tuple(out.shape)} {out.dtype}"
+                f"-> output={output_summary}"
             )
             self._logged_zero_copy = True
-        return out
+        if len(self._out_names) == 1:
+            return outputs[self._out_name]
+        return tuple(outputs[name] for name in self._out_names)
 
 
 class MIGraphXDepthProvider:
@@ -145,6 +184,10 @@ class MIGraphXDepthProvider:
         model_name: str | None = None,
         depth_resolution: int = 518,
         patch_size: int | None = 14,
+        local_files_only: bool = True,
+        force_download: bool = False,
+        allow_pytorch_fallback: bool = True,
+        use_torch_compile: bool = False,
     ) -> None:
         self.device = torch.device(device)
         # cuDNN autotuning is disabled for the ROCm depth path (per project policy).
@@ -160,10 +203,21 @@ class MIGraphXDepthProvider:
         self.model_id = str(model_id)
         self.model_name = str(model_name or model_id)
         self.depth_resolution = max(1, int(depth_resolution))
-        self.patch_size = int(patch_size or (16 if "infinidepth" in self.model_id.lower() else 14))
-        # MIGraphX graphs are built fp16 by default (build_migraphx_graph quantizes
-        # to fp16 unless force_fp32), so the preprocessor must emit fp16 tensors to
-        # feed the engine without a dtype cast on the hot path.
+        self.local_files_only = bool(local_files_only)
+        self.force_download = bool(force_download)
+        self.allow_pytorch_fallback = bool(allow_pytorch_fallback)
+        self.use_torch_compile = bool(use_torch_compile)
+        self._zipdepth_parity_checked = False
+        self._zipdepth_fallback: ZipDepthProvider | None = None
+        self._zipdepth_model_provider: ZipDepthProvider | None = None
+        self._zipdepth_runtime_logged = False
+        self.patch_size = (
+            32
+            if _is_zipdepth_model(self.model_id)
+            else int(patch_size or (16 if "infinidepth" in self.model_id.lower() else 14))
+        )
+        # The input dtype follows the ONNX artifact; MIGraphX quantizes model
+        # internals to FP8 when available and otherwise to FP16.
         self._preprocessor_dtype = _dtype_from_onnx_name(self.onnx_path, torch.float16)
         self.preprocessor = ModelOnnxPreprocessor(
             model_id=self.model_id,
@@ -187,11 +241,92 @@ class MIGraphXDepthProvider:
             output_device=str(self.device),
         )
 
+    def _zipdepth_encoder_input_size(self) -> tuple[int, int]:
+        if self.onnx_path is not None and self.onnx_path.is_file():
+            import onnx
+
+            model = onnx.load(str(self.onnx_path), load_external_data=False)
+            for value in model.graph.input:
+                dims = value.type.tensor_type.shape.dim
+                if len(dims) >= 4:
+                    height = int(dims[-2].dim_value)
+                    width = int(dims[-1].dim_value)
+                    if height > 0 and width > 0:
+                        return height, width
+
+        if self.graph_path is not None and self.graph_path.is_file():
+            import migraphx as mx
+
+            graph = mx.load(str(self.graph_path))
+            for name, shape in graph.get_parameter_shapes().items():
+                if "#output_" not in name:
+                    dims = shape.lens()
+                    if len(dims) >= 4:
+                        return int(dims[-2]), int(dims[-1])
+
+        return self.preprocessor.input_size(294, 518)
+
+    def _load_zipdepth_encoder(self) -> MIGraphXEngine:
+        if self.graph_path is None:
+            raise FileNotFoundError("MIGraphX graph path is required")
+
+        if self._zipdepth_model_provider is None:
+            self._zipdepth_model_provider = ZipDepthProvider(
+                model_id=self.model_id,
+                model_name=self.model_name,
+                device=self.device,
+                cache_dir=self.cache_dir,
+                dtype=self._preprocessor_dtype,
+                depth_resolution=self.depth_resolution,
+                patch_size=self.patch_size,
+                local_files_only=self.local_files_only,
+                force_download=self.force_download,
+                use_torch_compile=False,
+            )
+        torch_model = self._zipdepth_model_provider.load()
+
+        encoder_graph_path = self.graph_path.with_name(f"{self.graph_path.stem}_encoder_v3.mgx")
+        encoder_onnx_path = self.graph_path.with_name(f"{self.graph_path.stem}_encoder_v3.onnx")
+        if self.force_rebuild or not encoder_graph_path.is_file():
+            if self.force_rebuild or not encoder_onnx_path.is_file():
+                from ...onnx_export import export_zipdepth_encoder_onnx
+
+                height, width = self._zipdepth_encoder_input_size()
+                export_zipdepth_encoder_onnx(
+                    torch_model,
+                    encoder_onnx_path,
+                    height=height,
+                    width=width,
+                )
+            build_migraphx_graph(
+                encoder_onnx_path,
+                encoder_graph_path,
+                fp16=self._preprocessor_dtype == torch.float16,
+                fp8=False,
+                force=self.force_rebuild,
+            )
+
+        self.engine = MIGraphXEngine(encoder_graph_path, device=self.device)
+        self.info = replace(
+            self.info,
+            execution_provider="MIGraphX ROCm encoder + bundled PyTorch decoder",
+        )
+        if not self._zipdepth_runtime_logged:
+            print(
+                "[MIGraphX] ZipDepth uses zero-copy MIGraphX ROCm encoder "
+                "and bundled PyTorch ROCm decoder",
+                flush=True,
+            )
+            self._zipdepth_runtime_logged = True
+        return self.engine
+
     def load(self) -> MIGraphXEngine:
         if self.engine is not None:
             return self.engine
         if self.graph_path is None:
             raise FileNotFoundError("MIGraphX graph path is required")
+        if _is_zipdepth_model(self.model_id):
+            return self._load_zipdepth_encoder()
         if self.onnx_path is None and (self.build_graph or self.force_rebuild or not self.graph_path.exists()):
             raise FileNotFoundError("ONNX path is required to build a MIGraphX graph")
         if self.onnx_path is not None and (self.build_graph or self.force_rebuild or not self.graph_path.exists()):
@@ -211,6 +346,9 @@ class MIGraphXDepthProvider:
 
     def predict_profile(self, rgb: torch.Tensor) -> DepthProfileResult:
         import time
+
+        if self._zipdepth_fallback is not None:
+            return self._zipdepth_fallback.predict_profile(rgb)
 
         def sync() -> None:
             if self.profile_sync and self.device.type == "cuda" and torch.cuda.is_available():
@@ -244,7 +382,22 @@ class MIGraphXDepthProvider:
         record("depth_model_start")
         start = time.perf_counter()
         with torch.inference_mode():
-            predicted = engine(tensor)
+            engine_output = engine(tensor)
+            if _is_zipdepth_model(self.model_id):
+                if not isinstance(engine_output, tuple) or len(engine_output) != 6:
+                    raise RuntimeError(
+                        "MIGraphX ZipDepth encoder must return stem features and four stage features"
+                    )
+                if self._zipdepth_model_provider is None:
+                    raise RuntimeError("MIGraphX ZipDepth decoder model was not loaded")
+                model = self._zipdepth_model_provider.load()
+                predicted = model.decoder(
+                    engine_output[0],
+                    list(engine_output[2:]),
+                    input_size,
+                )
+            else:
+                predicted = engine_output
         sync()
         record("depth_model_end")
         model_ms = (time.perf_counter() - start) * 1000.0
@@ -270,7 +423,67 @@ class MIGraphXDepthProvider:
         # GPU timings are resolved by the pipeline after its existing ready
         # event completes. Profiling must not drain capture/presentation work
         # on every stage; normal inference remains ordered on the HIP stream.
-        return DepthProfileResult(depth, preprocess_ms, model_ms, postprocess_ms, cuda_timing_events=cuda_events)
+        result = DepthProfileResult(
+            depth,
+            preprocess_ms,
+            model_ms,
+            postprocess_ms,
+            cuda_timing_events=cuda_events,
+        )
+        if self.model_name.strip().casefold() != "zipdepth-small" or self._zipdepth_parity_checked:
+            return result
+
+        fallback = self._zipdepth_model_provider
+        if fallback is None:
+            raise RuntimeError("MIGraphX ZipDepth reference model was not loaded")
+        with torch.inference_mode():
+            reference_prediction = fallback._run_depth_model(tensor)
+        finite = (
+            bool(torch.isfinite(result.depth).all())
+            and bool(torch.isfinite(predicted).all())
+            and bool(torch.isfinite(reference_prediction).all())
+        )
+        if predicted.shape == reference_prediction.shape and finite:
+            max_abs_diff = float(
+                (predicted.float() - reference_prediction.float()).abs().amax().item()
+            )
+        else:
+            max_abs_diff = float("inf")
+        if max_abs_diff <= ZIPDEPTH_MIGRAPHX_RAW_MAX_ABS_DIFF:
+            self._zipdepth_parity_checked = True
+            return result
+
+        reason = (
+            "non-finite depth output"
+            if not finite
+            else f"MIGraphX/PyTorch raw max_abs_diff={max_abs_diff:.6f}"
+        )
+        if not self.allow_pytorch_fallback:
+            raise RuntimeError(f"MIGraphX ZipDepth-Small validation failed: {reason}")
+
+        self._zipdepth_parity_checked = True
+        self._zipdepth_fallback = fallback
+        depth_backend = (
+            "pytorch_rocm"
+            if torch.version.hip
+            else "pytorch_cuda"
+            if self.device.type == "cuda"
+            else "pytorch_cpu"
+        )
+        self.info = replace(
+            self.info,
+            provider=fallback.info.provider,
+            depth_backend=depth_backend,
+            runtime=fallback.info.runtime,
+            execution_provider="PyTorch fallback",
+            fallback_reason=f"MIGraphX ZipDepth-Small validation failed: {reason}",
+        )
+        print(
+            f"[MIGraphX] ZipDepth-Small validation failed ({reason}); "
+            "using bundled PyTorch for this session",
+            flush=True,
+        )
+        return fallback.predict_profile(rgb)
 
 
 def create_migraphx_rocm_provider(
@@ -290,6 +503,7 @@ def create_migraphx_rocm_provider(
     patch_size: int | None = 14,
     depth_upsample: DepthUpsampleMode = "bilinear",
     depth_upsample_edge_strength: float = 0.35,
+    use_torch_compile: bool = False,
 ):
     reason = None
     if not is_rocm_torch_available():
@@ -300,6 +514,20 @@ def create_migraphx_rocm_provider(
     if reason is not None:
         if not allow_pytorch_fallback:
             raise RuntimeError(reason)
+        if _is_zipdepth_model(model_id):
+            return ZipDepthProvider(
+                model_id=model_id,
+                model_name=model_name,
+                device=device,
+                cache_dir=cache_dir,
+                depth_resolution=depth_resolution,
+                patch_size=32,
+                local_files_only=local_files_only,
+                force_download=force_download,
+                depth_upsample=depth_upsample,
+                depth_upsample_edge_strength=depth_upsample_edge_strength,
+                use_torch_compile=use_torch_compile,
+            )
         provider = create_pytorch_rocm_provider(
             model_id=model_id,
             model_name=model_name,
@@ -327,13 +555,22 @@ def create_migraphx_rocm_provider(
     if onnx_path is None or graph_path is None or onnx_missing_for_build:
         from stereo_runtime.model_artifacts import prepare_model_artifacts
 
-        # ``depth_resolution`` is the configured long-edge target. Preserve the
-        # standard 16:9 export aspect ratio when direct callers do not provide
-        # already-built artifacts; model_artifacts applies the model patch size.
-        export_width = max(1, int(depth_resolution))
-        export_height = max(1, int(round(export_width * 294 / 518)))
+        # ZipDepth interprets the configured resolution as its short edge;
+        # other families retain the existing long-edge convention.
+        if _is_zipdepth_model(model_id):
+            export_height = max(1, int(depth_resolution))
+            export_width = max(1, int(round(export_height * 518 / 294)))
+        else:
+            export_width = max(1, int(depth_resolution))
+            export_height = max(1, int(round(export_width * 294 / 518)))
         artifacts = prepare_model_artifacts(
-            model_id,
+            (
+                model_name
+                if _is_zipdepth_model(model_id)
+                and model_name
+                and model_name.casefold() in {"zipdepth-base", "zipdepth-small"}
+                else model_id
+            ),
             cache_dir=cache_dir or "./models",
             model_dir=Path(onnx_path).parent if onnx_path is not None else None,
             local_files_only=local_files_only,
@@ -344,8 +581,8 @@ def create_migraphx_rocm_provider(
             artifact_backend="migraphx",
             export_height=export_height,
             export_width=export_width,
-            build_migraphx_if_missing=build_graph or force_rebuild,
-            force_rebuild_migraphx=force_rebuild,
+            build_migraphx_if_missing=(build_graph or force_rebuild) and not _is_zipdepth_model(model_id),
+            force_rebuild_migraphx=force_rebuild and not _is_zipdepth_model(model_id),
         )
         if onnx_path is None or not Path(onnx_path).is_file():
             onnx_path = artifacts.selected_onnx_path
@@ -364,6 +601,10 @@ def create_migraphx_rocm_provider(
         model_name=model_name,
         depth_resolution=depth_resolution,
         patch_size=patch_size,
+        local_files_only=local_files_only,
+        force_download=force_download,
+        allow_pytorch_fallback=allow_pytorch_fallback,
+        use_torch_compile=use_torch_compile,
     )
 
 

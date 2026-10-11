@@ -20,6 +20,7 @@ from stereo_runtime.depth_provider import (
     DepthProviderInfo,
     DistillAnyDepthBase518,
     GenericAutoDepthProvider,
+    ZipDepthProvider,
 )
 from stereo_runtime.depth_upsample import DepthUpsampleMode
 
@@ -383,6 +384,8 @@ class _CoreMLMixin:
         with torch.inference_mode(), torch.autocast(
             device_type=self.device.type, enabled=use_autocast
         ):
+            if isinstance(self, ZipDepthProvider):
+                return model(tensor)
             return model(pixel_values=tensor)
 
     def _set_coreml_info(self, *, fallback_reason: str | None = None) -> None:
@@ -403,7 +406,7 @@ class _CoreMLMixin:
         raw_bgr: torch.Tensor | None = None,
     ):
         from stereo_runtime.depth_provider import (
-            _model_input_size,
+            _model_input_size_for_model,
             _normalization_tensors_for_model,
             _postprocess_generic_depth,
             ensure_b1hw,
@@ -415,13 +418,16 @@ class _CoreMLMixin:
         rgb = ensure_bchw(rgb, name="rgb").to(self.device)
         if rgb.dtype != torch.float32:
             rgb = rgb.float()
+        rgb = torch.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
         _, _, height, width = rgb.shape
         resolution = int(
             getattr(self, "depth_resolution", None)
             or DISTILL_ANY_DEPTH_BASE_RESOLUTION
         )
         patch_size = int(getattr(self, "patch_size", None) or 14)
-        input_h, input_w = _model_input_size(height, width, resolution, patch_size)
+        input_h, input_w = _model_input_size_for_model(
+            height, width, resolution, patch_size, self.model_id
+        )
 
         start = time.perf_counter()
         if raw_bgr is not None:
@@ -453,6 +459,7 @@ class _CoreMLMixin:
             cpu_rgb = ensure_bchw(cpu_rgb, name="cpu_rgb").float().clamp(0, 1)
         else:
             raise ValueError("CoreML requires raw host capture or CPU RGB staging")
+        cpu_rgb = torch.nan_to_num(cpu_rgb, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
         tensor = F.interpolate(
             cpu_rgb,
             size=(input_h, input_w),
@@ -570,7 +577,7 @@ class _CoreMLMixin:
         from stereo_runtime.depth_provider import (
             DISTILL_ANY_DEPTH_BASE_RESOLUTION,
             DISTILL_ANY_DEPTH_PATCH_SIZE,
-            _model_input_size,
+            _model_input_size_for_model,
             ensure_bchw,
         )
 
@@ -580,7 +587,9 @@ class _CoreMLMixin:
             getattr(self, "depth_resolution", None) or DISTILL_ANY_DEPTH_BASE_RESOLUTION
         )
         patch_size = int(getattr(self, "patch_size", None) or 14)
-        input_h, input_w = _model_input_size(height, width, resolution, patch_size)
+        input_h, input_w = _model_input_size_for_model(
+            height, width, resolution, patch_size, self.model_id
+        )
 
         engines = getattr(self, "_coreml_engines", None)
         if engines is None:
@@ -604,7 +613,8 @@ class _CoreMLMixin:
         # silently knocking depth back to plain PyTorch MPS.
         input_h, input_w = int(key[0]), int(key[1])
         dtype_tag = "fp16" if self.dtype == torch.float16 else "fp32"
-        model_dir = Path(str(self.cache_dir)) / "coreml" / _safe_model_tag(self.model_id)
+        model_tag = self.model_name if "zipdepth" in self.model_id.lower() else self.model_id
+        model_dir = Path(str(self.cache_dir)) / "coreml" / _safe_model_tag(model_tag)
         model_path = model_dir / f"model_{dtype_tag}_{input_h}x{input_w}.mlpackage"
 
         engine = None
@@ -628,7 +638,8 @@ class _CoreMLMixin:
             # Trace on the same device as the model weights (MPS); the
             # converted mlpackage is device-independent.
             trace_device = self.device if self.device.type != "cpu" else "cpu"
-            dummy = torch.randn(1, 3, input_h, input_w, device=trace_device, dtype=torch.float32)
+            dummy_factory = torch.rand if "zipdepth" in self.model_id.lower() else torch.randn
+            dummy = dummy_factory(1, 3, input_h, input_w, device=trace_device, dtype=torch.float32)
             try:
                 with torch.no_grad(), coreml_safe_interpolate(), coreml_safe_dinov2_positions(
                     torch_model
@@ -764,6 +775,42 @@ class GenericAutoDepthMpsProvider(_CoreMLMixin, _MpsInfoMixin, GenericAutoDepthP
         self.info = self._mark_mps_info(self.info)
 
 
+class ZipDepthMpsProvider(_CoreMLMixin, _MpsInfoMixin, ZipDepthProvider):
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        model_name: str | None = None,
+        device: str | torch.device = "mps",
+        cache_dir: str | Path | None = None,
+        depth_resolution: int = 384,
+        patch_size: int = 32,
+        local_files_only: bool = False,
+        force_download: bool = False,
+        depth_upsample: DepthUpsampleMode = "bilinear",
+        depth_upsample_edge_strength: float = 0.35,
+        use_coreml: bool = False,
+        recompile_coreml: bool = False,
+        use_torch_compile: bool = False,
+    ) -> None:
+        super().__init__(
+            model_id=model_id,
+            model_name=model_name,
+            device=device,
+            cache_dir=cache_dir,
+            depth_resolution=depth_resolution,
+            patch_size=patch_size,
+            local_files_only=local_files_only,
+            force_download=force_download,
+            depth_upsample=depth_upsample,
+            depth_upsample_edge_strength=depth_upsample_edge_strength,
+            use_torch_compile=use_torch_compile,
+        )
+        self.use_coreml = bool(use_coreml)
+        self.recompile_coreml = bool(recompile_coreml)
+        self.info = self._mark_mps_info(replace(self.info, runtime="zipdepth-mps"))
+
+
 TorchMpsDepthProvider = DistillAnyDepthBaseMps
 GenericTorchMpsDepthProvider = GenericAutoDepthMpsProvider
 
@@ -782,8 +829,25 @@ def create_pytorch_mps_provider(
     depth_upsample_edge_strength: float = 0.35,
     use_coreml: bool = False,
     recompile_coreml: bool = False,
+    use_torch_compile: bool = False,
 ):
     if model_id != DISTILL_ANY_DEPTH_BASE_MODEL_ID:
+        if "zipdepth" in model_id.lower():
+            return ZipDepthMpsProvider(
+                model_id=model_id,
+                model_name=model_name,
+                device=device,
+                cache_dir=cache_dir,
+                depth_resolution=depth_resolution,
+                patch_size=patch_size or 32,
+                local_files_only=local_files_only,
+                force_download=force_download,
+                depth_upsample=depth_upsample,
+                depth_upsample_edge_strength=depth_upsample_edge_strength,
+                use_coreml=use_coreml,
+                recompile_coreml=recompile_coreml,
+                use_torch_compile=use_torch_compile,
+            )
         return GenericAutoDepthMpsProvider(
             model_id=model_id,
             model_name=model_name,
@@ -815,6 +879,7 @@ def create_pytorch_mps_provider(
 __all__ = [
     "CoreMLEngine",
     "GenericAutoDepthMpsProvider",
+    "ZipDepthMpsProvider",
     "GenericTorchMpsDepthProvider",
     "DistillAnyDepthBaseMps",
     "TorchMpsDepthProvider",

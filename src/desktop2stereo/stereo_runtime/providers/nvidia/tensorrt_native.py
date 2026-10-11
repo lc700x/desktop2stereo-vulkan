@@ -7,12 +7,15 @@ import time
 
 import torch
 
-from ...depth_onnx_provider import ModelOnnxPreprocessor, _dtype_from_onnx_name, _input_size_from_artifact_name, _model_input_size, default_onnx_path
+from ...depth_onnx_provider import ModelOnnxPreprocessor, _dtype_from_onnx_name, _input_size_from_artifact_name, default_onnx_path
 from ...depth_provider import (
     DISTILL_ANY_DEPTH_BASE_MODEL_ID,
     DISTILL_ANY_DEPTH_BASE_NAME,
     DISTILL_ANY_DEPTH_PATCH_SIZE,
     DISTILL_ANY_DEPTH_BASE_RESOLUTION,
+    ZIPDEPTH_PATCH_SIZE,
+    _is_zipdepth_model,
+    _model_input_size_for_model,
     DepthProfileResult,
     DepthProviderConfig,
     DepthProviderInfo,
@@ -654,11 +657,12 @@ class DistillAnyDepthBaseNativeTensorRt:
         self._cuda_graph_disabled_reason: str | None = None
         configured_input_size = None
         if self._explicit_onnx_path is None:
-            configured_input_size = _model_input_size(
+            configured_input_size = _model_input_size_for_model(
                 294,
                 518,
                 self.depth_resolution,
-                DISTILL_ANY_DEPTH_PATCH_SIZE,
+                ZIPDEPTH_PATCH_SIZE if _is_zipdepth_model(self.model_id) else DISTILL_ANY_DEPTH_PATCH_SIZE,
+                self.model_id,
             )
         self._preprocessor = ModelOnnxPreprocessor(
             model_id=self.model_id,
@@ -828,6 +832,8 @@ class DistillAnyDepthBaseNativeTensorRt:
             _record_cuda_event(cuda_events, "depth_post_start", predicted)
             _record_cuda_event(cuda_events, "depth_norm_start", predicted)
             depth = ensure_b1hw(predicted.float())
+            if _is_zipdepth_model(self.model_id):
+                depth = depth.clamp_min(5e-3).reciprocal()
             depth = _normalize_depth(depth)
             _record_cuda_event(cuda_events, "depth_norm_end", depth)
             _record_cuda_event(cuda_events, "depth_upsample_start", depth)

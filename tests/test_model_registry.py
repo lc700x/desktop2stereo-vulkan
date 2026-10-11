@@ -5,8 +5,14 @@ from path_config import APP_ROOT
 
 from gui.model_catalog import GUI_MODEL_CATALOG, V25_GUI_MODEL_NAMES
 from stereo_runtime import DepthRuntimeConfig, ModelRegistry, resolve_model_dir
-from stereo_runtime.adapter import depth_provider_config_from_runtime
-from stereo_runtime.model_capabilities import DISABLE_MIGRAPHX_KEYWORDS
+from stereo_runtime.adapter import _depth_export_size_from_settings, depth_provider_config_from_runtime
+from stereo_runtime.model_artifacts import (
+    ZIPDEPTH_CHECKPOINT_FILENAMES,
+    _model_cache_is_complete,
+    artifact_paths_for_model,
+    ensure_model_downloaded,
+)
+from stereo_runtime.model_capabilities import DISABLE_COREML_KEYWORDS, DISABLE_MIGRAPHX_KEYWORDS
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -83,8 +89,72 @@ def test_model_registry_is_d2s_model_mapping_source():
     assert "DepthPro-Large" in names
 
 
-def test_migraphx_is_not_hidden_for_registered_model_families():
-    assert DISABLE_MIGRAPHX_KEYWORDS == []
+def test_zipdepth_base_and_small_keep_separate_variants_and_artifacts():
+    registry = ModelRegistry.default()
+    base = registry.get("ZipDepth-Base")
+    small = registry.get("ZipDepth-Small")
+
+    assert base.model_id == small.model_id == "pablovela5620/zipdepth"
+    assert base.family == "zipdepth"
+    assert small.family == "zipdepth-npu"
+    assert registry.get(base.model_id).name == "ZipDepth-Base"
+
+    base_paths = artifact_paths_for_model("ZipDepth-Base", cache_dir="cache")
+    small_paths = artifact_paths_for_model("ZipDepth-Small", cache_dir="cache")
+    assert base_paths.model_dir == small_paths.model_dir
+    assert base_paths.onnx_fp16_path != small_paths.onnx_fp16_path
+    assert base_paths.onnx_fp16_path.name == "zipdepth_base_model_fp16_384x672.onnx"
+    assert small_paths.onnx_fp16_path.name == "zipdepth_small_model_fp16_384x672.onnx"
+
+
+def test_zipdepth_runtime_config_preserves_selected_variant():
+    config = DepthRuntimeConfig(
+        model_id="ZipDepth-Small",
+        export_height=384,
+        export_width=677,
+    )
+
+    provider_config = depth_provider_config_from_runtime(config)
+
+    assert provider_config.model_id == "pablovela5620/zipdepth"
+    assert provider_config.model_name == "ZipDepth-Small"
+    assert provider_config.depth_resolution == 384
+    assert provider_config.patch_size == 32
+    assert _depth_export_size_from_settings(
+        {"Depth Model": "ZipDepth-Small", "Depth Resolution": 384}
+    ) == (384, 677)
+
+
+def test_zipdepth_download_cache_uses_variant_checkpoint(monkeypatch, tmp_path):
+    import stereo_runtime.depth_provider as depth_provider
+
+    def fake_download(model_id, filename, cache_dir, endpoint):
+        path = resolve_model_dir(model_id, cache_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"checkpoint")
+
+    monkeypatch.setattr(depth_provider, "_reachable_hf_endpoints", lambda model_id: ("hf",))
+    monkeypatch.setattr(depth_provider, "_download_hf_file_direct", fake_download)
+    registry = ModelRegistry.default()
+
+    for name, family in (("ZipDepth-Base", "zipdepth"), ("ZipDepth-Small", "zipdepth-npu")):
+        spec = registry.get(name)
+        model_dir = ensure_model_downloaded(spec, cache_dir=tmp_path)
+
+        assert spec.family == family
+        assert (model_dir / ZIPDEPTH_CHECKPOINT_FILENAMES[family]).is_file()
+        assert _model_cache_is_complete(spec, model_dir)
+
+
+def test_zipdepth_only_exposes_small_to_coreml_and_migraphx():
+    assert "zipdepth-base" in DISABLE_COREML_KEYWORDS
+    assert "zipdepth-base" in DISABLE_MIGRAPHX_KEYWORDS
+    assert not any(keyword in "zipdepth-small" for keyword in DISABLE_COREML_KEYWORDS)
+    assert not any(keyword in "zipdepth-small" for keyword in DISABLE_MIGRAPHX_KEYWORDS)
+
+
+def test_migraphx_is_hidden_for_zipdepth_base_only():
+    assert DISABLE_MIGRAPHX_KEYWORDS == ["zipdepth-base"]
 
 
 def test_gui_model_catalog_matches_v25_model_list_without_legacy_models():
@@ -98,7 +168,7 @@ def test_gui_model_catalog_matches_v25_model_list_without_legacy_models():
     assert settings.count("  dpt-") == 0
     assert settings.count("  zoedepth-") == 0
     assert settings.count("  depth-ai:") == 0
-    assert len(GUI_MODEL_CATALOG) == 35
+    assert len(GUI_MODEL_CATALOG) == 37
 
 
 def test_utils_model_mapping_delegates_to_runtime_registry():

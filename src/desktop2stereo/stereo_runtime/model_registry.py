@@ -25,7 +25,7 @@ class ModelRegistry:
         self._by_id: dict[str, DepthModelSpec] = {}
         for spec in specs:
             self._by_name[_key(spec.name)] = spec
-            self._by_id[_key(spec.model_id)] = spec
+            self._by_id.setdefault(_key(spec.model_id), spec)
 
     @classmethod
     def default(cls) -> "ModelRegistry":
@@ -64,6 +64,8 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
     DepthModelSpec("InfiniDepth-SmallPlus", "lc700x/InfiniDepth-SmallPlus", "infinidepth"),
     DepthModelSpec("InfiniDepth-Base", "lc700x/InfiniDepth-Base", "infinidepth"),
     DepthModelSpec("InfiniDepth-Large", "lc700x/InfiniDepth-Large", "infinidepth"),
+    DepthModelSpec("ZipDepth-Base", "pablovela5620/zipdepth", "zipdepth"),
+    DepthModelSpec("ZipDepth-Small", "pablovela5620/zipdepth", "zipdepth-npu"),
     DepthModelSpec("Video-Depth-Anything-Small", "depth-anything/Video-Depth-Anything-Small", "video-depth-anything"),
     DepthModelSpec("Video-Depth-Anything-Base", "depth-anything/Video-Depth-Anything-Base", "video-depth-anything"),
     DepthModelSpec("Video-Depth-Anything-Large", "depth-anything/Video-Depth-Anything-Large", "video-depth-anything"),

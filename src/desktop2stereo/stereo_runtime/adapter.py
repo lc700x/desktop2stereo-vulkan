@@ -51,6 +51,7 @@ class StereoRuntimeConfig:
     profile_sync: bool = False
     use_coreml: bool = False
     recompile_coreml: bool = False
+    use_torch_compile: bool = False
     parallel_inference: bool = False
     parallel_inference_workers: int = 1
     # Optional program-controlled OpenXR visual regression output directory.
@@ -137,7 +138,7 @@ class StereoRuntimeConfig:
 
     def _artifact_paths(self):
         return artifact_paths_for_model(
-            self.resolved_model_id,
+            self.model_id,
             cache_dir=self.cache_dir,
             model_dir=self.model_dir,
             export_height=self.export_height,
@@ -306,6 +307,7 @@ def runtime_config_from_d2s_settings(
         profile_sync=_to_bool(settings.get("Depth Profile Sync", settings.get("Profile Sync", False))),
         use_coreml=_to_bool(settings.get("CoreML", False)),
         recompile_coreml=_to_bool(settings.get("Recompile CoreML", False)),
+        use_torch_compile=_to_bool(settings.get("torch.compile", False)),
         parallel_inference=parallel_workers > 1,
         parallel_inference_workers=parallel_workers,
         stereo_compute_backend=_normalize_stereo_compute_backend(
@@ -390,9 +392,14 @@ def _depth_export_size_from_settings(
     default_height: int = 294,
     default_width: int = 518,
 ) -> tuple[int, int]:
+    model_name = settings.get("Depth Model") or settings.get("model_id") or ""
+    is_zipdepth = "zipdepth" in str(model_name).lower()
     explicit_height = _optional_int_setting(settings, "Export Height", "export_height")
     explicit_width = _optional_int_setting(settings, "Export Width", "export_width")
     depth_resolution = _optional_int_setting(settings, "Depth Resolution", "depth_resolution")
+    if is_zipdepth and explicit_height is None and explicit_width is None:
+        short_side = depth_resolution if depth_resolution is not None else 384
+        return max(1, int(short_side)), max(1, int(round(short_side * 518 / 294)))
     width = explicit_width if explicit_width is not None else depth_resolution
     if width is None:
         width = int(default_width)
@@ -581,16 +588,18 @@ def depth_provider_config_from_runtime(config: StereoRuntimeConfig) -> "DepthPro
     engine_path = config.migraphx_graph_path if backend == "migraphx_rocm" else None
     build_engine = config.build_migraphx_graph if backend == "migraphx_rocm" else config.build_trt_engine
     force_rebuild = config.force_rebuild_migraphx if backend == "migraphx_rocm" else config.force_rebuild_trt
+    is_zipdepth = "zipdepth" in config.resolved_model_id.lower()
 
     return DepthProviderConfig(
         backend=backend,
         model_id=config.resolved_model_id,
-        model_name=ModelRegistry.default().get(config.resolved_model_id).name,
+        model_name=ModelRegistry.default().get(config.model_id).name,
         device=config.device,
         cache_dir=config.model_path.parent,
         onnx_path=onnx_path,
         engine_path=engine_path,
-        depth_resolution=int(config.export_width),
+        depth_resolution=int(min(config.export_height, config.export_width) if is_zipdepth else config.export_width),
+        patch_size=32 if is_zipdepth else 14,
         onnx_dtype=config.onnx_dtype,
         local_files_only=False,
         prefer_native_tensorrt=backend == "tensorrt_native",
@@ -604,6 +613,7 @@ def depth_provider_config_from_runtime(config: StereoRuntimeConfig) -> "DepthPro
         profile_sync=config.profile_sync,
         use_coreml=bool(getattr(config, "use_coreml", False)),
         recompile_coreml=bool(getattr(config, "recompile_coreml", False)),
+        use_torch_compile=bool(getattr(config, "use_torch_compile", False)),
         execution_slot_count=config.parallel_inference_workers,
         depth_upsample=config.depth_upsample,
         depth_upsample_edge_strength=config.depth_upsample_edge_strength,

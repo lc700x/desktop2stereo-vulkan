@@ -448,37 +448,91 @@ def test_publish_runtime_item_marks_inference_pipeline_ready():
         breakdown_add_time=lambda *args, **kwargs: None,
         source_stat_inc=lambda *args, **kwargs: None,
     )
+    loop._pending_cuda_poll_interval_s = 0.002
 
     loop._publish_runtime_item((object(), 1.0, 0.01, 0.02, None))
 
     assert ready.is_set()
     assert runtime_q.qsize() == 1
+    assert loop._pending_cuda_poll_interval_s == 0.001
 
 
-def test_pending_cuda_retains_latest_raw_frame(monkeypatch):
+def test_cuda_timing_events_are_recorded_after_gpu_completion():
+    class FakeCudaEvent:
+        def __init__(self, ready, elapsed_ms=0.0):
+            self.ready = ready
+            self.elapsed_ms = elapsed_ms
+
+        def query(self):
+            return self.ready
+
+        def elapsed_time(self, end):
+            return end.elapsed_ms
+
+    ready_event = FakeCudaEvent(False)
+    start_event = FakeCudaEvent(False)
+    end_event = FakeCudaEvent(False, elapsed_ms=2.5)
+    recorded = []
+    runtime_q = queue.Queue(maxsize=1)
+    loop = object.__new__(RuntimePipelineLoop)
+    loop.context = SimpleNamespace(
+        runtime_q=runtime_q,
+        runtime_ready_event=threading.Event(),
+        queue_put_latest=lambda q, item: q.put_nowait(item),
+        breakdown_inc=lambda *args, **kwargs: None,
+        breakdown_add_time=lambda name, value: (
+            recorded.append((name, value)) if name.startswith("rt_gpu_") else None
+        ),
+        source_stat_inc=lambda *args, **kwargs: None,
+    )
+    loop._pending_cuda_timing_results = []
+    loop._pending_cuda_poll_interval_s = 0.002
+    result = SimpleNamespace(
+        debug_info={},
+        cuda_ready_event=ready_event,
+        cuda_timing_events={"start": start_event, "depth": end_event},
+    )
+
+    loop._publish_runtime_item((result, 1.0, 0.01, 0.02, None))
+
+    assert recorded == []
+    assert loop._pending_cuda_timing_results == [result]
+    ready_event.ready = True
+    start_event.ready = True
+    end_event.ready = True
+    loop._publish_ready_cuda_timing_results()
+    assert recorded == [("rt_gpu_depth", 0.0025)]
+    assert loop._pending_cuda_timing_results == []
+
+
+def test_pending_cuda_retains_latest_raw_frame():
     raw_q = queue.Queue(maxsize=1)
     raw_q.put_nowait("latest-frame")
     stats = []
     breakdown = []
-    sleeps = []
+    waits = []
+    shutdown = threading.Event()
     loop = object.__new__(RuntimePipelineLoop)
     loop.context = SimpleNamespace(
         raw_q=raw_q,
         time_sleep=1.0 / 60.0,
+        shutdown_event=SimpleNamespace(
+            is_set=shutdown.is_set,
+            wait=lambda seconds: waits.append(seconds),
+        ),
         source_stat_inc=lambda name, *args, **kwargs: stats.append(name),
         breakdown_inc=lambda name, *args, **kwargs: breakdown.append(name),
     )
-    monkeypatch.setattr(
-        "stereo_runtime.pipeline.time.sleep",
-        lambda seconds: sleeps.append(seconds),
-    )
+    loop._pending_cuda_poll_interval_s = 0.001
 
+    loop._retain_latest_raw_while_cuda_pending()
     loop._retain_latest_raw_while_cuda_pending()
 
     assert raw_q.get_nowait() == "latest-frame"
-    assert stats == ["runtime_pending_cuda_inflight"]
-    assert breakdown == ["runtime_pending_cuda_inflight"]
-    assert sleeps == [0.001]
+    assert stats == ["runtime_pending_cuda_inflight", "runtime_pending_cuda_inflight"]
+    assert breakdown == ["runtime_pending_cuda_inflight", "runtime_pending_cuda_inflight"]
+    assert waits == [0.001, 0.002]
+    assert loop._pending_cuda_poll_interval_s == 0.002
 
 
 def test_cuda_ready_event_uses_gpu_waitable_event(monkeypatch):

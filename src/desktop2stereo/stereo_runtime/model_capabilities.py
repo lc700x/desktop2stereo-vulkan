@@ -54,6 +54,7 @@ DISABLE_COREML_KEYWORDS = [
     "zoedepth",
     "depthpro",
     "infinidepth",
+    "zipdepth-base",
 ]
 
 DISABLE_OPENVINO_KEYWORDS = [
@@ -61,10 +62,9 @@ DISABLE_OPENVINO_KEYWORDS = [
     "dpt-hybrid-midas-hf",
 ]
 
-# MIGraphX is selected from the compiled ONNX graph, not from a model-family
-# allowlist. Unsupported operators/shapes must be reported by export/compile
-# instead of silently hiding the backend in the GUI.
-DISABLE_MIGRAPHX_KEYWORDS = []
+# MIGraphX is selected from the compiled ONNX graph. This variant is hidden
+# because its Unfold upsampler is not the supported mobile/NPU graph path.
+DISABLE_MIGRAPHX_KEYWORDS = ["zipdepth-base"]
 
 DISABLE_CUDNN_KEYWORDS = [
     "6950",
