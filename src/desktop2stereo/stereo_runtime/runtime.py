@@ -549,6 +549,10 @@ def _try_openxr_no_fill_fused_rgba_u8(
 
     _record_cuda_event(cuda_events, "synth_start", rgb)
     depth_shift_start = time.perf_counter()
+    edge_smoothing_enabled = output_edge_aa_enabled()
+    edge_supersampling_enabled = edge_smoothing_enabled and (
+        torch.version.hip is not None or max(int(rgb.shape[-2]), int(rgb.shape[-1])) <= 1920
+    )
     processed_depth = postprocess_depth(
         match_depth(
             depth,
@@ -559,7 +563,7 @@ def _try_openxr_no_fill_fused_rgba_u8(
         ),
         depth_pop=float(getattr(config, "depth_pop", 0.0)),
         antialias_strength=float(getattr(config, "depth_antialias_strength", 0.0)),
-        global_gaussian=output_edge_aa_enabled(),
+        global_gaussian=edge_smoothing_enabled,
     )
     _record_cuda_event(cuda_events, "synth_depth_postprocess", rgb)
     params = ShiftParams(
@@ -590,7 +594,12 @@ def _try_openxr_no_fill_fused_rgba_u8(
         rgba_u8_error = None
         use_float_warp_pack = False
         try:
-            left, right = warp_composite2_rgba_u8(rgb, processed_depth, base_shift)
+            left, right = warp_composite2_rgba_u8(
+                rgb,
+                processed_depth,
+                base_shift,
+                edge_aa_enabled=edge_supersampling_enabled,
+            )
         except Exception as exc:
             rgba_u8_error = type(exc).__name__
             use_float_warp_pack = True

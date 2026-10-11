@@ -615,6 +615,8 @@ def warp_composite2_rgba_u8(
     rgb: torch.Tensor,
     depth: torch.Tensor,
     base_shift: torch.Tensor,
+    *,
+    edge_aa_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rgb = rgb.contiguous()
     depth = depth.contiguous()
@@ -628,5 +630,5 @@ def warp_composite2_rgba_u8(
     _warp_composite2_rgba_u8_kernel[
         grid
     ](rgb, depth, base_shift, left, right, pixels, width, 0.08,
-       False, block)
+       bool(edge_aa_enabled), block)
     return left, right

@@ -1122,19 +1122,33 @@ kernel void d2s_filter_depth_global_gaussian(
     constant DepthGaussianParams& p [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.depth_width || gid.y >= p.depth_height) return;
-    constexpr float weights[7] = {
-        0.07015933f, 0.13107488f, 0.19071282f, 0.21610594f,
-        0.19071282f, 0.13107488f, 0.07015933f
+    constexpr float weights[5] = {
+        0.15246914f, 0.22184130f, 0.25137912f,
+        0.22184130f, 0.15246914f
     };
+    float long_edge = float(max(p.depth_width, p.depth_height));
+    float spacing = 1.0f + 0.5f * clamp((long_edge - 1920.0f) / 1920.0f, 0.0f, 1.0f);
     float sum = 0.0f;
-    for (int oy = -3; oy <= 3; ++oy) {
-        int sy = clamp(int(gid.y) + oy, 0, int(p.depth_height) - 1);
-        float wy = weights[oy + 3];
-        for (int ox = -3; ox <= 3; ++ox) {
-            int sx = clamp(int(gid.x) + ox, 0, int(p.depth_width) - 1);
-            float weight = wy * weights[ox + 3];
-            float value = source_depth[uint(sy) * p.depth_width + uint(sx)];
-            sum += d2s_gaussian_depth_pop(value, p.depth_pop) * weight;
+    for (int oy = -2; oy <= 2; ++oy) {
+        float sample_y = clamp(
+            float(gid.y) + float(oy) * spacing, 0.0f, float(p.depth_height - 1u));
+        uint y0 = uint(floor(sample_y));
+        uint y1 = min(y0 + 1u, p.depth_height - 1u);
+        float fy = sample_y - float(y0);
+        float wy = weights[oy + 2];
+        for (int ox = -2; ox <= 2; ++ox) {
+            float sample_x = clamp(
+                float(gid.x) + float(ox) * spacing, 0.0f, float(p.depth_width - 1u));
+            uint x0 = uint(floor(sample_x));
+            uint x1 = min(x0 + 1u, p.depth_width - 1u);
+            float fx = sample_x - float(x0);
+            float top = mix(
+                d2s_gaussian_depth_pop(source_depth[y0 * p.depth_width + x0], p.depth_pop),
+                d2s_gaussian_depth_pop(source_depth[y0 * p.depth_width + x1], p.depth_pop), fx);
+            float bottom = mix(
+                d2s_gaussian_depth_pop(source_depth[y1 * p.depth_width + x0], p.depth_pop),
+                d2s_gaussian_depth_pop(source_depth[y1 * p.depth_width + x1], p.depth_pop), fx);
+            sum += mix(top, bottom, fy) * wy * weights[ox + 2];
         }
     }
     filtered_depth[gid.y * p.depth_width + gid.x] = clamp(sum, 0.0f, 1.0f);

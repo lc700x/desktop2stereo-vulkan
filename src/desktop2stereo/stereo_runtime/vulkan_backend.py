@@ -239,6 +239,9 @@ class VulkanStereoImageComputeBackend:
         for image in (left_eye, right_eye):
             resource = getattr(image, "resource", image)
             self.context.register_image_state(resource.image, output_state)
+        depth_gaussian_enabled = bool(
+            getattr(self._pass, "depth_gaussian_enabled", False)
+        )
         return int(timeline), {
             "stereo_compute_backend": "vulkan",
             "vulkan_fused_backend": (
@@ -261,9 +264,9 @@ class VulkanStereoImageComputeBackend:
             "vulkan_compute_input_color_space": "srgb",
             "vulkan_compute_output_image_format": "R8G8B8A8_UNORM",
             "vulkan_compute_output_image_encoding": "linear",
-            "vulkan_depth_gaussian_enabled": self._pass.depth_gaussian_enabled,
+            "vulkan_depth_gaussian_enabled": depth_gaussian_enabled,
             "vulkan_depth_gaussian": (
-                "7x7_sigma2" if self._pass.depth_gaussian_enabled else "disabled"
+                "5x5_sigma2_scaled" if depth_gaussian_enabled else "disabled"
             ),
             "vulkan_output_sync": "vulkan_compute_external_semaphore",
             "vulkan_input_path": input_mode,

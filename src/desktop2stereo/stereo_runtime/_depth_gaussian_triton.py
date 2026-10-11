@@ -21,6 +21,8 @@ if triton is not None:
         width: tl.constexpr,
         height: tl.constexpr,
         total: tl.constexpr,
+        WEIGHTS: tl.constexpr,
+        RADIUS: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -32,39 +34,22 @@ if triton is not None:
         x = pixel % width
         result = tl.full((BLOCK,), 0.0, tl.float32)
 
-        for dy in tl.static_range(-3, 4):
+        for dy in tl.static_range(-RADIUS, RADIUS + 1):
             yy = tl.minimum(tl.maximum(y + dy, 0), height - 1)
-            wy = tl.where(
-                tl.abs(dy) == 3,
-                0.07015933,
-                tl.where(
-                    tl.abs(dy) == 2,
-                    0.13107488,
-                    tl.where(tl.abs(dy) == 1, 0.19071282, 0.21610594),
-                ),
-            )
-            for dx in tl.static_range(-3, 4):
+            wy = WEIGHTS[dy + RADIUS]
+            for dx in tl.static_range(-RADIUS, RADIUS + 1):
                 xx = tl.minimum(tl.maximum(x + dx, 0), width - 1)
-                wx = tl.where(
-                    tl.abs(dx) == 3,
-                    0.07015933,
-                    tl.where(
-                        tl.abs(dx) == 2,
-                        0.13107488,
-                        tl.where(tl.abs(dx) == 1, 0.19071282, 0.21610594),
-                    ),
-                )
+                wx = WEIGHTS[dx + RADIUS]
+                base = batch * plane
                 sample = tl.load(
-                    source + batch * plane + yy * width + xx,
-                    mask=active,
-                    other=0.0,
+                    source + base + yy * width + xx, mask=active, other=0.0
                 ).to(tl.float32)
                 result += sample * wx * wy
 
         tl.store(output + offset, tl.minimum(tl.maximum(result, 0.0), 1.0), mask=active)
 
 
-def gaussian_1(depth: torch.Tensor) -> torch.Tensor:
+def gaussian_1(depth: torch.Tensor, *, spacing: float = 1.0) -> torch.Tensor:
     if (
         triton is None
         or not isinstance(depth, torch.Tensor)
@@ -74,11 +59,21 @@ def gaussian_1(depth: torch.Tensor) -> torch.Tensor:
         or not triton_runtime_available(depth.device)
     ):
         raise RuntimeError("Triton depth Gaussian is unavailable")
+    from .depth_postprocess import _global_gaussian_axis_weights
+
     batch, _, height, width = map(int, depth.shape)
     output = torch.empty_like(depth)
     total = batch * height * width
     block = 256
+    weights = _global_gaussian_axis_weights(float(spacing))
     _gaussian_1_kernel[(triton.cdiv(total, block),)](
-        depth, output, width, height, total, block
+        depth,
+        output,
+        width,
+        height,
+        total,
+        WEIGHTS=weights,
+        RADIUS=len(weights) // 2,
+        BLOCK=block,
     )
     return output

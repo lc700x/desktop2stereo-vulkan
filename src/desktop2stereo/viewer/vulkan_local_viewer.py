@@ -2446,7 +2446,7 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             reused = False
             try:
                 result, _started = runtime_q.get(
-                    timeout=0.005 if cached_frame is not None else 0.05
+                    timeout=(1.0 / 60.0) if cached_frame is not None else 0.05
                 )
             except queue.Empty:
                 if viewer is not None and cached_frame is not None:

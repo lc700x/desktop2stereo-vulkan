@@ -483,15 +483,23 @@ class WindowsCaptureEventRunner:
                     self.capture_tool,
                 )
                 enqueue_start_time = time.perf_counter()
-                resource_contract = native_resource_contract(native_resource) if native_resource is not None else {
-                    "resource_kind": "cpu_frame_buffer",
-                    "resource_format": type(frame.frame_buffer).__name__,
-                    "resource_width": None,
-                    "resource_height": None,
-                    "adapter_luid": 0,
-                    "adapter_identity": None,
-                    "resource_lifecycle": "owned_copy",
-                }
+                if native_resource is not None:
+                    resource_contract = native_resource_contract(native_resource)
+                else:
+                    gpu_tensor = copy_mode is FrameCopyMode.GPU_TENSOR
+                    resource_contract = {
+                        "resource_kind": (
+                            f"{frame_raw_device}_tensor" if gpu_tensor else "cpu_frame_buffer"
+                        ),
+                        "resource_format": type(frame.frame_buffer).__name__,
+                        "resource_width": None,
+                        "resource_height": None,
+                        "adapter_luid": 0,
+                        "adapter_identity": None,
+                        "resource_lifecycle": (
+                            "retained_tensor_reference" if gpu_tensor else "owned_copy"
+                        ),
+                    }
                 native_output = native_resource is not None
                 native_to_cpu = bool(native_output and raw is not native_resource)
                 output_frame = native_resource if native_output else raw

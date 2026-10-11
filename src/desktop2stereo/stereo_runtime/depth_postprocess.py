@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import functools
+import logging
+import math
+import threading
 import torch
 import torch.nn.functional as F
 
 from .output import ensure_b1hw, ensure_bchw
+
+
+_LOGGER = logging.getLogger(__name__)
+_TRITON_GAUSSIAN_FAILURE_LOCK = threading.Lock()
+_TRITON_GAUSSIAN_FAILURE_RECORDED = False
 
 
 _GLOBAL_GAUSSIAN_MSL = r"""
@@ -15,21 +23,28 @@ kernel void d2s_depth_global_gaussian(
     device const float* source [[buffer(0)]],
     device float* output [[buffer(1)]],
     constant DepthGaussianParams& p [[buffer(2)]],
+    constant float& spacing [[buffer(3)]],
     uint3 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.width || gid.y >= p.height || gid.z >= p.batches) return;
-    constexpr float weights[7] = {
-        0.07015933f, 0.13107488f, 0.19071282f, 0.21610594f,
-        0.19071282f, 0.13107488f, 0.07015933f
+    constexpr float weights[5] = {
+        0.15246914f, 0.22184130f, 0.25137912f,
+        0.22184130f, 0.15246914f
     };
     float sum = 0.0f;
-    for (int dy = -3; dy <= 3; ++dy) {
-        int y = clamp(int(gid.y) + dy, 0, int(p.height) - 1);
-        float wy = weights[dy + 3];
-        for (int dx = -3; dx <= 3; ++dx) {
-            int x = clamp(int(gid.x) + dx, 0, int(p.width) - 1);
-            float weight = wy * weights[dx + 3];
-            uint index = gid.z * p.width * p.height + uint(y) * p.width + uint(x);
-            sum += source[index] * weight;
+    for (int dy = -2; dy <= 2; ++dy) {
+        float sample_y = clamp(float(gid.y) + float(dy) * spacing, 0.0f, float(p.height - 1));
+        uint y0 = uint(floor(sample_y));
+        uint y1 = min(y0 + 1u, p.height - 1u);
+        float fy = sample_y - float(y0);
+        for (int dx = -2; dx <= 2; ++dx) {
+            float sample_x = clamp(float(gid.x) + float(dx) * spacing, 0.0f, float(p.width - 1));
+            uint x0 = uint(floor(sample_x));
+            uint x1 = min(x0 + 1u, p.width - 1u);
+            float fx = sample_x - float(x0);
+            uint base = gid.z * p.width * p.height;
+            float top = mix(source[base + y0 * p.width + x0], source[base + y0 * p.width + x1], fx);
+            float bottom = mix(source[base + y1 * p.width + x0], source[base + y1 * p.width + x1], fx);
+            sum += mix(top, bottom, fy) * weights[dy + 2] * weights[dx + 2];
         }
     }
     uint index = gid.z * p.width * p.height + gid.y * p.width + gid.x;
@@ -43,19 +58,53 @@ def _mps_depth_gaussian_library():
     return torch.mps.compile_shader(_GLOBAL_GAUSSIAN_MSL)
 
 
+@functools.lru_cache(maxsize=16)
+def _global_gaussian_axis_weights(spacing: float) -> tuple[float, ...]:
+    radius = math.ceil(2.0 * spacing)
+    axis = [0.0] * (2 * radius + 1)
+    sample_weights = [math.exp(-(offset * offset) / 8.0) for offset in range(-2, 3)]
+    weight_sum = sum(sample_weights)
+    for offset, weight in zip(range(-2, 3), sample_weights):
+        position = offset * spacing
+        lower = math.floor(position)
+        fraction = position - lower
+        axis[lower + radius] += weight / weight_sum * (1.0 - fraction)
+        if fraction > 0.0:
+            axis[lower + radius + 1] += weight / weight_sum * fraction
+    return tuple(axis)
+
+
+@functools.lru_cache(maxsize=16)
+def _global_gaussian_kernel(device_type: str, device_index: int | None, dtype: torch.dtype, spacing: float):
+    device = torch.device(device_type, device_index) if device_index is not None else torch.device(device_type)
+    axis_tensor = torch.tensor(
+        _global_gaussian_axis_weights(spacing), dtype=dtype, device=device
+    )
+    return (axis_tensor[:, None] * axis_tensor[None, :]).view(
+        1, 1, len(axis_tensor), len(axis_tensor)
+    )
+
+
+def _depth_gaussian_spacing(height: int, width: int) -> float:
+    long_edge = max(int(height), int(width))
+    return 1.0 + 0.5 * min(1.0, max(0.0, (long_edge - 1920.0) / 1920.0))
+
+
 def anti_alias_depth_global_gaussian(depth: torch.Tensor) -> torch.Tensor:
-    """Apply the shared 7x7, sigma-2 Gaussian to normalized depth values."""
+    """Apply one resolution-scaled 5x5, sigma-2 Gaussian to normalized depth."""
     depth = ensure_b1hw(depth).float().contiguous()
     batch, _, height, width = map(int, depth.shape)
     if min(batch, height, width) < 1:
         return depth
+    spacing = _depth_gaussian_spacing(height, width)
 
     if depth.device.type == "mps":
         try:
             output = torch.empty_like(depth)
             params = torch.tensor((width, height, batch), dtype=torch.int32, device="mps")
+            sample_spacing = torch.tensor((spacing,), dtype=torch.float32, device="mps")
             _mps_depth_gaussian_library().d2s_depth_global_gaussian(
-                depth, output, params, threads=(width, height, batch)
+                depth, output, params, sample_spacing, threads=(width, height, batch)
             )
             return output
         except Exception:
@@ -65,15 +114,22 @@ def anti_alias_depth_global_gaussian(depth: torch.Tensor) -> torch.Tensor:
         try:
             from ._depth_gaussian_triton import gaussian_1
 
-            return gaussian_1(depth)
-        except Exception:
-            pass
+            return gaussian_1(depth, spacing=spacing)
+        except Exception as exc:
+            global _TRITON_GAUSSIAN_FAILURE_RECORDED
+            with _TRITON_GAUSSIAN_FAILURE_LOCK:
+                if not _TRITON_GAUSSIAN_FAILURE_RECORDED:
+                    _LOGGER.warning(
+                        "Triton 5x5 depth Gaussian failed; falling back to Torch: %s",
+                        exc,
+                    )
+                    _TRITON_GAUSSIAN_FAILURE_RECORDED = True
 
-    coords = torch.arange(-3, 4, device=depth.device, dtype=depth.dtype)
-    kernel_1d = torch.exp(-(coords * coords) / 8.0)
-    kernel_1d = kernel_1d / kernel_1d.sum().clamp_min(1e-8)
-    kernel = (kernel_1d[:, None] * kernel_1d[None, :]).view(1, 1, 7, 7)
-    padded = F.pad(depth, (3, 3, 3, 3), mode="replicate")
+    kernel = _global_gaussian_kernel(
+        depth.device.type, depth.device.index, depth.dtype, spacing
+    )
+    radius = int(kernel.shape[-1]) // 2
+    padded = F.pad(depth, (radius, radius, radius, radius), mode="replicate")
     return F.conv2d(padded, kernel).clamp(0.0, 1.0)
 
 

@@ -4,7 +4,7 @@ import os
 import platform
 import warnings
 from dataclasses import dataclass
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any
 
 try:
@@ -15,7 +15,11 @@ except Exception:  # pragma: no cover - exercised on installations without Trito
     tl = None
 
 
-def _ensure_windows_cc() -> None:
+_WINDOWS_CC_LOCK = Lock()
+_WINDOWS_CC_CHECKED = False
+
+
+def _ensure_windows_cc(*, force: bool = False) -> None:
     """Point Triton's C compiler at its bundled TinyCC when MSVC is absent.
 
     On Windows, ``triton.runtime.build.get_cc()`` prefers the ROCm SDK
@@ -29,34 +33,42 @@ def _ensure_windows_cc() -> None:
     uses bundled TinyCC), so Triton's "Failed to find MSVC" UserWarning is
     noise here and is suppressed for the probe.
     """
-    if os.name != "nt" or os.environ.get("CC"):
+    if os.name != "nt":
         return
-    try:
-        import sysconfig
+    global _WINDOWS_CC_CHECKED
+    with _WINDOWS_CC_LOCK:
+        if _WINDOWS_CC_CHECKED and not force:
+            return
+        if os.environ.get("CC"):
+            _WINDOWS_CC_CHECKED = True
+            return
+        try:
+            import sysconfig
 
-        from triton.windows_utils import find_msvc
+            from triton.windows_utils import find_msvc
 
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Failed to find MSVC.*",
-                category=UserWarning,
-                module=r"triton\.windows_utils",
-            )
-            msvc_bin, _, _ = find_msvc(env_only=False)
-        if msvc_bin:
-            return  # real MSVC present; keep Triton's default compiler
-        tcc = os.path.join(
-            sysconfig.get_paths()["platlib"],
-            "triton",
-            "runtime",
-            "tcc",
-            "tcc.exe",
-        )
-        if os.path.exists(tcc):
-            os.environ["CC"] = tcc
-    except Exception:  # pragma: no cover - best-effort environment fix
-        pass
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Failed to find MSVC.*",
+                    category=UserWarning,
+                    module=r"triton\.windows_utils",
+                )
+                msvc_bin, _, _ = find_msvc(env_only=False)
+            if not msvc_bin:
+                tcc = os.path.join(
+                    sysconfig.get_paths()["platlib"],
+                    "triton",
+                    "runtime",
+                    "tcc",
+                    "tcc.exe",
+                )
+                if os.path.exists(tcc):
+                    os.environ["CC"] = tcc
+        except Exception:  # pragma: no cover - best-effort environment fix
+            pass
+        finally:
+            _WINDOWS_CC_CHECKED = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,7 +135,6 @@ def probe_triton_runtime(device: Any = None, *, force: bool = False) -> TritonRu
     from a vendor ID or package name.
     """
 
-    _ensure_windows_cc()
     try:
         import torch
     except Exception as exc:
@@ -142,6 +153,8 @@ def probe_triton_runtime(device: Any = None, *, force: bool = False) -> TritonRu
             cached = _CACHE.get(key)
         if cached is not None:
             return cached
+
+    _ensure_windows_cc(force=force)
 
     torch_version = str(getattr(torch, "__version__", "unknown"))
     try:
@@ -249,3 +262,6 @@ def clear_triton_probe_cache() -> None:
 
     with _LOCK:
         _CACHE.clear()
+    global _WINDOWS_CC_CHECKED
+    with _WINDOWS_CC_LOCK:
+        _WINDOWS_CC_CHECKED = False

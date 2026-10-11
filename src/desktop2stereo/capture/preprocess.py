@@ -61,6 +61,12 @@ def prepare_rgb_for_stereo_runtime(frame_rgb, *, device=None):
         raise TypeError("frame_rgb must be a torch.Tensor or numpy.ndarray prepared by capture")
 
     source_frame = frame_rgb
+    already_normalized = getattr(source_frame, "_d2s_preprocess_backend", None) in {
+        "torch_bgr_norm",
+        "torch_bgr_resize_norm",
+        "triton_bgr_resize_norm",
+        "triton_bgr_area_resize_norm",
+    }
     if frame_rgb.ndim == 3 and frame_rgb.shape[0] == 3:
         tensor = frame_rgb.unsqueeze(0)
     elif frame_rgb.ndim == 4 and frame_rgb.shape[1] == 3:
@@ -72,7 +78,8 @@ def prepare_rgb_for_stereo_runtime(frame_rgb, *, device=None):
     tensor = tensor.to(device=device, dtype=torch.float32)
     if scale_from_uint8:
         tensor = tensor.mul_(1.0 / 255.0)
-    tensor = tensor.clamp_(0.0, 1.0)
+    if scale_from_uint8 or not already_normalized:
+        tensor = tensor.clamp_(0.0, 1.0)
     _copy_preprocess_metadata(source_frame, tensor)
     return tensor
 

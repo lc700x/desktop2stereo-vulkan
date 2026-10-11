@@ -140,6 +140,7 @@ def test_windows_capture_runner_uses_copy_or_clone_buffers(monkeypatch):
     assert received[-1].copy_mode is FrameCopyMode.GPU_TENSOR
     assert received[-1].frame_raw_device == "cuda"
     assert received[-1].metadata["zero_copy"] is True
+    assert received[-1].metadata["resource_kind"] == "cuda_tensor"
     assert received[-1].capture_tool == "WindowsCaptureCUDA"
     assert received[-1].capture_mode == "Monitor"
     assert received[-1].monitor_index == 3
@@ -458,6 +459,7 @@ def test_windows_capture_runner_marks_rocm_direct_device(monkeypatch):
     assert received[-1].copy_mode is FrameCopyMode.GPU_TENSOR
     assert received[-1].frame_raw_device == "rocm"
     assert received[-1].metadata["zero_copy"] is True
+    assert received[-1].metadata["resource_kind"] == "rocm_tensor"
 
 
 def test_windows_capture_cuda_source_fps_log_defaults_off(capsys):
