@@ -1,0 +1,60 @@
+# -r requirements-pip-options.txt
+glcontext==3.0.0
+glfw==2.10.0
+moderngl==5.12.0
+opencv-python==4.13.0.92
+transformers==5.12.1
+huggingface_hub==1.20.1
+hf_xet==1.5.1
+safetensors==0.8.0
+numpy==2.5.0
+pillow==12.2.0
+flet==0.86.5
+onnx==1.22.0
+onnxscript==0.7.0
+mss==10.2.0
+pynput==1.8.2
+pyperclip==1.11.0
+wincam==1.0.14; sys_platform == "win32"
+windows-capture==2.0.0; sys_platform == "win32"
+python_xlib; sys_platform == "linux"
+# for video depth anything
+imageio==2.37.3
+easydict==1.13
+einops==0.8.2
+
+# for rtmp and new streaming
+sounddevice==0.5.5
+pygltflib>=1.16.5
+
+# Vulkan/OpenXR primary path
+pyopenxr==1.1.5301
+# PyPI package "vulkan" currently has no 1.4.x release; 1.3.275.1 is the latest available binding.
+vulkan==1.3.275.1
+
+# OpenGL fallback path
+PyOpenGL==3.1.10
+PyOpenGL-accelerate==3.1.10
+
+# Torch 2.11 requires setuptools<82.
+setuptools==78.1.0
+
+# for da3
+omegaconf==2.3.1
+addict==2.4.0
+evo==1.36.5
+e3nn==0.6.0
+
+# test
+pytest==9.1.1
+
+# cert truststore
+truststore==0.10.4
+
+# Optional NVIDIA zero-copy encoder API (Windows x64; FFmpeg remains the fallback).
+PyNvVideoCodec==2.2.0; platform_system == "Windows" and platform_machine == "AMD64"
+# Optional Windows WASAPI loopback capture; 0.4.6 supports NumPy 2.x binary buffers.
+soundcard==0.4.6; platform_system == "Windows"
+
+# GPU profiles are installed separately from requirements-cuda.txt or requirements-rocm7.txt.
+# CUDA 12.8 stable profile: torch 2.11.0 + torchvision 0.26.0 + Triton 3.6.

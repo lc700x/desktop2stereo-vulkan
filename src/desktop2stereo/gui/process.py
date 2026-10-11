@@ -83,6 +83,9 @@ _STATUS_PREFIX = "[D2S_STATUS] "
 _BACKEND_STATUS_PREFIX = "[D2S_BACKEND_STATUS] "
 _DISPLAY_REFRESH_WARNING_PREFIX = "[D2S_DISPLAY_REFRESH_WARNING] "
 _TCL_SHUTDOWN_NOISE_MARKER = "tcl_asyncdelete: async handler deleted by the wrong thread"
+_MIGRAPHX_QUICK_TUNING_WARNING = (
+    "per-problem quick tuning does not represent the current problem's output_fusions"
+)
 _TCL_SHUTDOWN_STACK_RE = re.compile(r"^0x[0-9a-f]+(?:,|\s)", re.IGNORECASE)
 _ASYNCIO_SHUTDOWN_UNRAISABLE_MODULES = (
     "asyncio.base_subprocess",
@@ -1668,6 +1671,8 @@ class GUIProcessMixin:
     def _log_child_line(self, line):
         text = str(line or "").strip()
         if not text:
+            return
+        if _MIGRAPHX_QUICK_TUNING_WARNING in text.casefold():
             return
         # Tk can emit this native panic while the runtime is exiting if a
         # background Tk thread is being finalized at the same time.  It is

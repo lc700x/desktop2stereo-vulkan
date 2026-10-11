@@ -3,7 +3,7 @@
 Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp. depth), using `src\python3` as the ROCm env, without breaking the CUDA path.
 
 ## Environment facts
-- `src\python3` = AMD ROCm env: Python 3.12, torch 2.10.0+rocm7.14.0, migraphx, wc_rocm (WindowsCaptureROCm capture), triton 3.7.1.
+- `src\python3` = AMD ROCm env: Python 3.12, torch 2.11.0+rocm7.14.0, migraphx, wc_rocm (WindowsCaptureROCm capture), triton 3.7.1.
 - `src\python3_cuda` = CUDA env (torch 2.11+cu128) — used to verify CUDA path unchanged.
 - Machine: AMD Radeon RX 9060 XT (primary). NVIDIA RTX 5070 Ti was present but is now disabled. Virtual display adapters exist.
 - Monitor on the AMD GPU: D270H (identity `DISPLAY\TUP0270\5&3b49acb3&8&UID4357`, manuf TUP, 1920x1200). Dell U2410(DP) `DELF017` is elsewhere.

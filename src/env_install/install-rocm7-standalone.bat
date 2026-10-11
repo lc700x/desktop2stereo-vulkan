@@ -5,7 +5,11 @@ echo --- Desktop2Stereo Installer (With ROCm7 for AMD GPU/APUs.) ---
 set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%..") do set "PROJECT_ROOT=%%~fI"
 set "PYTHON_ROOT=%PROJECT_ROOT%\python3"
-set "PYTHONPATH=%PYTHON_ROOT%;%PYTHONPATH%"
+set "PYTHONPATH=%PYTHON_ROOT%"
+set "PYTHONNOUSERSITE=1"
+set "PIP_TARGET="
+set "PIP_PREFIX="
+set "PIP_USER="
 set "PYTHON_EXE=%PYTHON_ROOT%\python.exe"
 set "PYTHON_VERSION=3.12.10"
 set "PYTHON_STAGING=%SCRIPT_DIR%python3.installing"
@@ -65,13 +69,13 @@ set "REQUIREMENTS_FILE=%SCRIPT_DIR%requirements-rocm7.txt"
 
 echo.
 echo Installing requirements from: %REQUIREMENTS_FILE%
-"%PYTHON_EXE%" -m pip install -r "%REQUIREMENTS_FILE%" --cache-dir "%D2S_PIP_CACHE%" --prefer-binary --no-warn-script-location --retries %PIP_RETRIES% --timeout %PIP_TIMEOUT%
+"%PYTHON_EXE%" -m pip install -r "%REQUIREMENTS_FILE%" --cache-dir "%D2S_PIP_CACHE%" --prefer-binary --no-user --no-warn-script-location --retries %PIP_RETRIES% --timeout %PIP_TIMEOUT%
 if errorlevel 1 (
     echo Failed to install ROCm requirements
     pause
     exit /b 1
 )
-"%PYTHON_EXE%" -m pip install -r "%SCRIPT_DIR%requirements.txt" --cache-dir "%D2S_PIP_CACHE%" --prefer-binary --no-warn-script-location --retries %PIP_RETRIES% --timeout %PIP_TIMEOUT%
+"%PYTHON_EXE%" -m pip install -r "%SCRIPT_DIR%requirements.txt" --cache-dir "%D2S_PIP_CACHE%" --prefer-binary --no-user --no-warn-script-location --retries %PIP_RETRIES% --timeout %PIP_TIMEOUT%
 if errorlevel 1 (
     echo Failed to install requirements
     pause
@@ -92,9 +96,15 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+"%PYTHON_EXE%" -c "from pathlib import Path; import sys,triton; Path(triton.__file__).resolve().relative_to(Path(sys.prefix).resolve())" >nul 2>nul
+if errorlevel 1 (
+    echo Triton is not installed in the bundled Python runtime
+    pause
+    exit /b 1
+)
 echo Python environment deployed successfully.
 
-echo To enable torch.compile on AMD ROCm7 supported GPUs, you must install vs_buildtools https://aka.ms/vs/17/release/vs_buildtools.exe and select the "Desktop development with C++" to install (~6GB). OR you can just run with the torch.compile unchecked.
+echo The bundled AMD Triton JIT uses the bundled ROCm clang and project-local runtime stubs; Visual Studio Build Tools are not required for this path.
 
 pause
 exit /b 0

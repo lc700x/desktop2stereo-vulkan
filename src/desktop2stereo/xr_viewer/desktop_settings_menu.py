@@ -1,9 +1,8 @@
 """Flet desktop mirror for the in-headset OpenXR settings menu.
 
 The in-headset menu remains the source of truth. This module only mirrors its
-snapshots in a normal Flet desktop window and returns physical mouse actions
-through the existing action queue. A tiny Tk gear remains solely as the
-transparent floating launcher requested for the OpenXR desktop view.
+snapshots in a Flet desktop window and returns physical mouse actions through
+the existing action queue. The floating launcher uses the same Flet window.
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ import queue
 import subprocess
 import threading
 import time
-import tkinter as tk
 from pathlib import Path
 from typing import Any
 
@@ -306,6 +304,16 @@ def _icon_geometry_for_monitor(
     return icon_x, icon_y, icon_width, icon_height
 
 
+def _primary_screen_size() -> tuple[int, int]:
+    """Return the primary screen size for launcher placement without Tk."""
+    if os.name == "nt":
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    return 1920, 1080
+
+
 def _flet_panel_position_for_monitor(
     monitor_rect: tuple[int, int, int, int] | None,
 ) -> tuple[int, int] | None:
@@ -521,7 +529,7 @@ def _run_flet_desktop_settings_app(
         page.title = translate("Desktop2Stereo OpenXR Settings")
         page.padding = 0
         page.spacing = 0
-        page.bgcolor = _menu_color("surface")
+        page.bgcolor = ft.Colors.TRANSPARENT
         page.fonts = {"Inter": "InterVariable.ttf"}
         page.theme = ft.Theme(
             color_scheme_seed=_menu_color("primary"),
@@ -531,17 +539,27 @@ def _run_flet_desktop_settings_app(
         icon_path = Path(__file__).resolve().parents[1] / "icon2.ico"
         if icon_path.is_file():
             page.window.icon = str(icon_path)
-        page.window.width = _FLET_PANEL_SIZE[0]
-        page.window.height = _FLET_PANEL_SIZE[1]
-        panel_position = _flet_panel_position_for_monitor(input_monitor_rect)
-        if panel_position is not None:
-            page.window.left, page.window.top = panel_position
-        page.window.min_width = 580
-        page.window.min_height = 420
+        icon_geometry = _icon_geometry_for_monitor(
+            input_monitor_rect,
+            fallback_size=_primary_screen_size(),
+        )
+        page.window.width = DESKTOP_SETTINGS_ICON_SIZE[0]
+        page.window.height = DESKTOP_SETTINGS_ICON_SIZE[1]
+        page.window.left, page.window.top = icon_geometry[:2]
+        page.window.min_width = 1
+        page.window.min_height = 1
         page.window.maximizable = False
+        page.window.resizable = False
+        page.window.movable = False
         page.window.always_on_top = True
+        page.window.skip_task_bar = True
+        page.window.frameless = True
+        page.window.title_bar_hidden = True
+        page.window.title_bar_buttons_hidden = True
+        page.window.opacity = DESKTOP_SETTINGS_ICON_OPACITY
+        page.window.bgcolor = ft.Colors.TRANSPARENT
         page.window.prevent_close = True
-        page.window.visible = False
+        page.window.visible = True
 
         body_content = ft.Column(
             controls=[
@@ -588,20 +606,91 @@ def _run_flet_desktop_settings_app(
             expand=True,
             vertical_alignment=ft.CrossAxisAlignment.STRETCH,
         )
-        page.add(
-            ft.Container(
-                expand=True,
-                bgcolor=_menu_color("surface"),
-                padding=8,
-                content=layout,
-            )
+        panel_view = ft.Container(
+            expand=True,
+            bgcolor=_menu_color("surface"),
+            padding=8,
+            content=layout,
         )
+
+        def request_panel_toggle(_event: Any) -> None:
+            try:
+                commands.put_nowait("__toggle_flet__")
+            except Exception:
+                pass
+
+        launcher_view = ft.Container(
+            width=DESKTOP_SETTINGS_ICON_SIZE[0],
+            height=DESKTOP_SETTINGS_ICON_SIZE[1],
+            alignment=ft.Alignment.CENTER,
+            bgcolor=ft.Colors.TRANSPARENT,
+            content=ft.IconButton(
+                icon=ft.Icons.SETTINGS,
+                icon_size=32,
+                icon_color=_menu_color("text_primary"),
+                tooltip=translate("OpenXR Settings"),
+                on_click=request_panel_toggle,
+            ),
+        )
+        page.add(launcher_view)
 
         slider_widgets: dict[str, tuple[Any, Any, float]] = {}
         step_widgets: dict[str, tuple[Any, Any]] = {}
         toggle_widgets: dict[str, Any] = {}
         layout_signature: tuple[Any, ...] | None = None
+        active_monitor_rect = input_monitor_rect
         visible = False
+
+        def set_window_mode(show_panel: bool) -> None:
+            nonlocal visible
+            visible = show_panel
+            page.controls.clear()
+            if show_panel:
+                page.add(panel_view)
+                page.bgcolor = _menu_color("surface")
+                page.window.width = _FLET_PANEL_SIZE[0]
+                page.window.height = _FLET_PANEL_SIZE[1]
+                page.window.min_width = 580
+                page.window.min_height = 420
+                page.window.resizable = True
+                page.window.movable = True
+                page.window.skip_task_bar = False
+                page.window.frameless = False
+                page.window.title_bar_hidden = False
+                page.window.title_bar_buttons_hidden = False
+                page.window.opacity = 1.0
+                page.window.bgcolor = _menu_color("surface")
+                monitor_rect = active_monitor_rect or (
+                    0,
+                    0,
+                    *_primary_screen_size(),
+                )
+                panel_position = _flet_panel_position_for_monitor(monitor_rect)
+                if panel_position is not None:
+                    page.window.left, page.window.top = panel_position
+                page.window.visible = True
+                page.window.focused = True
+            else:
+                page.add(launcher_view)
+                page.bgcolor = ft.Colors.TRANSPARENT
+                page.window.width = DESKTOP_SETTINGS_ICON_SIZE[0]
+                page.window.height = DESKTOP_SETTINGS_ICON_SIZE[1]
+                page.window.min_width = 1
+                page.window.min_height = 1
+                page.window.resizable = False
+                page.window.movable = False
+                page.window.skip_task_bar = True
+                page.window.frameless = True
+                page.window.title_bar_hidden = True
+                page.window.title_bar_buttons_hidden = True
+                page.window.opacity = DESKTOP_SETTINGS_ICON_OPACITY
+                page.window.bgcolor = ft.Colors.TRANSPARENT
+                geometry = _icon_geometry_for_monitor(
+                    active_monitor_rect,
+                    fallback_size=_primary_screen_size(),
+                )
+                page.window.left, page.window.top = geometry[:2]
+                page.window.visible = True
 
         def queue_action(key: str, value: float | None = None) -> None:
             try:
@@ -1156,10 +1245,8 @@ def _run_flet_desktop_settings_app(
             return changed
 
         def on_window_event(event: Any) -> None:
-            nonlocal visible
             if event.type == ft.WindowEventType.CLOSE:
-                visible = False
-                page.window.visible = False
+                set_window_mode(False)
                 page.update()
 
         page.window.on_event = on_window_event
@@ -1171,22 +1258,41 @@ def _run_flet_desktop_settings_app(
             if command == "__quit__":
                 break
             if command == "__toggle_flet__":
-                visible = not visible
-                page.window.visible = visible
-                page.window.focused = visible
+                set_window_mode(not visible)
                 changed = True
             elif command == "__show_flet__":
-                visible = True
-                page.window.visible = True
-                page.window.focused = True
+                set_window_mode(True)
                 changed = True
             elif command == "__hide_flet__":
                 visible = False
                 page.window.visible = False
                 changed = True
+            elif command == "__show_icon__":
+                set_window_mode(False)
+                changed = True
 
             snapshot = _drain_latest(snapshots)
             if snapshot is not None:
+                monitor_rect = snapshot.get("input_monitor_rect")
+                if isinstance(monitor_rect, (tuple, list)) and len(monitor_rect) == 4:
+                    try:
+                        normalized_rect = tuple(int(value) for value in monitor_rect)
+                    except (TypeError, ValueError):
+                        normalized_rect = None
+                    if (
+                        normalized_rect is not None
+                        and normalized_rect[2] > 0
+                        and normalized_rect[3] > 0
+                        and normalized_rect != active_monitor_rect
+                    ):
+                        active_monitor_rect = normalized_rect
+                        if not visible and page.window.visible:
+                            geometry = _icon_geometry_for_monitor(
+                                active_monitor_rect,
+                                fallback_size=_primary_screen_size(),
+                            )
+                            page.window.left, page.window.top = geometry[:2]
+                            changed = True
                 signature = _snapshot_layout_signature(snapshot)
                 if signature != layout_signature:
                     rebuild(snapshot)
@@ -1228,16 +1334,10 @@ class DesktopOpenXrSettingsWindow:
         self._flet_commands = context.Queue()
         self._started = threading.Event()
         self._closed = threading.Event()
-        self._root: Any | None = None
-        self._icon: Any | None = None
         self._icon_visible = True
-        self._icon_photo: Any = None
         self._input_monitor_rect = monitor_rect
-        self._icon_geometry: tuple[int, int, int, int] | None = None
         self._flet_process: multiprocessing.Process | None = None
         self._flet_job: _WindowsKillOnCloseJob | None = None
-        self._icon_thread: threading.Thread | None = None
-        self._icon_stopped = threading.Event()
 
     @property
     def actions(self) -> Any:
@@ -1304,12 +1404,6 @@ class DesktopOpenXrSettingsWindow:
                 return
             self._flet_job = flet_job
             start_gate.set()
-        self._icon_thread = threading.Thread(
-            target=self._run_icon,
-            name="desktop-settings-menu-icon",
-            daemon=True,
-        )
-        self._icon_thread.start()
 
     def stop(self) -> None:
         if self._closed.is_set():
@@ -1329,20 +1423,17 @@ class DesktopOpenXrSettingsWindow:
             if self._flet_job is not None:
                 self._flet_job.close()
                 self._flet_job = None
-        icon_thread = self._icon_thread
-        if (
-            icon_thread is not None
-            and icon_thread is not threading.current_thread()
-        ):
-            # Tk must destroy its interpreter and ImageTk references on the
-            # thread that created them.  Waiting here prevents Python from
-            # finalizing those objects on the runtime thread during exit.
-            self._icon_stopped.wait(timeout=2.0)
 
     def toggle_icon_visibility(self) -> None:
         if self._closed.is_set():
             return
         self._icon_visible = not self._icon_visible
+        try:
+            self._flet_commands.put_nowait(
+                "__show_icon__" if self._icon_visible else "__hide_flet__"
+            )
+        except Exception:
+            pass
 
     def publish_snapshot(self, snapshot: dict[str, Any]) -> None:
         if not self._started.is_set() or self._closed.is_set():
@@ -1364,84 +1455,6 @@ class DesktopOpenXrSettingsWindow:
             except queue.Full:
                 pass
 
-    def _run_icon(self) -> None:
-        root = None
-        try:
-            root = tk.Tk()
-            root.overrideredirect(True)
-            root.attributes("-topmost", True)
-            root.attributes("-alpha", DESKTOP_SETTINGS_ICON_OPACITY)
-            root.configure(bg=DESKTOP_SETTINGS_ICON_TRANSPARENT_COLOR)
-            geometry = _icon_geometry_for_monitor(
-                self._input_monitor_rect,
-                fallback_size=(
-                    max(0, int(root.winfo_screenwidth())),
-                    max(0, int(root.winfo_screenheight())),
-                ),
-            )
-            self._set_icon_geometry(root, geometry)
-            root.protocol("WM_DELETE_WINDOW", self.stop)
-            self._root = root
-            self._icon = root
-            self._build_icon_content(root)
-            root.deiconify()
-            root.lift()
-            root.after(100, self._poll_icon)
-            root.mainloop()
-        except Exception as exc:
-            print(
-                "[DesktopSettings] Floating icon failed: "
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
-            )
-        finally:
-            if root is not None:
-                try:
-                    root.destroy()
-                except (RuntimeError, tk.TclError):
-                    pass
-            # Drop all Tk-owned references before this thread exits.  This is
-            # deliberately done here, never by the runtime thread.
-            self._icon_photo = None
-            self._icon = None
-            self._root = None
-            self._icon_stopped.set()
-
-    def _build_icon_content(self, icon: Any) -> None:
-        try:
-            icon.attributes(
-                "-transparentcolor",
-                DESKTOP_SETTINGS_ICON_TRANSPARENT_COLOR,
-            )
-        except tk.TclError:
-            pass
-        icon.bind("<Button-1>", self._on_icon_click)
-        label = tk.Label(
-            icon,
-            bg=DESKTOP_SETTINGS_ICON_TRANSPARENT_COLOR,
-            cursor="hand2",
-            bd=0,
-            highlightthickness=0,
-        )
-        try:
-            from PIL import Image, ImageTk
-
-            icon_path = Path(__file__).resolve().parents[1] / "icon2.ico"
-            image = Image.open(icon_path).resize(DESKTOP_SETTINGS_ICON_IMAGE_SIZE)
-            self._icon_photo = ImageTk.PhotoImage(image)
-            label.configure(image=self._icon_photo)
-        except Exception:
-            label.configure(
-                text="⚙",
-                fg="white",
-                font=("Segoe UI", 15, "bold"),
-                width=2,
-                height=1,
-            )
-        label.pack(padx=4, pady=4)
-        label.bind("<Button-1>", self._on_icon_click)
-        icon.update_idletasks()
-
     def _on_icon_click(self, _event: Any) -> str:
         self._toggle_panel()
         return "break"
@@ -1453,42 +1466,3 @@ class DesktopOpenXrSettingsWindow:
             self._flet_commands.put_nowait("__toggle_flet__")
         except Exception:
             pass
-
-    def _poll_icon(self) -> None:
-        root = self._root
-        if root is None:
-            return
-        if self._closed.is_set():
-            root.destroy()
-            return
-        try:
-            geometry = _icon_geometry_for_monitor(
-                self._input_monitor_rect,
-                fallback_size=(
-                    max(0, int(root.winfo_screenwidth())),
-                    max(0, int(root.winfo_screenheight())),
-                ),
-            )
-            self._set_icon_geometry(root, geometry)
-            if self._icon_visible:
-                root.deiconify()
-                root.attributes("-topmost", True)
-            else:
-                root.withdraw()
-                self._flet_commands.put_nowait("__hide_flet__")
-        except (queue.Full, tk.TclError):
-            pass
-        root.after(100, self._poll_icon)
-
-    def _set_icon_geometry(
-        self,
-        root: Any,
-        geometry: tuple[int, int, int, int],
-    ) -> None:
-        if geometry == self._icon_geometry:
-            return
-        x, y, width, height = geometry
-        x_offset = f"+{x}" if x >= 0 else str(x)
-        y_offset = f"+{y}" if y >= 0 else str(y)
-        root.geometry(f"{width}x{height}{x_offset}{y_offset}")
-        self._icon_geometry = geometry

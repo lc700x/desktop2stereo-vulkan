@@ -29,7 +29,7 @@ src\python3\python.exe -m pytest -q tests/test_rocm_torch_glow_source.py
 src\python3\python.exe src\tools\rocm_glow_smoke.py --seconds 120
 ```
 
-On RX 9060 XT with bundled torch `2.10.0+rocm7.14.0a20260615`, a 20-second
+On RX 9060 XT with bundled torch `2.11.0+rocm10.1.0a20260822`, a 20-second
 smoke passed 12 exact patterned-image readbacks, 424 glow publications, and 46
 checks that retained images stayed unchanged. Diagnostic readbacks exist only
 in the smoke tool. Visual/headset validation is required to confirm the

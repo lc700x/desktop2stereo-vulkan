@@ -1,0 +1,13 @@
+﻿# AMD ROCm7 Nightly Builds
+# RX 9070, RX 9070 XT, AI PRO R9700, R9600D, RX 9060, RX 9060 XT, 820M iGPU, Ryzen AI 7 350, Ryzen AI Max+ PRO 395, Ryzen AI 9 HX 375, Ryzen 7 7840U, Ryzen 9 270, RX 7600, RX 7800 XT, RX 7700 XT, PRO V710, W7700, RX 7900 XTX, RX 7900 XT, PRO W7900, W7800, RX 6900 XT, RX 6800 XT, PRO W6800, V620, RX 6750 XT, RX 6700 XT, RX 6600 XT, RX 6600, PRO W6600, Van Gogh iGPU, RX 6500 XT, 680M iGPU, Raphael iGPU, RX 5700, RX 5700 XT, Pro V520, Pro W5500
+# -r requirements-pip-options.txt
+--extra-index-url https://rocm.nightlies.amd.com/whl-multi-arch/
+# torchaudio
+rocm[libraries,device-gfx1200,device-gfx1201]==10.1.0a20260822
+torch[device-gfx1200,device-gfx1201]==2.11.0+rocm10.1.0a20260822
+torchvision[device-gfx1200,device-gfx1201]==0.26.0+rocm10.1.0a20260822
+rocm_sdk_devel==10.1.0a20260822
+triton<3.8; sys_platform == "linux"
+triton-windows<3.9; sys_platform == "win32"
+migraphx @ https://ghfast.top/github.com/lc700x/MIGraphX-Windows/releases/download/v10.1.0a20260822/migraphx-0.1.2+all-cp312-cp312-win_amd64.whl ; sys_platform == "win32"
+wc-rocm==0.1.3.post1 ; sys_platform == "win32"

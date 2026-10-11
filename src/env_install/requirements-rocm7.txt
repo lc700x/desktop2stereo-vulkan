@@ -3,11 +3,11 @@
 -r requirements-pip-options.txt
 --extra-index-url https://rocm.nightlies.amd.com/whl-multi-arch/
 # torchaudio
-rocm[libraries,device-all]==7.14.0a20260615
-torch[device-all]==2.10.0+rocm7.14.0a20260615
-torchvision[device-all]==0.25.0+rocm7.14.0a20260615
-rocm_sdk_devel==7.14.0a20260615
+rocm[libraries,device-all]==10.1.0a20260822
+torch[device-all]==2.11.0+rocm10.1.0a20260822
+torchvision[device-all]==0.26.0+rocm10.1.0a20260822
+rocm_sdk_devel==10.1.0a20260822
 triton<3.8; sys_platform == "linux"
 triton-windows==3.7.1.post27; sys_platform == "win32"
-migraphx @ https://ghfast.top/github.com/lc700x/MIGraphX-Windows/releases/download/v7.14.0a20260615.post.2.2/migraphx-0.1.2+multiarch-cp312-cp312-win_amd64.whl ; sys_platform == "win32"
+migraphx @ https://ghfast.top/github.com/lc700x/MIGraphX-Windows/releases/download/v10.1.0a20260822/migraphx-0.1.2+all-cp312-cp312-win_amd64.whl ; sys_platform == "win32"
 wc-rocm==0.1.3.post1 ; sys_platform == "win32"

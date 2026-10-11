@@ -57,14 +57,30 @@ def test_rocm_installer_uses_and_validates_project_local_python() -> None:
     )
 
     assert 'set "PYTHON_ROOT=%PROJECT_ROOT%\\python3"' in script
-    assert 'if not exist "%PYTHON_EXE%"' in script
+    assert 'if exist "%PYTHON_EXE%" (' in script
     assert "sys.version_info[:2] == (3, 12)" in script
     assert '"%PYTHON_EXE%" -m pip install -r "%REQUIREMENTS_FILE%"' in script
     assert "Failed to install ROCm requirements" in script
     assert "Failed to initialize the ROCm SDK" in script
     assert 'set "D2S_PIP_CACHE=%LOCALAPPDATA%\\Desktop2Stereo\\pip-cache"' in script
     assert '--cache-dir "%D2S_PIP_CACHE%" --prefer-binary' in script
+    assert "--no-user" in script
+    assert 'set "PYTHONNOUSERSITE=1"' in script
+    assert 'set "PIP_TARGET="' in script
+    assert 'set "PIP_PREFIX="' in script
+    assert 'set "PIP_USER="' in script
+    assert 'relative_to(Path(sys.prefix).resolve())' in script
+    assert "Visual Studio Build Tools are not required for this path" in script
     assert "--no-cache-dir" not in script
+
+    gfx1200_script = (ENV_INSTALL_ROOT / "install-rocm7-standalone-9000.bat").read_text(
+        encoding="utf-8"
+    )
+    assert 'set "PYTHONNOUSERSITE=1"' in gfx1200_script
+    assert '"%PYTHON_EXE%" -m pip install -r "%REQUIREMENTS_FILE%"' in gfx1200_script
+    assert "--no-user" in gfx1200_script
+    assert 'relative_to(Path(sys.prefix).resolve())' in gfx1200_script
+    assert "Visual Studio Build Tools are not required for this path" in gfx1200_script
 
 
 def test_posix_installers_use_the_virtualenv_python_and_current_layout() -> None:

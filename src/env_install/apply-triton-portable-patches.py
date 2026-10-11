@@ -17,11 +17,14 @@ from pathlib import Path
 
 def patch_file(path: Path, old: str, new: str, what: str) -> bool:
     if not path.is_file():
-        print(f"[skip] {path} missing ({what})")
+        print(f"[error] {path} missing ({what})")
         return False
     text = path.read_text(encoding="utf-8", errors="ignore")
+    if new in text:
+        print(f"[ok] {path} already patched ({what})")
+        return True
     if old not in text:
-        print(f"[skip] {path} already patched ({what})")
+        print(f"[error] {path} has an unsupported Triton source layout ({what})")
         return False
     path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="")
     print(f"[patch] {path} ({what})")
@@ -36,8 +39,19 @@ def main() -> int:
     if site_packages is None or not site_packages.is_dir():
         print("usage: apply-triton-portable-patches.py <site-packages dir>")
         return 2
-    patched = 0
-    patched += patch_file(
+    valid = patch_file(
+        site_packages / "triton" / "windows_utils.py",
+        '''def find_msvc(env_only: bool) -> tuple[Optional[str], list[str], list[str]]:
+    if env_only:''',
+        '''def find_msvc(env_only: bool) -> tuple[Optional[str], list[str], list[str]]:
+    if os.environ.get("TRITON_NO_WINSDK"):
+        # The bundled ROCm clang is selected before this discovery path. Avoid
+        # adding host MSVC headers and libraries to the portable link command.
+        return None, [], []
+    if env_only:''',
+        "windows_utils NO_WINSDK MSVC discovery",
+    )
+    valid = patch_file(
         site_packages / "triton" / "windows_utils.py",
         '''def find_winsdk(env_only: bool) -> tuple[list[str], list[str]]:
     if env_only:''',
@@ -52,8 +66,8 @@ def main() -> int:
         return [], ([_lib] if _lib else [])
     if env_only:''',
         "windows_utils NO_WINSDK lib passthrough",
-    )
-    patched += patch_file(
+    ) and valid
+    valid = patch_file(
         site_packages / "triton" / "runtime" / "build.py",
         '''        libraries = libraries + [f"python{version}"]
     if is_msvc(cc) or is_clang_cl(cc):''',
@@ -63,8 +77,8 @@ def main() -> int:
             libraries = libraries + ["kernel32"]
     if is_msvc(cc) or is_clang_cl(cc):''',
         "build.py kernel32 lib",
-    )
-    patched += patch_file(
+    ) and valid
+    valid = patch_file(
         site_packages
         / "triton" / "backends" / "amd" / "include" / "hip" / "hip_runtime.h",
         """#else
@@ -76,8 +90,11 @@ def main() -> int:
 #include <stddef.h>
 #endif  // __cplusplus""",
         "hip_runtime.h stdlib->stddef",
-    )
-    print(f"triton portable patches done ({patched} files)")
+    ) and valid
+    if not valid:
+        print("triton portable patches failed; refusing to leave an unverified toolchain")
+        return 1
+    print("triton portable patches verified")
     return 0
 
 
