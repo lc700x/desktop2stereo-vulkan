@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import queue
+import threading
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -47,9 +48,12 @@ def _native_frame(bridge) -> NativeCoreMLFrame:
 
 
 def test_native_result_abi_has_stable_layout() -> None:
-    assert ctypes.sizeof(_NativeResult) == 80
+    assert ctypes.sizeof(_NativeResult) == 96
     assert _NativeResult.source_width.offset > _NativeResult.slot.offset
-    assert ctypes.sizeof(_NativeWarpConfig) == 80
+    assert _NativeResult.raw_normalize_lo.offset == 80
+    assert _NativeResult.normalization_history_reset.offset == 88
+    assert ctypes.sizeof(_NativeWarpConfig) == 84
+    assert _NativeWarpConfig.edge_aa_enabled.offset == 80
 
 
 def test_native_output_modes_match_runtime_frame_shapes() -> None:
@@ -90,6 +94,24 @@ def test_native_scalar_kernels_use_one_dimensional_threadgroups() -> None:
     assert "dispatchThreadgroups:groups" not in pack
     assert "threadsPerThreadgroup:MTLSizeMake(w, h, 1)" not in normalize
     assert "threadsPerThreadgroup:MTLSizeMake(w, h, 1)" not in pack
+
+
+def test_native_output_resolution_depth_gaussian_runs_before_warp_without_color_aa() -> None:
+    source = _NATIVE_SOURCE.read_text()
+    pack_start = source.index("static int32_t d2s_coreml_io_pack_internal")
+    pack_end = source.index("int32_t d2s_coreml_io_pack(", pack_start)
+    pack = source[pack_start:pack_end]
+
+    gaussian = pack.index("if (global_depth_gaussian)")
+    upsample = pack.index("setComputePipelineState:ctx->depth_upsample_pipeline")
+    warp = pack.index("[encoder setComputePipelineState:ctx->warp_pipeline]")
+    assert "depth_upsample_pipeline" in pack[gaussian:warp]
+    assert "depth_global_gaussian_pipeline" in pack[gaussian:warp]
+    assert "MTLSizeMake(source_width, source_height, 1)" in pack[gaussian:warp]
+    assert "[gaussian_encoder setBuffer:warp_depth_buffer offset:0 atIndex:0]" in pack[gaussian:warp]
+    assert gaussian < upsample < warp
+    assert "fxaa" not in pack.lower()
+    assert "memcpy(destination, destination_buffer.contents, output_bytes);" in pack
 
 
 def test_native_metal_bridge_preserves_metal_logical_rgb_channel_order() -> None:
@@ -194,6 +216,49 @@ def test_native_frame_pack_uses_destination_without_host_conversion() -> None:
     assert len(bridge.pack_calls) == 1
     assert bridge.pack_calls[0][2] == len(destination)
     assert bridge.release_calls == [1]
+
+
+def test_native_frame_release_waits_for_in_flight_pack() -> None:
+    pack_started = threading.Event()
+    finish_pack = threading.Event()
+    release_started = threading.Event()
+    release_called = threading.Event()
+    call_order = []
+
+    class BlockingBridge:
+        def pack(self, frame, destination, destination_size, width, height, output_format):
+            pack_started.set()
+            assert finish_pack.wait(timeout=2)
+            call_order.append("pack")
+
+        def release(self, slot):
+            call_order.append("release")
+            release_called.set()
+
+    frame = _native_frame(BlockingBridge())
+    pack_thread = threading.Thread(
+        target=frame.pack,
+        args=(bytearray(8), (2, 1), "half_sbs"),
+    )
+    pack_thread.start()
+    assert pack_started.wait(timeout=1)
+
+    def release_frame() -> None:
+        release_started.set()
+        frame.release()
+
+    release_thread = threading.Thread(target=release_frame)
+    release_thread.start()
+    assert release_started.wait(timeout=1)
+    assert not release_called.wait(timeout=0.05)
+
+    finish_pack.set()
+    pack_thread.join(timeout=2)
+    release_thread.join(timeout=2)
+
+    assert not pack_thread.is_alive()
+    assert not release_thread.is_alive()
+    assert call_order == ["pack", "release"]
 
 
 def test_native_frame_can_request_gpu_rgb24_pack() -> None:

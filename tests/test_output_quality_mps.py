@@ -13,6 +13,8 @@ from stereo_runtime.output_quality import (
     apply_output_quality,
     output_sampling_plan_for_config,
 )
+from stereo_runtime.output import downsample_horizontal_area_srgb, make_sbs, sbs_backend
+from stereo_runtime.output_mps import make_half_sbs_srgb
 
 MPS = torch.device("mps") if torch.backends.mps.is_available() else None
 
@@ -51,3 +53,24 @@ def test_d2s_cap_output_upscale_keeps_native_resolution(monkeypatch) -> None:
     assert plan is not None
     assert plan.mode == "native_mip"
     assert (plan.target_width, plan.target_height) == (1920, 1080)
+
+
+def test_mps_half_sbs_srgb_matches_reference_and_is_independent_of_depth_aa(monkeypatch) -> None:
+    torch.manual_seed(17)
+    left = torch.rand(1, 3, 24, 40, device=MPS)
+    right = torch.rand_like(left)
+    reference = torch.cat(
+        (downsample_horizontal_area_srgb(left), downsample_horizontal_area_srgb(right)),
+        dim=-1,
+    )
+
+    filtered_path = make_half_sbs_srgb(left, right)
+    monkeypatch.setenv("D2S_SBS_AA", "0")
+    without_depth_aa = make_sbs(left, right, "half_sbs")
+    monkeypatch.setenv("D2S_SBS_AA", "1")
+    with_depth_aa = make_sbs(left, right, "half_sbs")
+    torch.mps.synchronize()
+
+    assert torch.allclose(filtered_path, reference, atol=1e-6, rtol=1e-6)
+    assert torch.equal(without_depth_aa, with_depth_aa)
+    assert sbs_backend(left, right, "half_sbs") == "mps_half_sbs_srgb"

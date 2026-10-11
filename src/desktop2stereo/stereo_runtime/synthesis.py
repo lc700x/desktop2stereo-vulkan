@@ -135,6 +135,7 @@ def _layered_synthesis(
         ),
         depth_pop=config.depth_pop,
         antialias_strength=config.depth_antialias_strength,
+        global_gaussian=output_edge_aa_enabled(),
     )
     _record_cuda_event(cuda_events, "synth_depth_postprocess", rgb)
     base_shift = compute_shift_px(depth, rgb.shape[-1], params)
@@ -178,7 +179,7 @@ def _layered_synthesis(
                 direct_start = time.perf_counter()
                 direct_sbs = (
                     warp_composite2_half_sbs(rgb, depth, base_shift)
-                    if config.output_format == "half_sbs" and not output_edge_aa_enabled()
+                    if config.output_format == "half_sbs"
                     else warp_composite2_full_sbs(rgb, depth, base_shift)
                 )
                 direct_sbs_backend = (
@@ -215,7 +216,7 @@ def _layered_synthesis(
 
             direct_sbs = mps_warp_composite2_u8(
                 rgb, depth, base_shift,
-                "full_sbs" if config.output_format == "half_sbs" and output_edge_aa_enabled() else config.output_format,
+                config.output_format,
             )
             if direct_sbs is not None:
                 direct_sbs_backend = "metal_mps_warp_composite2_u8"
@@ -469,6 +470,7 @@ def synthesize_stereo(
             depth,
             depth_pop=config.depth_pop,
             antialias_strength=config.depth_antialias_strength,
+            global_gaussian=output_edge_aa_enabled(),
         )
         _record_cuda_event(cuda_events, "synth_depth_shift", rgb)
         stage_times["fast_depth_postprocess_ms"] = (time.perf_counter() - stage_start) * 1000.0
@@ -660,15 +662,6 @@ def synthesize_stereo(
         debug["sbs_backend"] = debug.get("direct_sbs_backend", "triton_direct_sbs")
         stage_times["sbs_backend_ms"] = 0.0
         sbs = direct_sbs
-        if output_edge_aa_enabled() and config.output_format in {"half_sbs", "full_sbs"}:
-            if config.output_format == "half_sbs":
-                from .display_antialias import antialias_sbs_half
-
-                sbs = antialias_sbs_half(sbs)
-            else:
-                from .display_antialias import antialias_sbs
-
-                sbs = antialias_sbs(sbs, "full_sbs")
         stage_times["make_sbs_ms"] = (time.perf_counter() - stage_start) * 1000.0
     else:
         debug["sbs_backend"] = sbs_backend(
@@ -693,7 +686,7 @@ def synthesize_stereo(
         stage_times["make_sbs_ms"] = (time.perf_counter() - stage_start) * 1000.0
 
     debug["edge_aa_backend"] = (
-        "output_fxaa" if output_edge_aa_enabled() and config.output_format in {"half_sbs", "full_sbs"}
+        "depth_global_gaussian" if output_edge_aa_enabled()
         else "disabled"
     )
     _record_cuda_event(cuda_events, "synth_sbs", rgb)

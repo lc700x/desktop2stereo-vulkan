@@ -16,6 +16,7 @@ from .adapter import StereoRuntimeConfig, depth_provider_config_from_runtime, st
 from .baseline_shift import ShiftParams, compute_shift_px, shift_debug_info
 from .depth_postprocess import (
     anti_alias_depth_guided,
+    anti_alias_depth_global_gaussian,
     apply_depth_pop,
     postprocess_depth,
 )
@@ -377,20 +378,15 @@ def openxr_result_from_stereo_result(
     cuda_events = dict(getattr(stereo_result, "cuda_timing_events", None) or {})
     display_size = _runtime_frame_size(left_eye)
     stereo_output_format = getattr(stereo_result, "output_format", None) or debug.get("runtime_output_format")
-    eyes_filtered_from_sbs = False
     if stereo_output_format == "half_sbs" and _should_split_half_sbs_for_openxr(debug):
         split_eyes = _split_half_sbs_frame(stereo_result.sbs)
         if split_eyes is not None:
             left_eye, right_eye = split_eyes
-            eyes_filtered_from_sbs = True
             display_size = _runtime_frame_size(stereo_result.sbs)
             debug.setdefault("runtime_output_pack_backend", "split_half_sbs")
 
-    if output_edge_aa_enabled() and not eyes_filtered_from_sbs:
-        from .display_antialias import antialias_eye
-
-        left_eye, right_eye = antialias_eye(left_eye), antialias_eye(right_eye)
-        debug["edge_aa_backend"] = "output_fxaa"
+    if output_edge_aa_enabled():
+        debug["edge_aa_backend"] = "depth_global_gaussian"
     pack_start = time.perf_counter()
     _record_cuda_event(cuda_events, "openxr_pack_start", left_eye if isinstance(left_eye, torch.Tensor) else None)
     if _openxr_runtime_output_uint8_enabled():
@@ -559,6 +555,7 @@ def _try_openxr_no_fill_fused_rgba_u8(
         ),
         depth_pop=float(getattr(config, "depth_pop", 0.0)),
         antialias_strength=float(getattr(config, "depth_antialias_strength", 0.0)),
+        global_gaussian=output_edge_aa_enabled(),
     )
     _record_cuda_event(cuda_events, "synth_depth_postprocess", rgb)
     params = ShiftParams(
@@ -589,10 +586,6 @@ def _try_openxr_no_fill_fused_rgba_u8(
         left, right = warp_composite2_rgba_u8(rgb, processed_depth, base_shift)
     except Exception as exc:
         return None, f"triton_output_failed:{type(exc).__name__}"
-    if output_edge_aa_enabled():
-        from .display_antialias import antialias_eye
-
-        left, right = antialias_eye(left), antialias_eye(right)
     _record_cuda_event(cuda_events, "synth_warp", left)
     _record_cuda_event(cuda_events, "synth_occlusion", left)
     _record_cuda_event(cuda_events, "synth_hole_fill", left)
@@ -1635,9 +1628,9 @@ class StereoRuntime:
         # at draw time (v2.5 approach). runtime_entry sets the env default to
         # "1" only for Darwin Local Viewer, so stream/OpenXR paths never see
         # it unless a user opts in explicitly.
-        deferred_warp = (
-            not skip_sbs_output
-            and os.environ.get("D2S_METAL_SHADER_WARP", "0") == "1"
+        deferred_warp = _deferred_metal_shader_warp_enabled(
+            stereo_config.output_format,
+            skip_sbs_output=skip_sbs_output,
         )
         # Advanced macOS streaming has no native Metal-to-encoder texture
         # bridge in this output path. Use the same synthesis contract as
@@ -2078,10 +2071,6 @@ class StereoRuntime:
                 if vulkan_stereo is not None:
                     left_eye = vulkan_stereo.left_eye
                     right_eye = vulkan_stereo.right_eye
-                    if output_edge_aa_enabled():
-                        from .display_antialias import antialias_eye
-
-                        left_eye, right_eye = antialias_eye(left_eye), antialias_eye(right_eye)
                     if bool(getattr(openxr_stereo_config, "cross_eyed", False)):
                         left_eye, right_eye = right_eye, left_eye
                     output_format = "openxr_eye_views"
@@ -2140,10 +2129,6 @@ class StereoRuntime:
 
                         left_eye = triton_stereo.left_eye
                         right_eye = triton_stereo.right_eye
-                        if output_edge_aa_enabled():
-                            from .display_antialias import antialias_eye
-
-                            left_eye, right_eye = antialias_eye(left_eye), antialias_eye(right_eye)
                         if os.environ.get("D2S_FRAME_SHAPE_DIAG"):
                             print("[FrameShape] branch=synthesize eye=" + str(tuple(left_eye.shape)), flush=True)
                         output_format = "openxr_eye_views"
@@ -2192,10 +2177,7 @@ class StereoRuntime:
                     else:
                         quality_debug = {"output_quality_mode": "skipped_openxr_env"}
                     if output_edge_aa_enabled():
-                        from .display_antialias import antialias_eye
-
-                        left_eye, right_eye = antialias_eye(left_eye), antialias_eye(right_eye)
-                        edge_aa_debug = {"edge_aa_backend": "output_fxaa"}
+                        edge_aa_debug = {"edge_aa_backend": "depth_global_gaussian"}
                     quality_debug.update(edge_aa_debug)
                     _record_cuda_event(cuda_events, "openxr_pack_start", left_eye)
                     if _openxr_runtime_output_uint8_enabled():
@@ -2382,6 +2364,7 @@ class StereoRuntime:
                 ),
                 depth_pop=float(getattr(stereo_config, "depth_pop", 0.0)),
                 antialias_strength=float(getattr(stereo_config, "depth_antialias_strength", 0.0)),
+                global_gaussian=output_edge_aa_enabled(),
             )
             budget = resolve_parallax_budget(
                 render_width=int(rgb_frame.shape[-1]),
@@ -2446,6 +2429,7 @@ class StereoRuntime:
                 if antialias_strength is None
                 else float(antialias_strength)
             ),
+            global_gaussian=output_edge_aa_enabled(),
         )
         return self._stabilize_openxr_rgb_depth(
             depth,
@@ -2610,9 +2594,6 @@ class StereoRuntime:
             return None, "hole_fill_disabled"
         if stereo_config.output_format != "half_sbs":
             return None, f"format={stereo_config.output_format}"
-        if output_edge_aa_enabled():
-            # This shortcut emits reduced eyes; AA needs the complete eyes first.
-            return None, "output_antialias_requires_full_eyes"
         if not _runtime_output_uint8_enabled():
             return None, "runtime_uint8_off"
         if bool(getattr(stereo_config, "cross_eyed", False)):
@@ -2779,6 +2760,7 @@ class StereoRuntime:
                 ),
                 depth_pop=float(getattr(stereo_config, "depth_pop", 0.0)),
                 antialias_strength=float(getattr(stereo_config, "depth_antialias_strength", 0.0)),
+                global_gaussian=output_edge_aa_enabled(),
             )
             budget = resolve_parallax_budget(
                 render_width=int(rgb_frame.shape[-1]),
@@ -2895,6 +2877,7 @@ class StereoRuntime:
                 ),
                 depth_pop=float(getattr(stereo_config, "depth_pop", 0.0)),
                 antialias_strength=float(getattr(stereo_config, "depth_antialias_strength", 0.0)),
+                global_gaussian=output_edge_aa_enabled(),
             )
             budget = resolve_parallax_budget(
                 render_width=int(rgb_frame.shape[-1]),
@@ -3097,7 +3080,7 @@ def _configure_native_coreml_warp(
             "native_coreml_max_disparity_px": values["max_disparity_px"],
             "native_coreml_edge_aa_enabled": values["edge_aa_enabled"],
             "native_coreml_edge_aa_backend": (
-                "fxaa" if values["edge_aa_enabled"] else "disabled"
+                "depth_global_gaussian" if values["edge_aa_enabled"] else "disabled"
             ),
         }
     except Exception as exc:
@@ -3508,16 +3491,27 @@ def _quantize_depth_for_warp(depth: torch.Tensor) -> torch.Tensor:
 
 
 def _needs_depth_postprocess(stereo_config: Any) -> bool:
-    """True only when Depth Pop or Anti-aliasing is actually enabled.
+    """True when depth shaping or shared output AA is active.
 
-    Mode-isolation guard: cinema/game/image presets run with both knobs at
-    their preset values, and every non-warp consumer must stay on the
-    exact pre-existing code path (zero extra passes) unless the user
-    explicitly raised a knob.
+    This is only used by the deferred stereo warp, which must honor the
+    shared AA switch even when the depth-AA slider is set to zero.
     """
     pop = float(getattr(stereo_config, "depth_pop", 0.0) or 0.0)
     aa = float(getattr(stereo_config, "depth_antialias_strength", 0.0) or 0.0)
-    return abs(pop) >= 1e-6 or aa > 0.0
+    return abs(pop) >= 1e-6 or aa > 0.0 or output_edge_aa_enabled()
+
+
+def _deferred_metal_shader_warp_enabled(
+    output_format: Any,
+    *,
+    skip_sbs_output: bool,
+) -> bool:
+    """Keep diagnostic depth maps on the shared antialiased output path."""
+    return (
+        not skip_sbs_output
+        and str(output_format).strip().lower() != "depth_map"
+        and os.environ.get("D2S_METAL_SHADER_WARP", "0") == "1"
+    )
 
 
 def _warp_depth_postprocess(
@@ -3531,10 +3525,11 @@ def _warp_depth_postprocess(
     Pop + Anti-aliasing) before warping; the deferred Metal-shader-warp
     path -- the v2.5 traditional method -- shipped the raw model output
     and skipped both, so depth edges kept their per-frame aliasing and
-    flicker. Apply the same pass here. Zero extra passes when both knobs
-    are off (the common realtime default).
+    flicker. Apply the same pass here, including the shared global Gaussian
+    whenever output AA is enabled.
 
-    With a guide frame, the antialiasing becomes RGB-guided edge-aware
+    With a guide frame and nonzero depth-AA strength, configured smoothing
+    becomes RGB-guided edge-aware
     smoothing (arXiv 1911.07036 "3D Photography" stage 1): depth averages
     only across color-similar neighbors, denoising flat regions WITHOUT
     widening object-edge transition bands. D2S_GUIDED_DEPTH_SMOOTH=0
@@ -3568,11 +3563,13 @@ def _postprocess_depth_fast(
     """
     if guide is None:
         return postprocess_depth(
-            depth, depth_pop=depth_pop, antialias_strength=antialias_strength
+            depth, depth_pop=depth_pop, antialias_strength=antialias_strength,
+            global_gaussian=output_edge_aa_enabled(),
         )
     if os.environ.get("D2S_GUIDED_AA_HALFRES", "1") in {"0", "false", "off"}:
         return postprocess_depth(
-            depth, depth_pop=depth_pop, antialias_strength=antialias_strength
+            depth, depth_pop=depth_pop, antialias_strength=antialias_strength,
+            global_gaussian=output_edge_aa_enabled(),
         )
     h, w = int(depth.shape[-2]), int(depth.shape[-1])
     if min(h, w) < 256 or antialias_strength <= 0.0:
@@ -3581,6 +3578,7 @@ def _postprocess_depth_fast(
             depth_pop=depth_pop,
             antialias_strength=antialias_strength,
             guide=guide,
+            global_gaussian=output_edge_aa_enabled(),
         )
     out = depth.clamp(0.0, 1.0)
     if abs(float(depth_pop)) >= 1e-6:
@@ -3592,9 +3590,10 @@ def _postprocess_depth_fast(
         guide, size=half.shape[-2:], mode="bilinear", align_corners=False
     )
     lo = anti_alias_depth_guided(half, g_lo, antialias_strength)
-    return torch.nn.functional.interpolate(
+    out = torch.nn.functional.interpolate(
         lo, size=(h, w), mode="bilinear", align_corners=False
     )
+    return anti_alias_depth_global_gaussian(out) if output_edge_aa_enabled() else out
 
 
 def _match_guide_to_depth(guide_rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:

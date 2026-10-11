@@ -9,25 +9,12 @@ import torch.nn.functional as F
 
 from utils.screen_resolution_policy import OutputSamplingPlan, build_output_sampling_plan
 
-from .baseline_shift import make_base_grid_components
 from .output import (
     downsample_horizontal_lanczos2,
     downsample_vertical_lanczos2,
     ensure_bchw,
     match_depth,
 )
-
-
-def apply_dibr_edge_aa_to_eyes(
-    left: torch.Tensor,
-    right: torch.Tensor,
-    depth: torch.Tensor,
-    shift_px: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Display AA for completed eyes; depth and disparity are left untouched."""
-    from .display_antialias import antialias_eye
-
-    return antialias_eye(left), antialias_eye(right)
 
 
 def output_sampling_plan_for_config(

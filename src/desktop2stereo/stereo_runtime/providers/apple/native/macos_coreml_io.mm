@@ -1,5 +1,4 @@
 #import "macos_coreml_io.h"
-#include "sbs_fxaa_msl.h"
 
 #import <CoreML/CoreML.h>
 #import <CoreVideo/CoreVideo.h>
@@ -20,8 +19,6 @@ enum {
     D2S_COREML_BUSY = -2,
     D2S_COREML_UNSUPPORTED = -3,
     D2S_COREML_OUTPUT_BACKING = -4,
-    // Private warp-only mode; the public output API remains formats 0..8.
-    D2S_OUTPUT_FULL_SBS_FROM_HALF = 9,
 };
 
 typedef struct {
@@ -49,7 +46,21 @@ typedef struct {
     float strength;
     float sigma_color;
     float max_keep;
+    float depth_pop;
 } D2SDepthFilterParams;
+
+typedef struct {
+    uint32_t depth_width;
+    uint32_t depth_height;
+    float depth_pop;
+} D2SDepthGaussianParams;
+
+typedef struct {
+    uint32_t source_width;
+    uint32_t source_height;
+    uint32_t depth_width;
+    uint32_t depth_height;
+} D2SDepthUpsampleParams;
 
 typedef struct {
     uint32_t source_width;
@@ -63,38 +74,9 @@ typedef struct {
     D2SCoreMLIOWarpConfig stereo;
 } D2SWarpParams;
 
-typedef struct {
-    uint32_t width;
-    uint32_t height;
-    uint32_t channels;
-    uint32_t layout;
-    uint32_t eye_width;
-    uint32_t batches;
-} D2SFxaaParams;
-
-typedef struct {
-    uint32_t width;
-    uint32_t height;
-    uint32_t channels;
-    uint32_t layout;
-    uint32_t eye_width;
-    uint32_t batches;
-    uint32_t half_sbs;
-    uint32_t reserved;
-} D2SSmaaParams;
-
-typedef struct {
-    uint32_t width;
-    uint32_t height;
-    uint32_t channels;
-    uint32_t eye_width;
-} D2SHalfDownsampleParams;
-
 static const char *D2SMetalSource = R"D2S(
 #include <metal_stdlib>
 using namespace metal;
-
-constant uint D2S_OUTPUT_FULL_SBS_FROM_HALF = 9u;
 
 struct PreprocessParams {
     uint source_width;
@@ -900,13 +882,10 @@ kernel void d2s_warp_pack(
         float source_x = (float(eye_x) + 0.5f) *
                              (float(p.source_width) / float(eye_width)) - 0.5f;
         float source_y = float(y);
-        bool from_half = p.output_format == D2S_OUTPUT_FULL_SBS_FROM_HALF;
-        uint display_eye_width = from_half ? eye_width / 2u : eye_width;
+        uint display_eye_width = eye_width;
         uint edge = min(uint(max(p.screen_edge_suppression, 0)),
                         min(display_eye_width, p.output_height));
-        // Half-SBS border suppression is measured in packed display pixels:
-        // full-eye AA doubles only x coordinates; y keeps its original units.
-        uint horizontal_edge = from_half ? edge * 2u : edge;
+        uint horizontal_edge = edge;
         bool screen_edge = edge > 0u &&
             (eye_x < horizontal_edge || y < edge ||
              eye_x >= eye_width - horizontal_edge || y >= p.output_height - edge);
@@ -926,54 +905,6 @@ kernel void d2s_warp_pack(
 
 )D2S";
 
-static const char *D2SHalfDownsampleMetalSource = R"D2S_DOWNSAMPLE(
-#include <metal_stdlib>
-using namespace metal;
-
-struct HalfDownsampleParams {
-    uint width;
-    uint height;
-    uint channels;
-    uint eye_width;
-};
-
-kernel void d2s_sbs_downsample_half(
-    device const uchar *source [[buffer(0)]],
-    device uchar *output [[buffer(1)]],
-    constant HalfDownsampleParams& p [[buffer(2)]],
-    uint2 gid [[thread_position_in_grid]]) {
-    uint output_width = p.width / 2u;
-    if (gid.x >= output_width || gid.y >= p.height) return;
-    uint left_output_width = p.eye_width / 2u;
-    bool right_eye = gid.x >= left_output_width;
-    uint output_eye_x = right_eye ? gid.x - left_output_width : gid.x;
-    uint eye_source_x = right_eye ? p.eye_width : 0u;
-    uint source_x = eye_source_x + output_eye_x * 2u;
-    uint source_offset = (gid.y * p.width + source_x) * p.channels;
-    uint output_offset = (gid.y * output_width + gid.x) * p.channels;
-    float3 left = float3(source[source_offset], source[source_offset + 1u],
-                         source[source_offset + 2u]) / 255.0f;
-    float3 right = float3(source[source_offset + p.channels],
-                          source[source_offset + p.channels + 1u],
-                          source[source_offset + p.channels + 2u]) / 255.0f;
-    float3 left_linear = select(pow((left + 0.055f) / 1.055f, float3(2.4f)),
-                                left / 12.92f, left <= 0.04045f);
-    float3 right_linear = select(pow((right + 0.055f) / 1.055f, float3(2.4f)),
-                                 right / 12.92f, right <= 0.04045f);
-    float3 linear = (left_linear + right_linear) * 0.5f;
-    float3 encoded = select(1.055f * pow(linear, float3(1.0f / 2.4f)) - 0.055f,
-                            linear * 12.92f, linear <= 0.0031308f);
-    output[output_offset] = uchar(clamp(encoded.r * 255.0f + 0.5f, 0.0f, 255.0f));
-    output[output_offset + 1u] = uchar(clamp(encoded.g * 255.0f + 0.5f, 0.0f, 255.0f));
-    output[output_offset + 2u] = uchar(clamp(encoded.b * 255.0f + 0.5f, 0.0f, 255.0f));
-    if (p.channels == 4u) {
-        uint alpha = uint(source[source_offset + 3u]) +
-                     uint(source[source_offset + p.channels + 3u]);
-        output[output_offset + 3u] = uchar((alpha + 1u) / 2u);
-    }
-}
-)D2S_DOWNSAMPLE";
-
 // Optional model-grid edge-aware smoothing. Keeping this in a separate
 // library lets the existing CoreML inference and warp pipelines initialize
 // even if a device cannot compile this optional filter.
@@ -987,7 +918,20 @@ struct DepthFilterParams {
     float strength;
     float sigma_color;
     float max_keep;
+    float depth_pop;
 };
+
+static inline float d2s_filter_depth_pop(float value, float pop) {
+    if (abs(pop) < 1.0e-6f) return clamp(value, 0.0f, 1.0f);
+    float centered = value - 0.5f;
+    if (pop < 0.0f) {
+        return clamp(0.5f + centered * (1.0f - clamp(-pop, 0.0f, 1.0f)),
+                     0.0f, 1.0f);
+    }
+    float exponent = 1.0f / (1.0f + pop);
+    float magnitude = pow(abs(centered), exponent);
+    return clamp(0.5f + (centered < 0.0f ? -magnitude : magnitude), 0.0f, 1.0f);
+}
 
 static inline float3 d2s_depth_guide_at(
     texture2d<float, access::sample> source, int x, int y,
@@ -1006,7 +950,7 @@ kernel void d2s_filter_depth_guided(
     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.depth_width || gid.y >= p.depth_height) return;
     uint output_index = gid.y * p.depth_width + gid.x;
-    float center = source_depth[output_index];
+    float center = d2s_filter_depth_pop(source_depth[output_index], p.depth_pop);
     int kernel_size = int(3.0f * p.strength) | 1;
     int radius = min(max((kernel_size - 1) / 2, 0), 6);
     if (radius <= 0) {
@@ -1031,7 +975,8 @@ kernel void d2s_filter_depth_guided(
             float sample_depth = 0.0f;
             if (sx >= 0 && sy >= 0 && sx < int(p.depth_width) &&
                 sy < int(p.depth_height)) {
-                sample_depth = source_depth[uint(sy) * p.depth_width + uint(sx)];
+                sample_depth = d2s_filter_depth_pop(
+                    source_depth[uint(sy) * p.depth_width + uint(sx)], p.depth_pop);
             }
             smooth_sum += sample_depth * weight;
             weight_sum += weight;
@@ -1058,6 +1003,142 @@ kernel void d2s_filter_depth_guided(
     filtered_depth[output_index] = clamp(
         keep * center + (1.0f - keep) * smooth, 0.0f, 1.0f);
 }
+
+struct DepthUpsampleParams {
+    uint source_width;
+    uint source_height;
+    uint depth_width;
+    uint depth_height;
+};
+
+static inline float3 d2s_upsample_color(
+    texture2d<float, access::sample> source_rgb, float x, float y,
+    constant DepthUpsampleParams& p) {
+    constexpr sampler s(address::clamp_to_edge, filter::linear);
+    float2 uv = (float2(x, y) + 0.5f) /
+                float2(p.depth_width, p.depth_height);
+    return source_rgb.sample(s, uv).rgb;
+}
+
+kernel void d2s_upsample_depth_joint_bilateral(
+    texture2d<float, access::sample> source_rgb [[texture(0)]],
+    device const float *source_depth [[buffer(0)]],
+    device float *upsampled_depth [[buffer(1)]],
+    constant DepthUpsampleParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.source_width || gid.y >= p.source_height) return;
+    constexpr sampler s(address::clamp_to_edge, filter::linear);
+    float dx = clamp((float(gid.x) + 0.5f) * float(p.depth_width) /
+                     float(p.source_width) - 0.5f,
+                     0.0f, float(p.depth_width) - 1.0f);
+    float dy = clamp((float(gid.y) + 0.5f) * float(p.depth_height) /
+                     float(p.source_height) - 0.5f,
+                     0.0f, float(p.depth_height) - 1.0f);
+    int x0 = int(floor(dx));
+    int y0 = int(floor(dy));
+    int x1 = min(x0 + 1, int(p.depth_width) - 1);
+    int y1 = min(y0 + 1, int(p.depth_height) - 1);
+    float fx = dx - float(x0);
+    float fy = dy - float(y0);
+    uint i00 = uint(y0) * p.depth_width + uint(x0);
+    uint i10 = uint(y0) * p.depth_width + uint(x1);
+    uint i01 = uint(y1) * p.depth_width + uint(x0);
+    uint i11 = uint(y1) * p.depth_width + uint(x1);
+    float d00 = source_depth[i00];
+    float d10 = source_depth[i10];
+    float d01 = source_depth[i01];
+    float d11 = source_depth[i11];
+    float s00 = (1.0f - fy) * (1.0f - fx);
+    float s10 = (1.0f - fy) * fx;
+    float s01 = fy * (1.0f - fx);
+    float s11 = fy * fx;
+    float bilinear = s00 * d00 + s10 * d10 + s01 * d01 + s11 * d11;
+
+    float2 rgb_uv = (float2(gid) + 0.5f) /
+                    float2(p.source_width, p.source_height);
+    float3 high_rgb = source_rgb.sample(s, rgb_uv).rgb;
+    float3 c00 = d2s_upsample_color(source_rgb, float(x0), float(y0), p);
+    float3 c10 = d2s_upsample_color(source_rgb, float(x1), float(y0), p);
+    float3 c01 = d2s_upsample_color(source_rgb, float(x0), float(y1), p);
+    float3 c11 = d2s_upsample_color(source_rgb, float(x1), float(y1), p);
+    float delta00 = dot(abs(high_rgb - c00), float3(1.0f / 3.0f));
+    float delta10 = dot(abs(high_rgb - c10), float3(1.0f / 3.0f));
+    float delta01 = dot(abs(high_rgb - c01), float3(1.0f / 3.0f));
+    float delta11 = dot(abs(high_rgb - c11), float3(1.0f / 3.0f));
+    float w00 = s00 * exp(-delta00 / 0.12f);
+    float w10 = s10 * exp(-delta10 / 0.12f);
+    float w01 = s01 * exp(-delta01 / 0.12f);
+    float w11 = s11 * exp(-delta11 / 0.12f);
+    float total = w00 + w10 + w01 + w11;
+    float guided = (w00 * d00 + w10 * d10 + w01 * d01 + w11 * d11) /
+                   max(total, 1.0e-8f);
+
+    float minimum = min(min(d00, d10), min(d01, d11));
+    float maximum = max(max(d00, d10), max(d01, d11));
+    float midpoint = (minimum + maximum) * 0.5f;
+    float nearest_delta = delta00;
+    float nearest_depth = d00;
+    if (delta10 < nearest_delta) { nearest_delta = delta10; nearest_depth = d10; }
+    if (delta01 < nearest_delta) { nearest_delta = delta01; nearest_depth = d01; }
+    if (delta11 < nearest_delta) { nearest_depth = d11; }
+    bool choose_high = nearest_depth >= midpoint;
+    float q00 = w00 * (((d00 >= midpoint) == choose_high) ? 1.0f : 0.0f);
+    float q10 = w10 * (((d10 >= midpoint) == choose_high) ? 1.0f : 0.0f);
+    float q01 = w01 * (((d01 >= midpoint) == choose_high) ? 1.0f : 0.0f);
+    float q11 = w11 * (((d11 >= midpoint) == choose_high) ? 1.0f : 0.0f);
+    float selected_total = q00 + q10 + q01 + q11;
+    float selected = (q00 * d00 + q10 * d10 + q01 * d01 + q11 * d11) /
+                     max(selected_total, 1.0e-8f);
+    float color_contrast = max(max(delta00, delta10), max(delta01, delta11)) -
+                           min(min(delta00, delta10), min(delta01, delta11));
+    bool use_class = maximum - minimum >= 0.04f &&
+                     selected_total > 1.0e-8f && color_contrast >= 0.005f;
+    if (use_class) guided = selected;
+    bool has_depth_edge = maximum - minimum >= 0.04f;
+    upsampled_depth[gid.y * p.source_width + gid.x] = clamp(
+        has_depth_edge && total > 1.0e-8f ? guided : bilinear, 0.0f, 1.0f);
+}
+
+struct DepthGaussianParams {
+    uint depth_width;
+    uint depth_height;
+    float depth_pop;
+};
+
+static inline float d2s_gaussian_depth_pop(float value, float pop) {
+    if (abs(pop) < 1.0e-6f) return clamp(value, 0.0f, 1.0f);
+    float centered = value - 0.5f;
+    if (pop < 0.0f) {
+        return clamp(0.5f + centered * (1.0f - clamp(-pop, 0.0f, 1.0f)),
+                     0.0f, 1.0f);
+    }
+    float magnitude = pow(abs(centered), 1.0f / (1.0f + pop));
+    return clamp(0.5f + (centered < 0.0f ? -magnitude : magnitude), 0.0f, 1.0f);
+}
+
+kernel void d2s_filter_depth_global_gaussian(
+    device const float *source_depth [[buffer(0)]],
+    device float *filtered_depth [[buffer(1)]],
+    constant DepthGaussianParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.depth_width || gid.y >= p.depth_height) return;
+    constexpr float weights[7] = {
+        0.07015933f, 0.13107488f, 0.19071282f, 0.21610594f,
+        0.19071282f, 0.13107488f, 0.07015933f
+    };
+    float sum = 0.0f;
+    for (int oy = -3; oy <= 3; ++oy) {
+        int sy = clamp(int(gid.y) + oy, 0, int(p.depth_height) - 1);
+        float wy = weights[oy + 3];
+        for (int ox = -3; ox <= 3; ++ox) {
+            int sx = clamp(int(gid.x) + ox, 0, int(p.depth_width) - 1);
+            float weight = wy * weights[ox + 3];
+            float value = source_depth[uint(sy) * p.depth_width + uint(sx)];
+            sum += d2s_gaussian_depth_pop(value, p.depth_pop) * weight;
+        }
+    }
+    filtered_depth[gid.y * p.depth_width + gid.x] = clamp(sum, 0.0f, 1.0f);
+}
 )D2S_FILTER";
 
 typedef struct {
@@ -1068,10 +1149,6 @@ typedef struct {
     __strong id<MTLBuffer> filtered_depth_buffer;
     __strong id<MTLBuffer> status_buffer;
     __strong id<MTLBuffer> packed_buffer;
-    __strong id<MTLBuffer> raw_packed_buffer;
-    __strong id<MTLBuffer> half_packed_buffer;
-    __strong id<MTLBuffer> smaa_edges_buffer;
-    __strong id<MTLBuffer> smaa_weights_buffer;
     __strong id<MTLTexture> color_texture;
     __strong MLMultiArray *input_array;
     __strong MLMultiArray *output_array;
@@ -1096,15 +1173,11 @@ typedef struct {
     __strong id<MTLComputePipelineState> normalize_half_pipeline;
     __strong id<MTLComputePipelineState> normalize_float_pipeline;
     __strong id<MTLComputePipelineState> depth_filter_pipeline;
+    __strong id<MTLComputePipelineState> depth_upsample_pipeline;
+    __strong id<MTLComputePipelineState> depth_global_gaussian_pipeline;
     __strong id<MTLComputePipelineState> warp_pipeline;
-    __strong id<MTLComputePipelineState> fxaa_pipeline;
-    __strong id<MTLComputePipelineState> fxaa_half_pipeline;
-    __strong id<MTLComputePipelineState> downsample_half_pipeline;
-    __strong id<MTLComputePipelineState> smaa_edges_pipeline;
-    __strong id<MTLComputePipelineState> smaa_weights_pipeline;
-    __strong id<MTLComputePipelineState> smaa_resolve_pipeline;
-    __strong id<MTLBuffer> smaa_area_buffer;
-    __strong id<MTLBuffer> smaa_search_buffer;
+    __strong id<MTLBuffer> upsampled_depth_buffer;
+    __strong id<MTLBuffer> global_gaussian_depth_buffer;
     CVMetalTextureCacheRef texture_cache;
     __strong NSString *input_name;
     __strong NSString *output_name;
@@ -1119,6 +1192,8 @@ typedef struct {
     D2SSlot slots[3];
     pthread_mutex_t mutex;
     int32_t mutex_initialized;
+    pthread_mutex_t pack_mutex;
+    int32_t pack_mutex_initialized;
     uint64_t depth_range_frame_id;
     float depth_range_lo;
     float depth_range_hi;
@@ -1198,14 +1273,11 @@ static void d2s_release_slot(D2SSlot *slot) {
 
 static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     if (ctx == NULL) return;
+    if (ctx->pack_mutex_initialized) pthread_mutex_lock(&ctx->pack_mutex);
     if (ctx->mutex_initialized) pthread_mutex_lock(&ctx->mutex);
     for (int i = 0; i < 3; ++i) {
         d2s_release_slot(&ctx->slots[i]);
         ctx->slots[i].packed_buffer = nil;
-        ctx->slots[i].raw_packed_buffer = nil;
-        ctx->slots[i].half_packed_buffer = nil;
-        ctx->slots[i].smaa_edges_buffer = nil;
-        ctx->slots[i].smaa_weights_buffer = nil;
         ctx->slots[i].filtered_depth_buffer = nil;
     }
     if (ctx->texture_cache != NULL) {
@@ -1220,15 +1292,11 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     ctx->normalize_half_pipeline = nil;
     ctx->normalize_float_pipeline = nil;
     ctx->depth_filter_pipeline = nil;
+    ctx->depth_upsample_pipeline = nil;
+    ctx->depth_global_gaussian_pipeline = nil;
+    ctx->upsampled_depth_buffer = nil;
+    ctx->global_gaussian_depth_buffer = nil;
     ctx->warp_pipeline = nil;
-    ctx->fxaa_pipeline = nil;
-    ctx->fxaa_half_pipeline = nil;
-    ctx->downsample_half_pipeline = nil;
-    ctx->smaa_edges_pipeline = nil;
-    ctx->smaa_weights_pipeline = nil;
-    ctx->smaa_resolve_pipeline = nil;
-    ctx->smaa_area_buffer = nil;
-    ctx->smaa_search_buffer = nil;
     ctx->input_name = nil;
     ctx->output_name = nil;
     ctx->input_shape = nil;
@@ -1238,31 +1306,29 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
         pthread_mutex_destroy(&ctx->mutex);
         ctx->mutex_initialized = 0;
     }
+    if (ctx->pack_mutex_initialized) {
+        pthread_mutex_unlock(&ctx->pack_mutex);
+        pthread_mutex_destroy(&ctx->pack_mutex);
+        ctx->pack_mutex_initialized = 0;
+    }
     free(ctx);
 }
 
 static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     id<MTLLibrary> library = [ctx->device newLibraryWithSource:
-                                                          [NSString stringWithFormat:@"%s\n%s", D2SMetalSource, D2S_FXAA_MSL]
-                                                          options:nil
-                                                            error:error];
+        [NSString stringWithUTF8String:D2SMetalSource] options:nil error:error];
     if (library == nil) return NO;
     id<MTLFunction> preprocess = [library newFunctionWithName:@"d2s_preprocess"];
     id<MTLFunction> norm_half = [library newFunctionWithName:@"d2s_normalize_half"];
     id<MTLFunction> norm_float = [library newFunctionWithName:@"d2s_normalize_float"];
     id<MTLFunction> warp = [library newFunctionWithName:@"d2s_warp_pack"];
-    id<MTLFunction> fxaa = [library newFunctionWithName:@"d2s_sbs_fxaa"];
-    id<MTLFunction> fxaa_half = [library newFunctionWithName:@"d2s_sbs_fxaa_half"];
-    if (!preprocess || !norm_half || !norm_float || !warp || !fxaa || !fxaa_half) return NO;
+    if (!preprocess || !norm_half || !norm_float || !warp) return NO;
     ctx->preprocess_pipeline = [ctx->device newComputePipelineStateWithFunction:preprocess error:error];
     ctx->normalize_half_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_half error:error];
     ctx->normalize_float_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_float error:error];
     ctx->warp_pipeline = [ctx->device newComputePipelineStateWithFunction:warp error:error];
-    ctx->fxaa_pipeline = [ctx->device newComputePipelineStateWithFunction:fxaa error:error];
-    ctx->fxaa_half_pipeline = [ctx->device newComputePipelineStateWithFunction:fxaa_half error:error];
     if (!(ctx->preprocess_pipeline && ctx->normalize_half_pipeline &&
-           ctx->normalize_float_pipeline && ctx->warp_pipeline &&
-           ctx->fxaa_pipeline && ctx->fxaa_half_pipeline)) return NO;
+           ctx->normalize_float_pipeline && ctx->warp_pipeline)) return NO;
 
     NSError *filter_error = nil;
     id<MTLLibrary> filter_library = [ctx->device newLibraryWithSource:
@@ -1271,32 +1337,30 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     if (filter_library != nil) {
         id<MTLFunction> filter_function =
             [filter_library newFunctionWithName:@"d2s_filter_depth_guided"];
+        id<MTLFunction> upsample_function =
+            [filter_library newFunctionWithName:@"d2s_upsample_depth_joint_bilateral"];
+        id<MTLFunction> global_gaussian_function =
+            [filter_library newFunctionWithName:@"d2s_filter_depth_global_gaussian"];
         if (filter_function != nil) {
             ctx->depth_filter_pipeline = [ctx->device
                 newComputePipelineStateWithFunction:filter_function error:&filter_error];
         }
-    }
-
-    NSError *downsample_error = nil;
-    id<MTLLibrary> downsample_library = [ctx->device newLibraryWithSource:
-        [NSString stringWithUTF8String:D2SHalfDownsampleMetalSource]
-        options:nil error:&downsample_error];
-    if (downsample_library != nil) {
-        id<MTLFunction> downsample_function =
-            [downsample_library newFunctionWithName:@"d2s_sbs_downsample_half"];
-        if (downsample_function != nil) {
-            ctx->downsample_half_pipeline = [ctx->device
-                newComputePipelineStateWithFunction:downsample_function
-                error:&downsample_error];
+        if (upsample_function != nil) {
+            ctx->depth_upsample_pipeline = [ctx->device
+                newComputePipelineStateWithFunction:upsample_function error:&filter_error];
+        }
+        if (global_gaussian_function != nil) {
+            ctx->depth_global_gaussian_pipeline = [ctx->device
+                newComputePipelineStateWithFunction:global_gaussian_function
+                error:&filter_error];
         }
     }
-    if (ctx->downsample_half_pipeline == nil) {
-        fprintf(stderr, "[CoreML] Reduced-resolution Half-SBS FXAA unavailable: %s\n",
-                downsample_error.localizedDescription.UTF8String ?: "Metal kernel unavailable");
+    if (ctx->depth_global_gaussian_pipeline == nil) {
+        if (error != NULL) *error = filter_error;
+        return NO;
     }
-
-    // All runtime backends use the shared single-pass FXAA display filter.
-    // Leave the dormant SMAA fields nil so native packing follows its FXAA path.
+    // Guided depth filtering is optional; global Gaussian is required whenever
+    // the shared display-AA switch is enabled.
     return YES;
 }
 
@@ -1362,6 +1426,13 @@ void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
             return NULL;
         }
         ctx->mutex_initialized = 1;
+        if (pthread_mutex_init(&ctx->pack_mutex, NULL) != 0) {
+            d2s_set_create_error(error_buffer, error_capacity,
+                                 @"native CoreML pack lock initialization failed");
+            d2s_destroy_context(ctx);
+            return NULL;
+        }
+        ctx->pack_mutex_initialized = 1;
         ctx->input_width = input_width;
         ctx->input_height = input_height;
         ctx->device = MTLCreateSystemDefaultDevice();
@@ -1421,35 +1492,6 @@ void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
         for (int i = 0; i < 3; ++i) ctx->slots[i].state = 0;
         return ctx;
     }
-}
-
-int32_t d2s_coreml_io_set_smaa_luts(void *handle,
-                                    const void *area, size_t area_size,
-                                    const void *search, size_t search_size) {
-    D2SCoreMLIO *ctx = (D2SCoreMLIO *)handle;
-    if (ctx == NULL || area == NULL || search == NULL ||
-        area_size != 160u * 560u * 2u || search_size != 64u * 16u) {
-        return D2S_COREML_UNSUPPORTED;
-    }
-    D2SLockGuard lock(&ctx->mutex);
-    if (ctx->smaa_edges_pipeline == nil || ctx->smaa_weights_pipeline == nil ||
-        ctx->smaa_resolve_pipeline == nil) {
-        d2s_set_error(ctx, @"Metal SMAA pipelines are unavailable");
-        return D2S_COREML_UNSUPPORTED;
-    }
-    ctx->smaa_area_buffer = [ctx->device newBufferWithBytes:area
-                                                     length:area_size
-                                                    options:MTLResourceStorageModeShared];
-    ctx->smaa_search_buffer = [ctx->device newBufferWithBytes:search
-                                                       length:search_size
-                                                      options:MTLResourceStorageModeShared];
-    if (ctx->smaa_area_buffer == nil || ctx->smaa_search_buffer == nil) {
-        ctx->smaa_area_buffer = nil;
-        ctx->smaa_search_buffer = nil;
-        d2s_set_error(ctx, @"Metal SMAA lookup table allocation failed");
-        return D2S_COREML_ERROR;
-    }
-    return D2S_COREML_OK;
 }
 
 static int32_t d2s_find_slot(D2SCoreMLIO *ctx) {
@@ -1859,6 +1901,9 @@ static int32_t d2s_coreml_io_pack_internal(
                 return D2S_COREML_ERROR;
             }
         }
+        // Output-resolution depth buffers are shared by the pack queue. Keep
+        // allocation and command use ordered if more than one caller packs.
+        D2SLockGuard pack_lock(&ctx->pack_mutex);
         size_t output_bytes = (size_t)output_width * (size_t)output_height * output_channels;
         if (slot->packed_buffer == nil || slot->packed_buffer.length < output_bytes) {
             slot->packed_buffer = [ctx->device newBufferWithLength:(NSUInteger)output_bytes
@@ -1885,37 +1930,10 @@ static int32_t d2s_coreml_io_pack_internal(
             output_channels,
             warp_config != NULL ? *warp_config : default_stereo,
         };
-        BOOL filter_sbs = params.stereo.edge_aa_enabled != 0 &&
-            (output_format == D2S_OUTPUT_HALF_SBS || output_format == D2S_OUTPUT_FULL_SBS);
-        BOOL filter_half = filter_sbs && output_format == D2S_OUTPUT_HALF_SBS;
-        // Keep the DIBR warp single-sampled; SBS color AA runs in a separate pass.
+        BOOL global_depth_gaussian = params.stereo.edge_aa_enabled != 0;
+        // Depth is filtered before the warp; no pixel-space AA follows it.
         params.stereo.edge_aa_enabled = 0;
-        uint32_t raw_width = filter_half
-            ? (uint32_t)output_width * 2u : (uint32_t)output_width;
-        if (filter_half) {
-            params.output_width = raw_width;
-            params.output_format = D2S_OUTPUT_FULL_SBS_FROM_HALF;
-        }
         id<MTLBuffer> warp_destination = destination_buffer;
-        BOOL use_reduced_half_aa = filter_half && ctx->downsample_half_pipeline != nil;
-        if (filter_sbs) {
-            size_t raw_bytes = (size_t)raw_width * output_height * output_channels;
-            if (slot->raw_packed_buffer == nil || slot->raw_packed_buffer.length < raw_bytes) {
-                slot->raw_packed_buffer = [ctx->device newBufferWithLength:(NSUInteger)raw_bytes
-                                                                  options:MTLResourceStorageModePrivate];
-            }
-            warp_destination = slot->raw_packed_buffer;
-            if (warp_destination == nil) {
-                d2s_set_error(ctx, @"Metal edge-AA input buffer allocation failed");
-                return D2S_COREML_ERROR;
-            }
-        }
-        if (use_reduced_half_aa &&
-            (slot->half_packed_buffer == nil || slot->half_packed_buffer.length < output_bytes)) {
-            slot->half_packed_buffer = [ctx->device newBufferWithLength:(NSUInteger)output_bytes
-                                                               options:MTLResourceStorageModePrivate];
-        }
-        use_reduced_half_aa = use_reduced_half_aa && slot->half_packed_buffer != nil;
         id<MTLCommandBuffer> command = [ctx->pack_queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
         d2s_encode_normalize(ctx, slot, encoder, slot->normalize_lo, slot->normalize_hi);
@@ -1938,6 +1956,7 @@ static int32_t d2s_coreml_io_pack_internal(
                     fminf(4.0f, fmaxf(0.0f, 2.0f * params.stereo.antialias_strength)),
                     0.1f,
                     0.35f,
+                    0.0f,
                 };
                 id<MTLComputeCommandEncoder> filter_encoder =
                     [command computeCommandEncoder];
@@ -1955,10 +1974,81 @@ static int32_t d2s_coreml_io_pack_internal(
                         threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
                     [filter_encoder endEncoding];
                     warp_depth_buffer = slot->filtered_depth_buffer;
-                    // The model-grid filter now owns depth AA for this frame.
+                    // The model-grid filter now owns the configured guided AA.
                     params.stereo.antialias_strength = 0.0f;
                 }
             }
+        }
+
+        if (global_depth_gaussian) {
+            if (ctx->depth_upsample_pipeline == nil ||
+                ctx->depth_global_gaussian_pipeline == nil) {
+                d2s_set_error(ctx, @"Metal output-resolution depth AA pipeline is unavailable");
+                return D2S_COREML_ERROR;
+            }
+            size_t source_depth_bytes =
+                (size_t)source_width * source_height * sizeof(float);
+            if (ctx->upsampled_depth_buffer == nil ||
+                ctx->upsampled_depth_buffer.length < source_depth_bytes) {
+                ctx->upsampled_depth_buffer = [ctx->device
+                    newBufferWithLength:(NSUInteger)source_depth_bytes
+                    options:MTLResourceStorageModePrivate];
+            }
+            if (ctx->global_gaussian_depth_buffer == nil ||
+                ctx->global_gaussian_depth_buffer.length < source_depth_bytes) {
+                ctx->global_gaussian_depth_buffer = [ctx->device
+                    newBufferWithLength:(NSUInteger)source_depth_bytes
+                    options:MTLResourceStorageModePrivate];
+            }
+            if (ctx->upsampled_depth_buffer == nil ||
+                ctx->global_gaussian_depth_buffer == nil) {
+                d2s_set_error(ctx, @"Metal global depth Gaussian buffer allocation failed");
+                return D2S_COREML_ERROR;
+            }
+
+            if (source_width != (uint32_t)ctx->depth_width ||
+                source_height != (uint32_t)ctx->depth_height) {
+                D2SDepthUpsampleParams upsample_params = {
+                    source_width,
+                    source_height,
+                    (uint32_t)ctx->depth_width,
+                    (uint32_t)ctx->depth_height,
+                };
+                id<MTLComputeCommandEncoder> upsample_encoder =
+                    [command computeCommandEncoder];
+                [upsample_encoder setComputePipelineState:ctx->depth_upsample_pipeline];
+                [upsample_encoder setTexture:slot->color_texture atIndex:0];
+                [upsample_encoder setBuffer:warp_depth_buffer offset:0 atIndex:0];
+                [upsample_encoder setBuffer:ctx->upsampled_depth_buffer offset:0 atIndex:1];
+                [upsample_encoder setBytes:&upsample_params
+                    length:sizeof(upsample_params) atIndex:2];
+                MTLSize upsample_grid = MTLSizeMake(source_width, source_height, 1);
+                [upsample_encoder dispatchThreads:upsample_grid
+                    threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                [upsample_encoder endEncoding];
+                warp_depth_buffer = ctx->upsampled_depth_buffer;
+            }
+
+            D2SDepthGaussianParams gaussian_params = {
+                source_width,
+                source_height,
+                params.stereo.depth_pop,
+            };
+            id<MTLComputeCommandEncoder> gaussian_encoder =
+                [command computeCommandEncoder];
+            [gaussian_encoder setComputePipelineState:ctx->depth_global_gaussian_pipeline];
+            [gaussian_encoder setBuffer:warp_depth_buffer offset:0 atIndex:0];
+            [gaussian_encoder setBuffer:ctx->global_gaussian_depth_buffer offset:0 atIndex:1];
+            [gaussian_encoder setBytes:&gaussian_params
+                length:sizeof(gaussian_params) atIndex:2];
+            MTLSize gaussian_grid = MTLSizeMake(source_width, source_height, 1);
+            [gaussian_encoder dispatchThreads:gaussian_grid
+                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            [gaussian_encoder endEncoding];
+            warp_depth_buffer = ctx->global_gaussian_depth_buffer;
+            params.depth_width = source_width;
+            params.depth_height = source_height;
+            params.stereo.depth_pop = 0.0f;
         }
 
         encoder = [command computeCommandEncoder];
@@ -1968,114 +2058,10 @@ static int32_t d2s_coreml_io_pack_internal(
         [encoder setBuffer:warp_destination offset:0 atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         NSUInteger threads = 64;
-        MTLSize grid = MTLSizeMake((NSUInteger)raw_width * output_height, 1, 1);
+        MTLSize grid = MTLSizeMake((NSUInteger)output_width * output_height, 1, 1);
         [encoder dispatchThreads:grid
           threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         [encoder endEncoding];
-        if (filter_sbs && use_reduced_half_aa) {
-            D2SHalfDownsampleParams downsample_params = {
-                raw_width, (uint32_t)output_height, output_channels,
-                raw_width / 2u,
-            };
-            encoder = [command computeCommandEncoder];
-            [encoder setComputePipelineState:ctx->downsample_half_pipeline];
-            [encoder setBuffer:warp_destination offset:0 atIndex:0];
-            [encoder setBuffer:slot->half_packed_buffer offset:0 atIndex:1];
-            [encoder setBytes:&downsample_params
-                length:sizeof(downsample_params) atIndex:2];
-            [encoder dispatchThreads:MTLSizeMake(output_width, output_height, 1)
-              threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
-            [encoder endEncoding];
-
-            D2SFxaaParams aa_params = {
-                (uint32_t)output_width, (uint32_t)output_height,
-                output_channels, 0u, (uint32_t)output_width / 2u, 1u,
-            };
-            encoder = [command computeCommandEncoder];
-            [encoder setComputePipelineState:ctx->fxaa_pipeline];
-            [encoder setBuffer:slot->half_packed_buffer offset:0 atIndex:0];
-            [encoder setBuffer:slot->half_packed_buffer offset:0 atIndex:1];
-            [encoder setBuffer:destination_buffer offset:0 atIndex:2];
-            [encoder setBuffer:destination_buffer offset:0 atIndex:3];
-            [encoder setBytes:&aa_params length:sizeof(aa_params) atIndex:4];
-            [encoder dispatchThreads:MTLSizeMake(output_width, output_height, 1)
-              threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
-            [encoder endEncoding];
-        } else if (filter_sbs) {
-            BOOL use_smaa = ctx->smaa_edges_pipeline != nil &&
-                ctx->smaa_weights_pipeline != nil && ctx->smaa_resolve_pipeline != nil &&
-                ctx->smaa_area_buffer != nil && ctx->smaa_search_buffer != nil;
-            size_t raw_pixels = (size_t)raw_width * output_height;
-            size_t edge_bytes = raw_pixels * 2u;
-            size_t weight_bytes = raw_pixels * 4u;
-            if (use_smaa) {
-                if (slot->smaa_edges_buffer == nil || slot->smaa_edges_buffer.length < edge_bytes) {
-                    slot->smaa_edges_buffer = [ctx->device newBufferWithLength:edge_bytes
-                        options:MTLResourceStorageModePrivate];
-                }
-                if (slot->smaa_weights_buffer == nil || slot->smaa_weights_buffer.length < weight_bytes) {
-                    slot->smaa_weights_buffer = [ctx->device newBufferWithLength:weight_bytes
-                        options:MTLResourceStorageModePrivate];
-                }
-                use_smaa = slot->smaa_edges_buffer != nil && slot->smaa_weights_buffer != nil;
-            }
-            if (use_smaa) {
-                // SMAA runs on complete eyes at warp resolution. The final
-                // resolve also performs the positive-weight Half-SBS shrink.
-                D2SSmaaParams aa_params = {
-                    raw_width, (uint32_t)output_height, output_channels, 0u,
-                    raw_width / 2u, 1u, filter_half ? 1u : 0u, 0u,
-                };
-                MTLSize aa_grid = MTLSizeMake(raw_width, output_height, 1);
-                MTLSize aa_group = MTLSizeMake(16, 8, 1);
-                encoder = [command computeCommandEncoder];
-                [encoder setComputePipelineState:ctx->smaa_edges_pipeline];
-                [encoder setBuffer:warp_destination offset:0 atIndex:0];
-                [encoder setBuffer:warp_destination offset:0 atIndex:1];
-                [encoder setBuffer:slot->smaa_edges_buffer offset:0 atIndex:2];
-                [encoder setBytes:&aa_params length:sizeof(aa_params) atIndex:3];
-                [encoder dispatchThreads:aa_grid threadsPerThreadgroup:aa_group];
-                [encoder endEncoding];
-
-                encoder = [command computeCommandEncoder];
-                [encoder setComputePipelineState:ctx->smaa_weights_pipeline];
-                [encoder setBuffer:slot->smaa_edges_buffer offset:0 atIndex:0];
-                [encoder setBuffer:ctx->smaa_area_buffer offset:0 atIndex:1];
-                [encoder setBuffer:ctx->smaa_search_buffer offset:0 atIndex:2];
-                [encoder setBuffer:slot->smaa_weights_buffer offset:0 atIndex:3];
-                [encoder setBytes:&aa_params length:sizeof(aa_params) atIndex:4];
-                [encoder dispatchThreads:aa_grid threadsPerThreadgroup:aa_group];
-                [encoder endEncoding];
-
-                encoder = [command computeCommandEncoder];
-                [encoder setComputePipelineState:ctx->smaa_resolve_pipeline];
-                [encoder setBuffer:warp_destination offset:0 atIndex:0];
-                [encoder setBuffer:warp_destination offset:0 atIndex:1];
-                [encoder setBuffer:slot->smaa_weights_buffer offset:0 atIndex:2];
-                [encoder setBuffer:destination_buffer offset:0 atIndex:3];
-                [encoder setBuffer:destination_buffer offset:0 atIndex:4];
-                [encoder setBytes:&aa_params length:sizeof(aa_params) atIndex:5];
-                [encoder dispatchThreads:MTLSizeMake(output_width, output_height, 1)
-                  threadsPerThreadgroup:aa_group];
-                [encoder endEncoding];
-            } else {
-                // Optional-SMAA setup failures retain the tested legacy path.
-                encoder = [command computeCommandEncoder];
-                [encoder setComputePipelineState:filter_half ? ctx->fxaa_half_pipeline : ctx->fxaa_pipeline];
-                [encoder setBuffer:warp_destination offset:0 atIndex:0];
-                [encoder setBuffer:warp_destination offset:0 atIndex:1];
-                [encoder setBuffer:destination_buffer offset:0 atIndex:2];
-                [encoder setBuffer:destination_buffer offset:0 atIndex:3];
-                D2SFxaaParams aa_params = {
-                    raw_width, (uint32_t)output_height,
-                    output_channels, 0u, raw_width / 2u, 1u,
-                };
-                [encoder setBytes:&aa_params length:sizeof(aa_params) atIndex:4];
-                [encoder dispatchThreads:MTLSizeMake(output_width, output_height, 1)
-                  threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
-                [encoder endEncoding];
-            }
-        }
         [command commit];
         [command waitUntilCompleted];
         if (command.status != MTLCommandBufferStatusCompleted) {

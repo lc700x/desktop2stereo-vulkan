@@ -121,12 +121,8 @@ vertex VertexOut vertex_main(uint vid [[vertex_id]]) {
 }
 
 static float2 displaced_uv(float2 uv, float eye, texture2d<float> depthTex, sampler s, constant Uniforms& u) {
-    // 3-tap Gaussian depth smoothing along horizontal parallax
-    float2 ds_dir = float2(sign(eye) / float(depthTex.get_width()) * 1.5, 0.0);
-    float d0 = depthTex.sample(s, uv).r;
-    float dm = depthTex.sample(s, uv - ds_dir).r;
-    float dp = depthTex.sample(s, uv + ds_dir).r;
-    float d = clamp(d0 * 0.7 + dm * 0.15 + dp * 0.15, 0.0, 1.0);
+    // Depth is globally antialiased before upload, so one sample is enough.
+    float d = clamp(depthTex.sample(s, uv).r, 0.0, 1.0);
     // Asymmetric depth shaping: boosts near-object pop ~35%
     float depth_shaped = d * (1.0 + 0.35 * (1.0 - d));
     float shift = (depth_shaped - u.convergence) * u.depthStrength * eye;

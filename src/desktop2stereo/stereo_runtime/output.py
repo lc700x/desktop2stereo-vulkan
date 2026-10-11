@@ -235,22 +235,6 @@ def make_sbs(
     depth: torch.Tensor | None = None,
     anaglyph_method: AnaglyphMethod = "red_cyan",
 ) -> torch.Tensor:
-    if output_edge_aa_enabled() and output_format in {"half_sbs", "full_sbs"}:
-        left_bchw = ensure_bchw(left, name="left")
-        right_bchw = ensure_bchw(right, name="right")
-        if left_bchw.shape != right_bchw.shape:
-            raise ValueError(
-                f"left and right shapes must match, got {left_bchw.shape} and {right_bchw.shape}"
-            )
-        if left_bchw.shape[1] in (3, 4):
-            from .display_antialias import antialias_sbs, antialias_sbs_half
-
-            packed = torch.cat((left_bchw, right_bchw), dim=-1)
-            if output_format == "half_sbs":
-                # One device dispatch performs both eye-local FXAA and the
-                # positive-weight linear-light Half-SBS reduction.
-                return antialias_sbs_half(packed)
-            return antialias_sbs(packed, output_format)
     return _make_sbs_unfiltered(left, right, output_format, fused, depth, anaglyph_method)
 
 
@@ -301,6 +285,11 @@ def _make_sbs_unfiltered(
         if depth is None:
             raise ValueError("depth_map output requires depth")
         depth = match_depth(depth, left.shape[-2], left.shape[-1])
+        # A depth map is also the synthesis field, so use the same global
+        # Gaussian applied before DIBR rather than smoothing display RGB.
+        from .display_antialias import antialias_depth_map
+
+        depth = antialias_depth_map(depth)
         if sbs_backend(left, right, output_format, fused=fused, depth=depth) == "triton_depth_map":
             from .output_triton import make_depth_map
 
@@ -318,13 +307,22 @@ def _make_sbs_unfiltered(
         if sbs_backend(left, right, output_format, fused=fused) == "triton_half_sbs":
             from .output_triton import make_half_sbs
 
-            return make_half_sbs(left, right, linear_srgb=output_edge_aa_enabled())
+            return make_half_sbs(left, right, linear_srgb=True)
+        if (
+            left.device.type == "mps"
+            and right.device.type == "mps"
+            and left.dtype == torch.float32
+            and left.shape[1] in (3, 4)
+            and left.shape[-1] % 2 == 0
+        ):
+            try:
+                from .output_mps import make_half_sbs_srgb
+
+                return make_half_sbs_srgb(left, right)
+            except Exception:
+                pass
         width = int(left.shape[-1])
-        downsample = (
-            downsample_horizontal_area_srgb
-            if output_edge_aa_enabled() and left.shape[1] in (3, 4)
-            else downsample_horizontal_area
-        )
+        downsample = downsample_horizontal_area_srgb if left.shape[1] in (3, 4) else downsample_horizontal_area
         left_half = downsample(left, width // 2)
         right_half = downsample(right, width - width // 2)
         return torch.cat([left_half, right_half], dim=-1)
@@ -369,6 +367,15 @@ def sbs_backend(
         return "torch_mono_left"
     if output_format in {"anaglyph", "interleaved", "leia"} and (not fused or _triton_disabled_by_env()):
         return f"torch_{output_format}"
+    if (
+        output_format == "half_sbs"
+        and left.device.type == "mps"
+        and left.dtype == torch.float32
+        and left.ndim == 4
+        and left.shape[1] in (3, 4)
+        and left.shape[-1] % 2 == 0
+    ):
+        return "mps_half_sbs_srgb"
     if output_format not in {"half_sbs", "full_sbs", "half_tab", "full_tab", "depth_map", "anaglyph", "interleaved", "leia"}:
         return "torch_output"
     try:

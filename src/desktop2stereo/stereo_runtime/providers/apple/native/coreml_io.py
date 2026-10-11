@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ....output import output_edge_aa_enabled
@@ -26,7 +26,6 @@ from ....output import output_edge_aa_enabled
 _NATIVE_DIR = Path(__file__).resolve().parent
 _SOURCE = _NATIVE_DIR / "macos_coreml_io.mm"
 _HEADER = _NATIVE_DIR / "macos_coreml_io.h"
-_FXAA_HEADER = _NATIVE_DIR / "sbs_fxaa_msl.h"
 _LOGGER = logging.getLogger(__name__)
 
 _NATIVE_OUTPUT_FORMATS = {
@@ -133,9 +132,7 @@ def _cache_path() -> Path:
         if override
         else Path.home() / "Library" / "Caches" / "desktop2stereo" / "coreml_io"
     )
-    digest = hashlib.sha256(
-        _SOURCE.read_bytes() + _HEADER.read_bytes() + _FXAA_HEADER.read_bytes()
-    ).hexdigest()[:16]
+    digest = hashlib.sha256(_SOURCE.read_bytes() + _HEADER.read_bytes()).hexdigest()[:16]
     return root / f"libd2s_coreml_io-{platform.machine()}-{digest}.dylib"
 
 
@@ -154,7 +151,7 @@ def _sdk_path() -> str | None:
 
 
 def _build_library() -> tuple[Path | None, str | None]:
-    if not all(path.is_file() for path in (_SOURCE, _HEADER, _FXAA_HEADER)):
+    if not all(path.is_file() for path in (_SOURCE, _HEADER)):
         return None, "native CoreML bridge source is missing"
     clang = shutil.which("clang++")
     if clang is None:
@@ -242,6 +239,9 @@ class NativeCoreMLFrame:
     normalization_history_reset: bool = False
     warp_config: dict[str, float | int | str] | None = None
     released: bool = False
+    _lifetime_lock: Any = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     @property
     def shape(self) -> tuple[int, int, int, int]:
@@ -259,25 +259,30 @@ class NativeCoreMLFrame:
         *,
         rgb: bool = False,
     ) -> None:
-        if self.released:
-            raise RuntimeError("native CoreML frame was already released")
-        pointer, view = _buffer_pointer(destination)
-        width, height = (int(output_size[0]), int(output_size[1]))
-        arguments = (self, pointer, len(view), width, height, output_format)
-        if rgb:
-            self.bridge.pack(*arguments, rgb=True)
-        else:
-            self.bridge.pack(*arguments)
+        # The native slot owns Metal buffers used until pack's command buffer
+        # completes. Serialize release with the whole pack call so a queue
+        # drop or shutdown cannot free those buffers while Metal is using them.
+        with self._lifetime_lock:
+            if self.released:
+                raise RuntimeError("native CoreML frame was already released")
+            pointer, view = _buffer_pointer(destination)
+            width, height = (int(output_size[0]), int(output_size[1]))
+            arguments = (self, pointer, len(view), width, height, output_format)
+            if rgb:
+                self.bridge.pack(*arguments, rgb=True)
+            else:
+                self.bridge.pack(*arguments)
 
     def configure_warp(self, **values: float | int | str) -> None:
         """Attach the shared stereo parameters before presenter-side packing."""
         self.warp_config = dict(values)
 
     def release(self) -> None:
-        if self.released:
-            return
-        self.released = True
-        self.bridge.release(self.slot)
+        with self._lifetime_lock:
+            if self.released:
+                return
+            self.released = True
+            self.bridge.release(self.slot)
 
 
 class NativeCoreMLIOBridge:
@@ -355,9 +360,6 @@ class NativeCoreMLIOBridge:
         self.input_width = int(input_width)
         self.input_height = int(input_height)
         self.last_error = ""
-        # Keep native CoreML output on the same fast FXAA path as Vulkan and
-        # CUDA/ROCm. Inference and its synchronization remain untouched.
-        self.smaa_enabled = False
 
     @classmethod
     def try_create(cls, model_path: str | Path, input_width: int, input_height: int):

@@ -1,9 +1,80 @@
 from __future__ import annotations
 
+import functools
 import torch
 import torch.nn.functional as F
 
 from .output import ensure_b1hw, ensure_bchw
+
+
+_GLOBAL_GAUSSIAN_MSL = r"""
+#include <metal_stdlib>
+using namespace metal;
+struct DepthGaussianParams { uint width; uint height; uint batches; };
+kernel void d2s_depth_global_gaussian(
+    device const float* source [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant DepthGaussianParams& p [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.width || gid.y >= p.height || gid.z >= p.batches) return;
+    constexpr float weights[7] = {
+        0.07015933f, 0.13107488f, 0.19071282f, 0.21610594f,
+        0.19071282f, 0.13107488f, 0.07015933f
+    };
+    float sum = 0.0f;
+    for (int dy = -3; dy <= 3; ++dy) {
+        int y = clamp(int(gid.y) + dy, 0, int(p.height) - 1);
+        float wy = weights[dy + 3];
+        for (int dx = -3; dx <= 3; ++dx) {
+            int x = clamp(int(gid.x) + dx, 0, int(p.width) - 1);
+            float weight = wy * weights[dx + 3];
+            uint index = gid.z * p.width * p.height + uint(y) * p.width + uint(x);
+            sum += source[index] * weight;
+        }
+    }
+    uint index = gid.z * p.width * p.height + gid.y * p.width + gid.x;
+    output[index] = clamp(sum, 0.0f, 1.0f);
+}
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _mps_depth_gaussian_library():
+    return torch.mps.compile_shader(_GLOBAL_GAUSSIAN_MSL)
+
+
+def anti_alias_depth_global_gaussian(depth: torch.Tensor) -> torch.Tensor:
+    """Apply the shared 7x7, sigma-2 Gaussian to normalized depth values."""
+    depth = ensure_b1hw(depth).float().contiguous()
+    batch, _, height, width = map(int, depth.shape)
+    if min(batch, height, width) < 1:
+        return depth
+
+    if depth.device.type == "mps":
+        try:
+            output = torch.empty_like(depth)
+            params = torch.tensor((width, height, batch), dtype=torch.int32, device="mps")
+            _mps_depth_gaussian_library().d2s_depth_global_gaussian(
+                depth, output, params, threads=(width, height, batch)
+            )
+            return output
+        except Exception:
+            pass
+
+    if depth.device.type == "cuda":
+        try:
+            from ._depth_gaussian_triton import gaussian_1
+
+            return gaussian_1(depth)
+        except Exception:
+            pass
+
+    coords = torch.arange(-3, 4, device=depth.device, dtype=depth.dtype)
+    kernel_1d = torch.exp(-(coords * coords) / 8.0)
+    kernel_1d = kernel_1d / kernel_1d.sum().clamp_min(1e-8)
+    kernel = (kernel_1d[:, None] * kernel_1d[None, :]).view(1, 1, 7, 7)
+    padded = F.pad(depth, (3, 3, 3, 3), mode="replicate")
+    return F.conv2d(padded, kernel).clamp(0.0, 1.0)
 
 
 def apply_depth_pop(depth: torch.Tensor, depth_pop: float, mid: float = 0.5, eps: float = 1e-6) -> torch.Tensor:
@@ -79,6 +150,7 @@ def postprocess_depth(
     depth_pop: float = 0.0,
     antialias_strength: float = 0.0,
     guide: torch.Tensor | None = None,
+    global_gaussian: bool = False,
 ) -> torch.Tensor:
     out = ensure_b1hw(depth).float().clamp(0.0, 1.0)
     if abs(float(depth_pop)) >= 1e-6:
@@ -87,4 +159,6 @@ def postprocess_depth(
         out = anti_alias_depth(out, antialias_strength)
     else:
         out = anti_alias_depth_guided(out, guide, antialias_strength)
+    if global_gaussian:
+        out = anti_alias_depth_global_gaussian(out)
     return out

@@ -10,6 +10,7 @@ from stereo_runtime.runtime import (
     _half_res_synth_enabled,
     _pack_sbs_host_frame,
     _viewer_host_frame_enabled,
+    _deferred_metal_shader_warp_enabled,
     _warp_depth_postprocess,
 )
 
@@ -46,6 +47,17 @@ def test_viewer_env_flags_opt_in(monkeypatch) -> None:
     assert _viewer_host_frame_enabled() is True
 
 
+def test_depth_map_uses_shared_antialiased_output_path(monkeypatch) -> None:
+    monkeypatch.setenv("D2S_METAL_SHADER_WARP", "1")
+
+    assert _deferred_metal_shader_warp_enabled(
+        "half_sbs", skip_sbs_output=False
+    ) is True
+    assert _deferred_metal_shader_warp_enabled(
+        "depth_map", skip_sbs_output=False
+    ) is False
+
+
 @pytest.mark.skipif(MPS is None, reason="requires MPS")
 def test_pack_sbs_host_frame_returns_hwc_rgba8() -> None:
     sbs = torch.rand(1, 3, 64, 128, device=MPS)
@@ -58,9 +70,10 @@ def test_pack_sbs_host_frame_returns_hwc_rgba8() -> None:
 
 
 @pytest.mark.skipif(MPS is None, reason="requires MPS")
-def test_warp_depth_postprocess_noop_when_knobs_off() -> None:
+def test_warp_depth_postprocess_noop_when_knobs_off(monkeypatch) -> None:
     from types import SimpleNamespace
 
+    monkeypatch.setenv("D2S_SBS_AA", "0")
     depth = torch.rand(1, 1, 64, 64, device=MPS)
     config = SimpleNamespace(depth_pop=0.0, depth_antialias_strength=0.0)
     out = _warp_depth_postprocess(depth, config, depth)

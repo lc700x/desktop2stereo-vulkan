@@ -22,7 +22,6 @@ import sys
 
 import numpy as np
 
-from .output import output_edge_aa_enabled
 
 WARP_MSL = r"""
 #include <metal_stdlib>
@@ -152,7 +151,6 @@ kernel void warp_pack(
     constant uint&  outW          [[buffer(8)]],
     constant uint&  outH          [[buffer(9)]],
     constant float& smoothTexels  [[buffer(10)]],
-    constant uint& edgeAA         [[buffer(11)]],
     uint idx [[thread_position_in_grid]])
 {
     // HALF-SBS contract: output frame is outW x outH (runtime input
@@ -176,22 +174,6 @@ kernel void warp_pack(
     float value = warp_pack_sample(
         col, dep, comp, srcW, srcH, eye, depthStrength, convergence,
         smoothTexels, u, v);
-    float d0 = sampf(dep, srcW, srcH, u, v);
-    float depthEdge = max(
-        max(abs(sampf(dep, srcW, srcH, u - 1.0f / (float)srcW, v) - d0),
-            abs(sampf(dep, srcW, srcH, u + 1.0f / (float)srcW, v) - d0)),
-        max(abs(sampf(dep, srcW, srcH, u, v - 1.0f / (float)srcH) - d0),
-            abs(sampf(dep, srcW, srcH, u, v + 1.0f / (float)srcH) - d0)));
-    if (edgeAA != 0u && depthEdge > 0.025f) {
-        float du = 0.25f / (float)pw;
-        float dv = 0.25f / (float)outH;
-        value = 0.25f * (
-            warp_pack_sample(col, dep, comp, srcW, srcH, eye, depthStrength, convergence, smoothTexels, u - du, v - dv) +
-            warp_pack_sample(col, dep, comp, srcW, srcH, eye, depthStrength, convergence, smoothTexels, u + du, v - dv) +
-            warp_pack_sample(col, dep, comp, srcW, srcH, eye, depthStrength, convergence, smoothTexels, u - du, v + dv) +
-            warp_pack_sample(col, dep, comp, srcW, srcH, eye, depthStrength, convergence, smoothTexels, u + du, v + dv));
-    }
-
     float cval = value * 255.0f + 0.5f;
     out[idx] = (uchar)clamp(cval, 0.0f, 255.0f);
 }
@@ -382,43 +364,6 @@ static inline float blend_common(
     return (w0 * sample0 + w1 * sample1) / weight_sum;
 }
 
-static inline float blend_subpixel_common(
-    device const float* col,
-    device const float* dep,
-    uint batch,
-    uint channel,
-    uint W,
-    uint H,
-    uint C,
-    uint x,
-    uint y,
-    float offset_x,
-    float offset_y,
-    float eye_sign,
-    float d,
-    float base
-) {
-    float w0 = exp(-(d * d) / 0.08f);
-    float w1 = exp(-((d - 1.0f) * (d - 1.0f)) / 0.08f);
-    float weight_sum = max(w0 + w1, 1.0e-6f);
-    float shift0 = base * 0.875f;
-    float shift1 = base;
-    int depth_class = edge_depth_class_common(
-        col, dep, batch, x, y, W, H, C, d
-    );
-    float sample0 = depth_class < 0
-        ? sample_common(col, batch, channel, W, H, C,
-            (float)x + offset_x + shift0 * eye_sign, (float)y + offset_y)
-        : sample_class_common(col, dep, batch, channel, W, H, C,
-            (float)x + offset_x + shift0 * eye_sign, (float)y + offset_y, d);
-    float sample1 = depth_class < 0
-        ? sample_common(col, batch, channel, W, H, C,
-            (float)x + offset_x + shift1 * eye_sign, (float)y + offset_y)
-        : sample_class_common(col, dep, batch, channel, W, H, C,
-            (float)x + offset_x + shift1 * eye_sign, (float)y + offset_y, d);
-    return (w0 * sample0 + w1 * sample1) / weight_sum;
-}
-
 static inline float downsample_common(
     device const float* col,
     device const float* dep,
@@ -501,7 +446,6 @@ kernel void warp_composite2(
     constant uint& C         [[buffer(6)]],
     constant uint& W         [[buffer(7)]],
     constant uint& H         [[buffer(8)]],
-    constant uint& edgeAA    [[buffer(9)]],
     uint idx [[thread_position_in_grid]])
 {
     uint total = B * C * H * W;
@@ -514,41 +458,12 @@ kernel void warp_composite2(
     uint pixel = rem % plane;
     uint y = pixel / W;
     uint x = pixel % W;
-    uint depth_idx = batch * plane + pixel;
-    float d = clamp(dep[depth_idx], 0.0f, 1.0f);
-    float base = shift[depth_idx];
     float left_value = blend_common(
         col, dep, shift, batch, channel, W, H, C, x, y, 1.0f
     );
     float right_value = blend_common(
         col, dep, shift, batch, channel, W, H, C, x, y, -1.0f
     );
-    if (edgeAA != 0u) {
-        float depth_left = x > 0u ? dep[depth_idx - 1u] : d;
-        float depth_right = x + 1u < W ? dep[depth_idx + 1u] : d;
-        float depth_up = y > 0u ? dep[depth_idx - W] : d;
-        float depth_down = y + 1u < H ? dep[depth_idx + W] : d;
-        float shift_left = x > 0u ? shift[depth_idx - 1u] : base;
-        float shift_right = x + 1u < W ? shift[depth_idx + 1u] : base;
-        float shift_up = y > 0u ? shift[depth_idx - W] : base;
-        float shift_down = y + 1u < H ? shift[depth_idx + W] : base;
-        bool edge = max(max(abs(depth_left - d), abs(depth_right - d)),
-                        max(abs(depth_up - d), abs(depth_down - d))) > 0.025f ||
-                    max(max(abs(shift_left - base), abs(shift_right - base)),
-                        max(abs(shift_up - base), abs(shift_down - base))) > 0.25f;
-        if (edge) {
-            left_value = 0.25f * (
-                blend_subpixel_common(col, dep, batch, channel, W, H, C, x, y, -0.25f, -0.25f, 1.0f, d, base) +
-                blend_subpixel_common(col, dep, batch, channel, W, H, C, x, y,  0.25f, -0.25f, 1.0f, d, base) +
-                blend_subpixel_common(col, dep, batch, channel, W, H, C, x, y, -0.25f,  0.25f, 1.0f, d, base) +
-                blend_subpixel_common(col, dep, batch, channel, W, H, C, x, y,  0.25f,  0.25f, 1.0f, d, base));
-            right_value = 0.25f * (
-                blend_subpixel_common(col, dep, batch, channel, W, H, C, x, y, -0.25f, -0.25f, -1.0f, d, base) +
-                blend_subpixel_common(col, dep, batch, channel, W, H, C, x, y,  0.25f, -0.25f, -1.0f, d, base) +
-                blend_subpixel_common(col, dep, batch, channel, W, H, C, x, y, -0.25f,  0.25f, -1.0f, d, base) +
-                blend_subpixel_common(col, dep, batch, channel, W, H, C, x, y,  0.25f,  0.25f, -1.0f, d, base));
-        }
-    }
     left[idx] = left_value;
     right[idx] = right_value;
 }
@@ -849,8 +764,7 @@ def fused_sbs_pack(rgb_f32_chw, depth_f32, host_out=None, out_size=None,
         )
         if ow % 2 != 0 or ow < 4 or oh < 4:
             return None  # half-SBS needs an even frame width
-        antialias = output_edge_aa_enabled() and output_format in {"half_sbs", "full_sbs"}
-        render_width = ow * 2 if antialias and output_format == "half_sbs" else ow
+        render_width = ow
         out_t = torch.empty(render_width * oh * 4, dtype=torch.uint8, device="mps")
         eo, ds, cv = warp_params_from_env()
         stex = warp_smooth_texels(w, ow)
@@ -858,17 +772,7 @@ def fused_sbs_pack(rgb_f32_chw, depth_f32, host_out=None, out_size=None,
             out_t, rgb_f32_chw.contiguous(), dep.contiguous(),
             float(eo), float(ds), float(cv),
             int(w), int(h), int(render_width), int(oh), float(stex),
-            0,
         )
-        if antialias:
-            from .display_antialias import antialias_sbs, antialias_sbs_half
-
-            image = out_t.view(oh, render_width, 4).permute(2, 0, 1).unsqueeze(0)
-            if output_format == "half_sbs":
-                image = antialias_sbs_half(image)
-            else:
-                image = antialias_sbs(image, "full_sbs")
-            out_t = image.squeeze(0).permute(1, 2, 0).contiguous().view(-1)
         # Half-SBS: reported dims are the FRAME dims (ow x oh), matching the
         # synthesized half_sbs contract the viewer was built around.
         if host_out is not None:
@@ -914,8 +818,6 @@ def mps_warp_composite2(rgb_f32, depth_f32, base_shift, edge_aa_enabled=None):
             return None
         left = torch.empty_like(rgb_f32)
         right = torch.empty_like(rgb_f32)
-        if edge_aa_enabled is None:
-            edge_aa_enabled = False
         _lib().warp_composite2(
             left,
             right,
@@ -926,7 +828,6 @@ def mps_warp_composite2(rgb_f32, depth_f32, base_shift, edge_aa_enabled=None):
             int(channels),
             int(width),
             int(height),
-            int(bool(edge_aa_enabled)),
         )
         return left, right
     except Exception as exc:

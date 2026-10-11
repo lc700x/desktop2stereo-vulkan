@@ -12,8 +12,6 @@ from viewer.vulkan_descriptors import (
     VulkanDescriptorArena,
 )
 
-from .output import output_edge_aa_enabled
-from .vulkan_edge_aa import VulkanEyeEdgeAA
 
 VULKAN_HOLE_FILL_BALANCED = 0
 VULKAN_HOLE_FILL_QUALITY = 1
@@ -147,10 +145,10 @@ class VulkanLayeredStereoParams:
         )
 
     def pack(self, width: int, height: int, *, edge_aa_enabled: bool | None = None) -> bytes:
-        if edge_aa_enabled is None:
-            edge_aa_enabled = output_edge_aa_enabled()
+        # Depth is antialiased before this pass. Keep the legacy packed flag
+        # for ABI compatibility, but never run output-color AA here.
         return self._pack_base(width, height) + struct.pack(
-            "<I", 1 if edge_aa_enabled else 0
+            "<I", 0
         )
 
     def pack_image(
@@ -162,10 +160,8 @@ class VulkanLayeredStereoParams:
         edge_aa_enabled: bool | None = None,
     ) -> bytes:
         """Pack image output flags after the shared layered parameters."""
-        if edge_aa_enabled is None:
-            edge_aa_enabled = output_edge_aa_enabled()
         return self._pack_base(width, height) + struct.pack(
-            "<II", 1 if packed_output else 0, 1 if edge_aa_enabled else 0
+            "<II", 1 if packed_output else 0, 0
         )
 
 
@@ -200,8 +196,6 @@ class VulkanStereoFusedPass:
         self._descriptor_index = 0
         self._active_descriptor_set: Any | None = None
         self._active_push_constants: bytes | None = None
-        self._edge_aa: VulkanEyeEdgeAA | None = None
-        self._active_edge_aa = False
         storage_buffer = context.vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
         try:
             bindings = [
@@ -265,8 +259,6 @@ class VulkanStereoFusedPass:
     def _record_active(self, command_buffer: Any) -> None:
         if self.pipeline is None or self._active_descriptor_set is None:
             raise RuntimeError("Vulkan stereo pass is not ready")
-        if self._active_edge_aa:
-            self._edge_aa.barrier(command_buffer, before_render=True)
         self.pipeline.record_dispatch(
             command_buffer,
             group_count_x=self.group_counts[0],
@@ -275,8 +267,6 @@ class VulkanStereoFusedPass:
             descriptor_set=self._active_descriptor_set,
             push_constants=self._active_push_constants,
         )
-        if self._active_edge_aa:
-            self._edge_aa.record(command_buffer)
 
     def submit(
         self,
@@ -299,20 +289,14 @@ class VulkanStereoFusedPass:
         slot = self._descriptor_index
         descriptor_set = self.descriptor_sets[slot]
         self._descriptor_index = (self._descriptor_index + 1) % len(self.descriptor_sets)
-        self._active_edge_aa = bool(apply_edge_aa)
-        if self._active_edge_aa:
-            if self._edge_aa is None:
-                self._edge_aa = VulkanEyeEdgeAA(self.context, self.width, self.height, images=False)
-            scratch = self._edge_aa.prepare(slot, left_eye, right_eye)
-            render_buffers = (rgb, depth, *scratch, occlusion_mask)
-        else:
-            render_buffers = buffers
-        for binding, buffer in enumerate(render_buffers):
+        # Depth is antialiased before synthesis. Keep accepting the legacy
+        # option for callers, but do not filter completed RGB eye buffers.
+        for binding, buffer in enumerate(buffers):
             self.descriptor_arena.update_storage_buffer(descriptor_set, binding, buffer)
         self._active_descriptor_set = descriptor_set
         effective_params = params or VulkanStereoFusedParams()
-        # Generic synthesis anti-aliases completed full eyes before SBS
-        # packing. Standalone eye consumers can opt into this GPU pass.
+        # Depth is filtered before Vulkan synthesis; keep the shader's legacy
+        # output-AA flag off for every output route.
         if isinstance(effective_params, VulkanLayeredStereoParams):
             self._active_push_constants = effective_params.pack(
                 self.width, self.height, edge_aa_enabled=False)
@@ -324,10 +308,6 @@ class VulkanStereoFusedPass:
         return self.context.submit_on("compute", self._record_active, **submit_kwargs)
 
     def close(self) -> None:
-        if self._edge_aa is not None:
-            self._edge_aa.close()
-        self._edge_aa = None
-        self._active_edge_aa = False
         if self.pipeline is not None:
             self.pipeline.close()
         if self.descriptor_arena is not None:
