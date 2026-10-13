@@ -62,7 +62,9 @@ def _fps_to_minimum_update_interval_ms(fps):
         return None
     if fps_value <= 0:
         return None
-    return max(1, int(round(1000.0 / fps_value)))
+    # The software gate enforces the exact rate. Rounding 60 Hz up to 17 ms
+    # caps capture below 60 Hz and can skip alternating 60 Hz source updates.
+    return max(1, int(1000.0 / fps_value))
 
 
 def _software_throttle_enabled(capture_tool):
@@ -77,12 +79,15 @@ def _windows_capture_kwargs(config, capture_tool):
         kwargs = {"window_name": config.window_title}
     else:
         kwargs = {"monitor_index": config.monitor_index}
-    if capture_tool == "WindowsCaptureCUDA":
+    if capture_tool in {"WindowsCaptureCUDA", "WindowsCaptureROCm"}:
         optional = {
             "minimum_update_interval": _fps_to_minimum_update_interval_ms(getattr(config, "fps", None)),
-            "reuse_output_buffer": _env_bool("D2S_WGC_REUSE_OUTPUT_BUFFER"),
-            "output_buffer_count": _env_int("D2S_WGC_OUTPUT_BUFFER_COUNT"),
         }
+        if capture_tool == "WindowsCaptureCUDA":
+            optional.update(
+                reuse_output_buffer=_env_bool("D2S_WGC_REUSE_OUTPUT_BUFFER"),
+                output_buffer_count=_env_int("D2S_WGC_OUTPUT_BUFFER_COUNT"),
+            )
         kwargs.update({key: value for key, value in optional.items() if value is not None})
     return kwargs
 
@@ -178,9 +183,12 @@ class WindowsCaptureEventRunner:
         self._software_limited_frames = 0
         self._replay_lock = threading.Lock()
         self._frame_publish_lock = (
-            threading.Lock() if self.capture_tool == "WindowsCaptureROCm" else None
+            threading.Lock()
+            if self.capture_tool in {"WindowsCaptureCUDA", "WindowsCaptureROCm"}
+            else None
         )
         self._replay_frame = None
+        self._capture_frame_id = 0
         self._last_capture_ts = 0.0
         self._last_frame_emit_ts = 0.0
         self._replay_thread = None
@@ -245,6 +253,11 @@ class WindowsCaptureEventRunner:
             self._last_capture_ts = float(now)
             self._last_frame_emit_ts = float(now)
 
+    def _next_capture_frame_id(self) -> int:
+        with self._replay_lock:
+            self._capture_frame_id += 1
+            return self._capture_frame_id
+
     def _publish_captured_frame(self, captured_frame, now: float, on_frame) -> None:
         with self._frame_publish_lock:
             self._remember_emitted_frame(captured_frame, now)
@@ -257,7 +270,7 @@ class WindowsCaptureEventRunner:
                 return None
             interval = 1.0 / float(self._target_fps())
             minimum_capture_stall = interval * (
-                2.0 if self.capture_tool == "WindowsCaptureROCm" else 1.0
+                2.0 if self.capture_tool in {"WindowsCaptureCUDA", "WindowsCaptureROCm"} else 1.0
             )
             if float(now) - self._last_capture_ts + 1e-9 < minimum_capture_stall:
                 return None
@@ -421,12 +434,15 @@ class WindowsCaptureEventRunner:
         _setup_dpi_awareness()
         WindowsCapture, Frame, InternalCaptureControl = _load_windows_capture(self.capture_tool)
         self._start_keyboard_worker(shutdown_event)
-        self._start_static_replay_worker(
-            shutdown_event=shutdown_event,
-            on_frame=on_frame,
-            is_paused=is_paused,
-            is_hard_idle=is_hard_idle,
-        )
+        # A CUDA replay would enqueue the same depth inference again. The
+        # viewer and OpenXR presenter retain their latest completed image.
+        if self.capture_tool != "WindowsCaptureCUDA":
+            self._start_static_replay_worker(
+                shutdown_event=shutdown_event,
+                on_frame=on_frame,
+                is_paused=is_paused,
+                is_hard_idle=is_hard_idle,
+            )
         on_closed_callback = on_closed
 
         while not shutdown_event.is_set():
@@ -469,6 +485,7 @@ class WindowsCaptureEventRunner:
                     return
                 if not self._accept_software_paced_frame(capture_start_time):
                     return
+                capture_frame_id = self._next_capture_frame_id()
                 self._log_capture_gap(capture_start_time, capture_kwargs)
                 self._log_capture_fps(capture_start_time)
                 copy_start_time = time.perf_counter()
@@ -520,6 +537,7 @@ class WindowsCaptureEventRunner:
                     cpu_compat_frame=raw if native_to_cpu else None,
                     metadata={
                         "backend": "windows_capture_event",
+                        "capture_frame_id": capture_frame_id,
                         "native_resource_output": native_output,
                         "capture_gpu": bool(
                             copy_mode is FrameCopyMode.GPU_TENSOR

@@ -194,7 +194,9 @@ def make_half_sbs_uint8(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor
 
 
 @triton.jit
-def _chw_rgb_to_hwc_rgba_u8_kernel(src, out, pixels: tl.constexpr, width: tl.constexpr, block: tl.constexpr):
+def _chw_rgb_to_hwc_rgba_u8_kernel(
+    src, out, pixels: tl.constexpr, width: tl.constexpr, input_uint8: tl.constexpr, block: tl.constexpr,
+):
     offsets = tl.program_id(0) * block + tl.arange(0, block)
     active = offsets < pixels
     y = offsets // width
@@ -203,10 +205,14 @@ def _chw_rgb_to_hwc_rgba_u8_kernel(src, out, pixels: tl.constexpr, width: tl.con
     r = tl.load(src + src_offset, mask=active, other=0.0)
     g = tl.load(src + pixels + src_offset, mask=active, other=0.0)
     b = tl.load(src + pixels * 2 + src_offset, mask=active, other=0.0)
+    if not input_uint8:
+        r = (tl.minimum(tl.maximum(r, 0.0), 1.0) * 255.0).to(tl.uint8)
+        g = (tl.minimum(tl.maximum(g, 0.0), 1.0) * 255.0).to(tl.uint8)
+        b = (tl.minimum(tl.maximum(b, 0.0), 1.0) * 255.0).to(tl.uint8)
     out_base = offsets * 4
-    tl.store(out + out_base, (tl.minimum(tl.maximum(r, 0.0), 1.0) * 255.0).to(tl.uint8), mask=active)
-    tl.store(out + out_base + 1, (tl.minimum(tl.maximum(g, 0.0), 1.0) * 255.0).to(tl.uint8), mask=active)
-    tl.store(out + out_base + 2, (tl.minimum(tl.maximum(b, 0.0), 1.0) * 255.0).to(tl.uint8), mask=active)
+    tl.store(out + out_base, r, mask=active)
+    tl.store(out + out_base + 1, g, mask=active)
+    tl.store(out + out_base + 2, b, mask=active)
     tl.store(out + out_base + 3, 255, mask=active)
 
 
@@ -219,7 +225,7 @@ def make_chw_rgb_to_hwc_rgba_u8(tensor: torch.Tensor) -> torch.Tensor:
     pixels = height * width
     block = 256
     grid = (triton.cdiv(pixels, block),)
-    _chw_rgb_to_hwc_rgba_u8_kernel[grid](tensor, out, pixels, width, block)
+    _chw_rgb_to_hwc_rgba_u8_kernel[grid](tensor, out, pixels, width, tensor.dtype == torch.uint8, block)
     return out
 
 

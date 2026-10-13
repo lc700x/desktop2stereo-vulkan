@@ -259,6 +259,29 @@ def test_cuda_float_chw_packer_returns_rgba8_without_host_round_trip() -> None:
     assert packed[0, 0].tolist() == [255, 0, 0, 255]
 
 
+def test_cuda_uint8_chw_packer_preserves_bytes_without_torch_cat(monkeypatch) -> None:
+    import torch
+    import pytest
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm is unavailable")
+    from stereo_runtime.triton_runtime import triton_runtime_available
+    if not triton_runtime_available(torch.device("cuda")):
+        pytest.skip("Triton is unavailable")
+    frame = torch.randint(0, 256, (1, 3, 7, 10), device="cuda", dtype=torch.uint8)
+    expected = torch.cat((frame[0].permute(1, 2, 0),
+                          torch.full((7, 10, 1), 255, device="cuda", dtype=torch.uint8)), dim=-1)
+    def reject_cat(*args, **kwargs):
+        raise AssertionError("fused byte packing must not use torch.cat")
+    monkeypatch.setattr(torch, "cat", reject_cat)
+
+    packed = frame_to_cuda_rgba(frame)
+
+    assert packed is not None
+    assert packed.is_contiguous()
+    assert torch.equal(packed, expected)
+
+
 def test_local_viewer_uses_srgb_source_and_preferred_surface_format() -> None:
     selected, is_srgb = choose_srgb_surface_format(
         [_Format(99), _Format(_VulkanFormats.VK_FORMAT_R8G8B8A8_SRGB)],

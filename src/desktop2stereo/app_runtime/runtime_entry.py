@@ -506,20 +506,21 @@ def _wait_for_runtime_ready(
 
 
 def _resolve_local_viewer_render_size_config(settings, run_mode, device):
-    """Use the v2.5 local-viewer source size while keeping 4K I/O.
+    """Respect native processing for NVIDIA TensorRT; retain other source policies.
 
-    The old local path captured the 4K monitor and presented to the 4K
-    display, but ran the Half-SBS warp at one eye (1920x1080) and upscaled
-    that packed result in the display shader.  The current scaled/native path
-    accidentally moved depth and warp to 3840x2160.  Restore that contract
-    only for the non-Darwin GPU local viewer; the Vulkan swapchain and capture
-    target remain native 4K.  D2S_LOCAL_VIEWER_NATIVE_4K=1 is an explicit
-    escape hatch for full-resolution processing.
+    The optimized CUDA Half-SBS path keeps the requested 4K processing size.
+    Other GPU providers retain the v2.5 one-eye source size. The existing
+    D2S_LOCAL_VIEWER_NATIVE_4K override still controls either behavior.
     """
     if platform.system() == "Darwin" or run_mode not in {"Local Viewer", "Viewer"}:
         return RENDER_SIZE_CONFIG
     if str(getattr(device, "type", device)).strip().lower() != "cuda":
         return RENDER_SIZE_CONFIG
+    if "D2S_LOCAL_VIEWER_NATIVE_4K" not in os.environ and settings.get("TensorRT") is True:
+        import torch
+
+        if not torch.version.hip:
+            return RENDER_SIZE_CONFIG
     if os.environ.get("D2S_LOCAL_VIEWER_NATIVE_4K", "0").strip().lower() in {
         "1", "true", "yes", "on"
     }:

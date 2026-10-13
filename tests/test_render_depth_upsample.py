@@ -6,6 +6,35 @@ import pytest
 from stereo_runtime.depth_upsample import upsample_depth
 
 
+@pytest.mark.parametrize("fail_kernel", [False, True])
+def test_cuda_joint_upsample_allocates_bilinear_only_for_fallback(monkeypatch, fail_kernel):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm is unavailable")
+    import stereo_runtime.triton_runtime as triton_runtime
+    from stereo_runtime import _depth_upsample_triton as kernels
+
+    depth = torch.rand(1, 1, 2, 3, device="cuda")
+    rgb = torch.rand(1, 3, 8, 10, device="cuda")
+    interpolate = torch.nn.functional.interpolate
+    expected = interpolate(depth, size=(8, 10), mode="bilinear", align_corners=False)
+    calls = []
+    def track_interpolate(input, *args, **kwargs):
+        calls.append((input.shape[1], kwargs.get("size")))
+        return interpolate(input, *args, **kwargs)
+    def kernel(*args, **kwargs):
+        if fail_kernel:
+            raise RuntimeError("kernel unavailable")
+        return expected
+    monkeypatch.setattr(triton_runtime, "triton_runtime_available", lambda device: True)
+    monkeypatch.setattr(kernels, "joint_bilateral_upsample", kernel)
+    monkeypatch.setattr(torch.nn.functional, "interpolate", track_interpolate)
+
+    actual = upsample_depth(depth, 8, 10, rgb=rgb, mode="joint_bilateral")
+
+    assert torch.equal(actual, expected)
+    assert ((1, (8, 10)) in calls) is fail_kernel
+
+
 def test_joint_bilateral_upsample_keeps_depth_step_on_rgb_edge() -> None:
     height, width = 64, 64
     depth = torch.full((1, 1, 8, 8), 0.1)

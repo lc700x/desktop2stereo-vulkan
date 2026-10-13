@@ -75,7 +75,7 @@ def _preprocess_distill_rgb(rgb: torch.Tensor, *, device: torch.device, dtype: t
     ).to(dtype)
     mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype).view(1, 3, 1, 1)
-    return (tensor - mean) / std
+    return tensor.sub_(mean).div_(std)
 
 
 class ModelOnnxPreprocessor:
@@ -127,8 +127,18 @@ class ModelOnnxPreprocessor:
         self._shape_cache[key] = size
         return size
 
+    def _prepare_rgb(self, rgb: torch.Tensor) -> torch.Tensor:
+        already_normalized = getattr(rgb, "_d2s_preprocess_backend", None) in {
+            "torch_bgr_norm", "torch_bgr_resize_norm",
+            "triton_bgr_resize_norm", "triton_bgr_area_resize_norm",
+        }
+        rgb = ensure_bchw(rgb, name="rgb").to(self.device).float()
+        # Capture already scales and clamps these inputs. Avoid another full
+        # resolution allocation while retaining clamping for other callers.
+        return rgb if already_normalized else rgb.clamp(0, 1)
+
     def __call__(self, rgb: torch.Tensor) -> torch.Tensor:
-        rgb = ensure_bchw(rgb, name="rgb").to(self.device).float().clamp(0, 1)
+        rgb = self._prepare_rgb(rgb)
         _, _, height, width = rgb.shape
         input_h, input_w = self.input_size(height, width)
         use_bicubic = self.device.type == "cuda" and not self._is_zipdepth
@@ -141,7 +151,7 @@ class ModelOnnxPreprocessor:
         ).to(self.dtype)
         if self._is_infinidepth or self._is_zipdepth:
             return tensor
-        return (tensor - self._mean) / self._std
+        return tensor.sub_(self._mean).div_(self._std)
 
     def prepare(self, rgb: torch.Tensor, *, height: int, width: int) -> torch.Tensor:
         """Resize ``rgb`` to an explicit ``(height, width)`` and normalize.
@@ -151,7 +161,7 @@ class ModelOnnxPreprocessor:
         MIGraphX graph), so the resize does not have to follow the model-default
         input size computation.
         """
-        rgb = ensure_bchw(rgb, name="rgb").to(self.device).float().clamp(0, 1)
+        rgb = self._prepare_rgb(rgb)
         use_bicubic = self.device.type == "cuda" and not self._is_zipdepth
         tensor = F.interpolate(
             rgb,
@@ -162,7 +172,7 @@ class ModelOnnxPreprocessor:
         ).to(self.dtype)
         if self._is_infinidepth or self._is_zipdepth:
             return tensor
-        return (tensor - self._mean) / self._std
+        return tensor.sub_(self._mean).div_(self._std)
 
 
 class DistillPreprocessor(ModelOnnxPreprocessor):

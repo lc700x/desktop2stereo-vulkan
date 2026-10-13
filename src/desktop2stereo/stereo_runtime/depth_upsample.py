@@ -210,12 +210,11 @@ def upsample_depth(
     if depth.shape[-2:] == (height, width):
         return depth
 
-    bilinear = F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
     if mode == "bilinear":
-        return bilinear
+        return F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
     if mode == "joint_bilateral":
         if rgb is None:
-            return bilinear
+            return F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
         rgb = ensure_bchw(rgb, name="rgb").to(device=depth.device, dtype=torch.float32)
         if rgb.shape[-2:] != (height, width):
             rgb = F.interpolate(rgb, size=(height, width), mode="bilinear", align_corners=False)
@@ -233,7 +232,7 @@ def upsample_depth(
             except Exception:
                 # Preserve the stable MPS fallback rather than dispatching the
                 # much slower multi-kernel tensor implementation.
-                return bilinear
+                pass
         if depth.is_cuda:
             try:
                 from .triton_runtime import triton_runtime_available
@@ -254,8 +253,9 @@ def upsample_depth(
                         depth_edge_threshold=depth_edge_threshold,
                     )
             except Exception:
-                return bilinear
-            return bilinear
+                pass
+        if depth.device.type in {"cuda", "mps"}:
+            return F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
         return _joint_bilateral_upsample(
             depth,
             rgb,
@@ -265,6 +265,7 @@ def upsample_depth(
         )
     if mode != "guided":
         raise ValueError(f"unknown depth upsample mode: {mode!r}")
+    bilinear = F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
     if rgb is None:
         return bilinear
 

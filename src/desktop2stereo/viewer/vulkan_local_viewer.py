@@ -537,7 +537,7 @@ def frame_to_cuda_rgba(frame: Any) -> Any | None:
         if image.ndim != 3:
             return None
         if (
-            image.dtype == torch.float32
+            image.dtype in (torch.float32, torch.uint8)
             and image.shape[0] == 3
             and image.shape[-1] not in (1, 3, 4)
         ):

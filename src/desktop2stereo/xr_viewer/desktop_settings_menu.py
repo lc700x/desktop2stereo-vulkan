@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 from ctypes import wintypes
+from io import BytesIO
 import math
 import multiprocessing
 import os
@@ -36,6 +37,9 @@ DESKTOP_SETTINGS_ICON_SIZE = (51, 57)
 DESKTOP_SETTINGS_ICON_IMAGE_SIZE = (42, 42)
 _FLET_PANEL_SIZE = (760, 650)
 _FLET_PANEL_POLL_SECONDS = 0.08
+_FLET_DRAWER_WIDTH = 192
+_FLET_DRAWER_TAB_WIDTH = 12
+_FLET_DRAWER_HIDE_DELAY_SECONDS = 0.3
 _FLET_SIDEBAR_WIDTH = 144
 _FLET_SPACING = 8
 _FLET_BUTTON_HEIGHT = 40
@@ -291,17 +295,79 @@ def _icon_geometry_for_monitor(
     monitor_rect: tuple[int, int, int, int] | None,
     *,
     fallback_size: tuple[int, int],
+    pixel_ratio: float = 1.0,
 ) -> tuple[int, int, int, int]:
-    """Return icon ``(x, y, width, height)`` inside the input monitor."""
-    icon_width, icon_height = DESKTOP_SETTINGS_ICON_SIZE
+    """Return the right-edge drawer ``(x, y, width, height)`` inside the input monitor."""
+    icon_width, icon_height = _FLET_DRAWER_WIDTH, DESKTOP_SETTINGS_ICON_SIZE[1]
     if monitor_rect is None:
         monitor_left, monitor_top = 0, 0
         monitor_width, monitor_height = fallback_size
     else:
         monitor_left, monitor_top, monitor_width, monitor_height = monitor_rect
-    icon_x = monitor_left + max(0, int(monitor_width) - icon_width - 24)
+    ratio = float(pixel_ratio or 1.0)
+    monitor_left, monitor_top, monitor_width, monitor_height = (
+        round(value / ratio)
+        for value in (monitor_left, monitor_top, monitor_width, monitor_height)
+    )
+    icon_x = monitor_left + max(0, int(monitor_width) - icon_width)
     icon_y = monitor_top + max(0, (int(monitor_height) - icon_height) // 2)
     return icon_x, icon_y, icon_width, icon_height
+
+
+def _windows_flet_window_handle() -> int | None:
+    """Find this worker's Flet client window without targeting another runtime."""
+    if os.name != "nt":
+        return None
+    from gui.flet_runtime import _flet_process_ids, _windows_process_snapshot
+
+    client_pids = set(_flet_process_ids(_windows_process_snapshot(), os.getpid()))
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def visit(hwnd: int, _data: int) -> bool:
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in client_pids:
+            name = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(hwnd, name, len(name))
+            if name.value == "FLUTTER_RUNNER_WIN32_WINDOW":
+                found.append(hwnd)
+                return False
+        return True
+
+    user32.EnumWindows(visit, 0)
+    return found[0] if found else None
+
+
+def _clip_windows_drawer(hwnd: int | None, *, expanded: bool, pixel_ratio: float) -> None:
+    """Restrict the collapsed native window's drawing and hit area to its tab."""
+    if hwnd is None:
+        return
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HANDLE, wintypes.BOOL]
+    region = None
+    if not expanded:
+        gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+        gdi32.CreateRectRgn.argtypes = [ctypes.c_int] * 4
+        gdi32.CreateRectRgn.restype = wintypes.HANDLE
+        gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+        region = gdi32.CreateRectRgn(
+            round((_FLET_DRAWER_WIDTH - _FLET_DRAWER_TAB_WIDTH) * pixel_ratio),
+            0,
+            round(_FLET_DRAWER_WIDTH * pixel_ratio),
+            round(DESKTOP_SETTINGS_ICON_SIZE[1] * pixel_ratio),
+        )
+        if not region:
+            raise ctypes.WinError(ctypes.get_last_error())
+    if not user32.SetWindowRgn(hwnd, region, True):
+        error = ctypes.get_last_error()
+        if region is not None:
+            gdi32.DeleteObject(region)
+        raise ctypes.WinError(error)
+    # Windows owns a successfully assigned region and releases it on replacement.
 
 
 def _primary_screen_size() -> tuple[int, int]:
@@ -316,6 +382,8 @@ def _primary_screen_size() -> tuple[int, int]:
 
 def _flet_panel_position_for_monitor(
     monitor_rect: tuple[int, int, int, int] | None,
+    *,
+    pixel_ratio: float = 1.0,
 ) -> tuple[int, int] | None:
     """Return the centered Flet panel position for the selected input monitor."""
     if monitor_rect is None:
@@ -328,6 +396,11 @@ def _flet_panel_position_for_monitor(
         return None
     if monitor_width <= 0 or monitor_height <= 0:
         return None
+    ratio = float(pixel_ratio or 1.0)
+    monitor_left, monitor_top, monitor_width, monitor_height = (
+        round(value / ratio)
+        for value in (monitor_left, monitor_top, monitor_width, monitor_height)
+    )
     panel_width, panel_height = _FLET_PANEL_SIZE
     return (
         monitor_left + max(0, (monitor_width - panel_width) // 2),
@@ -539,18 +612,28 @@ def _run_flet_desktop_settings_app(
         icon_path = Path(__file__).resolve().parents[1] / "icon2.ico"
         if icon_path.is_file():
             page.window.icon = str(icon_path)
+
+        def window_pixel_ratio() -> float:
+            # Windows capture rectangles are physical pixels; Flet places
+            # native windows in logical pixels. macOS monitor bounds use points.
+            return float(page.media.device_pixel_ratio or 1.0) if os.name == "nt" else 1.0
+
         icon_geometry = _icon_geometry_for_monitor(
             input_monitor_rect,
             fallback_size=_primary_screen_size(),
+            pixel_ratio=window_pixel_ratio(),
         )
-        page.window.width = DESKTOP_SETTINGS_ICON_SIZE[0]
+        page.window.width = _FLET_DRAWER_WIDTH
         page.window.height = DESKTOP_SETTINGS_ICON_SIZE[1]
         page.window.left, page.window.top = icon_geometry[:2]
         page.window.min_width = 1
         page.window.min_height = 1
         page.window.maximizable = False
         page.window.resizable = False
-        page.window.movable = False
+        # The bundled Windows window_manager has no setMovable implementation.
+        # Sending it aborts the remaining Window updates, including frameless
+        # and prevent_close, leaving the icon's drawing and hit area offset.
+        page.window.movable = None if os.name == "nt" else False
         page.window.always_on_top = True
         page.window.skip_task_bar = True
         page.window.frameless = True
@@ -613,23 +696,125 @@ def _run_flet_desktop_settings_app(
             content=layout,
         )
 
+        active_monitor_rect = input_monitor_rect
+        visible = False
+        drawer_expanded = False
+        drawer_hide_task: asyncio.Task | None = None
+        native_window_handle = None
+
+        def cancel_drawer_hide() -> None:
+            nonlocal drawer_hide_task
+            if drawer_hide_task is not None:
+                drawer_hide_task.cancel()
+                drawer_hide_task = None
+
+        def apply_drawer_region() -> None:
+            nonlocal native_window_handle
+            if os.name == "nt":
+                if native_window_handle is None:
+                    native_window_handle = _windows_flet_window_handle()
+                _clip_windows_drawer(
+                    native_window_handle,
+                    expanded=visible or drawer_expanded,
+                    pixel_ratio=window_pixel_ratio(),
+                )
+            elif not visible:
+                geometry = _icon_geometry_for_monitor(
+                    active_monitor_rect,
+                    fallback_size=_primary_screen_size(),
+                    pixel_ratio=window_pixel_ratio(),
+                )
+                width = _FLET_DRAWER_WIDTH if drawer_expanded else _FLET_DRAWER_TAB_WIDTH
+                page.window.width = width
+                page.window.left = geometry[0] + _FLET_DRAWER_WIDTH - width
+                launcher_view.width = width
+                launcher_view.content.width = width
+
+        def set_drawer_expanded(expanded: bool) -> None:
+            nonlocal drawer_expanded
+            drawer_expanded = expanded
+            drawer_body.visible = expanded
+            drawer_handle.visible = not expanded
+            page.window.opacity = 1.0 if expanded else DESKTOP_SETTINGS_ICON_OPACITY
+            apply_drawer_region()
+            page.window.update()
+            page.update()
+
+        async def hide_drawer_after_leave() -> None:
+            await asyncio.sleep(_FLET_DRAWER_HIDE_DELAY_SECONDS)
+            if not visible and page.window.visible and drawer_expanded:
+                set_drawer_expanded(False)
+
+        async def on_launcher_hover(event: Any) -> None:
+            nonlocal drawer_hide_task
+            if visible:
+                return
+            cancel_drawer_hide()
+            if event.data is True or event.data == "true":
+                if not drawer_expanded:
+                    set_drawer_expanded(True)
+            elif drawer_expanded:
+                drawer_hide_task = asyncio.create_task(hide_drawer_after_leave())
+
         def request_panel_toggle(_event: Any) -> None:
             try:
                 commands.put_nowait("__toggle_flet__")
             except Exception:
                 pass
 
-        launcher_view = ft.Container(
-            width=DESKTOP_SETTINGS_ICON_SIZE[0],
+        # Flutter does not decode ICO; convert the bundled app icon once in memory.
+        from PIL import Image
+
+        icon_bytes = BytesIO()
+        with Image.open(icon_path) as icon_image:
+            icon_image.save(icon_bytes, format="PNG")
+        launcher_label = ft.Text(
+            translate("OpenXR Settings"),
+            size=12,
+            color=_menu_color("text_primary"),
+            no_wrap=True,
+        )
+        drawer_body = ft.Container(
+            width=_FLET_DRAWER_WIDTH,
             height=DESKTOP_SETTINGS_ICON_SIZE[1],
+            bgcolor=_menu_color("surface_container_high"),
+            border_radius=ft.BorderRadius.only(top_left=12, bottom_left=12),
+            padding=ft.Padding.symmetric(horizontal=8, vertical=6),
+            visible=False,
+            content=ft.Row(
+                controls=[
+                    ft.Image(
+                        src=icon_bytes.getvalue(),
+                        width=DESKTOP_SETTINGS_ICON_IMAGE_SIZE[0],
+                        height=DESKTOP_SETTINGS_ICON_IMAGE_SIZE[1],
+                        fit=ft.BoxFit.CONTAIN,
+                    ),
+                    launcher_label,
+                ],
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
+        drawer_handle = ft.Container(
+            right=0,
+            width=_FLET_DRAWER_TAB_WIDTH,
+            height=DESKTOP_SETTINGS_ICON_SIZE[1],
+            bgcolor=_menu_color("primary"),
+            border_radius=ft.BorderRadius.only(top_left=8, bottom_left=8),
             alignment=ft.Alignment.CENTER,
+            content=ft.Container(width=3, height=20, border_radius=2, bgcolor=_menu_color("text_primary")),
+        )
+        launcher_view = ft.Container(
+            width=_FLET_DRAWER_WIDTH,
+            height=DESKTOP_SETTINGS_ICON_SIZE[1],
             bgcolor=ft.Colors.TRANSPARENT,
-            content=ft.IconButton(
-                icon=ft.Icons.SETTINGS,
-                icon_size=32,
-                icon_color=_menu_color("text_primary"),
-                tooltip=translate("OpenXR Settings"),
-                on_click=request_panel_toggle,
+            on_hover=on_launcher_hover,
+            on_click=request_panel_toggle,
+            content=ft.Stack(
+                controls=[drawer_body, drawer_handle],
+                width=_FLET_DRAWER_WIDTH,
+                height=DESKTOP_SETTINGS_ICON_SIZE[1],
+                clip_behavior=ft.ClipBehavior.HARD_EDGE,
             ),
         )
         page.add(launcher_view)
@@ -638,22 +823,30 @@ def _run_flet_desktop_settings_app(
         step_widgets: dict[str, tuple[Any, Any]] = {}
         toggle_widgets: dict[str, Any] = {}
         layout_signature: tuple[Any, ...] | None = None
-        active_monitor_rect = input_monitor_rect
-        visible = False
 
-        def set_window_mode(show_panel: bool) -> None:
-            nonlocal visible
+        async def set_window_mode(show_panel: bool) -> None:
+            nonlocal visible, drawer_expanded
+            cancel_drawer_hide()
             visible = show_panel
+            drawer_expanded = False
+            drawer_body.visible = False
+            drawer_handle.visible = True
+            if show_panel:
+                apply_drawer_region()
+            # Apply minimum constraints before shrinking the native window.
+            # Flet's Window service otherwise resizes against the old minimum.
+            page.window.min_width = 580 if show_panel else 1
+            page.window.min_height = 420 if show_panel else 1
+            page.window.update()
+            await page.window.wait_until_ready_to_show()
             page.controls.clear()
             if show_panel:
                 page.add(panel_view)
                 page.bgcolor = _menu_color("surface")
                 page.window.width = _FLET_PANEL_SIZE[0]
                 page.window.height = _FLET_PANEL_SIZE[1]
-                page.window.min_width = 580
-                page.window.min_height = 420
                 page.window.resizable = True
-                page.window.movable = True
+                page.window.movable = None if os.name == "nt" else True
                 page.window.skip_task_bar = False
                 page.window.frameless = False
                 page.window.title_bar_hidden = False
@@ -665,7 +858,9 @@ def _run_flet_desktop_settings_app(
                     0,
                     *_primary_screen_size(),
                 )
-                panel_position = _flet_panel_position_for_monitor(monitor_rect)
+                panel_position = _flet_panel_position_for_monitor(
+                    monitor_rect, pixel_ratio=window_pixel_ratio()
+                )
                 if panel_position is not None:
                     page.window.left, page.window.top = panel_position
                 page.window.visible = True
@@ -673,12 +868,11 @@ def _run_flet_desktop_settings_app(
             else:
                 page.add(launcher_view)
                 page.bgcolor = ft.Colors.TRANSPARENT
-                page.window.width = DESKTOP_SETTINGS_ICON_SIZE[0]
+                page.window.width = _FLET_DRAWER_WIDTH
+                launcher_view.width = _FLET_DRAWER_WIDTH
                 page.window.height = DESKTOP_SETTINGS_ICON_SIZE[1]
-                page.window.min_width = 1
-                page.window.min_height = 1
                 page.window.resizable = False
-                page.window.movable = False
+                page.window.movable = None if os.name == "nt" else False
                 page.window.skip_task_bar = True
                 page.window.frameless = True
                 page.window.title_bar_hidden = True
@@ -688,9 +882,11 @@ def _run_flet_desktop_settings_app(
                 geometry = _icon_geometry_for_monitor(
                     active_monitor_rect,
                     fallback_size=_primary_screen_size(),
+                    pixel_ratio=window_pixel_ratio(),
                 )
                 page.window.left, page.window.top = geometry[:2]
                 page.window.visible = True
+                apply_drawer_region()
 
         def queue_action(key: str, value: float | None = None) -> None:
             try:
@@ -719,6 +915,7 @@ def _run_flet_desktop_settings_app(
             step_widgets.clear()
             toggle_widgets.clear()
             locale = normalize_locale(snapshot.get("lang", "EN"))
+            launcher_label.value = translate("OpenXR Settings")
             page.title = translate("Desktop2Stereo OpenXR Settings")
             controls = tuple(snapshot.get("controls") or ())
             tab = str(snapshot.get("tab") or "picture")
@@ -1244,13 +1441,18 @@ def _run_flet_desktop_settings_app(
                     changed = True
             return changed
 
-        def on_window_event(event: Any) -> None:
+        async def on_window_event(event: Any) -> None:
             if event.type == ft.WindowEventType.CLOSE:
-                set_window_mode(False)
+                await set_window_mode(False)
+                page.window.update()
                 page.update()
+            elif event.type == ft.WindowEventType.SHOW and not visible:
+                apply_drawer_region()
 
         page.window.on_event = on_window_event
+        page.window.update()
         page.update()
+        apply_drawer_region()
 
         while True:
             changed = False
@@ -1258,17 +1460,18 @@ def _run_flet_desktop_settings_app(
             if command == "__quit__":
                 break
             if command == "__toggle_flet__":
-                set_window_mode(not visible)
+                await set_window_mode(not visible)
                 changed = True
             elif command == "__show_flet__":
-                set_window_mode(True)
+                await set_window_mode(True)
                 changed = True
             elif command == "__hide_flet__":
+                cancel_drawer_hide()
                 visible = False
                 page.window.visible = False
                 changed = True
             elif command == "__show_icon__":
-                set_window_mode(False)
+                await set_window_mode(False)
                 changed = True
 
             snapshot = _drain_latest(snapshots)
@@ -1290,8 +1493,10 @@ def _run_flet_desktop_settings_app(
                             geometry = _icon_geometry_for_monitor(
                                 active_monitor_rect,
                                 fallback_size=_primary_screen_size(),
+                                pixel_ratio=window_pixel_ratio(),
                             )
                             page.window.left, page.window.top = geometry[:2]
+                            apply_drawer_region()
                             changed = True
                 signature = _snapshot_layout_signature(snapshot)
                 if signature != layout_signature:
@@ -1300,9 +1505,11 @@ def _run_flet_desktop_settings_app(
                 elif apply_values(snapshot):
                     changed = True
             if changed:
+                page.window.update()
                 page.update()
             await asyncio.sleep(_FLET_PANEL_POLL_SECONDS)
 
+        cancel_drawer_hide()
         page.window.prevent_close = False
         await page.window.destroy()
 

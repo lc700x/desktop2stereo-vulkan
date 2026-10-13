@@ -1,12 +1,12 @@
 Capture Mode: Monitor
-Monitor Index: 2
+Monitor Index: 1
 Monitor Identity:
-  stable_id: DISPLAY\TUP0270\7&34414894&e&UID1540
+  stable_id: DISPLAY\TUP0270\7&314d3634&4&UID61700
   name: D270H
   manufacturer: TUP
   model: D270H
   serial: '808728147'
-  left: -3840
+  left: 0
   top: 0
   width: 3840
   height: 2160
@@ -73,6 +73,24 @@ Model List:
     - 240
     - 304
     - 336
+    - 384
+    - 448
+    - 512
+  ZipDepth-Base:
+    resolutions:
+    - 192
+    - 224
+    - 288
+    - 352
+    - 384
+    - 448
+    - 512
+  ZipDepth-Small:
+    resolutions:
+    - 192
+    - 224
+    - 288
+    - 352
     - 384
     - 448
     - 512
@@ -322,10 +340,10 @@ Model List:
   DepthPro-Large:
     resolutions:
     - 1536
-Depth Model: Distill-Any-Depth-Base
+Depth Model: ZipDepth-Small
 Depth Strength: 0.25
 Depth Quick: Standard
-Depth Resolution: 518
+Depth Resolution: 352
 Anti-aliasing: 0
 Depth Antialias Strength: 0.0
 Depth Pop: 0.0
@@ -365,13 +383,13 @@ Vulkan Projection RCAS Sharpness: 0.5
 Display Mode: Half-SBS
 FP16: true
 torch.compile: true
-TensorRT: null
+TensorRT: true
 Parallel Inference: false
 Parallel Inference Workers: 1
 Recompile TensorRT: false
 CoreML: null
 Recompile CoreML: false
-MIGraphX: true
+MIGraphX: null
 Recompile MIGraphX: false
 Recompile OpenVINO: false
 Computing Device: 0
@@ -381,7 +399,7 @@ XR Headset Model: Pico 4 / 4 Ultra
 XR Preview Window: false
 VSync: false
 Window Preview: false
-Target FPS: 0
+Target FPS: 60
 Processing Resolution: Auto
 Render Size Policy: scaled
 Render Scale: 4K / 100%
@@ -411,19 +429,19 @@ Environment Model: Default
 NVIDIA Frame Generation: false
 Lossless Scaling Support: false
 LSFG Support: false
-Capture Tool: WindowsCaptureROCm
+Capture Tool: WindowsCaptureCUDA
 Display Fit Mode: contain
 Stream Display Fit Mode: contain
 Fill 16:9: true
 Fix Viewer Aspect: true
 Stereo Output: 2
 Stereo Output Identity:
-  stable_id: DISPLAY\TUP0270\7&34414894&e&UID1540
-  name: D270H
-  manufacturer: TUP
-  model: D270H
-  serial: '808728147'
-  left: -3840
+  stable_id: DISPLAY\MTT1337\1&15ecd195&d&UID256
+  name: VITURE
+  manufacturer: MTT
+  model: VITURE
+  serial: '2290649088'
+  left: 3840
   top: 0
   width: 3840
   height: 2160

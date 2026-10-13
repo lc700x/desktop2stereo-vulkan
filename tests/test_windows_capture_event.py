@@ -9,6 +9,46 @@ from capture import CaptureConfig, CapturedFrame, FrameCopyMode
 from capture.backends import windows_capture_event
 
 
+def test_bundled_cuda_capture_patch_paces_before_transfer():
+    import runpy
+    from pathlib import Path
+
+    patch = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/env_install/apply-wc-cuda-patches.py"))
+    source = '''class Capture:
+    def __init__(self, minimum_update_interval):
+        self._stream = None
+        self._running = True
+        self.transfers = []
+    def start(self):
+        try:
+            while self._running:
+                # Use a small timeout to keep Python responsive (Ctrl+C)
+                self.transfers.append(time.perf_counter())
+                time.sleep(0.003)
+                self._running = len(self.transfers) < 3
+        finally:
+            pass
+'''
+    patched = patch["patched_source"](source)
+    assert patch["patched_source"](patched) == patched
+    now = [0.0]
+    clock = types.SimpleNamespace(perf_counter=lambda: now[0], sleep=lambda delay: now.__setitem__(0, now[0] + delay))
+    namespace = {"time": clock}
+    exec(patched, namespace)
+    capture = namespace["Capture"](16)
+    capture.start()
+    assert capture.transfers == pytest.approx([0.0, 0.016, 0.032])
+
+
+def test_bundled_cuda_capture_patch_rejects_unknown_source():
+    import runpy
+    from pathlib import Path
+
+    patch = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/env_install/apply-wc-cuda-patches.py"))
+    with pytest.raises(ValueError, match="Unsupported wc-cuda source layout"):
+        patch["patched_source"]("class DifferentCapture: pass\n")
+
+
 class FakeControl:
     def __init__(self):
         self.stopped = False
@@ -127,7 +167,7 @@ def test_windows_capture_runner_uses_copy_or_clone_buffers(monkeypatch):
     runner.run(shutdown_event=shutdown_event, on_frame=on_frame, on_error=on_error)
 
     capture = module.WindowsCapture.last_instance
-    assert capture.kwargs == {"monitor_index": 3, "minimum_update_interval": 17}
+    assert capture.kwargs == {"monitor_index": 3, "minimum_update_interval": 16}
     assert len(capture.handlers) == 2
 
     shutdown_event.clear()
@@ -268,22 +308,23 @@ def test_windows_capture_replays_last_frame_at_runtime_target_fps():
 
     runner._remember_emitted_frame(captured_frame, 10.0)
 
-    assert runner._replay_frame_if_due(10.049) is None
-    replayed = runner._replay_frame_if_due(10.05)
+    assert runner._replay_frame_if_due(10.099) is None
+    replayed = runner._replay_frame_if_due(10.1)
     assert replayed is not None
     assert replayed.frame == "frame"
-    assert replayed.timestamp == pytest.approx(10.05)
+    assert replayed.timestamp == pytest.approx(10.1)
     assert replayed.metadata["replayed_static_frame"] is True
     assert captured_frame.metadata == {"backend": "windows_capture_event"}
 
     target["fps"] = 10
-    assert runner._replay_frame_if_due(10.149) is None
-    assert runner._replay_frame_if_due(10.15) is not None
+    assert runner._replay_frame_if_due(10.199) is None
+    assert runner._replay_frame_if_due(10.2) is not None
 
 
-def test_rocm_replay_waits_for_capture_stall_before_replaying():
+@pytest.mark.parametrize("capture_tool", ["WindowsCaptureCUDA", "WindowsCaptureROCm"])
+def test_gpu_replay_waits_for_capture_stall_before_replaying(capture_tool):
     runner = windows_capture_event.WindowsCaptureEventRunner(
-        CaptureConfig(capture_tool="WindowsCaptureROCm", fps=60)
+        CaptureConfig(capture_tool=capture_tool, fps=60)
     )
     captured_frame = windows_capture_event.capture_frame_from_raw(
         "frame", 1080, 10.0, config=runner.config
@@ -367,7 +408,7 @@ def test_rocm_replay_cannot_be_published_after_a_new_capture(monkeypatch):
     assert published == [("old", True), ("new", False)]
 
 
-def test_frame_publication_lock_is_rocm_only():
+def test_frame_publication_lock_serializes_gpu_capture_and_replay():
     rocm = windows_capture_event.WindowsCaptureEventRunner(
         CaptureConfig(capture_tool="WindowsCaptureROCm")
     )
@@ -376,7 +417,7 @@ def test_frame_publication_lock_is_rocm_only():
     )
 
     assert rocm._frame_publish_lock is not None
-    assert cuda._frame_publish_lock is None
+    assert cuda._frame_publish_lock is not None
 
 
 def test_windows_capture_cuda_limiter_runs_before_gpu_buffer_delivery(monkeypatch):
@@ -596,7 +637,7 @@ def test_windows_capture_cuda_accepts_env_capture_options(monkeypatch):
 
     assert windows_capture_event._windows_capture_kwargs(config, "WindowsCaptureCUDA") == {
         "monitor_index": 1,
-        "minimum_update_interval": 17,
+        "minimum_update_interval": 16,
     }
 
     monkeypatch.setenv("D2S_WGC_REUSE_OUTPUT_BUFFER", "1")
@@ -604,7 +645,7 @@ def test_windows_capture_cuda_accepts_env_capture_options(monkeypatch):
 
     assert windows_capture_event._windows_capture_kwargs(config, "WindowsCaptureCUDA") == {
         "monitor_index": 1,
-        "minimum_update_interval": 17,
+        "minimum_update_interval": 16,
         "reuse_output_buffer": True,
         "output_buffer_count": 6,
     }

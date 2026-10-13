@@ -340,6 +340,24 @@ def test_distill_preprocessor_matches_reference():
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("explicit_size", [False, True])
+def test_onnx_preprocessor_reuses_normalized_capture_rgb(explicit_size):
+    rgb = torch.rand(1, 3, 12, 16)
+    preprocessor = DistillPreprocessor(device=torch.device("cpu"), dtype=torch.float32)
+    apply = (lambda x: preprocessor.prepare(x, height=14, width=28)) if explicit_size else preprocessor
+    expected = apply(rgb)
+    rgb._d2s_preprocess_backend = "triton_bgr_resize_norm"
+
+    assert preprocessor._prepare_rgb(rgb) is rgb
+    assert torch.equal(apply(rgb), expected)
+
+
+def test_onnx_preprocessor_clamps_unmarked_input():
+    rgb = torch.tensor([-1.0, 0.5, 2.0]).view(1, 3, 1, 1)
+    preprocessor = DistillPreprocessor(device=torch.device("cpu"), dtype=torch.float32)
+    assert torch.equal(preprocessor._prepare_rgb(rgb), rgb.clamp(0, 1))
+
+
 def test_infinidepth_onnx_preprocessor_uses_patch_16_without_normalization():
     rgb = torch.linspace(0, 1, steps=3 * 12 * 18, dtype=torch.float32).view(1, 3, 12, 18)
     preprocessor = ModelOnnxPreprocessor(
@@ -765,3 +783,33 @@ def test_native_tensorrt_engine_close_waits_for_slot_event():
     assert calls == ["sync"]
     assert engine._slots == []
     assert engine.context is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason="NVIDIA CUDA is required")
+def test_native_tensorrt_cuda_graph_replays_changed_input(tmp_path):
+    from stereo_runtime.providers.nvidia.tensorrt_native import NativeTensorRtEngine, ensure_tensorrt_dll_path
+
+    ensure_tensorrt_dll_path()
+    trt = pytest.importorskip("tensorrt")
+    logger = trt.Logger(trt.Logger.ERROR)
+    builder = trt.Builder(logger)
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    input_tensor = network.add_input("input", trt.float32, (1, 3, 4, 6))
+    output = network.add_activation(input_tensor, trt.ActivationType.RELU).get_output(0)
+    output.name = "predicted_depth"
+    network.mark_output(output)
+    serialized = builder.build_serialized_network(network, builder.create_builder_config())
+    assert serialized is not None
+    engine_path = tmp_path / "relu.trt"
+    engine_path.write_bytes(serialized)
+    engine = NativeTensorRtEngine(engine_path, dtype=torch.float32)
+    try:
+        for offset in (-1.0, 2.0):
+            tensor = torch.linspace(-2, 2, 72, device="cuda").reshape(1, 3, 4, 6) + offset
+            output, slot = engine.run_graph_with_slot(tensor)
+            actual = output.clone()
+            engine.mark_slot_available_after_current_stream(slot)
+            torch.cuda.synchronize()
+            assert torch.equal(actual, tensor.relu())
+    finally:
+        engine.close()

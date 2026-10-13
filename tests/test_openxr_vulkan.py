@@ -974,7 +974,8 @@ def test_tool_overlay_metrics_snapshot_latency_with_fps_window(monkeypatch) -> N
 
 
 def test_tool_overlay_latency_includes_work_since_xr_frame_timestamp(monkeypatch) -> None:
-    presenter = OpenXrVulkanPresenter()
+    timings = []
+    presenter = OpenXrVulkanPresenter(on_breakdown_add_time=lambda name, value: timings.append((name, value)))
     presenter._frame_now = 10.25
     monkeypatch.setattr("xr_viewer.core_openxr_vulkan.time.perf_counter", lambda: 10.27)
     frame = SimpleNamespace(frame_id=1, timestamp=10.20, metadata={})
@@ -983,6 +984,10 @@ def test_tool_overlay_latency_includes_work_since_xr_frame_timestamp(monkeypatch
 
     assert presenter._tool_overlay_pending_latency_ms == pytest.approx(70.0)
     assert presenter._tool_overlay_latency_ms == 0.0
+    assert timings == [("openxr_source_latency", pytest.approx(0.07))]
+
+    presenter._update_tool_overlay_metrics(frame)
+    assert len(timings) == 1
 
 
 def test_tool_overlay_sbs_fps_counts_unique_producer_frames() -> None:
@@ -4826,6 +4831,7 @@ def test_presenter_keeps_latest_output_during_non_renderable_xr_tick() -> None:
     frame = object()
     ended_frames = []
     dropped_frames = []
+    presented_frames = []
 
     class FakeXr:
         FrameEndInfo = staticmethod(lambda **kwargs: kwargs)
@@ -4864,13 +4870,14 @@ def test_presenter_keeps_latest_output_during_non_renderable_xr_tick() -> None:
     presenter._handle_controller_shortcuts = lambda: None
     presenter._handle_controller_guide_input = lambda *_args: None
     presenter._persist_screen_state_if_changed = lambda: None
-    presenter._record_xr_presented_frame = lambda: None
+    presenter._record_xr_presented_frame = lambda: presented_frames.append(True)
 
     assert presenter.run_frame() is True
 
     assert presenter._accept_output is True
     assert presenter._pending_output is frame
     assert dropped_frames == []
+    assert presented_frames == []
     assert presenter.frame_count == 1
     assert ended_frames == [
         {
@@ -5680,7 +5687,7 @@ def test_filament_stereo_camera_receives_head_and_relative_eyes() -> None:
     assert options == {"near_plane": 0.1, "far_plane": 50.0}
 
 
-def test_swapchain_image_is_released_when_wait_fails() -> None:
+def test_swapchain_image_is_not_released_when_wait_fails() -> None:
     calls: list[str] = []
 
     class FakeXr:
@@ -5716,7 +5723,7 @@ def test_swapchain_image_is_released_when_wait_fails() -> None:
     ]
     with pytest.raises(RuntimeError, match="wait failed"):
         presenter._render_projection_layer([object()])
-    assert calls == ["acquire", "wait", "release"]
+    assert calls == ["acquire", "wait"]
 
 
 def test_swapchain_image_is_released_after_wait_when_render_fails() -> None:
@@ -7415,67 +7422,54 @@ def test_settings_menu_render_scale_step_schedules_one_rebuild() -> None:
     assert calls[-1][0] == "persist_openxr_render_scale"
 
 
-def test_rocm_automatic_render_scale_is_capped_without_changing_manual_or_cuda(
-    monkeypatch,
+@pytest.mark.parametrize("rocm_backend", [True, False])
+def test_automatic_render_scale_is_capped_without_changing_manual_scale(
+    monkeypatch, rocm_backend,
 ) -> None:
     monkeypatch.setattr(
         OpenXrVulkanPresenter,
         "_is_rocm_backend",
-        staticmethod(lambda: True),
+        staticmethod(lambda: rocm_backend),
     )
-    rocm_startup_auto = OpenXrVulkanPresenter(
+    startup_auto = OpenXrVulkanPresenter(
         OpenXrVulkanConfig(
             render_scale=1.24,
             render_scale_auto=True,
             headset_model="Meta Quest 2",
         )
     )
-    assert rocm_startup_auto._openxr_render_scale == pytest.approx(1.0)
+    assert startup_auto._openxr_render_scale == pytest.approx(1.0)
 
-    rocm_auto = OpenXrVulkanPresenter(
+    auto = OpenXrVulkanPresenter(
         OpenXrVulkanConfig(
             render_scale=0.8,
             render_scale_auto=True,
             headset_model="Meta Quest 2",
         )
     )
-    assert rocm_auto._openxr_render_scale == pytest.approx(0.8)
+    assert auto._openxr_render_scale == pytest.approx(0.8)
     rebuild_scales = []
-    rocm_auto._release_projection_render_targets = lambda: None
-    rocm_auto._create_projection_swapchains_for_scale = (
+    auto._release_projection_render_targets = lambda: None
+    auto._create_projection_swapchains_for_scale = (
         lambda scale: rebuild_scales.append(scale)
     )
-    rocm_auto._initialize_filament_bridges = lambda: None
-    rocm_auto._projection_eye_extents = lambda: ()
-    rocm_auto._pending_openxr_render_scale = 1.24
+    auto._initialize_filament_bridges = lambda: None
+    auto._projection_eye_extents = lambda: ()
+    auto._pending_openxr_render_scale = 1.24
 
-    rocm_auto._apply_pending_openxr_render_scale()
+    auto._apply_pending_openxr_render_scale()
 
     assert rebuild_scales == [pytest.approx(1.0)]
-    assert rocm_auto._openxr_render_scale == pytest.approx(1.0)
+    assert auto._openxr_render_scale == pytest.approx(1.0)
 
-    rocm_manual = OpenXrVulkanPresenter(
+    manual = OpenXrVulkanPresenter(
         OpenXrVulkanConfig(
             render_scale=1.24,
             render_scale_auto=False,
             headset_model="Meta Quest 2",
         )
     )
-    assert rocm_manual._openxr_render_scale == pytest.approx(1.24)
-
-    monkeypatch.setattr(
-        OpenXrVulkanPresenter,
-        "_is_rocm_backend",
-        staticmethod(lambda: False),
-    )
-    cuda_auto = OpenXrVulkanPresenter(
-        OpenXrVulkanConfig(
-            render_scale=1.24,
-            render_scale_auto=True,
-            headset_model="Meta Quest 2",
-        )
-    )
-    assert cuda_auto._openxr_render_scale == pytest.approx(1.24)
+    assert manual._openxr_render_scale == pytest.approx(1.24)
 
 
 def test_visible_settings_menu_disables_screen_edge_ray_attraction() -> None:

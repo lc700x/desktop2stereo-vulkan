@@ -324,7 +324,7 @@ class NativeTensorRtEngine:
             return
         if self.device.type != "cuda":
             raise RuntimeError("CUDA graph requires CUDA")
-        static_input = torch.empty(input_shape, device=self.device, dtype=self.dtype)
+        static_input = torch.zeros(input_shape, device=self.device, dtype=self.dtype)
         outputs = self._bind_input_output(static_input, slot)
         output_name = "predicted_depth" if "predicted_depth" in outputs else self.output_names[0]
 
@@ -334,9 +334,10 @@ class NativeTensorRtEngine:
         torch.cuda.synchronize(self.device)
 
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.stream(slot.stream):
-            with torch.cuda.graph(graph):
-                self._execute(slot)
+        # enqueueV3 explicitly uses slot.stream. The graph context must capture
+        # that same stream, rather than torch.cuda.graph's default side stream.
+        with torch.cuda.graph(graph, stream=slot.stream):
+            self._execute(slot)
         torch.cuda.synchronize(self.device)
 
         slot.graph_input = static_input
@@ -388,7 +389,9 @@ class NativeTensorRtEngine:
         if slot_index is None:
             return
         slot = self._slots[int(slot_index)]
-        event = torch.cuda.Event(blocking=False)
+        # Slot acquisition may wait on this event. Let CUDA sleep the host
+        # thread during that wait instead of spinning a CPU core each frame.
+        event = torch.cuda.Event(blocking=True)
         event.record(torch.cuda.current_stream(self.device))
         slot_lock = getattr(self, "_slot_lock", None)
         if slot_lock is None:

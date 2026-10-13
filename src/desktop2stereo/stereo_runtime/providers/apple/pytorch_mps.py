@@ -460,13 +460,16 @@ class _CoreMLMixin:
         else:
             raise ValueError("CoreML requires raw host capture or CPU RGB staging")
         cpu_rgb = torch.nan_to_num(cpu_rgb, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-        tensor = F.interpolate(
-            cpu_rgb,
-            size=(input_h, input_w),
-            mode="bilinear",
-            align_corners=False,
-            antialias=False,
-        )
+        if tuple(cpu_rgb.shape[-2:]) == (input_h, input_w):
+            tensor = cpu_rgb.contiguous()
+        else:
+            tensor = F.interpolate(
+                cpu_rgb,
+                size=(input_h, input_w),
+                mode="bilinear",
+                align_corners=False,
+                antialias=False,
+            )
         mean, std = _normalization_tensors_for_model(
             self.model_id, torch.device("cpu"), torch.float32
         )

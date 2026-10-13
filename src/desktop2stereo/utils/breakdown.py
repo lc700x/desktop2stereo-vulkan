@@ -450,6 +450,7 @@ class FPSBreakdown:
             f"local_present_pack_ms={avg_ms('local_present_pack'):.2f}ms "
             f"screen_new={rate('openxr_new_screen_frame'):.1f} "
             f"screen_reuse={rate('openxr_reused_screen_frame'):.1f} "
+            f"screen_replay={rate('openxr_replayed_screen_frame'):.1f} "
             f"screen_proj={rate('openxr_projection_screen_present'):.1f} "
             f"screen_quad_requested={int(bool(stats.get('openxr_screen_quad_reprojection_requested', False)))} "
             f"screen_quad_active={int(bool(stats.get('openxr_screen_quad_reprojection_active', False)))} "

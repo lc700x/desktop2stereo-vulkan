@@ -88,6 +88,13 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+rem Keep WindowsCaptureROCm frame pacing inside the bundled Python runtime.
+"%PYTHON_EXE%" "%SCRIPT_DIR%apply-wc-rocm-patches.py"
+if errorlevel 1 (
+    echo Failed to apply bundled wc_rocm capture pacing patch
+    pause
+    exit /b 1
+)
 rem Portable triton JIT: patch the bundled triton to compile hip_utils
 rem against the project-local msvcstub instead of the Windows SDK/MSVC.
 "%PYTHON_EXE%" "%SCRIPT_DIR%apply-triton-portable-patches.py" "%PYTHON_ROOT%\Lib\site-packages"

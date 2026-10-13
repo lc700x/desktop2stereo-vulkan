@@ -127,6 +127,13 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+"%PYTHON_EXE%" "%SCRIPT_DIR%apply-wc-cuda-patches.py"
+if errorlevel 1 (
+    echo Failed to configure CUDA capture pacing
+    pause
+    exit /b 1
+)
+
 echo Python environment deployed successfully.
 pause
 exit /b 0

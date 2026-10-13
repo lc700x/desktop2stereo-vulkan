@@ -178,12 +178,17 @@ def _layered_synthesis(
             ):
                 direct_start = time.perf_counter()
                 direct_sbs = (
-                    warp_composite2_half_sbs(rgb, depth, base_shift)
+                    warp_composite2_half_sbs(
+                        rgb, depth, base_shift,
+                        output_uint8=os.environ.get("D2S_RUNTIME_OUTPUT_UINT8", "0").strip().lower()
+                        in {"1", "true", "yes", "on"},
+                    )
                     if config.output_format == "half_sbs"
                     else warp_composite2_full_sbs(rgb, depth, base_shift)
                 )
                 direct_sbs_backend = (
                     "triton_warp_composite2_half_sbs"
+                    + ("_uint8" if direct_sbs.dtype == torch.uint8 else "")
                     if config.output_format == "half_sbs"
                     else "triton_warp_composite2_full_sbs"
                 )

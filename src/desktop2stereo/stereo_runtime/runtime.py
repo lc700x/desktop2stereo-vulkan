@@ -1847,7 +1847,10 @@ class StereoRuntime:
             debug["runtime_output_dtype"] = "uint8"
         else:
             if sbs.dtype == torch.uint8:
-                debug.setdefault("runtime_output_pack_backend", debug.get("fast_plus_fused_backend", "prepacked_uint8"))
+                debug.setdefault(
+                    "runtime_output_pack_backend",
+                    debug.get("direct_sbs_backend") or debug.get("fast_plus_fused_backend", "prepacked_uint8"),
+                )
                 debug["runtime_output_dtype"] = "uint8"
             else:
                 debug["runtime_output_dtype"] = str(sbs.dtype).replace("torch.", "")

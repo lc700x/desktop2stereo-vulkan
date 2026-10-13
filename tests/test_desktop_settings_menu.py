@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import asyncio
 import multiprocessing
 import os
 import queue
@@ -6,6 +7,8 @@ import subprocess
 import sys
 import threading
 import time
+
+import pytest
 
 
 def _control(
@@ -59,7 +62,7 @@ def test_floating_icon_geometry_is_relative_to_input_monitor():
 
     assert _icon_geometry_for_monitor(
         (3840, 0, 1920, 1200), fallback_size=(1920, 1080)
-    ) == (5685, 571, 51, 57)
+    ) == (5568, 571, 192, 57)
 
 
 def test_floating_icon_geometry_supports_negative_monitor_coordinates():
@@ -68,8 +71,8 @@ def test_floating_icon_geometry_supports_negative_monitor_coordinates():
     x, y, width, height = _icon_geometry_for_monitor(
         (-1920, -100, 1920, 1080), fallback_size=(1920, 1080)
     )
-    assert (x, y) == (-75, 411)
-    assert (width, height) == (51, 57)
+    assert (x, y) == (-192, 411)
+    assert (width, height) == (192, 57)
 
 
 def test_flet_panel_is_centered_on_the_selected_input_monitor():
@@ -82,6 +85,28 @@ def test_flet_panel_position_preserves_negative_monitor_coordinates():
     from xr_viewer.desktop_settings_menu import _flet_panel_position_for_monitor
 
     assert _flet_panel_position_for_monitor((-1920, -100, 1920, 1080)) == (-1340, 115)
+
+
+@pytest.mark.parametrize(
+    ("monitor_rect", "icon_position", "panel_position"),
+    [
+        ((0, 0, 3840, 2160), (2368, 691), (900, 395)),
+        ((3840, 0, 3840, 2160), (4928, 691), (3460, 395)),
+        ((-3840, -150, 3840, 2160), (-192, 591), (-1660, 295)),
+    ],
+)
+def test_flet_geometry_converts_physical_monitor_pixels_to_logical_pixels(
+    monitor_rect, icon_position, panel_position
+):
+    from xr_viewer.desktop_settings_menu import (
+        _flet_panel_position_for_monitor,
+        _icon_geometry_for_monitor,
+    )
+
+    assert _icon_geometry_for_monitor(
+        monitor_rect, fallback_size=(3840, 2160), pixel_ratio=1.5
+    ) == (*icon_position, 192, 57)
+    assert _flet_panel_position_for_monitor(monitor_rect, pixel_ratio=1.5) == panel_position
 
 
 def test_snapshot_layout_signature_ignores_live_value_changes():
@@ -479,3 +504,74 @@ def test_physical_mouse_control_uses_the_existing_openxr_action_queue():
     window.actions.put(("depth_strength", 0.75))
 
     assert window.actions.get(timeout=1.0) == ("depth_strength", 0.75)
+
+
+def test_flet_launcher_starts_visible_and_restores_after_panel_and_hide(monkeypatch):
+    ft = pytest.importorskip("flet")
+    import gui.flet_runtime as flet_runtime
+    import xr_viewer.desktop_settings_menu as settings_menu
+
+    constraints = []
+    states = []
+
+    class Window(SimpleNamespace):
+        def update(self):
+            pass
+
+        async def wait_until_ready_to_show(self):
+            constraints.append((self.min_width, self.min_height, self.width, self.height))
+
+        async def destroy(self):
+            self.destroyed = True
+
+    window = Window(ignore_mouse_events=False, destroyed=False)
+
+    class Page:
+        def __init__(self):
+            self.window = window
+            self.controls = []
+            self.media = SimpleNamespace(device_pixel_ratio=1.5)
+
+        def add(self, control):
+            self.controls.append(control)
+
+        def update(self):
+            if os.name == "nt":
+                assert window.movable is None
+            states.append((
+                window.width, window.height, window.visible,
+                window.opacity, window.ignore_mouse_events,
+            ))
+
+    commands = object()
+    pending = iter(("__show_flet__", None, "__hide_flet__", "__show_icon__", "__quit__"))
+    monkeypatch.setattr(settings_menu, "_watch_flet_parent", lambda _commands: None)
+    monkeypatch.setattr(settings_menu, "_primary_screen_size", lambda: (3840, 2160))
+    monkeypatch.setattr(settings_menu, "_drain_latest", lambda source: next(pending) if source is commands else None)
+    monkeypatch.setattr(flet_runtime, "ensure_vendored_flet_view", lambda: None)
+
+    async def no_sleep(_seconds):
+        if len(states) == 2:
+            await window.on_event(SimpleNamespace(type=ft.WindowEventType.CLOSE))
+
+    monkeypatch.setattr(settings_menu.asyncio, "sleep", no_sleep)
+    run_options = {}
+
+    def run(main, **options):
+        run_options.update(options)
+        asyncio.run(main(Page()))
+
+    monkeypatch.setattr(ft, "run", run)
+    settings_menu._run_flet_desktop_settings_app(queue.Queue(), queue.Queue(), commands, (0, 0, 3840, 2160))
+
+    launcher_width = 192 if os.name == "nt" else 12
+    assert run_options["view"] == ft.AppView.FLET_APP_HIDDEN
+    assert states == [
+        (192, 57, True, 0.4, False),
+        (760, 650, True, 1.0, False),
+        (launcher_width, 57, True, 0.4, False),
+        (launcher_width, 57, False, 0.4, False),
+        (launcher_width, 57, True, 0.4, False),
+    ]
+    assert constraints[:2] == [(580, 420, launcher_width, 57), (1, 1, 760, 650)]
+    assert window.destroyed

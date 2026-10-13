@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import traceback
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -1223,11 +1223,11 @@ class OpenXrVulkanPresenter(
             OPENXR_RENDER_SCALE_MIN,
             min(OPENXR_RENDER_SCALE_MAX, float(self.config.render_scale)),
         )
-        if self._openxr_render_scale_auto and self._rocm_backend:
+        if self._openxr_render_scale_auto:
             automatic_scale = self._recommended_openxr_render_scale()
             if self._openxr_render_scale > automatic_scale:
                 print(
-                    "[OpenXRViewer] ROCm automatic render scale capped: "
+                    "[OpenXRViewer] Automatic render scale capped: "
                     f"configured={self._openxr_render_scale:.2f}x "
                     f"effective={automatic_scale:.2f}x",
                     flush=True,
@@ -1940,7 +1940,8 @@ class OpenXrVulkanPresenter(
                     "openxr_controls", time.perf_counter() - controls_started
                 )
         begin_started = time.perf_counter()
-        xr.begin_frame(self.session)
+        with getattr(self.vulkan, "_lock", nullcontext()):
+            xr.begin_frame(self.session)
         if self._on_breakdown_add_time is not None:
             self._on_breakdown_add_time(
                 "openxr_begin_frame", time.perf_counter() - begin_started
@@ -2124,7 +2125,8 @@ class OpenXrVulkanPresenter(
                     layer_pointers,
                     fallback_layer_pointers=primary_layer_pointers,
                 )
-                self._record_xr_presented_frame()
+                if layer_pointers:
+                    self._record_xr_presented_frame()
                 if self._on_breakdown_add_time is not None:
                     self._on_breakdown_add_time(
                         "openxr_end_frame", time.perf_counter() - end_started
@@ -2151,7 +2153,8 @@ class OpenXrVulkanPresenter(
             layers=layer_pointers or None,
         )
         try:
-            self.xr.end_frame(self.session, end_info)
+            with getattr(self.vulkan, "_lock", nullcontext()):
+                self.xr.end_frame(self.session, end_info)
         except Exception as exc:
             # VDXR can reject a cached quad/projection sub-image after a
             # render-scale or controller-scene rebuild.  The frame is still
@@ -2174,7 +2177,8 @@ class OpenXrVulkanPresenter(
                 layer_count=len(recovery_layers),
                 layers=recovery_layers or None,
             )
-            self.xr.end_frame(self.session, recovery_info)
+            with getattr(self.vulkan, "_lock", nullcontext()):
+                self.xr.end_frame(self.session, recovery_info)
 
     def _set_shortcut_panel(self, name: str | None) -> None:
         # Menu/A cycle: hidden -> FPS -> FPS + screen-side shortcut guide -> hidden.
@@ -6957,7 +6961,7 @@ class OpenXrVulkanPresenter(
             OPENXR_RENDER_SCALE_MIN,
             min(OPENXR_RENDER_SCALE_MAX, float(requested)),
         )
-        if self._openxr_render_scale_auto and self._rocm_backend:
+        if self._openxr_render_scale_auto:
             requested = min(requested, self._recommended_openxr_render_scale())
         self._pending_openxr_render_scale = None
         if abs(requested - self._openxr_render_scale) < 1e-6:
@@ -8237,7 +8241,7 @@ class OpenXrVulkanPresenter(
             return False
 
     def _recommended_openxr_render_scale(self) -> float:
-        """Resolve headset auto scale, limiting ROCm to runtime recommendation."""
+        """Resolve auto scale without supersampling the runtime recommendation."""
         scale = max(
             OPENXR_RENDER_SCALE_MIN,
             min(
@@ -8245,11 +8249,10 @@ class OpenXrVulkanPresenter(
                 float(self._headset_preset.recommended_render_scale),
             ),
         )
-        # OpenXR's recommended per-eye extent is the 1.0x baseline. The
-        # current ROCm projection loop misses its frame-time target, so avoid
-        # optional supersampling in Auto mode while keeping manual tuning and
-        # the CUDA path untouched.
-        return min(scale, 1.0) if self._rocm_backend else scale
+        # The runtime recommendation already includes headset distortion and
+        # compositor quality. Extra Auto supersampling competes with depth
+        # inference for GPU time; manual scales remain available separately.
+        return min(scale, 1.0)
 
     def _activate_rocm_openxr_stable_path(self) -> None:
         """Apply the validated AMD/VDXR overlay isolation after XR starts."""
@@ -10494,7 +10497,8 @@ class OpenXrVulkanPresenter(
             return None
         started = time.perf_counter()
         with _acquired_swapchain_image(self.xr, swapchain) as image_index:
-            bridge.render_controller_composition_layer(image_index)
+            with getattr(self.vulkan, "_lock", nullcontext()):
+                bridge.render_controller_composition_layer(image_index)
         if self._on_breakdown_add_time is not None:
             self._on_breakdown_add_time(
                 "openxr_controller_composition_layer",
@@ -10532,15 +10536,18 @@ class OpenXrVulkanPresenter(
         ):
             return None
         acquired_images: list[tuple[_EyeSwapchain, int]] = []
+        waited_images: list[tuple[_EyeSwapchain, int]] = []
         try:
             for eye in swapchains:
-                image_index = self.xr.acquire_swapchain_image(eye.handle)
+                with getattr(self.vulkan, "_lock", nullcontext()):
+                    image_index = self.xr.acquire_swapchain_image(eye.handle)
                 acquired_images.append((eye, image_index))
-            for eye, _image_index in acquired_images:
+            for eye, image_index in acquired_images:
                 self.xr.wait_swapchain_image(
                     eye.handle,
                     self.xr.SwapchainImageWaitInfo(timeout=self.xr.INFINITE_DURATION),
                 )
+                waited_images.append((eye, image_index))
             draws = []
             for eye_index, (eye, image_index) in enumerate(acquired_images):
                 draws.append(
@@ -10571,8 +10578,9 @@ class OpenXrVulkanPresenter(
             )
             return None
         finally:
-            for eye, _image_index in acquired_images:
-                self.xr.release_swapchain_image(eye.handle)
+            for eye, _image_index in waited_images:
+                with getattr(self.vulkan, "_lock", nullcontext()):
+                    self.xr.release_swapchain_image(eye.handle)
         if not self._vulkan_controller_proxy_layer_logged:
             self._vulkan_controller_proxy_layer_logged = True
             print(
@@ -10652,6 +10660,7 @@ class OpenXrVulkanPresenter(
             use_vulkan_projection_composer = False
         filament_queue_lock = getattr(self.vulkan, "_lock", None)
         filament_queue_locked = False
+        waited_images: list[tuple[_EyeSwapchain, int]] = []
         projection_started = time.perf_counter()
         self._projection_busy.set()
 
@@ -10701,17 +10710,19 @@ class OpenXrVulkanPresenter(
             # serializing the second acquire behind the first eye's wait.
             acquire_started = time.perf_counter()
             for eye in self.swapchains:
-                image_index = xr.acquire_swapchain_image(eye.handle)
+                with getattr(self.vulkan, "_lock", nullcontext()):
+                    image_index = xr.acquire_swapchain_image(eye.handle)
                 acquired_images.append((eye, image_index))
             record_time("openxr_projection_acquire_pair", acquire_started)
 
             wait_pair_started = time.perf_counter()
-            for eye_index, (eye, _image_index) in enumerate(acquired_images):
+            for eye_index, (eye, image_index) in enumerate(acquired_images):
                 wait_started = time.perf_counter()
                 xr.wait_swapchain_image(
                     eye.handle,
                     xr.SwapchainImageWaitInfo(timeout=xr.INFINITE_DURATION),
                 )
+                waited_images.append((eye, image_index))
                 record_time(
                     f"openxr_projection_wait_eye{eye_index}", wait_started
                 )
@@ -10983,8 +10994,16 @@ class OpenXrVulkanPresenter(
                 or self.filament_bridge is None
             ):
                 if self._on_breakdown_inc is not None:
+                    replayed_static_frame = (
+                        isinstance(output_frame, VulkanStereoOutputFrame)
+                        and bool(output_frame.metadata.get("replayed_static_frame", False))
+                    )
                     self._on_breakdown_inc(
-                        "openxr_new_screen_frame"
+                        (
+                            "openxr_replayed_screen_frame"
+                            if replayed_static_frame
+                            else "openxr_new_screen_frame"
+                        )
                         if isinstance(output_frame, VulkanStereoOutputFrame)
                         else "openxr_reused_screen_frame",
                         1,
@@ -11094,8 +11113,9 @@ class OpenXrVulkanPresenter(
                 filament_queue_lock.release()
                 filament_queue_locked = False
             release_started = time.perf_counter()
-            for eye, _image_index in acquired_images:
-                xr.release_swapchain_image(eye.handle)
+            for eye, _image_index in waited_images:
+                with getattr(self.vulkan, "_lock", nullcontext()):
+                    xr.release_swapchain_image(eye.handle)
             record_time("openxr_projection_release_pair", release_started)
             if (
                 isinstance(output_frame, VulkanStereoOutputFrame)
@@ -11812,6 +11832,10 @@ class OpenXrVulkanPresenter(
                 latency_ms = (time.perf_counter() - timestamp) * 1000.0
                 if 0.0 <= latency_ms <= 10000.0:
                     self._tool_overlay_pending_latency_ms = latency_ms
+                    if self._on_breakdown_add_time is not None:
+                        self._on_breakdown_add_time(
+                            "openxr_source_latency", latency_ms / 1000.0
+                        )
         sbs_elapsed = now - self._tool_overlay_sbs_window_started
         if sbs_elapsed >= _TOOL_OVERLAY_UPDATE_INTERVAL:
             self._tool_overlay_sbs_fps = (
@@ -13224,7 +13248,6 @@ class OpenXrVulkanPresenter(
                     entry["swapchain"], [], render_width, render_height,
                     entry["resources"],
                 ),
-                tool_quad=True,
             ) as image_index:
                 destination_rect = None
                 if (render_width, render_height) != (width, height):
@@ -13330,7 +13353,6 @@ class OpenXrVulkanPresenter(
                     entry["swapchain"], [], render_width, render_height,
                     entry["resources"],
                 ),
-                tool_quad=True,
             ) as image_index:
                 destination_rect = None
                 if (width, height) != (render_width, render_height):
@@ -13625,37 +13647,23 @@ def _decode_name(value: Any) -> str:
 
 
 @contextmanager
-def _acquired_swapchain_image(xr: Any, eye: _EyeSwapchain, *, tool_quad: bool = False):
-    """Guarantee release after every successful acquire, including wait errors.
-
-    ``tool_quad=True`` replaces the infinite compositor wait with a short
-    timeout: VDXR never releases images of quad swapchains that are not yet
-    part of a submitted frame, so the first uploads of a pooled overlay would
-    block forever (VkTimeout observed with INFINITE_DURATION).
-    """
-
-    image_index = xr.acquire_swapchain_image(eye.handle)
+def _acquired_swapchain_image(xr: Any, eye: _EyeSwapchain):
+    """Write only after ownership transfers; serialize access to the XR VkQueue."""
+    context = getattr(eye.resources[0], "context", None) if eye.resources else None
+    queue_lock = getattr(context, "_lock", nullcontext())
+    with queue_lock:
+        image_index = xr.acquire_swapchain_image(eye.handle)
+    # xrWaitSwapchainImage does not access VkQueue. Keep the queue available
+    # to the producer while waiting, and never write or release after timeout.
+    xr.wait_swapchain_image(
+        eye.handle,
+        xr.SwapchainImageWaitInfo(timeout=xr.INFINITE_DURATION),
+    )
     try:
-        if not tool_quad:
-            xr.wait_swapchain_image(
-                eye.handle,
-                xr.SwapchainImageWaitInfo(timeout=xr.INFINITE_DURATION),
-            )
-        else:
-            # VDXR does not signal quad-swapchain images promptly. The
-            # acquire already transfers image ownership to the app, so a
-            # short wait is only a courtesy; proceed and write after 5ms
-            # instead of stalling the presenter per overlay per frame.
-            try:
-                xr.wait_swapchain_image(
-                    eye.handle,
-                    xr.SwapchainImageWaitInfo(timeout=5_000_000),
-                )
-            except Exception:
-                pass
         yield image_index
     finally:
-        xr.release_swapchain_image(eye.handle)
+        with queue_lock:
+            xr.release_swapchain_image(eye.handle)
 
 
 def _xr_view_pose_to_model_mat4(pose: Any) -> np.ndarray:

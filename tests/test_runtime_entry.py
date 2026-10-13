@@ -265,6 +265,24 @@ def test_local_viewer_uses_v25_source_size_without_changing_4k_io(monkeypatch) -
     assert runtime_entry.OUTPUT_RESOLUTION == (3840, 2160)
 
 
+def test_local_viewer_tensorrt_respects_native_processing_by_default(monkeypatch) -> None:
+    import torch
+    import app_runtime.runtime_entry as runtime_entry
+
+    settings = {"Processing Resolution": "Auto", "Display Mode": "Half-SBS", "TensorRT": True}
+    device = type("CudaDevice", (), {"type": "cuda"})()
+    monkeypatch.delenv("D2S_LOCAL_VIEWER_NATIVE_4K", raising=False)
+    monkeypatch.setattr(runtime_entry.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(torch.version, "hip", None)
+    assert runtime_entry._resolve_local_viewer_render_size_config(
+        settings, "Viewer", device
+    ) is runtime_entry.RENDER_SIZE_CONFIG
+    monkeypatch.setenv("D2S_LOCAL_VIEWER_NATIVE_4K", "0")
+    assert runtime_entry._resolve_local_viewer_render_size_config(
+        settings, "Viewer", device
+    ).policy.value == "fixed"
+
+
 def test_local_viewer_native_4k_escape_hatch_and_macos_are_unchanged(monkeypatch) -> None:
     import app_runtime.runtime_entry as runtime_entry
 

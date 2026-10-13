@@ -275,15 +275,12 @@ def _warp_composite2_full_sbs_kernel(
 
 
 @triton.jit
-def _sample_composite_at(
+def _composite_weights_at(
     rgb,
     depth,
     base_shift,
-    channel,
     y,
     x,
-    scale0,
-    scale1,
     width: tl.constexpr,
     pixels: tl.constexpr,
     softness: tl.constexpr,
@@ -300,22 +297,7 @@ def _sample_composite_at(
         rgb, depth, source_pixel, x, y, width, pixels // width, pixels,
         depth_value, active, w0_raw / weight_sum, w1_raw / weight_sum
     )
-    return _sample_two_layers(
-        rgb,
-        depth,
-        depth_value,
-        channel,
-        y,
-        x,
-        shift,
-        scale0,
-        scale1,
-        width,
-        pixels,
-        active,
-        w0,
-        w1,
-    )
+    return depth_value, shift, w0, w1
 
 
 @triton.jit
@@ -329,6 +311,7 @@ def _warp_composite2_half_sbs_kernel(
     half_width: tl.constexpr,
     pixels: tl.constexpr,
     softness: tl.constexpr,
+    output_uint8: tl.constexpr,
     block: tl.constexpr,
 ):
     offsets = tl.program_id(0) * block + tl.arange(0, block)
@@ -336,27 +319,45 @@ def _warp_composite2_half_sbs_kernel(
     pixel = offsets % pixels
     y = pixel // width
     x = pixel - y * width
-    channel = offsets // pixels
 
     use_left = x < half_width
     source_x = tl.where(use_left, x, x - half_width)
     x0 = source_x * 2
     x1 = x0 + 1
 
-    left0 = _sample_composite_at(rgb, depth, base_shift, channel, y, x0, 0.875, 1.0, width, pixels, softness, active)
-    left1 = _sample_composite_at(rgb, depth, base_shift, channel, y, x1, 0.875, 1.0, width, pixels, softness, active)
-    right0 = _sample_composite_at(rgb, depth, base_shift, channel, y, x0, -0.875, -1.0, width, pixels, softness, active)
-    right1 = _sample_composite_at(rgb, depth, base_shift, channel, y, x1, -0.875, -1.0, width, pixels, softness, active)
-    value0 = tl.where(use_left, left0, right0)
-    value1 = tl.where(use_left, left1, right1)
-    linear0 = tl.where(value0 <= 0.04045, value0 / 12.92,
-        tl.exp2(2.4 * tl.log2(tl.maximum((value0 + 0.055) / 1.055, 1.0e-20))))
-    linear1 = tl.where(value1 <= 0.04045, value1 / 12.92,
-        tl.exp2(2.4 * tl.log2(tl.maximum((value1 + 0.055) / 1.055, 1.0e-20))))
-    linear_mean = (linear0 + linear1) * 0.5
-    value = tl.where(linear_mean <= 0.0031308, linear_mean * 12.92,
-        1.055 * tl.exp2(tl.log2(tl.maximum(linear_mean, 1.0e-20)) / 2.4) - 0.055)
-    tl.store(out + offsets, value, mask=active)
+    scale0 = tl.where(use_left, 0.875, -0.875)
+    scale1 = tl.where(use_left, 1.0, -1.0)
+    depth0, shift0, w00, w01 = _composite_weights_at(
+        rgb, depth, base_shift, y, x0, width, pixels, softness, active
+    )
+    depth1, shift1, w10, w11 = _composite_weights_at(
+        rgb, depth, base_shift, y, x1, width, pixels, softness, active
+    )
+    # Depth classification and disparity are shared by all RGB channels.
+    for channel in tl.static_range(3):
+        value0 = _sample_two_layers(
+            rgb, depth, depth0, channel, y, x0, shift0, scale0, scale1,
+            width, pixels, active, w00, w01
+        )
+        value1 = _sample_two_layers(
+            rgb, depth, depth1, channel, y, x1, shift1, scale0, scale1,
+            width, pixels, active, w10, w11
+        )
+        linear0 = tl.where(value0 <= 0.04045, value0 / 12.92,
+            tl.exp2(2.4 * tl.log2(tl.maximum((value0 + 0.055) / 1.055, 1.0e-20))))
+        linear1 = tl.where(value1 <= 0.04045, value1 / 12.92,
+            tl.exp2(2.4 * tl.log2(tl.maximum((value1 + 0.055) / 1.055, 1.0e-20))))
+        linear_mean = (linear0 + linear1) * 0.5
+        value = tl.where(linear_mean <= 0.0031308, linear_mean * 12.92,
+            1.055 * tl.exp2(tl.log2(tl.maximum(linear_mean, 1.0e-20)) / 2.4) - 0.055)
+        if output_uint8:
+            scaled = tl.minimum(tl.maximum(value, 0.0), 1.0) * 255.0
+            lower = tl.floor(scaled)
+            fraction = scaled - lower
+            # Match torch.round's ties-to-even before storing the packed bytes.
+            round_up = (fraction > 0.5) | ((fraction == 0.5) & ((lower.to(tl.int32) & 1) != 0))
+            value = lower + round_up.to(tl.float32)
+        tl.store(out + channel * pixels + offsets, value, mask=active)
 
 
 @triton.jit
@@ -572,6 +573,8 @@ def warp_composite2_half_sbs(
     rgb: torch.Tensor,
     depth: torch.Tensor,
     base_shift: torch.Tensor,
+    *,
+    output_uint8: bool = False,
 ) -> torch.Tensor:
     rgb = rgb.contiguous()
     depth = depth.contiguous()
@@ -579,14 +582,16 @@ def warp_composite2_half_sbs(
     _, channels, height, width = rgb.shape
     if width % 2:
         raise ValueError("half-SBS direct output requires an even width")
-    out = torch.empty_like(rgb)
+    out = torch.empty_like(rgb, dtype=torch.uint8 if output_uint8 else rgb.dtype)
     pixels = height * width
-    total = out.numel()
-    block = 256
+    total = pixels
+    # RGB sharing raises register use. A smaller NVIDIA block keeps more
+    # warps resident on Turing; retain the existing ROCm launch size.
+    block = 256 if torch.version.hip else 128
     grid = (triton.cdiv(total, block),)
     _warp_composite2_half_sbs_kernel[
         grid
-    ](rgb, depth, base_shift, out, total, width, width // 2, pixels, 0.08, block)
+    ](rgb, depth, base_shift, out, total, width, width // 2, pixels, 0.08, output_uint8, block, num_warps=4)
     return out
 
 

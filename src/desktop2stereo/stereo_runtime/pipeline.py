@@ -399,6 +399,8 @@ def _enable_openxr_depth_cuda_graph_if_needed(
 ) -> None:
     if not openxr_full_synthesis:
         return
+    # A graph first enabled here would be captured after frame acquisition.
+    # Keep graph selection explicit until capture-time warmup is available.
     if _captured_frame_uses_cuda_capture(captured_frame):
         config = getattr(ctx.stereo_runtime, "config", None)
         if config is not None and bool(getattr(config, "use_cuda_graph", False)):
@@ -410,21 +412,6 @@ def _enable_openxr_depth_cuda_graph_if_needed(
             )
             ctx.source_stat_inc("openxr_depth_cuda_graph_disabled_cuda_capture")
         ctx.source_stat_inc("openxr_depth_cuda_graph_skipped_cuda_capture")
-        return
-    config = getattr(ctx.stereo_runtime, "config", None)
-    if config is None or bool(getattr(config, "use_cuda_graph", False)):
-        return
-    provider = getattr(ctx.stereo_runtime, "depth_provider", None)
-    if getattr(provider, "_cuda_graph_disabled_reason", None):
-        return
-    backend = str(getattr(config, "depth_backend", "auto") or "auto").strip().lower()
-    if backend not in {"auto", "tensorrt_native"}:
-        return
-    ctx.stereo_runtime.apply_settings_snapshot(
-        RuntimeSettingsSnapshot(version=int(time.time() * 1000), timestamp=time.time(), use_cuda_graph=True),
-        active_preset=ctx.stereo_active_preset,
-    )
-    ctx.source_stat_inc("openxr_depth_cuda_graph_enabled")
 
 
 def _unpack_raw_queue_item(item):
@@ -644,6 +631,8 @@ def _attach_capture_debug(runtime_result, captured_frame: CapturedFrame | None, 
     if captured_frame is None:
         return
     metadata = captured_frame.metadata if isinstance(captured_frame.metadata, dict) else {}
+    if isinstance(debug_info, dict):
+        debug_info["replayed_static_frame"] = int(bool(metadata.get("replayed_static_frame")))
     capture_frame_id = metadata.get("capture_frame_id")
     if capture_frame_id is None:
         return
@@ -1941,7 +1930,9 @@ class RuntimePipelineLoop:
                 ctx.apply_stereo_hot_reload_if_needed()
                 _apply_latest_settings_snapshot(ctx)
                 openxr_full_synthesis = ctx.run_mode == "OpenXR" and _openxr_full_synthesis_enabled(ctx)
-                _enable_openxr_depth_cuda_graph_if_needed(ctx, openxr_full_synthesis, captured_frame)
+                _enable_openxr_depth_cuda_graph_if_needed(
+                    ctx, openxr_full_synthesis, captured_frame
+                )
                 runtime_call_start_time = time.perf_counter()
                 if ctx.run_mode == "OpenXR":
                     original_stereo_config = None
