@@ -3122,7 +3122,7 @@ def _prepare_pointer_priority_presenter(monkeypatch):
     return presenter, generation
 
 
-def test_physical_mouse_event_blocks_remote_cursor_and_resumes_next_frame(monkeypatch) -> None:
+def test_physical_mouse_event_keeps_remote_cursor_blocked(monkeypatch) -> None:
     presenter, generation = _prepare_pointer_priority_presenter(monkeypatch)
     cursor_positions = []
     monkeypatch.setattr(
@@ -3136,7 +3136,7 @@ def test_physical_mouse_event_blocks_remote_cursor_and_resumes_next_frame(monkey
     assert cursor_positions == []
 
     presenter._handle_vulkan_pointer_input()
-    assert len(cursor_positions) == 1
+    assert cursor_positions == []
 
 
 def test_physical_keyboard_event_blocks_remote_cursor(monkeypatch) -> None:

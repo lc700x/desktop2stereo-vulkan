@@ -16,6 +16,7 @@ from .windows_input import (
     _send_vscroll,
     _physical_keyboard_active,
     _physical_mouse_active,
+    _physical_key_down,
 )
 
 
@@ -29,7 +30,10 @@ class CoreInputHelpersMixin:
             ("win", 0x5B),
         ):
             if self._mod_state[modifier_name][0]:
-                self._toggle_modifier_key(modifier_name, virtual_key)
+                if _physical_key_down(virtual_key):
+                    self._mod_state[modifier_name][:] = [False, False, 0.0]
+                else:
+                    self._toggle_modifier_key(modifier_name, virtual_key)
 
     def _toggle_modifier_key(self, modifier_name, virtual_key) -> None:
         """Toggle a modifier key between a real key-down and key-up state."""
@@ -56,13 +60,18 @@ class CoreInputHelpersMixin:
         neg_vk = VK_MAP[neg_dir]
         pos_vk = VK_MAP[pos_dir]
 
-        if _physical_keyboard_active():
+        if (
+            getattr(self, "_physical_input_override", False)
+            or _physical_keyboard_active(timeout=0.0)
+            or _physical_mouse_active(timeout=0.0)
+        ):
             # The hardware keyboard has priority: while the user types on it,
             # release any beam-held arrow key and ignore the stick.
             for attr in (neg_attr, pos_attr):
                 if getattr(self, attr):
                     vk = neg_vk if attr == neg_attr else pos_vk
-                    ctypes.windll.user32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, 0)
+                    if not _physical_key_down(vk):
+                        ctypes.windll.user32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, 0)
                     setattr(self, attr, False)
             return
 
@@ -139,7 +148,11 @@ class CoreInputHelpersMixin:
             self._kb_hover_r = None
             self._release_locked_modifiers()
             return
-        if _physical_keyboard_active():
+        if (
+            getattr(self, "_physical_input_override", False)
+            or _physical_keyboard_active(timeout=0.0)
+            or _physical_mouse_active(timeout=0.0)
+        ):
             # The hardware keyboard has priority over the virtual keyboard:
             # while the user types on the physical keyboard, do not inject any
             # virtual keystrokes and release any held virtual key.
@@ -303,7 +316,11 @@ class CoreInputHelpersMixin:
         SCROLL_MAX_NOTCH = 35.0
         ACCEL_EXPONENT = 2.8
 
-        if _physical_mouse_active():
+        if (
+            getattr(self, "_physical_input_override", False)
+            or _physical_mouse_active(timeout=0.0)
+            or _physical_keyboard_active(timeout=0.0)
+        ):
             # The hardware mouse owns the wheel: while it was used recently,
             # drop the beam's accumulated scroll so no stale wheel events are
             # injected once the physical device goes quiet.

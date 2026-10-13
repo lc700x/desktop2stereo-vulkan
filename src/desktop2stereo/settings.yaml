@@ -340,10 +340,10 @@ Model List:
   DepthPro-Large:
     resolutions:
     - 1536
-Depth Model: ZipDepth-Small
+Depth Model: Distill-Any-Depth-Small
 Depth Strength: 0.25
 Depth Quick: Standard
-Depth Resolution: 352
+Depth Resolution: 518
 Anti-aliasing: 0
 Depth Antialias Strength: 0.0
 Depth Pop: 0.0

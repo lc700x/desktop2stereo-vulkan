@@ -21,6 +21,7 @@ __all__ = [
     '_physical_input_generation',
     '_physical_mouse_active',
     '_physical_keyboard_active',
+    '_physical_key_down',
     '_set_alt_long_press_callback',
     '_clear_alt_long_press_callback',
 ]
@@ -123,7 +124,7 @@ if sys.platform == "win32":
     # generate a hook event at all. The frame producer can then give the real
     # mouse/keyboard priority over the controller beam and the virtual keyboard.
     _LLMHF_INJECTED = 0x0001
-    _LLKHF_INJECTED = 0x0001
+    _LLKHF_INJECTED = 0x0010
     _WH_MOUSE_LL = 14
     _WH_KEYBOARD_LL = 13
     _WM_QUIT = 0x0012
@@ -153,6 +154,18 @@ if sys.platform == "win32":
     _physical_input_generation_value = 0
     _last_physical_mouse = 0.0
     _last_physical_keyboard = 0.0
+    _physical_keys_down: set[int] = set()
+    _physical_mouse_buttons_down: set[int] = set()
+    _PHYSICAL_MOUSE_BUTTON_MESSAGES = {
+        0x0201: 0x01, 0x0202: 0x01,  # Left button down/up.
+        0x0204: 0x02, 0x0205: 0x02,  # Right button down/up.
+        0x0207: 0x04, 0x0208: 0x04,  # Middle button down/up.
+    }
+    _PHYSICAL_MODIFIER_KEYS = {
+        0x10: (0xA0, 0xA1),  # Shift.
+        0x11: (0xA2, 0xA3),  # Control.
+        0x12: (0xA4, 0xA5),  # Alt.
+    }
     _VK_MENU = 0x12
     _VK_LMENU = 0xA4
     _VK_RMENU = 0xA5
@@ -164,10 +177,10 @@ if sys.platform == "win32":
     _hook_mouse = None
     _hook_keyboard = None
     _MouseProc = ctypes.WINFUNCTYPE(
-        ctypes.c_long, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+        ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_void_p
     )
     _KeyboardProc = ctypes.WINFUNCTYPE(
-        ctypes.c_long, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+        ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_void_p
     )
 
     @_MouseProc
@@ -180,6 +193,15 @@ if sys.platform == "win32":
                     with _physical_lock:
                         _physical_input_generation_value += 1
                         _last_physical_mouse = time.monotonic()
+                        message = int(wParam)
+                        button = _PHYSICAL_MOUSE_BUTTON_MESSAGES.get(message)
+                        if message in (0x020B, 0x020C):
+                            button = 0x05 if (int(data.mouseData) >> 16) == 1 else 0x06
+                        if button is not None:
+                            if message in (0x0201, 0x0204, 0x0207, 0x020B):
+                                _physical_mouse_buttons_down.add(button)
+                            else:
+                                _physical_mouse_buttons_down.discard(button)
             except Exception:
                 pass
         return ctypes.windll.user32.CallNextHookEx(
@@ -196,6 +218,10 @@ if sys.platform == "win32":
                     with _physical_lock:
                         _physical_input_generation_value += 1
                         _last_physical_keyboard = time.monotonic()
+                        if int(data.flags) & 0x0080:
+                            _physical_keys_down.discard(int(data.vkCode))
+                        else:
+                            _physical_keys_down.add(int(data.vkCode))
             except Exception:
                 pass
         return ctypes.windll.user32.CallNextHookEx(
@@ -224,10 +250,10 @@ if sys.platform == "win32":
         call_next.argtypes = [
             ctypes.c_void_p,
             ctypes.c_int,
-            ctypes.c_void_p,
+            ctypes.c_size_t,
             ctypes.c_void_p,
         ]
-        call_next.restype = ctypes.c_long
+        call_next.restype = ctypes.c_ssize_t
         _hook_mouse = set_hook(
             _WH_MOUSE_LL, ctypes.cast(_physical_mouse_proc, ctypes.c_void_p), None, 0
         )
@@ -284,17 +310,30 @@ if sys.platform == "win32":
         )
         _alt_poll_thread.start()
 
-    def _physical_mouse_active(timeout: float = 2.0) -> bool:
+    def _physical_mouse_active(timeout: float = 0.0) -> bool:
         with _physical_lock:
-            return (time.monotonic() - _last_physical_mouse) < float(timeout)
+            return bool(_physical_mouse_buttons_down) or (
+                time.monotonic() - _last_physical_mouse
+            ) < float(timeout)
 
     def _physical_input_generation() -> int:
         with _physical_lock:
             return int(_physical_input_generation_value)
 
-    def _physical_keyboard_active(timeout: float = 2.0) -> bool:
+    def _physical_keyboard_active(timeout: float = 0.0) -> bool:
         with _physical_lock:
-            return (time.monotonic() - _last_physical_keyboard) < float(timeout)
+            return bool(_physical_keys_down) or (
+                time.monotonic() - _last_physical_keyboard
+            ) < float(timeout)
+
+    def _physical_key_down(virtual_key: int) -> bool:
+        with _physical_lock:
+            key = int(virtual_key)
+            return (
+                key in _physical_keys_down
+                or key in _physical_mouse_buttons_down
+                or any(side in _physical_keys_down for side in _PHYSICAL_MODIFIER_KEYS.get(key, ()))
+            )
 
     def _set_alt_long_press_callback(callback):
         global _alt_callback
@@ -321,7 +360,8 @@ else:
 
     def _start_physical_input_monitor(): pass
     def _physical_input_generation() -> int: return 0
-    def _physical_mouse_active(timeout: float = 2.0) -> bool: return False
-    def _physical_keyboard_active(timeout: float = 2.0) -> bool: return False
+    def _physical_mouse_active(timeout: float = 0.0) -> bool: return False
+    def _physical_keyboard_active(timeout: float = 0.0) -> bool: return False
+    def _physical_key_down(virtual_key: int) -> bool: return False
     def _set_alt_long_press_callback(callback): return None
     def _clear_alt_long_press_callback(): return None

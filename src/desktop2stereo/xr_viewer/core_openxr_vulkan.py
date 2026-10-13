@@ -107,6 +107,7 @@ from .windows_input import (
     _physical_input_generation,
     _physical_mouse_active,
     _physical_keyboard_active,
+    _physical_key_down,
     _set_alt_long_press_callback,
     _clear_alt_long_press_callback,
 )
@@ -1123,6 +1124,11 @@ class OpenXrVulkanPresenter(
         # keyboard suppresses the beam's cursor emulation.
         _start_physical_input_monitor()
         self._last_physical_input_generation = _physical_input_generation()
+        self._physical_input_override = False
+        self._physical_priority_trigger_down = (False, False)
+        self._physical_priority_wait_for_release = False
+        self._pointer_control_hand = 1
+        self._pointer_resume_hand: int | None = None
         # Keep the controller lifecycle aligned with the legacy renderer:
         # movement refreshes a per-hand activity timestamp and both the model
         # and laser are hidden after the idle timeout.
@@ -1892,9 +1898,13 @@ class OpenXrVulkanPresenter(
         # session/form-factor loss is handled by the explicit waiting paths.
         controls_started = time.perf_counter()
         try:
+            # Physical input must release injected holds even if xrSyncActions
+            # fails while the headset session is unfocused.
+            self._physical_input_has_priority(controller_sample=False)
             if self._on_breakdown_inc is not None:
                 self._on_breakdown_inc("openxr_input_sample", 1)
             self._sync_controller_inputs(1.0 / 90.0)
+            physical_input_priority = self._physical_input_has_priority()
             controller_chord_consumed = self._update_controller_input_toggle()
             if not (
                 self._controller_input_disabled
@@ -1903,11 +1913,17 @@ class OpenXrVulkanPresenter(
                 self._update_aim_poses(frame_state.predicted_display_time)
                 self._update_grip_poses(frame_state.predicted_display_time)
                 self._smooth_controller_poses()
-            self._grip_l_now = bool(self._controller_input(0).get("grip", 0.0) > 0.5)
-            self._grip_r_now = bool(self._controller_input(1).get("grip", 0.0) > 0.5)
-            if not controller_chord_consumed:
+            self._grip_l_now = not physical_input_priority and bool(
+                self._controller_input(0).get("grip", 0.0) > 0.5
+            )
+            self._grip_r_now = not physical_input_priority and bool(
+                self._controller_input(1).get("grip", 0.0) > 0.5
+            )
+            if not controller_chord_consumed and not physical_input_priority:
                 menu_consumed = self._handle_settings_menu_input()
-                if not menu_consumed:
+                if menu_consumed:
+                    self._pointer_resume_hand = None
+                else:
                     self._handle_keyboard_input()
                     self._handle_vulkan_pointer_input()
                 self._handle_controller_shortcuts(controller_toggle_checked=True)
@@ -2604,12 +2620,14 @@ class OpenXrVulkanPresenter(
 
     def _reset_controller_interaction_state(self) -> None:
         """Release controller-owned interactions before suppressing input."""
+        self._pointer_resume_hand = None
         self._cancel_touch_contacts()
         for name, up_flag in (
             ("left", _MOUSEEVENTF_RIGHTUP),
             ("right", _MOUSEEVENTF_LEFTUP),
         ):
-            if self._pointer_state.get(name) != "idle":
+            button_vk = 0x02 if name == "left" else 0x01
+            if self._pointer_state.get(name) != "idle" and not _physical_key_down(button_vk):
                 _send_mouse_flags(up_flag)
             self._pointer_state[name] = "idle"
             self._pointer_press_time[name] = 0.0
@@ -2627,14 +2645,15 @@ class OpenXrVulkanPresenter(
                 try:
                     shift_dn, ctrl_dn, alt_dn, win_dn, key = held_mods
                     kbd = ctypes.windll.user32.keybd_event
-                    kbd(int(key), 0, _KEYEVENTF_KEYUP, 0)
+                    if not _physical_key_down(int(key)):
+                        kbd(int(key), 0, _KEYEVENTF_KEYUP, 0)
                     for active, virtual_key in (
                         (win_dn, 0x5B),
                         (alt_dn, 0x12),
                         (shift_dn, 0x10),
                         (ctrl_dn, 0x11),
                     ):
-                        if active:
+                        if active and not _physical_key_down(virtual_key):
                             kbd(virtual_key, 0, _KEYEVENTF_KEYUP, 0)
                 except (AttributeError, OSError, TypeError, ValueError):
                     pass
@@ -2829,7 +2848,9 @@ class OpenXrVulkanPresenter(
                     and not self._settings_menu.active_key.startswith("step:")
                 )
                 if (
-                    not _physical_mouse_active()
+                    not self._physical_input_override
+                    and not _physical_mouse_active(timeout=0.0)
+                    and not _physical_keyboard_active(timeout=0.0)
                     and self._settings_menu_grab_hand is None
                     and not slider_drag
                 ):
@@ -2845,7 +2866,11 @@ class OpenXrVulkanPresenter(
             # The hardware keyboard has priority over shortcut injection:
             # clipboard gestures are dropped while the user types on the
             # physical keyboard.
-            if not _physical_keyboard_active():
+            if not (
+                self._physical_input_override
+                or _physical_keyboard_active(timeout=0.0)
+                or _physical_mouse_active(timeout=0.0)
+            ):
                 shortcut_vk, shortcut_ctrl = {
                     "copy": (0x43, True),
                     "cut": (0x58, True),
@@ -4124,9 +4149,67 @@ class OpenXrVulkanPresenter(
         self._last_physical_input_generation = current
         return current != previous
 
+    def _physical_input_has_priority(self, *, controller_sample: bool = True) -> bool:
+        """Latch physical ownership until an intentional new trigger press."""
+        inputs = (self._controller_input(0), self._controller_input(1))
+        previous_triggers = self._physical_priority_trigger_down
+        trigger_down = tuple(
+            float(hand.get("trigger", 0.0) or 0.0) >= self._TRIGGER_PRESS_THRESHOLD
+            or (previous and float(hand.get("trigger", 0.0) or 0.0) > self._TRIGGER_RELEASE_THRESHOLD)
+            for hand, previous in zip(inputs, previous_triggers)
+        )
+        if controller_sample:
+            self._physical_priority_trigger_down = trigger_down
+        physical_event = self._physical_input_event_pending()
+        if (
+            physical_event
+            or _physical_mouse_active(timeout=0.0)
+            or _physical_keyboard_active(timeout=0.0)
+        ):
+            if physical_event:
+                self._physical_priority_wait_for_release = True
+            if not self._physical_input_override:
+                self._physical_input_override = True
+                self._physical_priority_wait_for_release = True
+                self._reset_controller_interaction_state()
+                self._release_locked_modifiers()
+                self._kb_hover_l = None
+                self._kb_hover_r = None
+                self._kb_show_shifted = bool(self._caps_lock)
+                self._scroll_accum_x = 0.0
+                self._scroll_accum_y = 0.0
+                self._settings_menu.active_hand = None
+                self._settings_menu.active_key = None
+                self._settings_menu.hover_key = None
+                self._settings_menu.mark_dirty()
+            if controller_sample and not any(trigger_down):
+                self._physical_priority_wait_for_release = False
+            return True
+        if controller_sample and not any(trigger_down):
+            self._physical_priority_wait_for_release = False
+        if controller_sample and sum(trigger_down) == 1:
+            hand = trigger_down.index(True)
+            if not previous_triggers[hand]:
+                self._pointer_control_hand = hand
+        if (
+            self._physical_input_override
+            and controller_sample
+            and not self._physical_priority_wait_for_release
+            and not self._controller_input_disabled
+            and not self._controller_toggle_wait_for_release
+            and not any(previous_triggers)
+            and sum(trigger_down) == 1
+        ):
+            self._physical_input_override = False
+            self._touch_trig_prev = {"left": 0.0, "right": 0.0}
+            self._pointer_resume_hand = self._pointer_control_hand
+        return self._physical_input_override
+
     def _handle_vulkan_pointer_input(self) -> None:
         """Reuse legacy trigger hold/drag semantics for the Vulkan screen."""
         self._right_grip_screen_pointer_applied = False
+        if self._physical_input_has_priority():
+            return
         now = time.perf_counter()
         inputs = (self._controller_input(0), self._controller_input(1))
         hits = (self._screen_ray_hit_for_hand(0), self._screen_ray_hit_for_hand(1))
@@ -4374,19 +4457,23 @@ class OpenXrVulkanPresenter(
             else:
                 self._reset_screen_control_hold("distance")
                 self._reset_screen_control_hold("size")
-        physical_input_event = self._physical_input_event_pending()
-        if physical_input_event:
-            # Cancel before updating contacts: InjectTouchInput can move the OS
-            # cursor even when the SetCursorPos path below is skipped.
-            self._cancel_touch_contacts()
-            for name, hand in (("left", inputs[0]), ("right", inputs[1])):
-                # A held trigger must be released and pressed again before the
-                # remote beam can create a new contact after cancellation.
-                self._touch_trig_prev[name] = float(hand.get("trigger", 0.0) or 0.0)
-
-        touch_active = (
-            False if physical_input_event else self._update_touch_contacts(inputs, hits)
+        resume_hand = self._pointer_resume_hand
+        self._pointer_resume_hand = None
+        resume_mouse_click = (
+            resume_hand is not None
+            and hits[resume_hand] is not None
+            and not self._hand_keyboard_hit(resume_hand)
+            and float(inputs[resume_hand].get("trigger", 0.0) or 0.0) >= self._TRIGGER_PRESS_THRESHOLD
         )
+        if resume_mouse_click or any(state != "idle" for state in self._pointer_state.values()):
+            # The takeover press uses the existing immediate mouse click/drag
+            # path. Keep that gesture on mouse input until release so touch
+            # injection cannot turn the same press into a second click.
+            touch_active = False
+            for name, hand in zip(("left", "right"), inputs):
+                self._touch_trig_prev[name] = float(hand.get("trigger", 0.0) or 0.0)
+        else:
+            touch_active = self._update_touch_contacts(inputs, hits)
         for name, hand, hit, down_flag, up_flag in (
             ("left", inputs[0], hits[0], _MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP),
             ("right", inputs[1], hits[1], _MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP),
@@ -4401,7 +4488,8 @@ class OpenXrVulkanPresenter(
                 # hover, and never fight a two-contact gesture (pinch/zoom/pan)
                 # with it.
                 if (
-                    hit is not None
+                    hand_index == self._pointer_control_hand
+                    and hit is not None
                     and not keyboard_hit
                     and not (
                         self._touch_state["left"] == "down"
@@ -4411,22 +4499,15 @@ class OpenXrVulkanPresenter(
                     _set_cursor_pos(*self._cursor_pixel_for_screen_uv(hit[0], hit[1]))
                 self._pointer_state[name] = "idle"
                 continue
-            if physical_input_event:
-                # The hardware mouse/keyboard owns this input event; release
-                # any beam-held button and ignore the beam for this frame.
-                if state != "idle":
-                    _send_mouse_flags(up_flag)
-                self._pointer_state[name] = "idle"
-                continue
             if hit is None or keyboard_hit:
                 if state != "idle":
                     _send_mouse_flags(up_flag)
                 self._pointer_state[name] = "idle"
                 continue
-            # Move the OS cursor every frame the laser is on the screen,
-            # matching the legacy _handle_cursor continuous tracking. The
-            # trigger press below then clicks at this already-updated spot.
-            _set_cursor_pos(*self._cursor_pixel_for_screen_uv(hit[0], hit[1]))
+            # Follow the last pressed controller's circle; another controller's
+            # hover must not move the desktop cursor away from that click.
+            if hand_index == self._pointer_control_hand or trigger >= 0.7 or state == "dragging":
+                _set_cursor_pos(*self._cursor_pixel_for_screen_uv(hit[0], hit[1]))
             if state == "idle" and trigger >= 0.7:
                 _send_mouse_flags(down_flag)
                 _send_mouse_flags(up_flag)
@@ -5370,7 +5451,12 @@ class OpenXrVulkanPresenter(
             return []
         normal = menu_matrix[:3, 2]
         specs = []
-        for hand, local_uv in enumerate(self._settings_menu_cursor_hits):
+        cursor_hits = (
+            tuple(self._settings_menu_ray_hit(hand) for hand in (0, 1))
+            if self._physical_input_override
+            else self._settings_menu_cursor_hits
+        )
+        for hand, local_uv in enumerate(cursor_hits):
             if local_uv is None:
                 continue
             if hand == self._settings_menu_grab_hand:
@@ -8080,7 +8166,10 @@ class OpenXrVulkanPresenter(
         if (
             grip_matrix is None
             or aim_matrix is None
-            or self._frame_now - float(last_move) > self._LASER_HIDE_AFTER
+            or (
+                not self._physical_input_override
+                and self._frame_now - float(last_move) > self._LASER_HIDE_AFTER
+            )
         ):
             return None
         origin, direction = self._controller_interaction_ray(hand)
@@ -8119,7 +8208,10 @@ class OpenXrVulkanPresenter(
             )
             if (
                 grip_matrix is None
-                or self._frame_now - float(last_move) > self._LASER_HIDE_AFTER
+                or (
+                    not self._physical_input_override
+                    and self._frame_now - float(last_move) > self._LASER_HIDE_AFTER
+                )
             ):
                 continue
             matrix = np.asarray(grip_matrix, dtype=np.float32)
@@ -9270,7 +9362,10 @@ class OpenXrVulkanPresenter(
             last_move = self._laser_last_move_l if hand == 0 else self._laser_last_move_r
             active = (
                 grip_matrix is not None
-                and self._frame_now - float(last_move) <= self._LASER_HIDE_AFTER
+                and (
+                    self._physical_input_override
+                    or self._frame_now - float(last_move) <= self._LASER_HIDE_AFTER
+                )
             )
             if getattr(bridge, "controller_visibility_abi_available", False):
                 bridge.set_controller_visible(hand, active)
