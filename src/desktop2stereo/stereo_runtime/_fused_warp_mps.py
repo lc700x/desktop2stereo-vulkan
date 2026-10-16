@@ -54,26 +54,29 @@ static inline float sampf_class(
     uint plane = W * H;
     float total = 0.0f;
     float weight = 0.0f;
+    float linear = sampf(col + channel * plane, W, H, u, v);
     float d = dep[y0 * W + x0];
-    if (abs(d - class_depth) <= 0.025f) {
-        total += col[channel * plane + y0 * W + x0] * w00; weight += w00;
-    }
+    float keep = 1.0f - smoothstep(0.02f, 0.06f, abs(d - class_depth));
+    total += col[channel * plane + y0 * W + x0] * w00 * keep; weight += w00 * keep;
     d = dep[y0 * W + x1];
-    if (abs(d - class_depth) <= 0.025f) {
-        total += col[channel * plane + y0 * W + x1] * w10; weight += w10;
-    }
+    keep = 1.0f - smoothstep(0.02f, 0.06f, abs(d - class_depth));
+    total += col[channel * plane + y0 * W + x1] * w10 * keep; weight += w10 * keep;
     d = dep[y1 * W + x0];
-    if (abs(d - class_depth) <= 0.025f) {
-        total += col[channel * plane + y1 * W + x0] * w01; weight += w01;
-    }
+    keep = 1.0f - smoothstep(0.02f, 0.06f, abs(d - class_depth));
+    total += col[channel * plane + y1 * W + x0] * w01 * keep; weight += w01 * keep;
     d = dep[y1 * W + x1];
-    if (abs(d - class_depth) <= 0.025f) {
-        total += col[channel * plane + y1 * W + x1] * w11; weight += w11;
-    }
-    return weight > 1.0e-6f ? total / weight : sampf(col + channel * plane, W, H, u, v);
+    keep = 1.0f - smoothstep(0.02f, 0.06f, abs(d - class_depth));
+    total += col[channel * plane + y1 * W + x1] * w11 * keep; weight += w11 * keep;
+    float edge = smoothstep(0.02f, 0.06f, max(max(dep[y0 * W + x0], dep[y0 * W + x1]),
+        max(dep[y1 * W + x0], dep[y1 * W + x1])) -
+        min(min(dep[y0 * W + x0], dep[y0 * W + x1]),
+        min(dep[y1 * W + x0], dep[y1 * W + x1])));
+    float support = min(weight, 1.0f);
+    float class_value = total / max(weight, 1.0e-6f);
+    return mix(linear, class_value, edge * support);
 }
 
-static inline int pack_depth_class(
+static inline float2 pack_depth_class(
     device float* col, device float* dep, uint srcW, uint srcH,
     float u, float v
 ) {
@@ -86,7 +89,7 @@ static inline int pack_depth_class(
     float dd = sampf(dep, srcW, srcH, u, v + dv);
     float low = min(min(dl, dr), min(duv, dd));
     float high = max(max(dl, dr), max(duv, dd));
-    if (high - low <= 0.025f) return -1;
+    float edge_strength = smoothstep(0.0125f, 0.05f, high - low);
     float midpoint = (low + high) * 0.5f;
     uint plane = srcW * srcH;
     float center_luma = 0.0f;
@@ -107,14 +110,19 @@ static inline int pack_depth_class(
             luma += sampf(col + c * plane, srcW, srcH, samples_u[i], samples_v[i])
                   * (c == 0u ? 0.299f : (c == 1u ? 0.587f : 0.114f));
         }
-        if (samples_d[i] < midpoint) { low_luma += luma; low_count += 1.0f; }
-        else { high_luma += luma; high_count += 1.0f; }
+        float low_weight = 1.0f - smoothstep(midpoint - 0.02f, midpoint + 0.02f, samples_d[i]);
+        float high_weight = 1.0f - low_weight;
+        low_luma += luma * low_weight;
+        high_luma += luma * high_weight;
+        low_count += low_weight;
+        high_count += high_weight;
     }
-    if (low_count < 1.0f || high_count < 1.0f) return -1;
-    low_luma /= low_count;
-    high_luma /= high_count;
-    if (abs(high_luma - low_luma) < 0.02f) return -1;
-    return abs(center_luma - high_luma) <= abs(center_luma - low_luma) ? 1 : 0;
+    low_luma /= max(low_count, 1.0e-6f);
+    high_luma /= max(high_count, 1.0e-6f);
+    float color_strength = smoothstep(0.01f, 0.05f, abs(high_luma - low_luma));
+    float prefer_high = smoothstep(-0.02f, 0.02f,
+        abs(center_luma - low_luma) - abs(center_luma - high_luma));
+    return float2(prefer_high, edge_strength * color_strength);
 }
 
 static inline float warp_pack_sample(
@@ -127,16 +135,18 @@ static inline float warp_pack_sample(
     float dm = sampf(dep, srcW, srcH, u - du, v);
     float dp_ = sampf(dep, srcW, srcH, u + du, v);
     float d = clamp(d0 * 0.7f + dm * 0.15f + dp_ * 0.15f, 0.0f, 1.0f);
-    int depth_class = pack_depth_class(col, dep, srcW, srcH, u, v);
-    if (depth_class == 0) d = clamp(min(dm, min(dp_, d0)), 0.0f, 1.0f);
-    else if (depth_class == 1) d = clamp(max(dm, max(dp_, d0)), 0.0f, 1.0f);
+    float2 depth_class = pack_depth_class(col, dep, srcW, srcH, u, v);
+    float low_depth = min(dm, min(dp_, d0));
+    float high_depth = max(dm, max(dp_, d0));
+    float selected_depth = mix(low_depth, high_depth, depth_class.x);
+    d = mix(d, selected_depth, depth_class.y);
     float d_shaped = d * (1.0f + 0.35f * (1.0f - d));
     float shift = (d_shaped - convergence) * depthStrength * eye;
     shift *= smoothstep(0.0f, 0.05f, u) * smoothstep(0.0f, 0.05f, 1.0f - u);
     float sample_u = clamp(u + shift, 0.0f, 1.0f);
-    return depth_class >= 0
-        ? sampf_class(col, dep, channel, srcW, srcH, sample_u, v, d)
-        : sampf(col + channel * (srcW * srcH), srcW, srcH, sample_u, v);
+    float linear = sampf(col + channel * (srcW * srcH), srcW, srcH, sample_u, v);
+    float classified = sampf_class(col, dep, channel, srcW, srcH, sample_u, v, d);
+    return mix(linear, classified, depth_class.y);
 }
 
 kernel void warp_pack(
@@ -219,7 +229,7 @@ static inline float luma_common(
     return r * 0.299f + g * 0.587f + b * 0.114f;
 }
 
-static inline int edge_depth_class_common(
+static inline float2 edge_depth_class_common(
     device const float* col,
     device const float* dep,
     uint batch,
@@ -242,7 +252,6 @@ static inline int edge_depth_class_common(
     float dd = dep[base + yd * W + x];
     float low = min(min(dl, dr), min(du, dd));
     float high = max(max(dl, dr), max(du, dd));
-    if (high - low <= 0.025f) return -1;
     float midpoint = (low + high) * 0.5f;
     float center = luma_common(col, batch, x, y, W, H, C);
     float ll = luma_common(col, batch, xl, y, W, H, C);
@@ -251,21 +260,23 @@ static inline int edge_depth_class_common(
     float ld = luma_common(col, batch, x, yd, W, H, C);
     float low_sum = 0.0f;
     float high_sum = 0.0f;
-    float low_count = 0.0f;
-    float high_count = 0.0f;
-    if (dl < midpoint) { low_sum += ll; low_count += 1.0f; }
-    else { high_sum += ll; high_count += 1.0f; }
-    if (dr < midpoint) { low_sum += lr; low_count += 1.0f; }
-    else { high_sum += lr; high_count += 1.0f; }
-    if (du < midpoint) { low_sum += lu; low_count += 1.0f; }
-    else { high_sum += lu; high_count += 1.0f; }
-    if (dd < midpoint) { low_sum += ld; low_count += 1.0f; }
-    else { high_sum += ld; high_count += 1.0f; }
-    if (low_count < 1.0f || high_count < 1.0f) return -1;
-    float low_luma = low_sum / low_count;
-    float high_luma = high_sum / high_count;
-    if (abs(high_luma - low_luma) < 0.02f) return -1;
-    return abs(center - high_luma) <= abs(center - low_luma) ? 1 : 0;
+    float low_l = 1.0f - smoothstep(midpoint - 0.02f, midpoint + 0.02f, dl);
+    float low_r = 1.0f - smoothstep(midpoint - 0.02f, midpoint + 0.02f, dr);
+    float low_u = 1.0f - smoothstep(midpoint - 0.02f, midpoint + 0.02f, du);
+    float low_d = 1.0f - smoothstep(midpoint - 0.02f, midpoint + 0.02f, dd);
+    float high_l = 1.0f - low_l, high_r = 1.0f - low_r;
+    float high_u = 1.0f - low_u, high_d = 1.0f - low_d;
+    float low_count = low_l + low_r + low_u + low_d;
+    float high_count = high_l + high_r + high_u + high_d;
+    low_sum = ll * low_l + lr * low_r + lu * low_u + ld * low_d;
+    high_sum = ll * high_l + lr * high_r + lu * high_u + ld * high_d;
+    float low_luma = low_sum / max(low_count, 1.0e-6f);
+    float high_luma = high_sum / max(high_count, 1.0e-6f);
+    float depth_strength = smoothstep(0.0125f, 0.05f, high - low);
+    float color_strength = smoothstep(0.01f, 0.05f, abs(high_luma - low_luma));
+    float prefer_high = smoothstep(-0.02f, 0.02f,
+        abs(center - low_luma) - abs(center - high_luma));
+    return float2(prefer_high, depth_strength * color_strength);
 }
 
 static inline float sample_class_common(
@@ -293,29 +304,104 @@ static inline float sample_class_common(
     uint depth_base = batch * plane;
     float total = 0.0f;
     float weight = 0.0f;
+    float linear = sample_common(col, batch, channel, W, H, C, x, y);
     float d = dep[depth_base + y0 * W + x0];
-    if (abs(d - class_depth) <= 0.04f) {
-        total += sample_common(col, batch, channel, W, H, C, (float)x0, (float)y0) * w00;
-        weight += w00;
-    }
+    float keep = 1.0f - smoothstep(0.02f, 0.06f, abs(d - class_depth));
+    total += sample_common(col, batch, channel, W, H, C, (float)x0, (float)y0) * w00 * keep;
+    weight += w00 * keep;
     d = dep[depth_base + y0 * W + x1];
-    if (abs(d - class_depth) <= 0.04f) {
-        total += sample_common(col, batch, channel, W, H, C, (float)x1, (float)y0) * w10;
-        weight += w10;
-    }
+    keep = 1.0f - smoothstep(0.02f, 0.06f, abs(d - class_depth));
+    total += sample_common(col, batch, channel, W, H, C, (float)x1, (float)y0) * w10 * keep;
+    weight += w10 * keep;
     d = dep[depth_base + y1 * W + x0];
-    if (abs(d - class_depth) <= 0.04f) {
-        total += sample_common(col, batch, channel, W, H, C, (float)x0, (float)y1) * w01;
-        weight += w01;
-    }
+    keep = 1.0f - smoothstep(0.02f, 0.06f, abs(d - class_depth));
+    total += sample_common(col, batch, channel, W, H, C, (float)x0, (float)y1) * w01 * keep;
+    weight += w01 * keep;
     d = dep[depth_base + y1 * W + x1];
-    if (abs(d - class_depth) <= 0.04f) {
-        total += sample_common(col, batch, channel, W, H, C, (float)x1, (float)y1) * w11;
-        weight += w11;
+    keep = 1.0f - smoothstep(0.02f, 0.06f, abs(d - class_depth));
+    total += sample_common(col, batch, channel, W, H, C, (float)x1, (float)y1) * w11 * keep;
+    weight += w11 * keep;
+    float d00 = dep[depth_base + y0 * W + x0];
+    float d10 = dep[depth_base + y0 * W + x1];
+    float d01 = dep[depth_base + y1 * W + x0];
+    float d11 = dep[depth_base + y1 * W + x1];
+    float edge = smoothstep(0.02f, 0.06f,
+        max(max(d00, d10), max(d01, d11)) - min(min(d00, d10), min(d01, d11)));
+    float class_value = total / max(weight, 1.0e-6f);
+    return mix(linear, class_value, edge * min(weight, 1.0f));
+}
+
+static inline float projection_scale_common(float value) {
+    return 0.875f + 0.125f / (1.0f + exp((1.0f - 2.0f * value) / 0.08f));
+}
+
+static inline float projected_common(
+    device const float* col, device const float* dep, device const float* shift,
+    uint batch, uint channel, uint W, uint H, uint C, uint x, uint y,
+    float target_depth, float target_shift, float eye, constant float2& bounds
+) {
+    float source_x = clamp(float(x) + target_shift * projection_scale_common(target_depth) * eye,
+                           0.0f, float(W) - 1.0f);
+    float source_depth = sample_common(dep, batch, 0u, W, H, 1u, source_x, float(y));
+    float source_shift = sample_common(shift, batch, 0u, W, H, 1u, source_x, float(y));
+    float refined_x = clamp(float(x) + source_shift * projection_scale_common(source_depth) * eye,
+                            0.0f, float(W) - 1.0f);
+    float front_x = clamp(float(x) + bounds.x * eye, 0.0f, float(W) - 1.0f);
+    float front_depth = sample_common(dep, batch, 0u, W, H, 1u, front_x, float(y));
+    float confidence = max(smoothstep(0.02f, 0.04f, abs(source_depth - target_depth)),
+                           smoothstep(0.125f, 0.5f, abs(refined_x - source_x)));
+    confidence = max(confidence, smoothstep(0.02f, 0.04f, front_depth - source_depth));
+    float linear = sample_common(col, batch, channel, W, H, C, refined_x, float(y));
+    if (confidence <= 0.0f) return linear;
+    int first = int(ceil(float(x) + min(bounds.x * eye, bounds.y * eye) - 1.0f));
+    int count = int(bounds.y - bounds.x) + 4;
+    float best_depth = -1.0f, best_coverage = 0.0f;
+    int best_x = int(x), left_x = int(x), right_x = int(x);
+    float left_error = 1.0e6f, right_error = 1.0e6f, left_depth = -1.0f, right_depth = -1.0f;
+    uint base = batch * W * H + y * W;
+    for (int offset = 0; offset < count; ++offset) {
+        int sx = first + offset;
+        if (sx < 0 || sx >= int(W)) continue;
+        float sample_depth = dep[base + uint(sx)];
+        float error = float(sx) - shift[base + uint(sx)] * projection_scale_common(sample_depth) * eye - float(x);
+        float coverage = max(1.0f - abs(error), 0.0f);
+        if (coverage > 0.0f && (sample_depth > best_depth ||
+            (sample_depth == best_depth && coverage > best_coverage))) {
+            best_depth = sample_depth; best_coverage = coverage; best_x = sx;
+        }
+        if (error <= 0.0f && abs(error) < left_error) {
+            left_error = abs(error); left_depth = sample_depth; left_x = sx;
+        }
+        if (error >= 0.0f && error < right_error) {
+            right_error = error; right_depth = sample_depth; right_x = sx;
+        }
     }
-    return weight > 1.0e-6f
-        ? total / weight
-        : sample_common(col, batch, channel, W, H, C, x, y);
+    bool use_left = left_error < 1.0e5f && (right_error >= 1.0e5f || left_depth <= right_depth);
+    int background_x = use_left ? left_x : right_x;
+    float background_depth = use_left ? left_depth : right_depth;
+    float left_color = sample_common(col, batch, channel, W, H, C, float(left_x), float(y));
+    float right_color = sample_common(col, batch, channel, W, H, C, float(right_x), float(y));
+    float side_fraction = left_error / max(left_error + right_error, 1.0e-6f);
+    float background_linear = mix(left_color, right_color, side_fraction);
+    float background_edge = smoothstep(0.02f, 0.04f, abs(left_depth - right_depth));
+    float background = mix(background_linear, use_left ? left_color : right_color, background_edge);
+    float foreground = 0.0f, foreground_coverage = 0.0f;
+    for (int offset = -1; offset <= 1; ++offset) {
+        int sx = best_x + offset;
+        if (best_depth < 0.0f || sx < 0 || sx >= int(W)) continue;
+        float sample_depth = dep[base + uint(sx)];
+        float error = float(sx) - shift[base + uint(sx)] * projection_scale_common(sample_depth) * eye - float(x);
+        float class_weight = 1.0f - smoothstep(0.02f, 0.04f, best_depth - sample_depth);
+        float coverage = max(1.0f - abs(error), 0.0f) * class_weight;
+        foreground += sample_common(col, batch, channel, W, H, C, float(sx), float(y)) * coverage;
+        foreground_coverage += coverage;
+    }
+    foreground /= max(foreground_coverage, 1.0e-6f);
+    float background_confidence = smoothstep(0.02f, 0.04f, best_depth - background_depth);
+    float resolved = mix(foreground, background,
+        (1.0f - min(foreground_coverage, 1.0f)) * background_confidence);
+    if (best_depth < 0.0f) resolved = background;
+    return mix(linear, resolved, confidence);
 }
 
 static inline float blend_common(
@@ -329,7 +415,8 @@ static inline float blend_common(
     uint C,
     uint x,
     uint y,
-    float eye_sign
+    float eye_sign,
+    constant float2& projection_bounds
 ) {
     uint plane = H * W;
     uint depth_idx = batch * plane + y * W + x;
@@ -338,29 +425,22 @@ static inline float blend_common(
     float w1 = exp(-((d - 1.0f) * (d - 1.0f)) / 0.08f);
     float weight_sum = max(w0 + w1, 1.0e-6f);
     float base = shift[depth_idx];
+    if (projection_bounds.x != 0.0f || projection_bounds.y != 0.0f) {
+        return projected_common(col, dep, shift, batch, channel, W, H, C,
+                                x, y, d, base, eye_sign, projection_bounds);
+    }
     float shift0 = base * 0.875f;
     float shift1 = base;
-    int depth_class = edge_depth_class_common(
+    float2 depth_class = edge_depth_class_common(
         col, dep, batch, x, y, W, H, C, d
     );
-    if (depth_class == 0) {
-        w0 = 1.0f;
-        w1 = 0.0f;
-    } else if (depth_class == 1) {
-        w0 = 0.0f;
-        w1 = 1.0f;
-    }
+    w1 = mix(w1, depth_class.x, depth_class.y);
+    w0 = 1.0f - w1;
     weight_sum = max(w0 + w1, 1.0e-6f);
-    float sample0 = depth_class < 0
-        ? sample_common(col, batch, channel, W, H, C,
-            (float)x + shift0 * eye_sign, (float)y)
-        : sample_class_common(col, dep, batch, channel, W, H, C,
-            (float)x + shift0 * eye_sign, (float)y, d);
-    float sample1 = depth_class < 0
-        ? sample_common(col, batch, channel, W, H, C,
-            (float)x + shift1 * eye_sign, (float)y)
-        : sample_class_common(col, dep, batch, channel, W, H, C,
-            (float)x + shift1 * eye_sign, (float)y, d);
+    float sample0 = sample_class_common(col, dep, batch, channel, W, H, C,
+        (float)x + shift0 * eye_sign, (float)y, d);
+    float sample1 = sample_class_common(col, dep, batch, channel, W, H, C,
+        (float)x + shift1 * eye_sign, (float)y, d);
     return (w0 * sample0 + w1 * sample1) / weight_sum;
 }
 
@@ -376,7 +456,8 @@ static inline float downsample_common(
     uint x,
     uint y,
     bool horizontal,
-    float eye_sign
+    float eye_sign,
+    constant float2& projection_bounds
 ) {
     uint center = 2u * (horizontal ? x : y);
     uint limit = (horizontal ? W : H) - 1u;
@@ -385,8 +466,8 @@ static inline float downsample_common(
     uint x1 = horizontal ? min(center + 1u, limit) : x;
     uint y1 = horizontal ? y : min(center + 1u, limit);
     return 0.5f * (
-        blend_common(col, dep, shift, batch, channel, W, H, C, x0, y0, eye_sign) +
-        blend_common(col, dep, shift, batch, channel, W, H, C, x1, y1, eye_sign)
+        blend_common(col, dep, shift, batch, channel, W, H, C, x0, y0, eye_sign, projection_bounds) +
+        blend_common(col, dep, shift, batch, channel, W, H, C, x1, y1, eye_sign, projection_bounds)
     );
 }
 
@@ -402,6 +483,7 @@ kernel void warp_composite2_u8(
     constant uint& outW      [[buffer(8)]],
     constant uint& outH      [[buffer(9)]],
     constant uint& format    [[buffer(10)]],
+    constant float2& projection_bounds [[buffer(11)]],
     uint idx [[thread_position_in_grid]])
 {
     uint total = B * C * outH * outW;
@@ -426,11 +508,11 @@ kernel void warp_composite2_u8(
     if (half_res) {
         value = downsample_common(
             col, dep, shift, batch, channel, W, H, C, x, y,
-            horizontal, eye_sign
+            horizontal, eye_sign, projection_bounds
         );
     } else {
         value = blend_common(
-            col, dep, shift, batch, channel, W, H, C, x, y, eye_sign
+            col, dep, shift, batch, channel, W, H, C, x, y, eye_sign, projection_bounds
         );
     }
     out[idx] = (uchar)clamp(value * 255.0f + 0.5f, 0.0f, 255.0f);
@@ -446,6 +528,7 @@ kernel void warp_composite2(
     constant uint& C         [[buffer(6)]],
     constant uint& W         [[buffer(7)]],
     constant uint& H         [[buffer(8)]],
+    constant float2& projection_bounds [[buffer(9)]],
     uint idx [[thread_position_in_grid]])
 {
     uint total = B * C * H * W;
@@ -459,10 +542,10 @@ kernel void warp_composite2(
     uint y = pixel / W;
     uint x = pixel % W;
     float left_value = blend_common(
-        col, dep, shift, batch, channel, W, H, C, x, y, 1.0f
+        col, dep, shift, batch, channel, W, H, C, x, y, 1.0f, projection_bounds
     );
     float right_value = blend_common(
-        col, dep, shift, batch, channel, W, H, C, x, y, -1.0f
+        col, dep, shift, batch, channel, W, H, C, x, y, -1.0f, projection_bounds
     );
     left[idx] = left_value;
     right[idx] = right_value;
@@ -537,6 +620,23 @@ kernel void pack_eyes_u8(
     out[idx] = (uchar)clamp(value * 255.0f + 0.5f, 0.0f, 255.0f);
 }
 
+static inline float joint_depth_curvature(
+    device const float* depth, uint base, int x, int y, uint height, uint width) {
+    float curvatureX = 0.0f, curvatureY = 0.0f;
+    if (width >= 3u) {
+        uint mx = uint(clamp(x, 1, int(width) - 2));
+        uint row = base + uint(y) * width;
+        curvatureX = abs(depth[row + mx - 1u] - 2.0f * depth[row + mx] + depth[row + mx + 1u]);
+    }
+    if (height >= 3u) {
+        uint my = uint(clamp(y, 1, int(height) - 2));
+        uint column = base + uint(x);
+        curvatureY = abs(depth[column + (my - 1u) * width] -
+                         2.0f * depth[column + my * width] + depth[column + (my + 1u) * width]);
+    }
+    return max(curvatureX, curvatureY);
+}
+
 kernel void joint_bilateral_depth(
     device float* output [[buffer(0)]],
     device const float* depth [[buffer(1)]],
@@ -585,52 +685,91 @@ kernel void joint_bilateral_depth(
     float high = max(max(d00, d10), max(d01, d11));
     float linear = w00 * d00 + w10 * d10 + w01 * d01 + w11 * d11;
 
+    float edgeSignal =
+        w00 * joint_depth_curvature(depth, depthBase, int(x0), int(y0), depthH, depthW) +
+        w10 * joint_depth_curvature(depth, depthBase, int(x1), int(y0), depthH, depthW) +
+        w01 * joint_depth_curvature(depth, depthBase, int(x0), int(y1), depthH, depthW) +
+        w11 * joint_depth_curvature(depth, depthBase, int(x1), int(y1), depthH, depthW);
+    float edgeWeight = smoothstep(max(edgeThreshold, 1.0e-6f) * 0.25f,
+                                  max(edgeThreshold, 1.0e-6f) * 0.5f, edgeSignal);
+    if (edgeWeight <= 0.0f) {
+        output[index] = linear;
+        return;
+    }
     uint rgbBase = batch * 3u * pixels;
     uint guideBase = batch * 3u * depthPixels;
     float3 target = float3(rgb[rgbBase + pixel], rgb[rgbBase + pixels + pixel],
                            rgb[rgbBase + 2u * pixels + pixel]);
-    float3 c00 = float3(guide[guideBase + i00], guide[guideBase + depthPixels + i00],
-                        guide[guideBase + 2u * depthPixels + i00]);
-    float3 c10 = float3(guide[guideBase + i10], guide[guideBase + depthPixels + i10],
-                        guide[guideBase + 2u * depthPixels + i10]);
-    float3 c01 = float3(guide[guideBase + i01], guide[guideBase + depthPixels + i01],
-                        guide[guideBase + 2u * depthPixels + i01]);
-    float3 c11 = float3(guide[guideBase + i11], guide[guideBase + depthPixels + i11],
-                        guide[guideBase + 2u * depthPixels + i11]);
-    float delta00 = dot(abs(target - c00), float3(1.0f / 3.0f));
-    float delta10 = dot(abs(target - c10), float3(1.0f / 3.0f));
-    float delta01 = dot(abs(target - c01), float3(1.0f / 3.0f));
-    float delta11 = dot(abs(target - c11), float3(1.0f / 3.0f));
-    float q00 = w00 * exp(-delta00 / colorSigma);
-    float q10 = w10 * exp(-delta10 / colorSigma);
-    float q01 = w01 * exp(-delta01 / colorSigma);
-    float q11 = w11 * exp(-delta11 / colorSigma);
-    float totalWeight = q00 + q10 + q01 + q11;
-    float guided = (q00 * d00 + q10 * d10 + q01 * d01 + q11 * d11)
-                 / max(totalWeight, 1.0e-8f);
-    float midpoint = (low + high) * 0.5f;
-    bool high00 = d00 >= midpoint;
-    bool high10 = d10 >= midpoint;
-    bool high01 = d01 >= midpoint;
-    bool high11 = d11 >= midpoint;
-    float nearestDelta = min(min(delta00, delta10), min(delta01, delta11));
-    bool chooseHigh = (delta00 == nearestDelta) ? high00
-                    : ((delta10 == nearestDelta) ? high10
-                    : ((delta01 == nearestDelta) ? high01 : high11));
-    float s00 = q00 * ((chooseHigh == high00) ? 1.0f : 0.0f);
-    float s10 = q10 * ((chooseHigh == high10) ? 1.0f : 0.0f);
-    float s01 = q01 * ((chooseHigh == high01) ? 1.0f : 0.0f);
-    float s11 = q11 * ((chooseHigh == high11) ? 1.0f : 0.0f);
-    float selectedWeight = s00 + s10 + s01 + s11;
-    float selected = (s00 * d00 + s10 * d10 + s01 * d01 + s11 * d11)
-                   / max(selectedWeight, 1.0e-8f);
-    float colorMin = min(min(delta00, delta10), min(delta01, delta11));
-    float colorMax = max(max(delta00, delta10), max(delta01, delta11));
-    bool useClass = (high - low >= edgeThreshold)
-                 && (selectedWeight > 1.0e-8f)
-                 && (colorMax - colorMin >= 0.005f);
-    guided = useClass ? selected : guided;
-    output[index] = clamp(high - low >= edgeThreshold ? guided : linear, 0.0f, 1.0f);
+    int cx = int(floor(dx + 0.5f)), cy = int(floor(dy + 0.5f));
+    float spatial_total = 0.0f, depth_sum = 0.0f, depth_square_sum = 0.0f;
+    float3 color_sum = float3(0.0f);
+    float color_square_sum = 0.0f, total_weight = 0.0f, guided_sum = 0.0f;
+    float max_log_weight = -1.0e30f;
+    float matching_distance_sum = 0.0f;
+    float low_count = 0.0f, high_count = 0.0f, low_delta_sum = 0.0f, high_delta_sum = 0.0f;
+    float low_total = 0.0f, high_total = 0.0f, low_sum = 0.0f, high_sum = 0.0f;
+    float threshold = max(edgeThreshold, 1.0e-6f);
+    float sigma = max(colorSigma / 3.0f, 1.0e-4f);
+    for (int oy = -1; oy <= 1; ++oy) {
+        for (int ox = -1; ox <= 1; ++ox) {
+            uint sx = uint(clamp(cx + ox, 0, int(depthW) - 1));
+            uint sy = uint(clamp(cy + oy, 0, int(depthH) - 1));
+            float spatial = (1.0f - smoothstep(0.5f, 1.5f, abs(dx - float(cx + ox)))) *
+                            (1.0f - smoothstep(0.5f, 1.5f, abs(dy - float(cy + oy))));
+            uint sample_index = sy * depthW + sx;
+            float sample = depth[depthBase + sample_index];
+            float3 color = float3(guide[guideBase + sample_index], guide[guideBase + depthPixels + sample_index],
+                                   guide[guideBase + 2u * depthPixels + sample_index]);
+            float3 difference = target - color;
+            float distance = dot(difference, difference) / 3.0f;
+            float log_weight = spatial > 0.0f
+                ? log(max(spatial, 1.0e-30f)) - distance / (2.0f * sigma * sigma) : -1.0e30f;
+            float new_max = max(max_log_weight, log_weight);
+            float rescale = exp(max_log_weight - new_max);
+            float weight = spatial > 0.0f ? exp(log_weight - new_max) : 0.0f;
+            total_weight = total_weight * rescale + weight;
+            guided_sum = guided_sum * rescale + weight * sample;
+            matching_distance_sum = matching_distance_sum * rescale + weight * distance;
+            max_log_weight = new_max;
+            float delta = dot(abs(difference), float3(1.0f / 3.0f));
+            float low = 1.0f - smoothstep(-0.5f * threshold, 0.5f * threshold, sample - linear);
+            float high = 1.0f - low;
+            low_count += spatial * low;
+            high_count += spatial * high;
+            low_delta_sum += spatial * low * delta;
+            high_delta_sum += spatial * high * delta;
+            low_total = low_total * rescale + weight * low;
+            high_total = high_total * rescale + weight * high;
+            low_sum = low_sum * rescale + weight * low * sample;
+            high_sum = high_sum * rescale + weight * high * sample;
+            spatial_total += spatial;
+            depth_sum += spatial * sample;
+            depth_square_sum += spatial * sample * sample;
+            color_sum += spatial * color;
+            color_square_sum += spatial * dot(color, color) / 3.0f;
+        }
+    }
+    float denominator = max(spatial_total, 1.0e-8f);
+    float mean_depth = depth_sum / denominator;
+    float3 mean_color = color_sum / denominator;
+    float depth_variance = max(depth_square_sum / denominator - mean_depth * mean_depth, 0.0f);
+    float color_variance = max(color_square_sum / denominator - dot(mean_color, mean_color) / 3.0f, 0.0f);
+    float confidence = smoothstep(threshold * threshold * 0.0625f,
+                                  threshold * threshold * 0.25f, depth_variance) *
+                       smoothstep(0.000025f, 0.0004f, color_variance);
+    float guided = total_weight > 1.0e-8f ? guided_sum / total_weight : linear;
+    float low_delta = low_delta_sum / max(low_count, 1.0e-8f);
+    float high_delta = high_delta_sum / max(high_count, 1.0e-8f);
+    float prefer_high = smoothstep(-0.02f, 0.02f, low_delta - high_delta);
+    float selected = mix(low_sum / max(low_total, 1.0e-8f),
+                         high_sum / max(high_total, 1.0e-8f), prefer_high);
+    float support = smoothstep(0.001f, 0.1f, min(low_count, high_count));
+    float class_confidence = smoothstep(0.0025f, 0.03f, abs(low_delta - high_delta)) * support;
+    class_confidence *= 1.0f - smoothstep(0.000025f, 0.0004f,
+                                        matching_distance_sum / max(total_weight, 1.0e-8f));
+    guided = mix(guided, selected, class_confidence);
+    output[index] =
+        clamp(mix(linear, guided, edgeWeight * confidence), 0.0f, 1.0f);
 }
 """
 
@@ -788,6 +927,13 @@ def fused_sbs_pack(rgb_f32_chw, depth_f32, host_out=None, out_size=None,
         return None
 
 
+@functools.lru_cache(maxsize=16)
+def _mps_projection_bounds(bounds: tuple[float, float]):
+    import torch
+
+    return torch.tensor(bounds, dtype=torch.float32, device="mps")
+
+
 def mps_warp_composite2(rgb_f32, depth_f32, base_shift, edge_aa_enabled=None):
     """Run the canonical two-layer warp without MPS grid_sample launches.
 
@@ -828,6 +974,7 @@ def mps_warp_composite2(rgb_f32, depth_f32, base_shift, edge_aa_enabled=None):
             int(channels),
             int(width),
             int(height),
+            _mps_projection_bounds(getattr(base_shift, "_d2s_projection_bounds", (0.0, 0.0))),
         )
         return left, right
     except Exception as exc:

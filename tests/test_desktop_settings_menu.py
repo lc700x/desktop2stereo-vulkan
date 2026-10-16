@@ -540,7 +540,7 @@ def test_flet_launcher_starts_visible_and_restores_after_panel_and_hide(monkeypa
                 assert window.movable is None
             states.append((
                 window.width, window.height, window.visible,
-                window.opacity, window.ignore_mouse_events,
+                window.opacity, window.ignore_mouse_events, window.skip_task_bar,
             ))
 
     commands = object()
@@ -567,11 +567,15 @@ def test_flet_launcher_starts_visible_and_restores_after_panel_and_hide(monkeypa
     launcher_width = 192 if os.name == "nt" else 12
     assert run_options["view"] == ft.AppView.FLET_APP_HIDDEN
     assert states == [
-        (192, 57, True, 0.4, False),
-        (760, 650, True, 1.0, False),
-        (launcher_width, 57, True, 0.4, False),
-        (launcher_width, 57, False, 0.4, False),
-        (launcher_width, 57, True, 0.4, False),
+        (launcher_width, 57, True, 0.4, False, True),
+        (760, 650, True, 1.0, False, False),
+        (launcher_width, 57, True, 0.4, False, True),
+        (launcher_width, 57, False, 0.4, False, True),
+        (launcher_width, 57, True, 0.4, False, True),
     ]
-    assert constraints[:2] == [(580, 420, launcher_width, 57), (1, 1, 760, 650)]
+    assert constraints[:3] == [
+        (1, 1, 192, 57),
+        (580, 420, launcher_width, 57),
+        (1, 1, 760, 650),
+    ]
     assert window.destroyed

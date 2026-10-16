@@ -76,7 +76,8 @@ def test_convergence_zeroes_shift_at_screen_plane():
     shift = compute_shift_px(depth, 3840, ShiftParams(convergence=0.45, max_disparity_px=20.0))
     assert torch.count_nonzero(shift) == 0
 
-def test_normal_sbs_eye_order_uses_left_then_right_views():
+def test_normal_sbs_eye_order_uses_left_then_right_views(monkeypatch):
+    monkeypatch.setenv("D2S_SBS_AA", "0")
     rgb, depth = make_inputs(width=64, height=32)
     config = StereoConfig(
         backend="fast",
@@ -86,6 +87,7 @@ def test_normal_sbs_eye_order_uses_left_then_right_views():
         depth_strength=2.0,
         convergence=0.0,
         max_disparity_px=6.0,
+        depth_antialias_strength=0.0,
     )
     result = synthesize_stereo(rgb, depth, config)
     expected_shift = compute_shift_px(
@@ -107,7 +109,8 @@ def test_normal_sbs_eye_order_uses_left_then_right_views():
     assert torch.equal(result.sbs[..., :, 64:], expected_right)
 
 
-def test_layered_quality_uses_resolved_parallax_budget_fields():
+def test_layered_quality_uses_resolved_parallax_budget_fields(monkeypatch):
+    monkeypatch.setenv("D2S_SBS_AA", "0")
     rgb, depth = make_inputs(width=64, height=32)
     config = StereoConfig(
         backend="quality_4k",
@@ -120,6 +123,7 @@ def test_layered_quality_uses_resolved_parallax_budget_fields():
         convergence=0.0,
         max_disparity_px=6.0,
         parallax_preset="strong",
+        depth_antialias_strength=0.0,
     )
 
     result = synthesize_stereo(rgb, depth, config)
@@ -504,12 +508,15 @@ def test_full_sbs_shape():
     assert result.sbs.shape == (1, 3, 32, 128)
 
 
-def test_tab_mono_and_depth_map_shapes():
+def test_tab_mono_and_depth_map_shapes(monkeypatch):
+    monkeypatch.setenv("D2S_SBS_AA", "0")
     rgb, depth = make_inputs()
     half_tab = synthesize_stereo(rgb, depth, StereoConfig(backend="fast", output_format="half_tab"))
     full_tab = synthesize_stereo(rgb, depth, StereoConfig(backend="fast", output_format="full_tab"))
     mono = synthesize_stereo(rgb, depth, StereoConfig(backend="fast", output_format="mono"))
-    depth_map = synthesize_stereo(rgb, depth, StereoConfig(backend="fast", output_format="depth_map"))
+    depth_map = synthesize_stereo(
+        rgb, depth, StereoConfig(backend="fast", output_format="depth_map", depth_antialias_strength=0.0)
+    )
     assert half_tab.sbs.shape == rgb.shape
     assert full_tab.sbs.shape == (1, 3, 64, 64)
     assert mono.sbs.shape == rgb.shape
@@ -558,33 +565,12 @@ def test_composite_display_output_semantics():
     assert torch.equal(leia[..., :, 1::2], right[..., :, 1::2])
 
 
-def test_half_sbs_fallback_uses_openxr_lanczos2_downsample():
+def test_half_sbs_fallback_uses_nonnegative_area_downsample():
     left = torch.arange(1 * 1 * 2 * 4, dtype=torch.float32).view(1, 1, 2, 4)
     right = left + 100.0
-
     actual = make_sbs(left, right, "half_sbs", fused=False)
-    left_padded = F.pad(left, (1, 2, 0, 0), mode="replicate")
-    right_padded = F.pad(right, (1, 2, 0, 0), mode="replicate")
-    expected = torch.cat(
-        [
-            (
-                -left_padded[..., 0:4:2]
-                + 9 * left_padded[..., 1:5:2]
-                + 9 * left_padded[..., 2:6:2]
-                - left_padded[..., 3:7:2]
-            )
-            / 16,
-            (
-                -right_padded[..., 0:4:2]
-                + 9 * right_padded[..., 1:5:2]
-                + 9 * right_padded[..., 2:6:2]
-                - right_padded[..., 3:7:2]
-            )
-            / 16,
-        ],
-        dim=-1,
-    )
-
+    expected = torch.cat(((left[..., 0::2] + left[..., 1::2]) * 0.5,
+                          (right[..., 0::2] + right[..., 1::2]) * 0.5), dim=-1)
     assert torch.equal(actual, expected)
 
 
@@ -683,26 +669,33 @@ def test_fast_synthesis_supports_odd_and_portrait_resolutions():
                 assert result.sbs.shape == rgb.shape
 
 
-def test_quality_depth_map_uses_matched_output_depth():
+def test_quality_depth_map_uses_matched_output_depth(monkeypatch):
+    monkeypatch.setenv("D2S_SBS_AA", "0")
     rgb, depth = make_inputs(width=64, height=32)
     low_res_depth = F.interpolate(depth, size=(16, 32), mode="bilinear", align_corners=False)
     result = synthesize_stereo(
         rgb,
         low_res_depth,
-        StereoConfig(backend="quality_4k", layers=2, output_format="depth_map", debug_output=True, temporal=False),
+        StereoConfig(
+            backend="quality_4k", layers=2, output_format="depth_map", debug_output=True,
+            temporal=False, depth_antialias_strength=0.0,
+        ),
     )
-    expected = match_depth(low_res_depth, rgb.shape[-2], rgb.shape[-1])
+    expected = match_depth(low_res_depth, rgb.shape[-2], rgb.shape[-1], rgb=rgb, edge_aware=True)
     assert result.sbs.shape == rgb.shape
     assert torch.equal(result.debug_info["output_depth"], expected)
     assert torch.equal(result.sbs[:, 0:1], expected)
 
 
-def test_depth_postprocess_defaults_preserve_output_depth():
+def test_disabled_depth_postprocess_preserves_output_depth():
     rgb, depth = make_inputs(width=64, height=32)
     result = synthesize_stereo(
         rgb,
         depth,
-        StereoConfig(backend="quality_4k", layers=2, output_format="depth_map", debug_output=True, temporal=False),
+        StereoConfig(
+            backend="quality_4k", layers=2, output_format="depth_map", debug_output=True,
+            temporal=False, depth_antialias_strength=0.0,
+        ),
     )
     assert torch.equal(result.debug_info["output_depth"], depth)
 
@@ -904,13 +897,15 @@ def test_composite_layers_two_layer_fast_path_matches_formula():
     assert torch.equal(actual, expected)
 
 
-def test_fused_warp_composite_cuda_matches_torch_path_when_available():
+def test_legacy_fused_warp_composite_cuda_matches_layered_torch_path_when_available():
     if not torch.cuda.is_available():
         return
     rgb, depth = make_inputs(width=40, height=24)
     rgb = rgb.cuda()
     depth = depth.cuda()
-    base_shift = compute_shift_px(depth, rgb.shape[-1], ShiftParams())
+    # An externally supplied shift tensor retains the legacy layered API.
+    # Budget-backed source visibility is covered by the projection tests.
+    base_shift = compute_shift_px(depth, rgb.shape[-1], ShiftParams()).clone()
     weights = make_depth_layers(depth, layers=2)
     left_layers = []
     right_layers = []
@@ -1214,6 +1209,22 @@ def test_mps_warp_horizontal_supports_border_clamping():
         actual[..., -2:].cpu(),
         torch.tensor([[[[7.0, 7.0]]]]),
     )
+
+
+def test_mps_source_projection_is_preferred_and_explicit_disable_is_respected(monkeypatch):
+    from types import SimpleNamespace
+    from stereo_runtime import _fused_warp_mps
+
+    monkeypatch.delenv("D2S_MAC_STREAM_MPS_FUSED", raising=False)
+    monkeypatch.setenv("STEREO_RUNTIME_DISABLE_TRITON", "1")
+    expected = (torch.zeros(1, 3, 2, 2), torch.ones(1, 3, 2, 2))
+    monkeypatch.setattr(_fused_warp_mps, "mps_warp_composite2", lambda *args: expected)
+    rgb = SimpleNamespace(device=SimpleNamespace(type="mps"))
+    depth = torch.zeros(1, 1, 2, 2)
+
+    assert _try_fused_warp_composite2(rgb, depth, depth, layers=2, symmetric=True) is expected
+    monkeypatch.setenv("D2S_MAC_STREAM_MPS_FUSED", "0")
+    assert _try_fused_warp_composite2(rgb, depth, depth, layers=2, symmetric=True) is None
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")

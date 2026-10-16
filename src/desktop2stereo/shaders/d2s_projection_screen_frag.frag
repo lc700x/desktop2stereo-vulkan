@@ -1,8 +1,11 @@
 #version 450
 
+layout(constant_id = 0) const bool screen_underlay = false;
+
 layout(set = 0, binding = 0) uniform sampler2D screen_texture;
 layout(set = 0, binding = 1, std430) readonly buffer ScreenCropState {
     vec4 source_crop;
+    vec4 target_viewport;
 } crop_state;
 layout(push_constant) uniform ScreenParams {
     mat4 view_projection;
@@ -176,11 +179,13 @@ vec3 sample_easu(vec2 uv) {
 }
 
 void main() {
-    // Fade only the outermost projected pixel. Global screen UVs keep the
-    // curved screen's internal triangle-strip boundaries fully opaque.
+    // Signed distance in projected pixels. The vertex fringe includes pixels
+    // outside the silhouette; global UVs keep internal strip seams opaque.
     vec2 edge_distance = min(texture_uv, vec2(1.0) - texture_uv);
-    vec2 pixel_width = max(fwidth(texture_uv), vec2(1e-6));
-    vec2 edge_coverage = clamp(edge_distance / pixel_width, vec2(0.0), vec2(1.0));
+    vec2 dx = dFdx(texture_uv);
+    vec2 dy = dFdy(texture_uv);
+    vec2 pixel_width = max(sqrt(dx * dx + dy * dy), vec2(1e-6));
+    vec2 edge_coverage = smoothstep(vec2(-0.75), vec2(0.75), edge_distance / pixel_width);
     float coverage = edge_coverage.x * edge_coverage.y;
     vec4 color = params.center.w < 0.0
         ? vec4(sample_easu(texture_uv), 1.0)
@@ -190,5 +195,6 @@ void main() {
     float opacity = params.size_curve.w < -0.5
         ? clamp(dot(color.rgb, vec3(0.299, 0.587, 0.114)) * 0.35, 0.0, 0.35)
         : 1.0;
-    output_color = vec4(color.rgb, opacity * coverage);
+    float alpha = opacity * coverage;
+    output_color = vec4(screen_underlay ? color.rgb * alpha : color.rgb, alpha);
 }

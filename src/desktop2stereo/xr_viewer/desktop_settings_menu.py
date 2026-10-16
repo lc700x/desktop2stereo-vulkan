@@ -342,11 +342,40 @@ def _windows_flet_window_handle() -> int | None:
     return found[0] if found else None
 
 
-def _clip_windows_drawer(hwnd: int | None, *, expanded: bool, pixel_ratio: float) -> None:
-    """Restrict the collapsed native window's drawing and hit area to its tab."""
+def _clip_windows_drawer(
+    hwnd: int | None, *, expanded: bool, pixel_ratio: float, show_taskbar_button: bool = False,
+) -> None:
+    """Apply the drawer's native hit region and taskbar window style."""
     if hwnd is None:
         return
     user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongW.restype = wintypes.LONG
+    user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+    user32.SetWindowLongW.restype = wintypes.LONG
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    extended_style = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE.
+    taskbar_style = (
+        (extended_style | 0x00040000) & ~0x00000080
+        if show_taskbar_button
+        else (extended_style | 0x00000080) & ~0x00040000
+    )
+    if taskbar_style != extended_style:
+        # The Shell observes tool-window styles when a window is shown. Flet's
+        # cached skip_task_bar value alone does not prevent a startup taskbar tab.
+        was_visible = bool(user32.IsWindowVisible(hwnd))
+        if was_visible:
+            user32.ShowWindow(hwnd, 0)  # SW_HIDE before changing taskbar style.
+        ctypes.set_last_error(0)
+        previous_style = user32.SetWindowLongW(hwnd, -20, taskbar_style)
+        error = ctypes.get_last_error()
+        if previous_style == 0 and error:
+            raise ctypes.WinError(error)
+        if was_visible:
+            user32.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE.
     user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HANDLE, wintypes.BOOL]
     region = None
     if not expanded:
@@ -642,7 +671,7 @@ def _run_flet_desktop_settings_app(
         page.window.opacity = DESKTOP_SETTINGS_ICON_OPACITY
         page.window.bgcolor = ft.Colors.TRANSPARENT
         page.window.prevent_close = True
-        page.window.visible = True
+        page.window.visible = False
 
         body_content = ft.Column(
             controls=[
@@ -717,6 +746,7 @@ def _run_flet_desktop_settings_app(
                     native_window_handle,
                     expanded=visible or drawer_expanded,
                     pixel_ratio=window_pixel_ratio(),
+                    show_taskbar_button=visible,
                 )
             elif not visible:
                 geometry = _icon_geometry_for_monitor(
@@ -1450,9 +1480,14 @@ def _run_flet_desktop_settings_app(
                 apply_drawer_region()
 
         page.window.on_event = on_window_event
+        # Configure the hidden client before showing it, so the Shell never
+        # creates a taskbar button for the default drawer window.
+        page.window.update()
+        await page.window.wait_until_ready_to_show()
+        apply_drawer_region()
+        page.window.visible = True
         page.window.update()
         page.update()
-        apply_drawer_region()
 
         while True:
             changed = False

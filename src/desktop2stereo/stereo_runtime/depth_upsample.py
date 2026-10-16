@@ -16,6 +16,7 @@ DepthUpsampleMode = Literal["bilinear", "guided", "joint_bilateral"]
 @dataclass
 class _ModelDepthAntialiasState:
     strength: float
+    edge_threshold: float = 0.04
     applied: bool = False
 
 
@@ -25,7 +26,7 @@ _MODEL_DEPTH_ANTIALIAS_STATE: ContextVar[_ModelDepthAntialiasState | None] = Con
 
 
 @contextmanager
-def model_depth_antialiasing(strength: float):
+def model_depth_antialiasing(strength: float, edge_threshold: float = 0.04):
     """Apply the configured spatial depth filter before provider upsampling.
 
     Providers share ``upsample_depth`` but own their model execution. A
@@ -33,7 +34,10 @@ def model_depth_antialiasing(strength: float):
     PyTorch, TensorRT, ONNX, ROCm, and MPS providers without changing their
     inference code or constructor contracts.
     """
-    state = _ModelDepthAntialiasState(max(0.0, float(strength)))
+    state = _ModelDepthAntialiasState(
+        max(0.0, float(strength)),
+        max(0.0, float(edge_threshold)),
+    )
     token = _MODEL_DEPTH_ANTIALIAS_STATE.set(state)
     try:
         yield state
@@ -45,33 +49,17 @@ def filter_model_depth(
     depth: torch.Tensor,
     rgb: torch.Tensor | None,
     strength: float,
+    *,
+    edge_threshold: float = 0.04,
 ) -> torch.Tensor:
     if strength <= 0.0:
         return depth
     # v2.5 maps the 0..2 GUI choice to AA_STRENGTH=0..4. Keep that mapping
     # while filtering on the model grid instead of the much larger RGB grid.
     model_strength = min(4.0, 2.0 * float(strength))
-    from .depth_postprocess import anti_alias_depth, anti_alias_depth_guided
+    from .depth_postprocess import anti_alias_depth
 
-    if rgb is None:
-        return anti_alias_depth(depth, model_strength)
-    guide = ensure_bchw(rgb, name="rgb").to(device=depth.device, dtype=torch.float32)
-    guide = F.interpolate(
-        guide[:, :3],
-        size=depth.shape[-2:],
-        mode="bilinear",
-        align_corners=False,
-    ).clamp(0.0, 1.0)
-    # The smooth Gaussian removes depth-grid stair steps; the RGB edge mask
-    # retains 35% of the original depth at strong image edges to limit contour
-    # widening. Both constants are mirrored by the native Metal kernel.
-    return anti_alias_depth_guided(
-        depth,
-        guide,
-        model_strength,
-        sigma_color=0.1,
-        max_keep=0.35,
-    )
+    return anti_alias_depth(depth, model_strength)
 
 
 def _gather_depth_samples(depth: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -89,7 +77,7 @@ def _joint_bilateral_upsample(
     color_sigma: float = 0.12,
     depth_edge_threshold: float = 0.04,
 ) -> torch.Tensor:
-    """Bilinear depth interpolation with same-frame RGB edge validation."""
+    """Reconstruct same-frame depth with continuous model-grid RGB support."""
     batch, _, depth_height, depth_width = depth.shape
     rgb = ensure_bchw(rgb, name="rgb").to(device=depth.device, dtype=torch.float32)
     if rgb.shape[0] == 1 and batch != 1:
@@ -98,91 +86,133 @@ def _joint_bilateral_upsample(
         raise ValueError("rgb and depth batch dimensions must match")
     if rgb.shape[-2:] != (height, width):
         rgb = F.interpolate(rgb, size=(height, width), mode="bilinear", align_corners=False)
-    rgb = rgb[:, :3].float().clamp(0.0, 1.0)
-
+    rgb = rgb[:, :3].clamp(0.0, 1.0)
+    guide = F.interpolate(rgb, size=(depth_height, depth_width), mode="bilinear", align_corners=False)
     y = ((torch.arange(height, device=depth.device, dtype=torch.float32) + 0.5)
-         * (float(depth_height) / float(height)) - 0.5).clamp(0, depth_height - 1)
+         * depth_height / height - 0.5).clamp(0, depth_height - 1)
     x = ((torch.arange(width, device=depth.device, dtype=torch.float32) + 0.5)
-         * (float(depth_width) / float(width)) - 0.5).clamp(0, depth_width - 1)
-    y0, x0 = y.floor().long(), x.floor().long()
-    y1 = (y0 + 1).clamp_max(depth_height - 1)
-    x1 = (x0 + 1).clamp_max(depth_width - 1)
-    fy, fx = y - y0, x - x0
-
-    i00 = y0[:, None] * depth_width + x0[None, :]
-    i10 = y0[:, None] * depth_width + x1[None, :]
-    i01 = y1[:, None] * depth_width + x0[None, :]
-    i11 = y1[:, None] * depth_width + x1[None, :]
-    d00, d10 = _gather_depth_samples(depth, i00), _gather_depth_samples(depth, i10)
-    d01, d11 = _gather_depth_samples(depth, i01), _gather_depth_samples(depth, i11)
-    fx, fy = fx.view(1, 1, 1, width), fy.view(1, 1, height, 1)
-    spatial = (
-        (1.0 - fy) * (1.0 - fx),
-        (1.0 - fy) * fx,
-        fy * (1.0 - fx),
-        fy * fx,
-    )
-
-    # Compare against color represented at each model-depth texel centre.
-    # Bilinear downsampling is supported by MPS for arbitrary display sizes.
-    low_rgb = F.interpolate(
-        rgb, size=(depth_height, depth_width), mode="bilinear", align_corners=False
-    )
-    flat_rgb = rgb.reshape(batch, 3, height * width)
-    flat_low_rgb = low_rgb.reshape(batch, 3, depth_height * depth_width)
-    indices = (i00, i10, i01, i11)
-    samples = (d00, d10, d01, d11)
-    weights = []
-    color_deltas = []
-    for index, spatial_weight in zip(indices, spatial):
-        guide = flat_low_rgb.gather(
-            2, index.reshape(1, 1, -1).expand(batch, 3, -1)
-        )
-        color_delta = (flat_rgb - guide).abs().mean(dim=1, keepdim=True)
-        color_deltas.append(color_delta)
-        weights.append(
-            spatial_weight.reshape(1, 1, -1)
-            * torch.exp(-color_delta / max(float(color_sigma), 1e-4))
-        )
-
-    total = sum(weights)
-    minimum = torch.minimum(torch.minimum(d00, d10), torch.minimum(d01, d11))
-    maximum = torch.maximum(torch.maximum(d00, d10), torch.maximum(d01, d11))
-    guided = sum(value * weight for value, weight in zip(samples, weights)) / total.clamp_min(1e-8)
-
-    # At a depth discontinuity, averaging the two sides creates a third
-    # surface.  That surface receives its own disparity during DIBR and shows
-    # up as a second contour.  Use the high-resolution RGB as a classifier and
-    # normalize only the taps belonging to the winning depth class.  Smooth
-    # regions retain the original joint-bilateral interpolation.
-    midpoint = (minimum + maximum) * 0.5
-    high_masks = [value >= midpoint for value in samples]
-    color_stack = torch.stack(color_deltas, dim=0)
-    high_stack = torch.stack([mask.float() for mask in high_masks], dim=0)
-    nearest_color = color_stack.argmin(dim=0, keepdim=True)
-    choose_high = torch.gather(high_stack, 0, nearest_color).squeeze(0).bool()
-    selected_weights = [
-        weight * torch.where(choose_high, mask, ~mask).float()
-        for weight, mask in zip(weights, high_masks)
-    ]
-    selected_total = sum(selected_weights)
-    selected = sum(
-        value * weight for value, weight in zip(samples, selected_weights)
-    ) / selected_total.clamp_min(1e-8)
-    color_contrast = color_stack.amax(dim=0) - color_stack.amin(dim=0)
-    class_edge = (maximum - minimum) >= float(depth_edge_threshold)
-    use_class = (
-        class_edge
-        & (selected_total > 1e-8)
-        & (color_contrast >= 0.005)
-    )
-    guided = torch.where(use_class, selected, guided)
-    has_depth_edge = (maximum - minimum) >= float(depth_edge_threshold)
+         * depth_width / width - 0.5).clamp(0, depth_width - 1)
+    cy, cx = (y + 0.5).floor().long(), (x + 0.5).floor().long()
+    flat_guide = guide.flatten(2)
+    spatial_total = torch.zeros_like(rgb[:, :1])
+    depth_sum = torch.zeros_like(spatial_total)
+    depth_square_sum = torch.zeros_like(spatial_total)
+    color_sum = torch.zeros_like(rgb)
+    color_square_sum = torch.zeros_like(spatial_total)
+    total = torch.zeros_like(spatial_total)
+    guided_sum = torch.zeros_like(spatial_total)
+    matching_distance_sum = torch.zeros_like(spatial_total)
+    max_log_weight = torch.full_like(spatial_total, -1.0e30)
+    sigma = max(float(color_sigma) / 3.0, 1.0e-4)
+    threshold = max(float(depth_edge_threshold), 1.0e-6)
     bilinear = F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
-    use_guided = (has_depth_edge & (total > 1e-8)).reshape(batch, 1, height, width)
-    return torch.where(
-        use_guided, guided.reshape(batch, 1, height, width), bilinear
-    ).clamp(0, 1)
+    if depth_width >= 3:
+        padded_x = F.pad(depth, (1, 1, 0, 0), mode="replicate")
+        curvature_x = (padded_x[..., :-2] - 2.0 * depth + padded_x[..., 2:]).abs()
+        curvature_x = torch.cat(
+            (
+                (depth[..., :1] - 2.0 * depth[..., 1:2] + depth[..., 2:3]).abs(),
+                curvature_x[..., 1:-1],
+                (depth[..., -3:-2] - 2.0 * depth[..., -2:-1] + depth[..., -1:]).abs(),
+            ),
+            dim=-1,
+        )
+    else:
+        curvature_x = torch.zeros_like(depth)
+    if depth_height >= 3:
+        padded_y = F.pad(depth, (0, 0, 1, 1), mode="replicate")
+        curvature_y = (padded_y[..., :-2, :] - 2.0 * depth + padded_y[..., 2:, :]).abs()
+        curvature_y = torch.cat(
+            (
+                (depth[..., :1, :] - 2.0 * depth[..., 1:2, :] + depth[..., 2:3, :]).abs(),
+                curvature_y[..., 1:-1, :],
+                (depth[..., -3:-2, :] - 2.0 * depth[..., -2:-1, :] + depth[..., -1:, :]).abs(),
+            ),
+            dim=-2,
+        )
+    else:
+        curvature_y = torch.zeros_like(depth)
+    edge_signal = F.interpolate(
+        torch.maximum(curvature_x, curvature_y), size=(height, width),
+        mode="bilinear", align_corners=False,
+    )
+    low_count = torch.zeros_like(total)
+    high_count = torch.zeros_like(total)
+    low_delta_sum = torch.zeros_like(total)
+    high_delta_sum = torch.zeros_like(total)
+    low_total = torch.zeros_like(total)
+    high_total = torch.zeros_like(total)
+    low_sum = torch.zeros_like(total)
+    high_sum = torch.zeros_like(total)
+
+    def smoothstep(value: torch.Tensor, edge0: float, edge1: float) -> torch.Tensor:
+        t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0)
+        return t.square() * (3.0 - 2.0 * t)
+
+    edge_weight = smoothstep(edge_signal, threshold * 0.25, threshold * 0.5)
+    # Zero support at +/-1.5 texels makes the moving 3x3 window continuous.
+    # Only per-tap tensors are materialized; no full-frame unfold is needed.
+    for oy in (-1, 0, 1):
+        wy = 1.0 - smoothstep((y - cy - oy).abs(), 0.5, 1.5)
+        sy = (cy + oy).clamp(0, depth_height - 1)
+        for ox in (-1, 0, 1):
+            wx = 1.0 - smoothstep((x - cx - ox).abs(), 0.5, 1.5)
+            sx = (cx + ox).clamp(0, depth_width - 1)
+            spatial = (wy[:, None] * wx[None, :])[None, None]
+            indices = sy[:, None] * depth_width + sx[None, :]
+            sample = _gather_depth_samples(depth, indices).reshape(batch, 1, height, width)
+            color = flat_guide.gather(
+                2, indices.reshape(1, 1, -1).expand(batch, 3, -1)
+            ).reshape(batch, 3, height, width)
+            difference = rgb - color
+            distance = difference.square().mean(dim=1, keepdim=True)
+            delta = difference.abs().mean(dim=1, keepdim=True)
+            log_weight = torch.where(
+                spatial > 0.0,
+                spatial.clamp_min(1.0e-30).log() - distance / (2.0 * sigma * sigma),
+                -1.0e30,
+            )
+            new_max = torch.maximum(max_log_weight, log_weight)
+            rescale = (max_log_weight - new_max).exp()
+            weight = torch.where(spatial > 0.0, (log_weight - new_max).exp(), 0.0)
+            total = total * rescale + weight
+            guided_sum = guided_sum * rescale + weight * sample
+            matching_distance_sum = matching_distance_sum * rescale + weight * distance
+            max_log_weight = new_max
+            low = 1.0 - smoothstep(sample - bilinear, -0.5 * threshold, 0.5 * threshold)
+            high = 1.0 - low
+            low_count += spatial * low
+            high_count += spatial * high
+            low_delta_sum += spatial * low * delta
+            high_delta_sum += spatial * high * delta
+            low_total = low_total * rescale + weight * low
+            high_total = high_total * rescale + weight * high
+            low_sum = low_sum * rescale + weight * low * sample
+            high_sum = high_sum * rescale + weight * high * sample
+            spatial_total += spatial
+            depth_sum += spatial * sample
+            depth_square_sum += spatial * sample.square()
+            color_sum += spatial * color
+            color_square_sum += spatial * color.square().mean(dim=1, keepdim=True)
+    denominator = spatial_total.clamp_min(1.0e-8)
+    depth_variance = (depth_square_sum / denominator - (depth_sum / denominator).square()).clamp_min(0.0)
+    color_variance = (
+        color_square_sum / denominator - (color_sum / denominator).square().mean(dim=1, keepdim=True)
+    ).clamp_min(0.0)
+    confidence = smoothstep(depth_variance, (threshold * 0.25) ** 2, (threshold * 0.5) ** 2)
+    confidence *= smoothstep(color_variance, 0.005 ** 2, 0.02 ** 2)
+    guided = torch.where(total > 1.0e-8, guided_sum / total.clamp_min(1.0e-8), bilinear)
+    low_delta = low_delta_sum / low_count.clamp_min(1.0e-8)
+    high_delta = high_delta_sum / high_count.clamp_min(1.0e-8)
+    prefer_high = smoothstep(low_delta - high_delta, -0.02, 0.02)
+    selected = torch.lerp(low_sum / low_total.clamp_min(1.0e-8),
+                          high_sum / high_total.clamp_min(1.0e-8), prefer_high)
+    support = smoothstep(torch.minimum(low_count, high_count), 0.001, 0.1)
+    class_confidence = smoothstep((low_delta - high_delta).abs(), 0.0025, 0.03) * support
+    class_confidence *= 1.0 - smoothstep(matching_distance_sum / total.clamp_min(1.0e-8),
+                                        0.000025, 0.0004)
+    guided = torch.lerp(guided, selected, class_confidence)
+    return (bilinear + edge_weight * confidence * (guided - bilinear)).clamp(0.0, 1.0)
 
 
 def upsample_depth(
@@ -204,12 +234,21 @@ def upsample_depth(
 
     depth = ensure_b1hw(depth).float()
     antialias_state = _MODEL_DEPTH_ANTIALIAS_STATE.get()
+    model_antialias_applied = False
     if antialias_state is not None and antialias_state.strength > 0.0:
-        depth = filter_model_depth(depth, rgb, antialias_state.strength)
+        depth = filter_model_depth(
+            depth,
+            rgb,
+            antialias_state.strength,
+            edge_threshold=antialias_state.edge_threshold,
+        )
         antialias_state.applied = True
+        model_antialias_applied = True
     if depth.shape[-2:] == (height, width):
         return depth
 
+    if model_antialias_applied:
+        return F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
     if mode == "bilinear":
         return F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
     if mode == "joint_bilateral":

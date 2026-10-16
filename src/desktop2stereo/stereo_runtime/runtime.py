@@ -18,6 +18,8 @@ from .depth_postprocess import (
     anti_alias_depth_guided,
     anti_alias_depth_global_gaussian,
     apply_depth_pop,
+    model_depth_aa_applied,
+    output_depth_gaussian_enabled,
     postprocess_depth,
 )
 from .depth_provider import DepthProfileResult, create_depth_provider
@@ -38,7 +40,7 @@ from .output_quality import (
     output_quality_requires_eye_images,
 )
 from .synthesis import StereoConfig, StereoResult, synthesize_stereo
-from .temporal import TemporalState, apply_temporal
+from .temporal import TemporalState, apply_temporal, stabilize_captured_depth
 from .triton_runtime import probe_triton_runtime
 
 
@@ -163,7 +165,10 @@ class DepthRuntime:
         capture_frame_id: int | None = None,
     ) -> DepthProfileResult:
         strength = float(getattr(self.config, "depth_antialias_strength", 0.0) or 0.0)
-        with model_depth_antialiasing(strength) as antialias_state:
+        with model_depth_antialiasing(
+            strength,
+            edge_threshold=float(getattr(self.config, "edge_threshold", 0.04)),
+        ) as antialias_state:
             result = self._predict_depth_profile_impl(
                 rgb_frame,
                 native_capture=native_capture,
@@ -174,7 +179,12 @@ class DepthRuntime:
             try:
                 result = replace(
                     result,
-                    depth=filter_model_depth(result.depth, rgb_frame, strength),
+                    depth=filter_model_depth(
+                        result.depth,
+                        rgb_frame,
+                        strength,
+                        edge_threshold=float(getattr(self.config, "edge_threshold", 0.04)),
+                    ),
                 )
                 filtered = True
             except Exception:
@@ -363,6 +373,7 @@ class OpenXRRuntimeResult:
     cuda_ready_event: Any | None = None
     cuda_timing_events: dict[str, Any] = field(default_factory=dict)
     vulkan_compute_request: VulkanComputeRequest | None = None
+    depth_profile: DepthProfileResult | None = None
     # Optional final composed BGRA8 D3D11 texture supplied by a native
     # compositor; kept separate from the Vulkan presenter request.
     native_final_sbs_surface: Any | None = None
@@ -564,6 +575,7 @@ def _try_openxr_no_fill_fused_rgba_u8(
         depth_pop=float(getattr(config, "depth_pop", 0.0)),
         antialias_strength=float(getattr(config, "depth_antialias_strength", 0.0)),
         global_gaussian=edge_smoothing_enabled,
+        edge_threshold=float(getattr(config, "edge_threshold", 0.04)),
     )
     _record_cuda_event(cuda_events, "synth_depth_postprocess", rgb)
     params = ShiftParams(
@@ -1133,6 +1145,7 @@ class StereoRuntime:
         self.depth_provider = depth_provider if depth_provider is not None else create_depth_provider(self.depth_config)
         self.temporal_state = temporal_state if temporal_state is not None else TemporalState()
         self._openxr_depth_temporal: torch.Tensor | None = None
+        self._openxr_rgb_temporal: torch.Tensor | None = None
         self._fused_depth_prev: torch.Tensor | None = None
         self._fused_rgb_prev: torch.Tensor | None = None
         self._openxr_rgb_depth_dumped = False
@@ -1265,6 +1278,7 @@ class StereoRuntime:
         if _TEMPORAL_RESET_HOT_RELOAD_FIELDS.intersection(changed_fields):
             self.temporal_state.reset_stereo()
             self._openxr_depth_temporal = None
+            self._openxr_rgb_temporal = None
             self._fused_depth_prev = None
             self._fused_rgb_prev = None
             self._pending_temporal_reset_reasons = (*self._pending_temporal_reset_reasons, "settings_changed")
@@ -1273,14 +1287,14 @@ class StereoRuntime:
             self._rebuild_depth_provider()
         return change_class
 
-    def _temporal_stabilize_depth(self, depth, rgb):
+    def _temporal_stabilize_depth(self, depth, rgb, *, enabled: bool = True):
         """Stabilize fused warp depth only at same-color, same-pixel locations.
 
         Color mismatch marks motion/disocclusion and takes current depth
         immediately, so a moved silhouette cannot leave a stale depth edge.
         Kill switch: D2S_DEPTH_TEMPORAL=0.
         """
-        if os.environ.get("D2S_DEPTH_TEMPORAL", "1") in {"0", "false", "off"}:
+        if not enabled or os.environ.get("D2S_DEPTH_TEMPORAL", "1") in {"0", "false", "off"}:
             self._fused_depth_prev = None
             self._fused_rgb_prev = None
             return depth
@@ -1364,6 +1378,16 @@ class StereoRuntime:
             _, _, height, width = rgb_frame.shape
         rgb = torch.zeros((1, 3, int(height), int(width)), device=device, dtype=torch.float32)
         depth = torch.linspace(0.0, 1.0, int(width), device=device, dtype=torch.float32).view(1, 1, 1, int(width)).expand(1, 1, int(height), int(width)).contiguous()
+        try:
+            from .temporal_triton import warmup_motion_depth_stabilization
+
+            warmup_motion_depth_stabilization(rgb, depth)
+        except Exception as exc:
+            LOGGER.warning(
+                "Motion-compensated depth warmup failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
         base = self.stereo_config
         depth_pop_values = {round(float(base.depth_pop), 3), 0.0, -0.7, 0.5}
         antialias_values = {round(float(base.depth_antialias_strength), 3), 0.0, 2.0}
@@ -1436,6 +1460,7 @@ class StereoRuntime:
         depth_profile: DepthProfileResult | None = None,
         pixel_buffer: Any | None = None,
         capture_frame_id: int | None = None,
+        depth_frame_id: int | None = None,
     ) -> StereoRuntimeResult:
         if not self._active:
             raise RuntimeError("StereoRuntime inference is paused")
@@ -1658,6 +1683,15 @@ class StereoRuntime:
         cuda_events.update(getattr(profile, "cuda_timing_events", None) or {})
         _record_cuda_event(cuda_events, "depth", rgb_frame)
         stereo_config, convergence_debug = _dynamic_convergence_config_for_depth(self, depth, self.stereo_config)
+        depth, motion_depth_debug = stabilize_captured_depth(
+            depth,
+            rgb_frame,
+            self.temporal_state,
+            capture_frame_id=capture_frame_id,
+            depth_frame_id=depth_frame_id,
+            edge_threshold=float(getattr(self.config, "edge_threshold", 0.04)),
+            enabled=bool(profile.finite_depth and stereo_config.temporal),
+        )
         requested_depth_antialias = float(stereo_config.depth_antialias_strength)
         if profile.model_depth_antialias_applied:
             stereo_config = replace(stereo_config, depth_antialias_strength=0.0)
@@ -1702,11 +1736,12 @@ class StereoRuntime:
             )
         else:
             if _intel_vulkan_network_path_enabled() and not skip_sbs_output:
-                deferred_vulkan_request, deferred_vulkan_reason = self._build_vulkan_compute_request(
-                    output_rgb,
-                    depth,
-                    stereo_config,
-                )
+                with model_depth_aa_applied(profile.model_depth_antialias_applied):
+                    deferred_vulkan_request, deferred_vulkan_reason = self._build_vulkan_compute_request(
+                        output_rgb,
+                        depth,
+                        stereo_config,
+                    )
             if deferred_vulkan_request is not None:
                 vulkan_stereo = None
                 vulkan_skip = "intel_network_deferred"
@@ -1730,12 +1765,13 @@ class StereoRuntime:
                 fused_sbs = None
                 fused_skip = "macos_stream_canonical_synthesis"
             else:
-                vulkan_stereo, vulkan_skip = self._try_vulkan_fused_stereo(
-                    output_rgb,
-                    depth,
-                    stereo_config,
-                    skip_sbs_output=skip_sbs_output,
-                )
+                with model_depth_aa_applied(profile.model_depth_antialias_applied):
+                    vulkan_stereo, vulkan_skip = self._try_vulkan_fused_stereo(
+                        output_rgb,
+                        depth,
+                        stereo_config,
+                        skip_sbs_output=skip_sbs_output,
+                    )
                 fused_sbs, fused_skip = (None, "vulkan_selected") if vulkan_stereo is not None else (
                     (None, "skip_sbs_output")
                     if skip_sbs_output
@@ -1767,13 +1803,14 @@ class StereoRuntime:
                 stereo_config_for_frame = stereo_config
                 if skip_sbs_output:
                     stereo_config_for_frame = replace(stereo_config, output_format="mono")
-                stereo = synthesize_stereo(
-                    output_rgb,
-                    depth,
-                    stereo_config_for_frame,
-                    temporal_state=self.temporal_state,
-                    sbs_only=not skip_sbs_output,
-                )
+                with model_depth_aa_applied(profile.model_depth_antialias_applied):
+                    stereo = synthesize_stereo(
+                        output_rgb,
+                        depth,
+                        stereo_config_for_frame,
+                        temporal_state=self.temporal_state,
+                        sbs_only=not skip_sbs_output,
+                    )
                 cuda_events.update(getattr(stereo, "cuda_timing_events", None) or {})
                 stereo.debug_info.setdefault("fast_plus_fused_backend", "not_used")
                 stereo.debug_info.setdefault("fast_plus_fused_skip", fused_skip)
@@ -1800,6 +1837,7 @@ class StereoRuntime:
         self.stats.update(timing, memory)
 
         debug = dict(stereo.debug_info)
+        debug.update(motion_depth_debug)
         if macos_stream_canonical_synthesis:
             debug["macos_stream_canonical_synthesis"] = 1
             debug["macos_stream_vulkan_skip"] = vulkan_skip
@@ -1936,15 +1974,23 @@ class StereoRuntime:
                 )
 
         if deferred_warp:
-            _vd_post = _warp_depth_postprocess(depth, stereo_config, output_rgb)
+            with model_depth_aa_applied(profile.model_depth_antialias_applied):
+                _vd_post = _warp_depth_postprocess(depth, stereo_config, output_rgb)
             if fused_warp_active():
                 # Fused warp-pack reads f32 directly: antialias only.
                 # Temporal stabilize damps ANE-fp16 / model dither that
                 # native-res warp otherwise amplifies into edge shimmer.
                 viewer_depth = _rz_ship(
-                    self._temporal_stabilize_depth(_vd_post, output_rgb), raw=depth
+                    self._temporal_stabilize_depth(
+                        _vd_post,
+                        output_rgb,
+                        enabled=bool(getattr(stereo_config, "temporal", False)),
+                    ),
+                    raw=depth,
                 )
             else:
+                self._fused_depth_prev = None
+                self._fused_rgb_prev = None
                 viewer_depth = _rz_ship(
                     _quantize_depth_for_warp(_vd_post), raw=depth
                 )
@@ -1983,6 +2029,8 @@ class StereoRuntime:
         openxr_config: OpenXRRenderConfig | None = None,
         *,
         depth_profile: DepthProfileResult | None = None,
+        capture_frame_id: int | None = None,
+        depth_frame_id: int | None = None,
     ) -> OpenXRRuntimeResult:
         if not self._active:
             raise RuntimeError("StereoRuntime inference is paused")
@@ -2052,6 +2100,15 @@ class StereoRuntime:
             stereo_config,
             depth_strength=max(0.0, float(openxr_config_for_frame.depth_strength)),
         )
+        depth, motion_depth_debug = stabilize_captured_depth(
+            depth,
+            rgb_frame,
+            self.temporal_state,
+            capture_frame_id=capture_frame_id,
+            depth_frame_id=depth_frame_id,
+            edge_threshold=float(getattr(self.config, "edge_threshold", 0.04)),
+            enabled=bool(profile.finite_depth and openxr_stereo_config.temporal),
+        )
         if bool(getattr(openxr_stereo_config, "output_quality_enabled", False)):
             # The shared quality stage runs on completed eye images before any
             # output format branches, so OpenXR cannot remain on rgb+depth DIBR.
@@ -2068,11 +2125,12 @@ class StereoRuntime:
         vulkan_compute_request: VulkanComputeRequest | None = None
         deferred_reason = "prewarp_disabled"
         if prewarp_eyes:
-            deferred_request, deferred_reason = self._build_vulkan_compute_request(
-                output_rgb,
-                depth,
-                openxr_stereo_config,
-            )
+            with model_depth_aa_applied(profile.model_depth_antialias_applied):
+                deferred_request, deferred_reason = self._build_vulkan_compute_request(
+                    output_rgb,
+                    depth,
+                    openxr_stereo_config,
+                )
             # OpenXR must defer the final stereo dispatch to the Presenter so
             # it can write directly into Presenter-owned images. This remains
             # true even if the runtime used its regular Vulkan backend for an
@@ -2107,12 +2165,13 @@ class StereoRuntime:
                 render_backend["vulkan_openxr_prewarp"] = 1
                 _record_cuda_event(cuda_events, "openxr_render", rgb_frame)
             else:
-                vulkan_stereo, vulkan_skip = self._try_vulkan_fused_stereo(
-                    output_rgb,
-                    depth,
-                    openxr_stereo_config,
-                    skip_sbs_output=True,
-                )
+                with model_depth_aa_applied(profile.model_depth_antialias_applied):
+                    vulkan_stereo, vulkan_skip = self._try_vulkan_fused_stereo(
+                        output_rgb,
+                        depth,
+                        openxr_stereo_config,
+                        skip_sbs_output=True,
+                    )
                 if vulkan_stereo is not None:
                     left_eye = vulkan_stereo.left_eye
                     right_eye = vulkan_stereo.right_eye
@@ -2172,12 +2231,13 @@ class StereoRuntime:
                         # Reuse the canonical synthesis path when the dedicated
                         # no-fill kernel cannot preserve the selected behavior.
                         triton_config = replace(openxr_stereo_config, output_format="mono")
-                        triton_stereo = synthesize_stereo(
-                            output_rgb,
-                            depth,
-                            triton_config,
-                            temporal_state=self.temporal_state,
-                        )
+                        with model_depth_aa_applied(profile.model_depth_antialias_applied):
+                            triton_stereo = synthesize_stereo(
+                                output_rgb,
+                                depth,
+                                triton_config,
+                                temporal_state=self.temporal_state,
+                            )
                         cuda_events.update(getattr(triton_stereo, "cuda_timing_events", None) or {})
 
                         left_eye = triton_stereo.left_eye
@@ -2249,12 +2309,14 @@ class StereoRuntime:
                     render_backend["openxr_grid_sample_fallback"] = 1
                     render_backend["openxr_grid_sample_fallback_reason"] = str(vulkan_skip)
         else:
-            depth = self._prepare_openxr_rgb_depth(
-                depth,
-                antialias_strength=float(
-                    getattr(stereo_config, "depth_antialias_strength", 0.0)
-                ),
-            )
+            with model_depth_aa_applied(profile.model_depth_antialias_applied):
+                depth = self._prepare_openxr_rgb_depth(
+                    depth,
+                    rgb=output_rgb,
+                    antialias_strength=float(
+                        getattr(stereo_config, "depth_antialias_strength", 0.0)
+                    ),
+                )
             _record_cuda_event(cuda_events, "openxr_depth_prepare", rgb_frame)
             visual_regression_dir = self._maybe_dump_openxr_rgb_depth(
                 source_rgb=source_rgb,
@@ -2293,6 +2355,7 @@ class StereoRuntime:
         self.stats.update(timing, memory)
 
         debug = dict(render_backend)
+        debug.update(motion_depth_debug)
         debug["application_runtime_target"] = "openxr"
         debug["stereo_synthesis_mode"] = "full_synthesis_eyes" if prewarp_eyes else "rgb_depth_direct"
         debug["vulkan_zero_copy_request"] = int(vulkan_compute_request is not None)
@@ -2375,6 +2438,7 @@ class StereoRuntime:
             provider_info=provider_info,
             cuda_timing_events=cuda_events,
             vulkan_compute_request=vulkan_compute_request,
+            depth_profile=profile,
         )
 
     def _build_vulkan_compute_request(
@@ -2418,6 +2482,7 @@ class StereoRuntime:
                 depth_pop=float(getattr(stereo_config, "depth_pop", 0.0)),
                 antialias_strength=float(getattr(stereo_config, "depth_antialias_strength", 0.0)),
                 global_gaussian=output_edge_aa_enabled(),
+                edge_threshold=float(getattr(stereo_config, "edge_threshold", 0.04)),
             )
             budget = resolve_parallax_budget(
                 render_width=int(rgb_frame.shape[-1]),
@@ -2467,6 +2532,7 @@ class StereoRuntime:
         self,
         depth: torch.Tensor,
         *,
+        rgb: torch.Tensor | None = None,
         antialias_strength: float | None = None,
     ) -> torch.Tensor:
         depth = depth.detach().contiguous().float().clamp(0.0, 1.0)
@@ -2483,9 +2549,13 @@ class StereoRuntime:
                 else float(antialias_strength)
             ),
             global_gaussian=output_edge_aa_enabled(),
+            edge_threshold=float(getattr(self.stereo_config, "edge_threshold", 0.04)),
         )
+        if depth.device.type == "cuda":
+            return depth
         return self._stabilize_openxr_rgb_depth(
             depth,
+            rgb=rgb,
             enabled=bool(getattr(self.stereo_config, "temporal", False)),
         )
 
@@ -2525,19 +2595,52 @@ class StereoRuntime:
         self,
         depth: torch.Tensor,
         *,
+        rgb: torch.Tensor | None = None,
         enabled: bool = True,
     ) -> torch.Tensor:
         alpha = _openxr_rgb_depth_temporal_alpha() if enabled else 0.0
         depth = depth.detach().contiguous().float()
-        if alpha <= 0.0:
+        if alpha <= 0.0 or not isinstance(rgb, torch.Tensor):
             self._openxr_depth_temporal = None
+            self._openxr_rgb_temporal = None
             return depth
+        rgb = ensure_bchw(rgb, name="rgb").detach().to(
+            device=depth.device,
+            dtype=torch.float32,
+        )[:, :3]
+        if rgb.shape[0] == 1 and depth.shape[0] != 1:
+            rgb = rgb.expand(depth.shape[0], -1, -1, -1)
+        if rgb.shape[0] != depth.shape[0]:
+            self._openxr_depth_temporal = None
+            self._openxr_rgb_temporal = None
+            return depth
+        if rgb.shape[-2:] != depth.shape[-2:]:
+            rgb = torch.nn.functional.interpolate(
+                rgb,
+                size=depth.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        rgb = rgb.mean(dim=1, keepdim=True).contiguous()
         prev = self._openxr_depth_temporal
-        if prev is None or prev.shape != depth.shape or prev.device != depth.device:
-            self._openxr_depth_temporal = depth
+        prev_rgb = self._openxr_rgb_temporal
+        if (
+            prev is None
+            or prev.shape != depth.shape
+            or prev.device != depth.device
+            or prev_rgb is None
+            or prev_rgb.shape != rgb.shape
+            or prev_rgb.device != rgb.device
+        ):
+            self._openxr_depth_temporal = depth.detach().clone()
+            self._openxr_rgb_temporal = rgb
             return depth
-        out = prev.mul(alpha).add(depth, alpha=(1.0 - alpha))
+        current = depth.detach()
+        history_valid = (rgb - prev_rgb).abs() <= (2.0 / 255.0)
+        smoothed = prev.mul(alpha).add(current, alpha=(1.0 - alpha))
+        out = torch.where(history_valid, smoothed, current)
         self._openxr_depth_temporal = out.detach()
+        self._openxr_rgb_temporal = rgb
         return out
 
     def _predict_depth_profile(
@@ -2548,7 +2651,10 @@ class StereoRuntime:
         capture_frame_id: int | None = None,
     ) -> DepthProfileResult:
         strength = float(getattr(self.config, "depth_antialias_strength", 0.0) or 0.0)
-        with model_depth_antialiasing(strength) as antialias_state:
+        with model_depth_antialiasing(
+            strength,
+            edge_threshold=float(getattr(self.config, "edge_threshold", 0.04)),
+        ) as antialias_state:
             result = self._predict_depth_profile_impl(
                 rgb_frame,
                 native_capture=native_capture,
@@ -2559,7 +2665,12 @@ class StereoRuntime:
             try:
                 result = replace(
                     result,
-                    depth=filter_model_depth(result.depth, rgb_frame, strength),
+                    depth=filter_model_depth(
+                        result.depth,
+                        rgb_frame,
+                        strength,
+                        edge_threshold=float(getattr(self.config, "edge_threshold", 0.04)),
+                    ),
                 )
                 filtered = True
             except Exception:
@@ -2814,6 +2925,7 @@ class StereoRuntime:
                 depth_pop=float(getattr(stereo_config, "depth_pop", 0.0)),
                 antialias_strength=float(getattr(stereo_config, "depth_antialias_strength", 0.0)),
                 global_gaussian=output_edge_aa_enabled(),
+                edge_threshold=float(getattr(stereo_config, "edge_threshold", 0.04)),
             )
             budget = resolve_parallax_budget(
                 render_width=int(rgb_frame.shape[-1]),
@@ -2931,6 +3043,7 @@ class StereoRuntime:
                 depth_pop=float(getattr(stereo_config, "depth_pop", 0.0)),
                 antialias_strength=float(getattr(stereo_config, "depth_antialias_strength", 0.0)),
                 global_gaussian=output_edge_aa_enabled(),
+                edge_threshold=float(getattr(stereo_config, "edge_threshold", 0.04)),
             )
             budget = resolve_parallax_budget(
                 render_width=int(rgb_frame.shape[-1]),
@@ -3578,8 +3691,8 @@ def _warp_depth_postprocess(
     Pop + Anti-aliasing) before warping; the deferred Metal-shader-warp
     path -- the v2.5 traditional method -- shipped the raw model output
     and skipped both, so depth edges kept their per-frame aliasing and
-    flicker. Apply the same pass here, including the shared global Gaussian
-    whenever output AA is enabled.
+    flicker. Apply the shared output-resolution pass here when model-grid
+    AA has not already handled the depth.
 
     With a guide frame and nonzero depth-AA strength, configured smoothing
     becomes RGB-guided edge-aware
@@ -3597,7 +3710,13 @@ def _warp_depth_postprocess(
         "D2S_GUIDED_DEPTH_SMOOTH", "1"
     ) not in {"0", "false", "off"}:
         guide = _match_guide_to_depth(guide_rgb, depth)
-    return _postprocess_depth_fast(depth, pop, aa, guide)
+    return _postprocess_depth_fast(
+        depth,
+        pop,
+        aa,
+        guide,
+        float(getattr(stereo_config, "edge_threshold", 0.04)),
+    )
 
 
 def _postprocess_depth_fast(
@@ -3605,6 +3724,7 @@ def _postprocess_depth_fast(
     depth_pop: float,
     antialias_strength: float,
     guide: torch.Tensor | None,
+    edge_threshold: float,
 ):
     """Realtime form of ``postprocess_depth`` for native-res frames.
 
@@ -3618,11 +3738,13 @@ def _postprocess_depth_fast(
         return postprocess_depth(
             depth, depth_pop=depth_pop, antialias_strength=antialias_strength,
             global_gaussian=output_edge_aa_enabled(),
+            edge_threshold=edge_threshold,
         )
     if os.environ.get("D2S_GUIDED_AA_HALFRES", "1") in {"0", "false", "off"}:
         return postprocess_depth(
             depth, depth_pop=depth_pop, antialias_strength=antialias_strength,
             global_gaussian=output_edge_aa_enabled(),
+            edge_threshold=edge_threshold,
         )
     h, w = int(depth.shape[-2]), int(depth.shape[-1])
     if min(h, w) < 256 or antialias_strength <= 0.0:
@@ -3632,6 +3754,7 @@ def _postprocess_depth_fast(
             antialias_strength=antialias_strength,
             guide=guide,
             global_gaussian=output_edge_aa_enabled(),
+            edge_threshold=edge_threshold,
         )
     out = depth.clamp(0.0, 1.0)
     if abs(float(depth_pop)) >= 1e-6:
@@ -3642,11 +3765,20 @@ def _postprocess_depth_fast(
     g_lo = torch.nn.functional.interpolate(
         guide, size=half.shape[-2:], mode="bilinear", align_corners=False
     )
-    lo = anti_alias_depth_guided(half, g_lo, antialias_strength)
+    lo = anti_alias_depth_guided(
+        half,
+        g_lo,
+        antialias_strength,
+        depth_edge_threshold=edge_threshold,
+    )
     out = torch.nn.functional.interpolate(
         lo, size=(h, w), mode="bilinear", align_corners=False
     )
-    return anti_alias_depth_global_gaussian(out) if output_edge_aa_enabled() else out
+    return (
+        anti_alias_depth_global_gaussian(out)
+        if output_edge_aa_enabled() and output_depth_gaussian_enabled()
+        else out
+    )
 
 
 def _match_guide_to_depth(guide_rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:

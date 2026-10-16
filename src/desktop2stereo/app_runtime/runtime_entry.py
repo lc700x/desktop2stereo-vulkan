@@ -1359,6 +1359,9 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     input_size = get_monitor_size(int(MONITOR_INDEX))
             except Exception:
                 input_size = None
+            inference_gpu_name = None
+            if str(getattr(DEVICE, "type", DEVICE)).strip().casefold() == "cuda":
+                inference_gpu_name = str(DEVICE_INFO or "").partition(":")[2].strip() or None
             local_viewer_config = VulkanLocalViewerConfig(
                 title=f"{WINDOW_TITLE or 'Desktop2Stereo'} Vulkan Viewer",
                 monitor_index=max(0, selected_monitor),
@@ -1389,6 +1392,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 on_capture_refresh_warning=report_capture_refresh_warning,
                 on_breakdown_inc=callbacks.breakdown_inc,
                 on_breakdown_add_time=callbacks.breakdown_add_time,
+                inference_gpu_name=inference_gpu_name,
             )
             local_viewer_kwargs = {
                 "runtime_q": presentation_q,

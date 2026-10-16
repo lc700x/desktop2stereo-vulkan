@@ -344,8 +344,8 @@ Depth Model: Distill-Any-Depth-Small
 Depth Strength: 0.25
 Depth Quick: Standard
 Depth Resolution: 518
-Anti-aliasing: 0
-Depth Antialias Strength: 0.0
+Anti-aliasing: 2
+Depth Antialias Strength: 2.0
 Depth Pop: 0.0
 Foreground Pop: 1.15
 Midground Pop: 1.05

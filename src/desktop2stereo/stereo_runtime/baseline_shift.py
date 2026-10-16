@@ -108,10 +108,20 @@ def compute_shift_px(depth: torch.Tensor, width: int, params: ShiftParams) -> to
     depth_strength = max(0.0, float(params.depth_strength))
     output_scale = -depth_strength * budget.max_disparity_px * 0.5
     fused_shift = _try_triton_shift(depth, params, output_scale=output_scale)
-    if fused_shift is not None:
-        return fused_shift
-    response = _layered_shift_response(depth, budget.depth_response(depth), params)
-    return response * output_scale
+    if fused_shift is None:
+        response = _layered_shift_response(depth, budget.depth_response(depth), params)
+        fused_shift = response * output_scale
+    scale_bound = max(1.0, params.foreground_shift_scale, params.midground_shift_scale, params.background_shift_scale)
+    if isinstance(params.convergence, torch.Tensor):
+        bounds = (-abs(output_scale) * scale_bound, abs(output_scale) * scale_bound)
+    else:
+        endpoints = (0.0, -float(params.convergence) * output_scale * scale_bound,
+                     (1.0 - float(params.convergence)) * output_scale * scale_bound)
+        bounds = (min(endpoints), max(endpoints))
+    # Projection metadata comes from the existing parallax budget; obtaining
+    # a conservative source search interval must not read GPU pixels on CPU.
+    fused_shift._d2s_projection_bounds = bounds
+    return fused_shift
 
 
 def shift_debug_info(depth: torch.Tensor, width: int, params: ShiftParams) -> dict[str, float | int | str]:

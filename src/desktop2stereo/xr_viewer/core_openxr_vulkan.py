@@ -837,6 +837,7 @@ class OpenXrVulkanPresenter(
         self._filament_controller_overlay_after_composer = _env_flag(
             "D2S_FILAMENT_CONTROLLER_OVERLAY_AFTER_COMPOSER", default=True
         )
+        self._filament_background_frame_count = 0
         self._vulkan_projection_composer_active = False
         self._vulkan_projection_composer_frame_id: int | None = None
         self._last_vulkan_projection_composer_status: tuple[Any, ...] | None = None
@@ -1904,7 +1905,7 @@ class OpenXrVulkanPresenter(
             if self._on_breakdown_inc is not None:
                 self._on_breakdown_inc("openxr_input_sample", 1)
             self._sync_controller_inputs(1.0 / 90.0)
-            physical_input_priority = self._physical_input_has_priority()
+            self._physical_input_has_priority()
             controller_chord_consumed = self._update_controller_input_toggle()
             if not (
                 self._controller_input_disabled
@@ -1913,13 +1914,13 @@ class OpenXrVulkanPresenter(
                 self._update_aim_poses(frame_state.predicted_display_time)
                 self._update_grip_poses(frame_state.predicted_display_time)
                 self._smooth_controller_poses()
-            self._grip_l_now = not physical_input_priority and bool(
+            self._grip_l_now = bool(
                 self._controller_input(0).get("grip", 0.0) > 0.5
             )
-            self._grip_r_now = not physical_input_priority and bool(
+            self._grip_r_now = bool(
                 self._controller_input(1).get("grip", 0.0) > 0.5
             )
-            if not controller_chord_consumed and not physical_input_priority:
+            if not controller_chord_consumed:
                 menu_consumed = self._handle_settings_menu_input()
                 if menu_consumed:
                     self._pointer_resume_hand = None
@@ -2618,8 +2619,8 @@ class OpenXrVulkanPresenter(
             return None
         return max(0.0, value)
 
-    def _reset_controller_interaction_state(self) -> None:
-        """Release controller-owned interactions before suppressing input."""
+    def _reset_controller_interaction_state(self, *, desktop_only: bool = False) -> None:
+        """Release remote desktop holds and, unless requested, scene gestures."""
         self._pointer_resume_hand = None
         self._cancel_touch_contacts()
         for name, up_flag in (
@@ -2675,6 +2676,9 @@ class OpenXrVulkanPresenter(
             except (AttributeError, OSError):
                 self._arrow_up_held = False
                 self._arrow_down_held = False
+
+        if desktop_only:
+            return
 
         self._settings_menu_trigger_down = [False, False]
         if hasattr(self._settings_menu, "_trigger_down"):
@@ -2803,13 +2807,15 @@ class OpenXrVulkanPresenter(
             # The pointer path below already applies the legacy exponential
             # right-grip/right-stick curve. Do not add the guide mixin's old
             # fixed-speed delta a second time in the same XR frame.
+            laser_hit = self._screen_ray_hit_for_hand(1)
             if (
                 not self._right_grip_screen_pointer_applied
-                and self._screen_ray_hit_for_hand(1) is not None
+                and laser_hit is not None
             ):
                 self._adjust_shortcut_screen_size(
                     float(values.get("width_delta", 0.0)),
                     float(values.get("distance_delta", 0.0)),
+                    laser_hit=laser_hit,
                 )
         elif action == "rotate_keyboard":
             self._keyboard_rotation_offset += np.asarray(
@@ -2825,6 +2831,12 @@ class OpenXrVulkanPresenter(
                 float(values.get("distance_delta", 0.0)),
             )
         elif action == "arrow_axes":
+            if (
+                self._physical_input_override
+                or _physical_mouse_active(timeout=0.0)
+                or _physical_keyboard_active(timeout=0.0)
+            ):
+                return
             self._send_arrow_impl(
                 float(values.get("horizontal", 0.0)),
                 "left", "right", deadzone=0.04,
@@ -2834,6 +2846,11 @@ class OpenXrVulkanPresenter(
                 "up", "down", deadzone=0.04,
             )
         elif action == "scroll_axes":
+            desktop_input_blocked = (
+                self._physical_input_override
+                or _physical_mouse_active(timeout=0.0)
+                or _physical_keyboard_active(timeout=0.0)
+            )
             horizontal = float(values.get("horizontal", 0.0))
             vertical = -float(values.get("vertical", 0.0))
             dt = float(values.get("dt", self._last_frame_dt))
@@ -2848,10 +2865,7 @@ class OpenXrVulkanPresenter(
                     and not self._settings_menu.active_key.startswith("step:")
                 )
                 if (
-                    not self._physical_input_override
-                    and not _physical_mouse_active(timeout=0.0)
-                    and not _physical_keyboard_active(timeout=0.0)
-                    and self._settings_menu_grab_hand is None
+                    self._settings_menu_grab_hand is None
                     and not slider_drag
                 ):
                     menu.scroll_by_wheel_axis(
@@ -2859,8 +2873,9 @@ class OpenXrVulkanPresenter(
                     )
                 # A menu hit owns the vertical wheel component, including at
                 # the scroll limits. Preserve horizontal desktop scrolling.
-                self._accum_scroll(horizontal, 0.0, dt)
-            else:
+                if not desktop_input_blocked:
+                    self._accum_scroll(horizontal, 0.0, dt)
+            elif not desktop_input_blocked:
                 self._accum_scroll(horizontal, vertical, dt)
         elif action in {"copy", "cut", "paste", "enter"}:
             # The hardware keyboard has priority over shortcut injection:
@@ -2938,7 +2953,7 @@ class OpenXrVulkanPresenter(
         self._screen_osd_show_t = time.perf_counter()
 
     def _adjust_shortcut_screen_size(
-        self, width_delta: float, distance_delta: float
+        self, width_delta: float, distance_delta: float, laser_hit: Any = None
     ) -> None:
         if self._filament_screen is None:
             return
@@ -2952,7 +2967,11 @@ class OpenXrVulkanPresenter(
         radial = np.asarray(position, dtype=np.float64) - head
         distance = max(float(np.linalg.norm(radial)), 1e-6)
         next_distance = max(0.3, distance + distance_delta)
-        next_position = head + radial / distance * next_distance
+        distance_offset = radial / distance * (next_distance - distance)
+        next_position = self._resize_screen_anchored(next_width, next_height, laser_hit)
+        if next_position is None:
+            next_position = np.asarray(position, dtype=np.float64)
+        next_position += distance_offset
         self._filament_screen = (
             tuple(float(value) for value in next_position),
             next_width,
@@ -2960,6 +2979,30 @@ class OpenXrVulkanPresenter(
             rotation,
         )
         self._screen_osd_show_t = time.perf_counter()
+
+    def _resize_screen_anchored(
+        self, width: float, height: float, laser_hit: Any = None
+    ) -> np.ndarray | None:
+        """Resize the screen while keeping the current laser UV at its world point."""
+        if self._filament_screen is None:
+            return None
+        position, _old_width, _old_height, rotation = self._filament_screen
+        anchor_world = None
+        if laser_hit is not None:
+            anchor_world = self._screen_uv_to_world(float(laser_hit[0]), float(laser_hit[1]))
+        self._filament_screen = (position, float(width), float(height), rotation)
+        next_position = np.asarray(position, dtype=np.float64)
+        if anchor_world is not None:
+            resized_anchor = self._screen_uv_to_world(float(laser_hit[0]), float(laser_hit[1]))
+            if resized_anchor is not None:
+                next_position += anchor_world - resized_anchor
+                self._filament_screen = (
+                    tuple(float(value) for value in next_position),
+                    float(width),
+                    float(height),
+                    rotation,
+                )
+        return next_position
 
     def _adjust_shortcut_keyboard(
         self, width_delta: float, distance_delta: float
@@ -3688,12 +3731,7 @@ class OpenXrVulkanPresenter(
         position, width, height, rotation = self._filament_screen
         next_width = max(0.3, float(width) + math.copysign(speed * dt, control_value))
         next_height = next_width * float(height) / max(float(width), 1e-6)
-        self._filament_screen = (
-            tuple(float(value) for value in position),
-            next_width,
-            next_height,
-            rotation,
-        )
+        self._resize_screen_anchored(next_width, next_height, laser_hit)
         self._screen_osd_show_t = time.perf_counter()
 
     def _screen_projection_world_points(self) -> np.ndarray | None:
@@ -4171,17 +4209,13 @@ class OpenXrVulkanPresenter(
             if not self._physical_input_override:
                 self._physical_input_override = True
                 self._physical_priority_wait_for_release = True
-                self._reset_controller_interaction_state()
+                self._reset_controller_interaction_state(desktop_only=True)
                 self._release_locked_modifiers()
                 self._kb_hover_l = None
                 self._kb_hover_r = None
                 self._kb_show_shifted = bool(self._caps_lock)
                 self._scroll_accum_x = 0.0
                 self._scroll_accum_y = 0.0
-                self._settings_menu.active_hand = None
-                self._settings_menu.active_key = None
-                self._settings_menu.hover_key = None
-                self._settings_menu.mark_dirty()
             if controller_sample and not any(trigger_down):
                 self._physical_priority_wait_for_release = False
             return True
@@ -4208,8 +4242,7 @@ class OpenXrVulkanPresenter(
     def _handle_vulkan_pointer_input(self) -> None:
         """Reuse legacy trigger hold/drag semantics for the Vulkan screen."""
         self._right_grip_screen_pointer_applied = False
-        if self._physical_input_has_priority():
-            return
+        desktop_input_blocked = self._physical_input_has_priority()
         now = time.perf_counter()
         inputs = (self._controller_input(0), self._controller_input(1))
         hits = (self._screen_ray_hit_for_hand(0), self._screen_ray_hit_for_hand(1))
@@ -4251,9 +4284,10 @@ class OpenXrVulkanPresenter(
                 # Match the legacy rising-edge latch: a highlighted key is
                 # sufficient to select the keyboard, even if the ray is in a
                 # key gap on the next frame.
-                keyboard_hit = self._keyboard_visible and getattr(
-                    self, f"_kb_hover_{suffix}"
-                ) is not None
+                keyboard_hit = self._keyboard_visible and (
+                    getattr(self, f"_kb_hover_{suffix}") is not None
+                    or (desktop_input_blocked and self._hand_keyboard_hit(index))
+                )
                 if keyboard_hit:
                     setattr(self, target_attr, "keyboard")
                 elif hits[index] is not None:
@@ -4457,6 +4491,10 @@ class OpenXrVulkanPresenter(
             else:
                 self._reset_screen_control_hold("distance")
                 self._reset_screen_control_hold("size")
+        # Screen/keyboard panel transforms remain available during physical
+        # ownership. Only OS mouse, touch and keyboard injection is suspended.
+        if desktop_input_blocked:
+            return
         resume_hand = self._pointer_resume_hand
         self._pointer_resume_hand = None
         resume_mouse_click = (
@@ -7092,19 +7130,25 @@ class OpenXrVulkanPresenter(
             usage_flags |= xr.SwapchainUsageFlags.SAMPLED_BIT
         if self._filament_multiview_layer_readback_requested and array_size >= 2:
             usage_flags |= xr.SwapchainUsageFlags.TRANSFER_SRC_BIT
-        handle = xr.create_swapchain(
-            self.session,
-            xr.SwapchainCreateInfo(
-                usage_flags=usage_flags,
-                format=self.swapchain_format,
-                sample_count=1,
-                width=width,
-                height=height,
-                face_count=1,
-                array_size=array_size,
-                mip_count=1,
-            ),
+        create_info = xr.SwapchainCreateInfo(
+            usage_flags=usage_flags,
+            format=self.swapchain_format,
+            sample_count=1,
+            width=width,
+            height=height,
+            face_count=1,
+            array_size=array_size,
+            mip_count=1,
         )
+        try:
+            handle = xr.create_swapchain(self.session, create_info)
+        except xr.exception.RuntimeFailureError as exc:
+            print(
+                "[OpenXRViewer] xrCreateSwapchain failed once; retrying: "
+                f"{exc}",
+                flush=True,
+            )
+            handle = xr.create_swapchain(self.session, create_info)
         images = list(
             xr.enumerate_swapchain_images(handle, xr.SwapchainImageVulkan2KHR)
         )
@@ -7986,6 +8030,7 @@ class OpenXrVulkanPresenter(
             bridge.set_skybox_brightness(self._filament_skybox_brightness)
             self._apply_filament_bridge_lighting(bridge)
             self.filament_bridge = bridge
+            self._filament_background_frame_count = 0
         except Exception:
             bridge.close()
             self.filament_bridge = None
@@ -8376,6 +8421,7 @@ class OpenXrVulkanPresenter(
         views: list[Any],
         filament_wait_semaphores: list[Any] | tuple[Any, ...] = (),
         filament_hdr_sources: list[Any] | tuple[Any, ...] = (),
+        controller_underlay: bool = False,
     ) -> int:
         if self.vulkan is None or len(acquired_images) not in {1, 2}:
             raise RuntimeError("Vulkan Projection Composer has no valid targets")
@@ -8530,6 +8576,7 @@ class OpenXrVulkanPresenter(
                 "source_crop_uv": source_crop_uv,
                 "clear_color": self.config.clear_color,
                 "wait_semaphore": wait_semaphore,
+                "screen_underlay": controller_underlay,
             }
             laser_params = (
                 self._projection_laser_params(eye_index)
@@ -8737,6 +8784,7 @@ class OpenXrVulkanPresenter(
                     or filament_wait_semaphores
                     or depth_sampling_timeline
                     or panorama_timeline
+                    or controller_underlay
                 ),
                 extra_wait_semaphores=filament_wait_semaphores,
                 wait_for_timeline=max(
@@ -10523,6 +10571,7 @@ class OpenXrVulkanPresenter(
                 )
                 if callable(adopt_depth):
                     adopt_depth(self._filament_depth_attachments[eye_index].resource)
+        self._filament_background_frame_count += 1
         return semaphores
 
     def _rocm_deferred_filament_eye_end_enabled(
@@ -10542,7 +10591,8 @@ class OpenXrVulkanPresenter(
         self,
         acquired_images: list[tuple[_EyeSwapchain, int]],
         record_time: Callable[[str, float], None],
-    ) -> None:
+        render_views: list[Any] | None = None,
+    ) -> int | None:
         bridge = self.filament_bridge
         if (
             not self._filament_controller_overlay_after_composer
@@ -10560,12 +10610,38 @@ class OpenXrVulkanPresenter(
                     flush=True,
                 )
             return
-        for eye_index, (_eye, image_index) in enumerate(acquired_images):
-            started = time.perf_counter()
-            bridge.set_active_eye(eye_index)
-            bridge.set_acquired_image(image_index)
-            bridge.render_controller_overlay()
-            record_time(f"openxr_filament_controller_overlay_eye{eye_index}", started)
+        semaphores: list[Any] = []
+        completion_timeline = None
+        try:
+            for eye_index, (_eye, image_index) in enumerate(acquired_images):
+                started = time.perf_counter()
+                bridge.set_active_eye(eye_index)
+                if render_views is not None:
+                    _update_filament_camera(
+                        bridge,
+                        render_views[eye_index],
+                        near_plane=self._profile_near_plane,
+                        far_plane=self._profile_far_plane,
+                    )
+                bridge.set_acquired_image(image_index)
+                bridge.render_controller_overlay()
+                record_time(f"openxr_filament_controller_overlay_eye{eye_index}", started)
+                if bool(getattr(bridge, "finished_drawing_semaphore_abi_available", False)):
+                    semaphore = bridge.get_finished_drawing_semaphore()
+                    if semaphore is not None:
+                        semaphores.append(semaphore)
+        finally:
+            # flushAndWait completes drawing but does not consume the binary
+            # completion signal. Drain the overlay's signals before their reuse,
+            # just as Composer consumes the background pass's signals.
+            if semaphores:
+                started = time.perf_counter()
+                completion_timeline = self.vulkan.submit_on(
+                    "graphics",
+                    lambda _command_buffer: None,
+                    wait_semaphore=tuple(semaphores),
+                )
+                record_time("openxr_filament_completion_drain", started)
         if not getattr(self, "_filament_controller_overlay_logged", False):
             self._filament_controller_overlay_logged = True
             print(
@@ -10573,6 +10649,38 @@ class OpenXrVulkanPresenter(
                 "order=environment->screen/glow->controller/laser/guide",
                 flush=True,
             )
+        return completion_timeline
+
+    def _can_skip_filament_background(self) -> bool:
+        """Composer can clear an empty room before the controller-only pass."""
+        return bool(
+            self.filament_bridge is not None
+            # Older bridges finish their bounded startup tracing in end_frame,
+            # which the controller-only ABI does not call. Warm up both eyes
+            # first so skipping backgrounds cannot turn tracing into frame logs.
+            and self._filament_background_frame_count >= 8
+            and not self.config.filament_glb_path
+            and not self._multiview_active
+            and not self._passthrough_backdrop
+            and not self._filament_projection_only
+            and self._filament_controller_overlay_after_composer
+            and getattr(self.filament_bridge, "controller_overlay_abi_available", False)
+        )
+
+    def _can_precompose_filament_controllers(self) -> bool:
+        # Drawing controllers before the CUDA-ready wait avoids a CPU/GPU
+        # round trip through Filament's synchronous overlay. Destination alpha
+        # keeps the screen behind the premultiplied controller pixels.
+        return bool(
+            self._can_skip_filament_background()
+            and not self._rocm_backend
+            and self._filament_glow_mode == "off"
+            and not self.config.filament_panorama_path
+            and not self._vulkan_projection_quality_chain_requested
+            and self.config.clear_color == (0.0, 0.0, 0.0, 1.0)
+            and not getattr(self, "_filament_controller_overlay_empty", False)
+            and callable(getattr(self.filament_bridge, "render_controller_overlay", None))
+        )
 
     def _render_controller_composition_layer(
         self, views: list[Any]
@@ -10755,6 +10863,7 @@ class OpenXrVulkanPresenter(
             use_vulkan_projection_composer = False
         filament_queue_lock = getattr(self.vulkan, "_lock", None)
         filament_queue_locked = False
+        filament_state_prepared = False
         waited_images: list[tuple[_EyeSwapchain, int]] = []
         projection_started = time.perf_counter()
         self._projection_busy.set()
@@ -10765,7 +10874,9 @@ class OpenXrVulkanPresenter(
                 callback(name, max(0.0, time.perf_counter() - started))
 
         def prepare_filament_rendering() -> None:
-            nonlocal filament_queue_locked, finished_semaphore_available
+            nonlocal filament_queue_locked, finished_semaphore_available, filament_state_prepared
+            if filament_state_prepared:
+                return
             if (
                 self.filament_bridge is not None
                 and filament_queue_lock is not None
@@ -10798,6 +10909,7 @@ class OpenXrVulkanPresenter(
                     False,
                 )
             )
+            filament_state_prepared = True
 
         try:
             # Acquire the complete stereo pair before entering either blocking
@@ -10870,7 +10982,16 @@ class OpenXrVulkanPresenter(
             if not render_succeeded and use_vulkan_projection_composer:
                 try:
                     filament_hdr_sources: tuple[Any, ...] = ()
-                    if self.filament_bridge is not None:
+                    skip_filament_background = self._can_skip_filament_background()
+                    controller_underlay = self._can_precompose_filament_controllers()
+                    if controller_underlay:
+                        self._clear_projection_targets(
+                            acquired_images, clear_color=(0.0, 0.0, 0.0, 0.0)
+                        )
+                        self._render_filament_controller_overlay(
+                            acquired_images, record_time, render_views=render_views
+                        )
+                    if self.filament_bridge is not None and not skip_filament_background:
                         if self._multiview_active:
                             finished = self._render_filament_multiview(
                                 render_views,
@@ -10898,21 +11019,31 @@ class OpenXrVulkanPresenter(
                                 )
                             )
                         filament_composer_rendered = True
-                    if filament_composer_wait_semaphores or filament_hdr_sources:
+                    if filament_composer_wait_semaphores or filament_hdr_sources or controller_underlay:
                         composer_timeline = self._render_vulkan_projection_composer(
                             composer_frame,
                             acquired_images,
                             composition_views,
                             filament_wait_semaphores=filament_composer_wait_semaphores,
                             filament_hdr_sources=filament_hdr_sources,
+                            controller_underlay=controller_underlay,
                         )
                     else:
                         composer_timeline = self._render_vulkan_projection_composer(
                             composer_frame, acquired_images, composition_views
                         )
-                    self._render_filament_controller_overlay(
-                        acquired_images, record_time
-                    )
+                    overlay_timeline = None
+                    if not controller_underlay:
+                        overlay_timeline = self._render_filament_controller_overlay(
+                            acquired_images,
+                            record_time,
+                            render_views=render_views if skip_filament_background else None,
+                        )
+                    elif self._on_breakdown_inc is not None:
+                        self._on_breakdown_inc("openxr_controllers_precomposed", 1)
+                    composer_timeline = max(int(composer_timeline), int(overlay_timeline or 0))
+                    if skip_filament_background and self._on_breakdown_inc is not None:
+                        self._on_breakdown_inc("openxr_filament_background_skipped", 1)
                     composer_frame.metadata["_vulkan_consumer_release_timeline"] = max(
                         int(
                             composer_frame.metadata.get(
@@ -12098,14 +12229,15 @@ class OpenXrVulkanPresenter(
         )
 
     def _clear_projection_targets(
-        self, acquired_images: list[tuple[_EyeSwapchain, int]]
+        self, acquired_images: list[tuple[_EyeSwapchain, int]],
+        *, clear_color: tuple[float, float, float, float] | None = None,
     ) -> None:
         for eye_index, (eye, image_index) in enumerate(acquired_images):
             array_layers = range(eye.array_size) if len(acquired_images) == 1 else (0,)
             for array_layer in array_layers:
                 self.vulkan.clear_color_image(
                     eye.resources[image_index].image,
-                    self.config.clear_color,
+                    self.config.clear_color if clear_color is None else clear_color,
                     base_array_layer=array_layer,
                 )
 

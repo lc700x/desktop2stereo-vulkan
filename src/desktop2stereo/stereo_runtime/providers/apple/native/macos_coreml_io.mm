@@ -47,6 +47,8 @@ typedef struct {
     float sigma_color;
     float max_keep;
     float depth_pop;
+    float edge_threshold;
+    int32_t axis;
 } D2SDepthFilterParams;
 
 typedef struct {
@@ -60,6 +62,7 @@ typedef struct {
     uint32_t source_height;
     uint32_t depth_width;
     uint32_t depth_height;
+    float edge_threshold;
 } D2SDepthUpsampleParams;
 
 typedef struct {
@@ -345,6 +348,11 @@ static inline float projected_target_x(float source_x, float depth_value,
 static inline float dibr_depth_at(
     texture2d<float, access::sample> color, device float *depth,
     float x, float y, constant WarpParams& p) {
+    // A negative strength marks model-grid AA already completed by the pack
+    // pass. Match CUDA/ROCm's bilinear depth sampling without re-sharpening it.
+    if (p.antialias_strength < 0.0f) {
+        return depth_pop(depth_at(depth, x, y, p), p);
+    }
     float sx = clamp(x, 0.0f, float(p.source_width) - 1.0f);
     float sy = clamp(y, 0.0f, float(p.source_height) - 1.0f);
     float dx = clamp((sx + 0.5f) * float(p.depth_width) /
@@ -385,40 +393,51 @@ static inline float dibr_depth_at(
     float source_x1 = (float(x1) + 0.5f) * float(p.source_width) /
                       float(p.depth_width) - 0.5f;
     float3 target_color = sample_color(color, sx, sy, p);
-    float delta00 = dot(abs(target_color - sample_color(color, source_x0, source_y0, p)),
-                        float3(1.0f / 3.0f));
-    float delta10 = dot(abs(target_color - sample_color(color, source_x1, source_y0, p)),
-                        float3(1.0f / 3.0f));
-    float delta01 = dot(abs(target_color - sample_color(color, source_x0, source_y1, p)),
-                        float3(1.0f / 3.0f));
-    float delta11 = dot(abs(target_color - sample_color(color, source_x1, source_y1, p)),
-                        float3(1.0f / 3.0f));
+    float3 c00 = sample_color(color, source_x0, source_y0, p);
+    float3 c10 = sample_color(color, source_x1, source_y0, p);
+    float3 c01 = sample_color(color, source_x0, source_y1, p);
+    float3 c11 = sample_color(color, source_x1, source_y1, p);
+    float delta00 = dot(abs(target_color - c00), float3(1.0f / 3.0f));
+    float delta10 = dot(abs(target_color - c10), float3(1.0f / 3.0f));
+    float delta01 = dot(abs(target_color - c01), float3(1.0f / 3.0f));
+    float delta11 = dot(abs(target_color - c11), float3(1.0f / 3.0f));
     float q00 = w00 * exp(-delta00 / 0.12f);
     float q10 = w10 * exp(-delta10 / 0.12f);
     float q01 = w01 * exp(-delta01 / 0.12f);
     float q11 = w11 * exp(-delta11 / 0.12f);
     float midpoint = (minimum + maximum) * 0.5f;
-    bool high00 = d00 >= midpoint;
-    bool high10 = d10 >= midpoint;
-    bool high01 = d01 >= midpoint;
-    bool high11 = d11 >= midpoint;
-    float nearest_delta = min(min(delta00, delta10), min(delta01, delta11));
-    bool choose_high = (delta00 == nearest_delta) ? high00 :
-                       ((delta10 == nearest_delta) ? high10 :
-                       ((delta01 == nearest_delta) ? high01 : high11));
-    float s00 = q00 * ((choose_high == high00) ? 1.0f : 0.0f);
-    float s10 = q10 * ((choose_high == high10) ? 1.0f : 0.0f);
-    float s01 = q01 * ((choose_high == high01) ? 1.0f : 0.0f);
-    float s11 = q11 * ((choose_high == high11) ? 1.0f : 0.0f);
-    float selected_total = s00 + s10 + s01 + s11;
-    float selected = (s00 * d00 + s10 * d10 + s01 * d01 + s11 * d11) /
-                     max(selected_total, 1.0e-6f);
-    float color_min = min(min(delta00, delta10), min(delta01, delta11));
-    float color_max = max(max(delta00, delta10), max(delta01, delta11));
-    bool use_class = (maximum - minimum >= max(p.edge_threshold, 0.02f)) &&
-                     (selected_total > 1.0e-6f) &&
-                     (color_max - color_min >= 0.005f);
-    return use_class ? selected : bilinear;
+    float low00 = 1.0f - smoothstep(midpoint - 0.02f, midpoint + 0.02f, d00);
+    float low10 = 1.0f - smoothstep(midpoint - 0.02f, midpoint + 0.02f, d10);
+    float low01 = 1.0f - smoothstep(midpoint - 0.02f, midpoint + 0.02f, d01);
+    float low11 = 1.0f - smoothstep(midpoint - 0.02f, midpoint + 0.02f, d11);
+    float q_low00 = q00 * low00, q_low10 = q10 * low10;
+    float q_low01 = q01 * low01, q_low11 = q11 * low11;
+    float q_high00 = q00 * (1.0f - low00), q_high10 = q10 * (1.0f - low10);
+    float q_high01 = q01 * (1.0f - low01), q_high11 = q11 * (1.0f - low11);
+    float low_total = q_low00 + q_low10 + q_low01 + q_low11;
+    float high_total = q_high00 + q_high10 + q_high01 + q_high11;
+    float low_depth = (q_low00 * d00 + q_low10 * d10 + q_low01 * d01 + q_low11 * d11) /
+                      max(low_total, 1.0e-6f);
+    float high_depth = (q_high00 * d00 + q_high10 * d10 + q_high01 * d01 + q_high11 * d11) /
+                       max(high_total, 1.0e-6f);
+    float low_delta = (q_low00 * delta00 + q_low10 * delta10 +
+                       q_low01 * delta01 + q_low11 * delta11) / max(low_total, 1.0e-6f);
+    float high_delta = (q_high00 * delta00 + q_high10 * delta10 +
+                        q_high01 * delta01 + q_high11 * delta11) / max(high_total, 1.0e-6f);
+    float3 low_color = (q_low00 * c00 + q_low10 * c10 + q_low01 * c01 + q_low11 * c11) /
+                       max(low_total, 1.0e-6f);
+    float3 high_color = (q_high00 * c00 + q_high10 * c10 +
+                         q_high01 * c01 + q_high11 * c11) / max(high_total, 1.0e-6f);
+    float prefer_high = smoothstep(-0.01f, 0.01f, low_delta - high_delta);
+    float selected = mix(low_depth, high_depth, prefer_high);
+    float depth_confidence = smoothstep(max(p.edge_threshold * 0.5f, 0.01f),
+                                        max(p.edge_threshold * 1.5f, 0.06f),
+                                        maximum - minimum);
+    float color_contrast = dot(abs(low_color - high_color), float3(1.0f / 3.0f));
+    float color_confidence = smoothstep(0.005f, 0.03f, color_contrast);
+    float class_support = smoothstep(1.0e-4f, 0.01f, min(low_total, high_total));
+    return mix(bilinear, selected,
+               depth_confidence * color_confidence * clamp(class_support, 0.0f, 1.0f));
 }
 
 static inline int dibr_search_radius(constant WarpParams& p) {
@@ -447,29 +466,24 @@ static inline float3 sample_color_depth_class(
     float w11 = fx * fy;
     float3 total = float3(0.0f);
     float weight = 0.0f;
+    float threshold = max(p.edge_threshold, 1.0e-6f);
     float d = dibr_depth_at(color, depth, float(x0), float(y0), p);
-    if (abs(d - class_depth) <= p.edge_threshold) {
-        total += sample_color(color, float(x0), float(y0), p) * w00;
-        weight += w00;
-    }
+    float keep = 1.0f - smoothstep(0.5f * threshold, threshold, abs(d - class_depth));
+    total += sample_color(color, float(x0), float(y0), p) * w00 * keep;
+    weight += w00 * keep;
     d = dibr_depth_at(color, depth, float(x1), float(y0), p);
-    if (abs(d - class_depth) <= p.edge_threshold) {
-        total += sample_color(color, float(x1), float(y0), p) * w10;
-        weight += w10;
-    }
+    keep = 1.0f - smoothstep(0.5f * threshold, threshold, abs(d - class_depth));
+    total += sample_color(color, float(x1), float(y0), p) * w10 * keep;
+    weight += w10 * keep;
     d = dibr_depth_at(color, depth, float(x0), float(y1), p);
-    if (abs(d - class_depth) <= p.edge_threshold) {
-        total += sample_color(color, float(x0), float(y1), p) * w01;
-        weight += w01;
-    }
+    keep = 1.0f - smoothstep(0.5f * threshold, threshold, abs(d - class_depth));
+    total += sample_color(color, float(x0), float(y1), p) * w01 * keep;
+    weight += w01 * keep;
     d = dibr_depth_at(color, depth, float(x1), float(y1), p);
-    if (abs(d - class_depth) <= p.edge_threshold) {
-        total += sample_color(color, float(x1), float(y1), p) * w11;
-        weight += w11;
-    }
-    return weight > 1.0e-6f
-        ? total / weight
-        : sample_color(color, x, y, p);
+    keep = 1.0f - smoothstep(0.5f * threshold, threshold, abs(d - class_depth));
+    total += sample_color(color, float(x1), float(y1), p) * w11 * keep;
+    weight += w11 * keep;
+    return mix(sample_color(color, x, y, p), total / max(weight, 1.0e-6f), min(weight, 1.0f));
 }
 
 static inline float3 dibr_gather_at(
@@ -540,11 +554,14 @@ static inline float3 dibr_gather_at(
         right_x = left_x;
     }
 
-    if (best_depth < 0.0f) {
-        float3 left = sample_color(color, left_x, target_y, p);
-        float3 right = sample_color(color, right_x, target_y, p);
-        return left_depth <= right_depth ? left : right;
-    }
+    float threshold = max(p.edge_threshold, 1.0e-6f);
+    float3 left = sample_color_depth_class(color, depth, left_x, target_y, left_depth, p);
+    float3 right = sample_color_depth_class(color, depth, right_x, target_y, right_depth, p);
+    float side_fraction = left_error / max(left_error + right_error, 1.0e-6f);
+    float3 background_linear = mix(left, right, side_fraction);
+    float background_edge = smoothstep(0.5f * threshold, threshold, abs(left_depth - right_depth));
+    float3 background = mix(background_linear, left_depth <= right_depth ? left : right, background_edge);
+    if (best_depth < 0.0f) return background;
 
     float3 foreground = float3(0.0f);
     float foreground_coverage = 0.0f;
@@ -552,27 +569,22 @@ static inline float3 dibr_gather_at(
         float source_x = best_x + float(offset);
         if (source_x >= 0.0f && source_x < float(p.source_width)) {
             float value = dibr_depth_at(color, depth, source_x, target_y, p);
-            if (value >= best_depth - p.edge_threshold) {
-                float projected_x = projected_target_x(source_x, value,
-                                                       eye_sign, p);
-                float coverage = max(0.0f, 1.0f - abs(projected_x - target_x));
-                if (coverage > 0.0f) {
-                    foreground += sample_color_depth_class(
-                        color, depth, source_x, target_y, best_depth, p
-                    ) * coverage;
-                    foreground_coverage += coverage;
-                }
+            float projected_x = projected_target_x(source_x, value, eye_sign, p);
+            float class_weight = 1.0f - smoothstep(0.5f * threshold, threshold, best_depth - value);
+            float coverage = max(0.0f, 1.0f - abs(projected_x - target_x)) * class_weight;
+            if (coverage > 0.0f) {
+                foreground += sample_color_depth_class(
+                    color, depth, source_x, target_y, best_depth, p
+                ) * coverage;
+                foreground_coverage += coverage;
             }
         }
     }
     foreground /= max(foreground_coverage, 1.0e-6f);
-    bool has_background = min(left_depth, right_depth) <
-                          best_depth - p.edge_threshold;
-    if (!has_background) return foreground;
-    float3 background = left_depth <= right_depth
-        ? sample_color_depth_class(color, depth, left_x, target_y, left_depth, p)
-        : sample_color_depth_class(color, depth, right_x, target_y, right_depth, p);
-    return mix(background, foreground, clamp(foreground_coverage, 0.0f, 1.0f));
+    float background_confidence = smoothstep(0.5f * threshold, threshold,
+        best_depth - min(left_depth, right_depth));
+    return mix(foreground, background,
+        (1.0f - clamp(foreground_coverage, 0.0f, 1.0f)) * background_confidence);
 }
 
 static inline float3 dibr_warp_at(
@@ -590,23 +602,27 @@ static inline float3 dibr_warp_at(
     float refined_x = clamp(target_x + source_shift * eye_sign, 0.0f,
                             float(p.source_width) - 1.0f);
     float source_residual = abs(refined_x - source_x);
-    bool foreground_candidate = false;
+    float front_confidence = 0.0f;
+    float threshold = max(p.edge_threshold, 1.0e-6f);
     // No depth can occlude a sample already within the visibility threshold of 1.
-    if (source_depth < 1.0f - p.edge_threshold) {
+    if (source_depth < 1.0f - 0.5f * threshold) {
         float front_shift = shift_from_depth(1.0f, p);
         float front_x = clamp(target_x + front_shift * eye_sign, 0.0f,
                               float(p.source_width) - 1.0f);
-        float front_depth = p.antialias_strength > 0.0f
+        float front_depth = p.antialias_strength != 0.0f
             ? dibr_depth_at(color, depth, front_x, target_y, p)
             : conservative_depth_at(depth, front_x, target_y, p);
-        foreground_candidate = front_depth > source_depth + p.edge_threshold;
+        front_confidence = smoothstep(0.5f * threshold, threshold, front_depth - source_depth);
     }
 
-    bool source_depth_edge = abs(source_depth - target_depth) > p.edge_threshold;
-    if (source_depth_edge || source_residual > 0.5f || foreground_candidate) {
-        return dibr_gather_at(color, depth, target_x, target_y, eye_sign, p);
+    float confidence = max(front_confidence,
+        max(smoothstep(0.5f * threshold, threshold, abs(source_depth - target_depth)),
+            smoothstep(0.125f, 0.5f, source_residual)));
+    float3 linear = sample_color(color, refined_x, target_y, p);
+    if (confidence > 0.0f) {
+        return mix(linear, dibr_gather_at(color, depth, target_x, target_y, eye_sign, p), confidence);
     }
-    return sample_color(color, refined_x, target_y, p);
+    return linear;
 }
 
 static inline float3 layered_warp_at(
@@ -905,7 +921,7 @@ kernel void d2s_warp_pack(
 
 )D2S";
 
-// Optional model-grid edge-aware smoothing. Keeping this in a separate
+// Optional model-grid separable smoothing. Keeping this in a separate
 // library lets the existing CoreML inference and warp pipelines initialize
 // even if a device cannot compile this optional filter.
 static const char *D2SDepthFilterMetalSource = R"D2S_FILTER(
@@ -919,6 +935,8 @@ struct DepthFilterParams {
     float sigma_color;
     float max_keep;
     float depth_pop;
+    float edge_threshold;
+    int axis;
 };
 
 static inline float d2s_filter_depth_pop(float value, float pop) {
@@ -933,17 +951,7 @@ static inline float d2s_filter_depth_pop(float value, float pop) {
     return clamp(0.5f + (centered < 0.0f ? -magnitude : magnitude), 0.0f, 1.0f);
 }
 
-static inline float3 d2s_depth_guide_at(
-    texture2d<float, access::sample> source, int x, int y,
-    constant DepthFilterParams& p) {
-    constexpr sampler s(address::clamp_to_edge, filter::linear);
-    float2 uv = (float2(float(x), float(y)) + 0.5f) /
-                float2(p.depth_width, p.depth_height);
-    return source.sample(s, uv).rgb;
-}
-
 kernel void d2s_filter_depth_guided(
-    texture2d<float, access::sample> source_rgb [[texture(0)]],
     device const float *source_depth [[buffer(0)]],
     device float *filtered_depth [[buffer(1)]],
     constant DepthFilterParams& p [[buffer(2)]],
@@ -962,46 +970,20 @@ kernel void d2s_filter_depth_guided(
     float inverse_two_sigma_sq = 0.5f / (sigma * sigma);
     float smooth_sum = 0.0f;
     float weight_sum = 0.0f;
-    for (int oy = -6; oy <= 6; ++oy) {
-        if (abs(oy) > radius) continue;
-        float dy = float(oy);
-        float wy = exp(-(dy * dy) * inverse_two_sigma_sq);
-        for (int ox = -6; ox <= 6; ++ox) {
-            if (abs(ox) > radius) continue;
-            float dx = float(ox);
-            float weight = wy * exp(-(dx * dx) * inverse_two_sigma_sq);
-            int sx = int(gid.x) + ox;
-            int sy = int(gid.y) + oy;
-            float sample_depth = 0.0f;
-            if (sx >= 0 && sy >= 0 && sx < int(p.depth_width) &&
-                sy < int(p.depth_height)) {
-                sample_depth = d2s_filter_depth_pop(
-                    source_depth[uint(sy) * p.depth_width + uint(sx)], p.depth_pop);
-            }
-            smooth_sum += sample_depth * weight;
-            weight_sum += weight;
-        }
+    for (int offset = -6; offset <= 6; ++offset) {
+        if (abs(offset) > radius) continue;
+        float distance = float(offset);
+        float weight = exp(-(distance * distance) * inverse_two_sigma_sq);
+        int sx = int(gid.x) + (p.axis == 0 ? offset : 0);
+        int sy = int(gid.y) + (p.axis == 1 ? offset : 0);
+        sx = clamp(sx, 0, int(p.depth_width) - 1);
+        sy = clamp(sy, 0, int(p.depth_height) - 1);
+        float sample_depth = d2s_filter_depth_pop(
+            source_depth[uint(sy) * p.depth_width + uint(sx)], p.depth_pop);
+        smooth_sum += sample_depth * weight;
+        weight_sum += weight;
     }
-    float smooth = clamp(smooth_sum / max(weight_sum, 1.0e-6f), 0.0f, 1.0f);
-
-    float3 guide_center = d2s_depth_guide_at(source_rgb, int(gid.x), int(gid.y), p);
-    float3 guide_sum = float3(0.0f);
-    for (int oy = -1; oy <= 1; ++oy) {
-        for (int ox = -1; ox <= 1; ++ox) {
-            int sx = int(gid.x) + ox;
-            int sy = int(gid.y) + oy;
-            if (sx >= 0 && sy >= 0 && sx < int(p.depth_width) &&
-                sy < int(p.depth_height)) {
-                guide_sum += d2s_depth_guide_at(source_rgb, sx, sy, p);
-            }
-        }
-    }
-    float3 guide_blur = guide_sum / 9.0f;
-    float edge = clamp(dot(abs(guide_center - guide_blur), float3(1.0f)) /
-                       max(p.sigma_color * 3.0f, 1.0e-6f), 0.0f, 1.0f);
-    float keep = clamp(p.max_keep * edge, 0.0f, 1.0f);
-    filtered_depth[output_index] = clamp(
-        keep * center + (1.0f - keep) * smooth, 0.0f, 1.0f);
+    filtered_depth[output_index] = clamp(smooth_sum / max(weight_sum, 1.0e-6f), 0.0f, 1.0f);
 }
 
 struct DepthUpsampleParams {
@@ -1009,6 +991,7 @@ struct DepthUpsampleParams {
     uint source_height;
     uint depth_width;
     uint depth_height;
+    float edge_threshold;
 };
 
 static inline float3 d2s_upsample_color(
@@ -1018,6 +1001,23 @@ static inline float3 d2s_upsample_color(
     float2 uv = (float2(x, y) + 0.5f) /
                 float2(p.depth_width, p.depth_height);
     return source_rgb.sample(s, uv).rgb;
+}
+
+static inline float d2s_upsample_curvature(
+    device const float* depth, int x, int y, uint height, uint width) {
+    float curvatureX = 0.0f, curvatureY = 0.0f;
+    if (width >= 3u) {
+        uint mx = uint(clamp(x, 1, int(width) - 2));
+        uint row = uint(y) * width;
+        curvatureX = abs(depth[row + mx - 1u] - 2.0f * depth[row + mx] + depth[row + mx + 1u]);
+    }
+    if (height >= 3u) {
+        uint my = uint(clamp(y, 1, int(height) - 2));
+        uint column = uint(x);
+        curvatureY = abs(depth[column + (my - 1u) * width] -
+                         2.0f * depth[column + my * width] + depth[column + (my + 1u) * width]);
+    }
+    return max(curvatureX, curvatureY);
 }
 
 kernel void d2s_upsample_depth_joint_bilateral(
@@ -1056,47 +1056,87 @@ kernel void d2s_upsample_depth_joint_bilateral(
 
     float2 rgb_uv = (float2(gid) + 0.5f) /
                     float2(p.source_width, p.source_height);
-    float3 high_rgb = source_rgb.sample(s, rgb_uv).rgb;
-    float3 c00 = d2s_upsample_color(source_rgb, float(x0), float(y0), p);
-    float3 c10 = d2s_upsample_color(source_rgb, float(x1), float(y0), p);
-    float3 c01 = d2s_upsample_color(source_rgb, float(x0), float(y1), p);
-    float3 c11 = d2s_upsample_color(source_rgb, float(x1), float(y1), p);
-    float delta00 = dot(abs(high_rgb - c00), float3(1.0f / 3.0f));
-    float delta10 = dot(abs(high_rgb - c10), float3(1.0f / 3.0f));
-    float delta01 = dot(abs(high_rgb - c01), float3(1.0f / 3.0f));
-    float delta11 = dot(abs(high_rgb - c11), float3(1.0f / 3.0f));
-    float w00 = s00 * exp(-delta00 / 0.12f);
-    float w10 = s10 * exp(-delta10 / 0.12f);
-    float w01 = s01 * exp(-delta01 / 0.12f);
-    float w11 = s11 * exp(-delta11 / 0.12f);
-    float total = w00 + w10 + w01 + w11;
-    float guided = (w00 * d00 + w10 * d10 + w01 * d01 + w11 * d11) /
-                   max(total, 1.0e-8f);
-
-    float minimum = min(min(d00, d10), min(d01, d11));
-    float maximum = max(max(d00, d10), max(d01, d11));
-    float midpoint = (minimum + maximum) * 0.5f;
-    float nearest_delta = delta00;
-    float nearest_depth = d00;
-    if (delta10 < nearest_delta) { nearest_delta = delta10; nearest_depth = d10; }
-    if (delta01 < nearest_delta) { nearest_delta = delta01; nearest_depth = d01; }
-    if (delta11 < nearest_delta) { nearest_depth = d11; }
-    bool choose_high = nearest_depth >= midpoint;
-    float q00 = w00 * (((d00 >= midpoint) == choose_high) ? 1.0f : 0.0f);
-    float q10 = w10 * (((d10 >= midpoint) == choose_high) ? 1.0f : 0.0f);
-    float q01 = w01 * (((d01 >= midpoint) == choose_high) ? 1.0f : 0.0f);
-    float q11 = w11 * (((d11 >= midpoint) == choose_high) ? 1.0f : 0.0f);
-    float selected_total = q00 + q10 + q01 + q11;
-    float selected = (q00 * d00 + q10 * d10 + q01 * d01 + q11 * d11) /
-                     max(selected_total, 1.0e-8f);
-    float color_contrast = max(max(delta00, delta10), max(delta01, delta11)) -
-                           min(min(delta00, delta10), min(delta01, delta11));
-    bool use_class = maximum - minimum >= 0.04f &&
-                     selected_total > 1.0e-8f && color_contrast >= 0.005f;
-    if (use_class) guided = selected;
-    bool has_depth_edge = maximum - minimum >= 0.04f;
-    upsampled_depth[gid.y * p.source_width + gid.x] = clamp(
-        has_depth_edge && total > 1.0e-8f ? guided : bilinear, 0.0f, 1.0f);
+    float edgeSignal =
+        s00 * d2s_upsample_curvature(source_depth, x0, y0, p.depth_height, p.depth_width) +
+        s10 * d2s_upsample_curvature(source_depth, x1, y0, p.depth_height, p.depth_width) +
+        s01 * d2s_upsample_curvature(source_depth, x0, y1, p.depth_height, p.depth_width) +
+        s11 * d2s_upsample_curvature(source_depth, x1, y1, p.depth_height, p.depth_width);
+    float edgeWeight = smoothstep(max(p.edge_threshold, 1.0e-6f) * 0.25f,
+                                  max(p.edge_threshold, 1.0e-6f) * 0.5f, edgeSignal);
+    if (edgeWeight <= 0.0f) {
+        upsampled_depth[gid.y * p.source_width + gid.x] = bilinear;
+        return;
+    }
+    float3 target = source_rgb.sample(s, rgb_uv).rgb;
+    int cx = int(floor(dx + 0.5f)), cy = int(floor(dy + 0.5f));
+    float spatial_total = 0.0f, depth_sum = 0.0f, depth_square_sum = 0.0f;
+    float3 color_sum = float3(0.0f);
+    float color_square_sum = 0.0f, total_weight = 0.0f, guided_sum = 0.0f;
+    float max_log_weight = -1.0e30f;
+    float matching_distance_sum = 0.0f;
+    float low_count = 0.0f, high_count = 0.0f, low_delta_sum = 0.0f, high_delta_sum = 0.0f;
+    float low_total = 0.0f, high_total = 0.0f, low_sum = 0.0f, high_sum = 0.0f;
+    float threshold = max(p.edge_threshold, 1.0e-6f);
+    float sigma = 0.04f;
+    for (int oy = -1; oy <= 1; ++oy) {
+        for (int ox = -1; ox <= 1; ++ox) {
+            uint sx = uint(clamp(cx + ox, 0, int(p.depth_width) - 1));
+            uint sy = uint(clamp(cy + oy, 0, int(p.depth_height) - 1));
+            float spatial = (1.0f - smoothstep(0.5f, 1.5f, abs(dx - float(cx + ox)))) *
+                            (1.0f - smoothstep(0.5f, 1.5f, abs(dy - float(cy + oy))));
+            uint sample_index = sy * p.depth_width + sx;
+            float sample = source_depth[sample_index];
+            float3 color = d2s_upsample_color(source_rgb, float(sx), float(sy), p);
+            float3 difference = target - color;
+            float distance = dot(difference, difference) / 3.0f;
+            float log_weight = spatial > 0.0f
+                ? log(max(spatial, 1.0e-30f)) - distance / (2.0f * sigma * sigma) : -1.0e30f;
+            float new_max = max(max_log_weight, log_weight);
+            float rescale = exp(max_log_weight - new_max);
+            float weight = spatial > 0.0f ? exp(log_weight - new_max) : 0.0f;
+            total_weight = total_weight * rescale + weight;
+            guided_sum = guided_sum * rescale + weight * sample;
+            matching_distance_sum = matching_distance_sum * rescale + weight * distance;
+            max_log_weight = new_max;
+            float delta = dot(abs(difference), float3(1.0f / 3.0f));
+            float low = 1.0f - smoothstep(-0.5f * threshold, 0.5f * threshold, sample - bilinear);
+            float high = 1.0f - low;
+            low_count += spatial * low;
+            high_count += spatial * high;
+            low_delta_sum += spatial * low * delta;
+            high_delta_sum += spatial * high * delta;
+            low_total = low_total * rescale + weight * low;
+            high_total = high_total * rescale + weight * high;
+            low_sum = low_sum * rescale + weight * low * sample;
+            high_sum = high_sum * rescale + weight * high * sample;
+            spatial_total += spatial;
+            depth_sum += spatial * sample;
+            depth_square_sum += spatial * sample * sample;
+            color_sum += spatial * color;
+            color_square_sum += spatial * dot(color, color) / 3.0f;
+        }
+    }
+    float denominator = max(spatial_total, 1.0e-8f);
+    float mean_depth = depth_sum / denominator;
+    float3 mean_color = color_sum / denominator;
+    float depth_variance = max(depth_square_sum / denominator - mean_depth * mean_depth, 0.0f);
+    float color_variance = max(color_square_sum / denominator - dot(mean_color, mean_color) / 3.0f, 0.0f);
+    float confidence = smoothstep(threshold * threshold * 0.0625f,
+                                  threshold * threshold * 0.25f, depth_variance) *
+                       smoothstep(0.000025f, 0.0004f, color_variance);
+    float guided = total_weight > 1.0e-8f ? guided_sum / total_weight : bilinear;
+    float low_delta = low_delta_sum / max(low_count, 1.0e-8f);
+    float high_delta = high_delta_sum / max(high_count, 1.0e-8f);
+    float prefer_high = smoothstep(-0.02f, 0.02f, low_delta - high_delta);
+    float selected = mix(low_sum / max(low_total, 1.0e-8f),
+                         high_sum / max(high_total, 1.0e-8f), prefer_high);
+    float support = smoothstep(0.001f, 0.1f, min(low_count, high_count));
+    float class_confidence = smoothstep(0.0025f, 0.03f, abs(low_delta - high_delta)) * support;
+    class_confidence *= 1.0f - smoothstep(0.000025f, 0.0004f,
+                                        matching_distance_sum / max(total_weight, 1.0e-8f));
+    guided = mix(guided, selected, class_confidence);
+    upsampled_depth[gid.y * p.source_width + gid.x] =
+        clamp(mix(bilinear, guided, edgeWeight * confidence), 0.0f, 1.0f);
 }
 
 struct DepthGaussianParams {
@@ -1122,36 +1162,40 @@ kernel void d2s_filter_depth_global_gaussian(
     constant DepthGaussianParams& p [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.depth_width || gid.y >= p.depth_height) return;
-    constexpr float weights[5] = {
+    constexpr float sample_weights[5] = {
         0.15246914f, 0.22184130f, 0.25137912f,
         0.22184130f, 0.15246914f
     };
     float long_edge = float(max(p.depth_width, p.depth_height));
     float spacing = 1.0f + 0.5f * clamp((long_edge - 1920.0f) / 1920.0f, 0.0f, 1.0f);
+    float axis_weights[7] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int offset = -2; offset <= 2; ++offset) {
+        float position = float(offset) * spacing;
+        int lower = int(floor(position));
+        float fraction = position - float(lower);
+        float weight = sample_weights[offset + 2];
+        axis_weights[lower + 3] += weight * (1.0f - fraction);
+        if (fraction > 0.0f) axis_weights[lower + 4] += weight * fraction;
+    }
     float sum = 0.0f;
-    for (int oy = -2; oy <= 2; ++oy) {
-        float sample_y = clamp(
-            float(gid.y) + float(oy) * spacing, 0.0f, float(p.depth_height - 1u));
-        uint y0 = uint(floor(sample_y));
-        uint y1 = min(y0 + 1u, p.depth_height - 1u);
-        float fy = sample_y - float(y0);
-        float wy = weights[oy + 2];
-        for (int ox = -2; ox <= 2; ++ox) {
-            float sample_x = clamp(
-                float(gid.x) + float(ox) * spacing, 0.0f, float(p.depth_width - 1u));
-            uint x0 = uint(floor(sample_x));
-            uint x1 = min(x0 + 1u, p.depth_width - 1u);
-            float fx = sample_x - float(x0);
-            float top = mix(
-                d2s_gaussian_depth_pop(source_depth[y0 * p.depth_width + x0], p.depth_pop),
-                d2s_gaussian_depth_pop(source_depth[y0 * p.depth_width + x1], p.depth_pop), fx);
-            float bottom = mix(
-                d2s_gaussian_depth_pop(source_depth[y1 * p.depth_width + x0], p.depth_pop),
-                d2s_gaussian_depth_pop(source_depth[y1 * p.depth_width + x1], p.depth_pop), fx);
-            sum += mix(top, bottom, fy) * wy * weights[ox + 2];
+    float weight_sum = 0.0f;
+    for (int oy = -3; oy <= 3; ++oy) {
+        float wy = axis_weights[oy + 3];
+        if (wy <= 0.0f) continue;
+        uint sy = uint(clamp(int(gid.y) + oy, 0, int(p.depth_height) - 1));
+        for (int ox = -3; ox <= 3; ++ox) {
+            float wx = axis_weights[ox + 3];
+            if (wx <= 0.0f) continue;
+            uint sx = uint(clamp(int(gid.x) + ox, 0, int(p.depth_width) - 1));
+            float sample = d2s_gaussian_depth_pop(
+                source_depth[sy * p.depth_width + sx], p.depth_pop);
+            float weight = wx * wy;
+            sum += sample * weight;
+            weight_sum += weight;
         }
     }
-    filtered_depth[gid.y * p.depth_width + gid.x] = clamp(sum, 0.0f, 1.0f);
+    filtered_depth[gid.y * p.depth_width + gid.x] = clamp(
+        sum / max(weight_sum, 1.0e-8f), 0.0f, 1.0f);
 }
 )D2S_FILTER";
 
@@ -1161,6 +1205,7 @@ typedef struct {
     __strong id<MTLBuffer> normalized_depth_buffer;
     // Retained across slot release so each model-depth allocation is reused.
     __strong id<MTLBuffer> filtered_depth_buffer;
+    __strong id<MTLBuffer> filter_intermediate_buffer;
     __strong id<MTLBuffer> status_buffer;
     __strong id<MTLBuffer> packed_buffer;
     __strong id<MTLTexture> color_texture;
@@ -1293,6 +1338,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
         d2s_release_slot(&ctx->slots[i]);
         ctx->slots[i].packed_buffer = nil;
         ctx->slots[i].filtered_depth_buffer = nil;
+        ctx->slots[i].filter_intermediate_buffer = nil;
     }
     if (ctx->texture_cache != NULL) {
         CFRelease(ctx->texture_cache);
@@ -1945,6 +1991,7 @@ static int32_t d2s_coreml_io_pack_internal(
             warp_config != NULL ? *warp_config : default_stereo,
         };
         BOOL global_depth_gaussian = params.stereo.edge_aa_enabled != 0;
+        BOOL model_depth_filtered = NO;
         // Depth is filtered before the warp; no pixel-space AA follows it.
         params.stereo.edge_aa_enabled = 0;
         id<MTLBuffer> warp_destination = destination_buffer;
@@ -1963,22 +2010,41 @@ static int32_t d2s_coreml_io_pack_internal(
                     newBufferWithLength:(NSUInteger)depth_bytes
                     options:MTLResourceStorageModePrivate];
             }
-            if (slot->filtered_depth_buffer != nil) {
-                D2SDepthFilterParams filter_params = {
-                    (uint32_t)ctx->depth_width,
-                    (uint32_t)ctx->depth_height,
-                    fminf(4.0f, fmaxf(0.0f, 2.0f * params.stereo.antialias_strength)),
-                    0.1f,
-                    0.35f,
-                    0.0f,
-                };
-                id<MTLComputeCommandEncoder> filter_encoder =
-                    [command computeCommandEncoder];
-                if (filter_encoder != nil) {
+            if (slot->filter_intermediate_buffer == nil ||
+                slot->filter_intermediate_buffer.length < depth_bytes) {
+                slot->filter_intermediate_buffer = [ctx->device
+                    newBufferWithLength:(NSUInteger)depth_bytes
+                    options:MTLResourceStorageModePrivate];
+            }
+            if (slot->filtered_depth_buffer != nil &&
+                slot->filter_intermediate_buffer != nil) {
+                BOOL filter_complete = YES;
+                for (int axis = 0; axis < 2; ++axis) {
+                    D2SDepthFilterParams filter_params = {
+                        (uint32_t)ctx->depth_width,
+                        (uint32_t)ctx->depth_height,
+                        fminf(4.0f, fmaxf(0.0f, 2.0f * params.stereo.antialias_strength)),
+                        0.1f,
+                        0.35f,
+                        0.0f,
+                        params.stereo.edge_threshold,
+                        axis,
+                    };
+                    id<MTLBuffer> filter_source = axis == 0
+                        ? slot->normalized_depth_buffer
+                        : slot->filtered_depth_buffer;
+                    id<MTLBuffer> filter_output = axis == 0
+                        ? slot->filtered_depth_buffer
+                        : slot->filter_intermediate_buffer;
+                    id<MTLComputeCommandEncoder> filter_encoder =
+                        [command computeCommandEncoder];
+                    if (filter_encoder == nil) {
+                        filter_complete = NO;
+                        break;
+                    }
                     [filter_encoder setComputePipelineState:ctx->depth_filter_pipeline];
-                    [filter_encoder setTexture:slot->color_texture atIndex:0];
-                    [filter_encoder setBuffer:slot->normalized_depth_buffer offset:0 atIndex:0];
-                    [filter_encoder setBuffer:slot->filtered_depth_buffer offset:0 atIndex:1];
+                    [filter_encoder setBuffer:filter_source offset:0 atIndex:0];
+                    [filter_encoder setBuffer:filter_output offset:0 atIndex:1];
                     [filter_encoder setBytes:&filter_params
                         length:sizeof(filter_params) atIndex:2];
                     MTLSize filter_grid = MTLSizeMake(
@@ -1987,12 +2053,15 @@ static int32_t d2s_coreml_io_pack_internal(
                     [filter_encoder dispatchThreads:filter_grid
                         threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
                     [filter_encoder endEncoding];
-                    warp_depth_buffer = slot->filtered_depth_buffer;
-                    // The model-grid filter now owns the configured guided AA.
-                    params.stereo.antialias_strength = 0.0f;
+                }
+                if (filter_complete) {
+                    warp_depth_buffer = slot->filter_intermediate_buffer;
+                    model_depth_filtered = YES;
+                    params.stereo.antialias_strength = -1.0f;
                 }
             }
         }
+        global_depth_gaussian = global_depth_gaussian && !model_depth_filtered;
 
         if (global_depth_gaussian) {
             if (ctx->depth_upsample_pipeline == nil ||
@@ -2027,6 +2096,7 @@ static int32_t d2s_coreml_io_pack_internal(
                     source_height,
                     (uint32_t)ctx->depth_width,
                     (uint32_t)ctx->depth_height,
+                    params.stereo.edge_threshold,
                 };
                 id<MTLComputeCommandEncoder> upsample_encoder =
                     [command computeCommandEncoder];

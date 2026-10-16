@@ -144,6 +144,8 @@ def test_windows_capture_runner_uses_copy_or_clone_buffers(monkeypatch):
     module = _install_capture_module(monkeypatch, "wc_cuda")
     monkeypatch.setenv("D2S_WGC_SOFTWARE_THROTTLE", "0")
     monkeypatch.setattr(windows_capture_event, "_setup_dpi_awareness", lambda: None)
+    monkeypatch.setattr(windows_capture_event, "_capture_monitor_rect", lambda _index: (0, 0, 1920, 1080))
+    monkeypatch.setattr(windows_capture_event, "_cursor_position_uv", lambda _rect: (0.25, 0.75))
     monkeypatch.setattr(windows_capture_event.WindowsCaptureEventRunner, "_start_keyboard_worker", lambda self, event: None)
 
     runner = windows_capture_event.WindowsCaptureEventRunner(
@@ -167,7 +169,11 @@ def test_windows_capture_runner_uses_copy_or_clone_buffers(monkeypatch):
     runner.run(shutdown_event=shutdown_event, on_frame=on_frame, on_error=on_error)
 
     capture = module.WindowsCapture.last_instance
-    assert capture.kwargs == {"monitor_index": 3, "minimum_update_interval": 16}
+    assert capture.kwargs == {
+        "monitor_index": 3,
+        "cursor_capture": True,
+        "minimum_update_interval": 16,
+    }
     assert len(capture.handlers) == 2
 
     shutdown_event.clear()
@@ -186,6 +192,8 @@ def test_windows_capture_runner_uses_copy_or_clone_buffers(monkeypatch):
     assert received[-1].monitor_index == 3
     assert received[-1].original_format == "CopyBuffer"
     assert received[-1].metadata["backend"] == "windows_capture_event"
+    assert received[-1].metadata["cursor_capture"] is True
+    assert received[-1].metadata["cursor_position_uv"] == (0.25, 0.75)
 
     shutdown_event.clear()
     clone_buffer = CloneBuffer()
@@ -629,7 +637,10 @@ def test_windows_capture_runner_uses_window_name_for_window_capture(monkeypatch)
         on_error=on_error,
     )
 
-    assert module.WindowsCapture.last_instance.kwargs == {"window_name": "Stereo Viewer"}
+    assert module.WindowsCapture.last_instance.kwargs == {
+        "window_name": "Stereo Viewer",
+        "cursor_capture": True,
+    }
 
 
 def test_windows_capture_cuda_accepts_env_capture_options(monkeypatch):
@@ -637,6 +648,7 @@ def test_windows_capture_cuda_accepts_env_capture_options(monkeypatch):
 
     assert windows_capture_event._windows_capture_kwargs(config, "WindowsCaptureCUDA") == {
         "monitor_index": 1,
+        "cursor_capture": True,
         "minimum_update_interval": 16,
     }
 
@@ -645,6 +657,7 @@ def test_windows_capture_cuda_accepts_env_capture_options(monkeypatch):
 
     assert windows_capture_event._windows_capture_kwargs(config, "WindowsCaptureCUDA") == {
         "monitor_index": 1,
+        "cursor_capture": True,
         "minimum_update_interval": 16,
         "reuse_output_buffer": True,
         "output_buffer_count": 6,

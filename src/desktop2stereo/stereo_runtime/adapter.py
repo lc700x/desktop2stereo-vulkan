@@ -78,7 +78,7 @@ class StereoRuntimeConfig:
     auto_reset_temporal: bool = False
     scene_reset_threshold: float = 0.22
     depth_pop: float = 0.0
-    depth_antialias_strength: float = 0.0
+    depth_antialias_strength: float = 2.0
     edge_threshold: float = 0.04
     edge_dilation: int = 2
     mask_feather_radius: int = 3
@@ -208,9 +208,10 @@ def runtime_config_from_d2s_settings(
     # MIGraphX is opt-in, and the supported GPU-native PyTorch provider is the
     # default when its checkbox is off.
     is_rocm = bool(getattr(torch.version, "hip", None))
-    if settings.get("MIGraphX", False):
+    device_type = torch.device(device).type
+    if is_rocm and settings.get("MIGraphX", False):
         depth_backend = "migraphx_rocm"
-    elif settings.get("TensorRT", False) and not is_rocm:
+    elif settings.get("TensorRT", False) and device_type == "cuda" and not is_rocm:
         depth_backend = "tensorrt_native"
     elif settings.get("ONNX", False):
         depth_backend = "onnx_cuda"
@@ -263,6 +264,11 @@ def runtime_config_from_d2s_settings(
         force_rebuild_trt=bool(settings.get("Recompile TensorRT", False)),
         build_migraphx_graph=bool(settings.get("MIGraphX", False)),
         force_rebuild_migraphx=bool(settings.get("Recompile MIGraphX", False)),
+        use_cuda_graph=(
+            _to_bool(settings.get("Depth CUDA Graph", settings.get("CUDA Graph", False)))
+            and device_type == "cuda"
+            and not is_rocm
+        ),
         openxr_visual_regression_dir=(
             str(settings.get("OpenXR Visual Regression Directory")).strip()
             if str(settings.get("OpenXR Visual Regression Directory", "")).strip()
@@ -286,7 +292,7 @@ def runtime_config_from_d2s_settings(
         auto_reset_temporal=_to_bool(settings.get("Auto Scene Reset", settings.get("Auto Reset Temporal", True))),
         scene_reset_threshold=float(settings.get("Scene Reset Threshold", 0.22)),
         depth_pop=float(settings.get("Depth Pop", 0.0)),
-        depth_antialias_strength=float(settings.get("Depth Antialias Strength", settings.get("Anti-aliasing", 0.0))),
+        depth_antialias_strength=float(settings.get("Depth Antialias Strength", settings.get("Anti-aliasing", 2.0))),
         edge_threshold=float(settings.get("Edge Threshold", 0.04)),
         edge_dilation=int(settings.get("Edge Dilation", 2)),
         mask_feather_radius=int(settings.get("Mask Feather Radius", 3)),

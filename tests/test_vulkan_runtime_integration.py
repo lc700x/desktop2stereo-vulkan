@@ -333,6 +333,53 @@ def test_openxr_depth_temporal_is_disabled_with_stereo_temporal(monkeypatch):
     runtime.close()
 
 
+def test_openxr_depth_temporal_blends_only_color_stable_pixels(monkeypatch):
+    monkeypatch.setenv("D2S_OPENXR_RGB_DEPTH_TEMPORAL_ALPHA", "0.9")
+    config = StereoRuntimeConfig(
+        model_id="lc700x/Distill-Any-Depth-Base-hf",
+        stereo_compute_backend="vulkan",
+        temporal=True,
+    )
+    runtime = StereoRuntime(config, depth_provider=_Provider(), collect_memory_stats=False)
+    first_depth = torch.zeros((1, 1, 2, 2), dtype=torch.float32)
+    first_rgb = torch.zeros((1, 3, 2, 2), dtype=torch.float32)
+    moved_rgb = first_rgb.clone()
+    moved_rgb[..., 0, 0] = 1.0
+    current_depth = torch.ones_like(first_depth)
+
+    runtime._stabilize_openxr_rgb_depth(first_depth, rgb=first_rgb)
+    result = runtime._stabilize_openxr_rgb_depth(current_depth, rgb=moved_rgb)
+
+    assert result[0, 0, 0, 0] == 1.0
+    assert torch.allclose(result[0, 0, 1, 1], torch.tensor(0.1))
+    assert torch.isfinite(result).all()
+    runtime.close()
+
+
+def test_fused_depth_temporal_respects_disabled_setting(monkeypatch):
+    monkeypatch.setenv("D2S_DEPTH_TEMPORAL", "1")
+    config = StereoRuntimeConfig(
+        model_id="lc700x/Distill-Any-Depth-Base-hf",
+        stereo_compute_backend="vulkan",
+        temporal=False,
+    )
+    runtime = StereoRuntime(config, depth_provider=_Provider(), collect_memory_stats=False)
+    runtime._fused_depth_prev = torch.zeros((1, 1, 2, 2), dtype=torch.float32)
+    runtime._fused_rgb_prev = torch.zeros((1, 3, 2, 2), dtype=torch.float32)
+    depth = torch.ones((1, 1, 2, 2), dtype=torch.float32)
+
+    result = runtime._temporal_stabilize_depth(
+        depth,
+        torch.zeros((1, 3, 2, 2), dtype=torch.float32),
+        enabled=False,
+    )
+
+    assert torch.equal(result, depth)
+    assert runtime._fused_depth_prev is None
+    assert runtime._fused_rgb_prev is None
+    runtime.close()
+
+
 @pytest.mark.parametrize("depth_strength", (0.0, 1.75))
 def test_openxr_deferred_vulkan_request_uses_runtime_depth_strength(monkeypatch, depth_strength):
     monkeypatch.setattr(

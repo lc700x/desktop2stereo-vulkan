@@ -23,8 +23,10 @@ from stereo_runtime.pipeline import (
     _resolve_pipeline_render_size,
     _unpack_raw_queue_item,
     _enable_openxr_depth_cuda_graph_if_needed,
+    _prewarm_gpu_runtime_before_capture,
     _motion_sample,
     _motion_score,
+    _cursor_only_rgb_change,
     _save_downsample_filter_comparison,
     _save_preprocess_image_diagnostic,
     _runtime_motion_gate_enabled,
@@ -71,6 +73,35 @@ def test_attach_capture_debug_marks_depth_complete_for_current_frame():
     assert result.depth_complete is True
     assert result.debug_info["depth_finite"] == 1
     assert result.debug_info["depth_nonfinite_count"] == 0
+
+
+def test_attach_capture_debug_keeps_cursor_reused_depth_source_frame_id():
+    result = SimpleNamespace(
+        depth=np.zeros((2, 2), dtype=np.float32),
+        depth_finite=True,
+        debug_info={},
+        timing={"depth_nonfinite_count": 0},
+    )
+    captured = CapturedFrame(
+        frame=np.zeros((2, 2, 3), dtype=np.uint8),
+        target_height=2,
+        timestamp=1.0,
+        metadata={"capture_frame_id": 42},
+    )
+
+    _attach_capture_debug(
+        result,
+        captured,
+        SimpleNamespace(),
+        depth_source_frame_id=41,
+        depth_reused_cursor_only=True,
+    )
+
+    assert result.capture_frame_id == 42
+    assert result.depth_frame_id == 41
+    assert result.debug_info["capture_frame_id"] == 42
+    assert result.debug_info["depth_frame_id"] == 41
+    assert result.debug_info["depth_reused_cursor_only"] == 1
 
 
 def test_native_coreml_capture_is_enabled_for_macos_network_stream(monkeypatch):
@@ -424,6 +455,31 @@ def test_motion_sample_is_snapshot_when_input_storage_is_reused():
     current = _motion_sample(frame)
 
     assert _motion_score(previous, current) == 1.0
+
+
+def test_cursor_only_rgb_change_ignores_pointer_region_but_not_scene_motion():
+    import torch
+
+    previous = torch.zeros((3, 54, 96), dtype=torch.float16)
+    pointer_update = previous.clone()
+    pointer_update[:, 24:29, 46:51] = 1.0
+    assert _cursor_only_rgb_change(
+        previous,
+        pointer_update,
+        (0.5, 0.5),
+        (0.5, 0.5),
+        (3840, 2160),
+    )
+
+    scene_update = pointer_update.clone()
+    scene_update[:, 8:12, 8:12] = 1.0
+    assert not _cursor_only_rgb_change(
+        previous,
+        scene_update,
+        (0.5, 0.5),
+        (0.5, 0.5),
+        (3840, 2160),
+    )
 
 
 def test_openxr_pipeline_keeps_deferred_vulkan_request_path():
@@ -896,3 +952,70 @@ def test_cuda_capture_disables_previously_enabled_openxr_cuda_graph():
     assert [snapshot.use_cuda_graph for snapshot in snapshots] == [False]
     assert ctx.stereo_runtime.config.use_cuda_graph is False
     assert "openxr_depth_cuda_graph_disabled_cuda_capture" in stats
+
+
+def test_cuda_capture_keeps_openxr_cuda_graph_when_prewarmed():
+    snapshots = []
+
+    class Runtime:
+        config = SimpleNamespace(depth_backend="tensorrt_native", use_cuda_graph=True)
+        depth_provider = SimpleNamespace(
+            _provider=SimpleNamespace(_cuda_graph_prepared=True),
+        )
+
+        def apply_settings_snapshot(self, snapshot, *, active_preset):
+            snapshots.append(snapshot)
+
+    stats = []
+    ctx = SimpleNamespace(
+        stereo_runtime=Runtime(),
+        stereo_active_preset="quality_4k",
+        source_stat_inc=lambda name, *args, **kwargs: stats.append(name),
+    )
+
+    _enable_openxr_depth_cuda_graph_if_needed(
+        ctx,
+        True,
+        SimpleNamespace(capture_tool="WindowsCaptureCUDA"),
+    )
+
+    assert snapshots == []
+    assert ctx.stereo_runtime.config.use_cuda_graph is True
+    assert "openxr_depth_cuda_graph_preserved_cuda_capture" in stats
+
+
+def test_gpu_runtime_warms_depth_and_stereo_before_capture(monkeypatch):
+    import torch
+
+    events = []
+
+    class Device:
+        type = "cuda"
+
+    monkeypatch.setattr(torch, "device", lambda value: Device())
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
+    monkeypatch.setattr(
+        torch,
+        "zeros",
+        lambda shape, **kwargs: events.append(("zeros", shape)) or object(),
+    )
+
+    ctx = SimpleNamespace(
+        capture_size_hint=(3840, 2160),
+        device="cuda",
+        stereo_runtime=SimpleNamespace(
+            _predict_depth_profile=lambda rgb: events.append("depth"),
+        ),
+        warmup_stereo_once_for_frame=lambda rgb: events.append("stereo"),
+    )
+
+    _prewarm_gpu_runtime_before_capture(ctx, None)
+
+    assert events == [
+        ("zeros", (1, 3, 2160, 3840)),
+        "depth",
+        "sync",
+        "stereo",
+        "sync",
+    ]

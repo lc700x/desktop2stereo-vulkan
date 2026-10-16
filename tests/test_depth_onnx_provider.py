@@ -373,6 +373,28 @@ def test_infinidepth_onnx_preprocessor_uses_patch_16_without_normalization():
     assert float(actual.min()) >= 0.0
     assert float(actual.max()) <= 1.0
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm is unavailable")
+def test_distill_preprocessor_uses_antialiased_bilinear_on_cuda():
+    import torch.nn.functional as F
+
+    rgb = torch.rand((1, 3, 64, 80), device="cuda")
+    preprocessor = ModelOnnxPreprocessor(
+        model_id="lc700x/Distill-Any-Depth-Small-hf",
+        device=torch.device("cuda"),
+        dtype=torch.float32,
+        fixed_input_size=(16, 16),
+    )
+
+    actual = preprocessor(rgb)
+    expected = F.interpolate(
+        rgb, size=(16, 16), mode="bilinear", align_corners=False, antialias=True
+    )
+    mean = torch.tensor((0.485, 0.456, 0.406), device="cuda").view(1, 3, 1, 1)
+    std = torch.tensor((0.229, 0.224, 0.225), device="cuda").view(1, 3, 1, 1)
+
+    assert torch.allclose(actual, (expected - mean) / std, atol=1e-6, rtol=0.0)
+
 def test_onnx_provider_defers_load_until_frame_artifact_size_is_known(tmp_path):
     from stereo_runtime.depth_onnx_provider import OnnxCudaDepthProvider
 

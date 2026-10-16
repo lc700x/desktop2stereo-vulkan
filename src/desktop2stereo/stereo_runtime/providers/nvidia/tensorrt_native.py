@@ -658,6 +658,7 @@ class DistillAnyDepthBaseNativeTensorRt:
         self._engine: NativeTensorRtEngine | None = None
         self._artifact_input_size: tuple[int, int] | None = None
         self._cuda_graph_disabled_reason: str | None = None
+        self._cuda_graph_prepared = False
         configured_input_size = None
         if self._explicit_onnx_path is None:
             configured_input_size = _model_input_size_for_model(
@@ -684,6 +685,7 @@ class DistillAnyDepthBaseNativeTensorRt:
             if self._engine is not None:
                 self._engine.close()
             self._engine = None
+            self._cuda_graph_prepared = False
         self.onnx_path = onnx_path
         self.engine_path = engine_path
         self.dtype = dtype
@@ -726,6 +728,18 @@ class DistillAnyDepthBaseNativeTensorRt:
         if self._engine is not None:
             self._preprocessor.fixed_input_size = self._engine.input_image_size
             return self._engine
+        if (
+            self.use_cuda_graph
+            and self._cuda_graph_disabled_reason is None
+            and self._explicit_onnx_path is None
+            and self._explicit_engine_path is None
+            and self._artifact_input_size is None
+        ):
+            # Resolve the configured Distill/ZipDepth artifact dimensions before
+            # capture starts. RuntimePipelineLoop.prepare() calls load() ahead
+            # of WGC and OpenXR startup, so graph capture stays out of the first
+            # live-frame deadline.
+            self._ensure_artifacts_for_input(294, 518)
         if self._explicit_onnx_path is None and self._explicit_engine_path is None and self._artifact_input_size is None:
             return None
         if self.build_engine or self.force_rebuild or not self.engine_path.exists():
@@ -749,6 +763,32 @@ class DistillAnyDepthBaseNativeTensorRt:
             execution_provider="TensorRT native",
             trt_lib_dirs=trt_lib_dirs,
         )
+        if self.use_cuda_graph and self._cuda_graph_disabled_reason is None:
+            try:
+                self._engine.capture_graph(self._engine.input_shape)
+                self._cuda_graph_prepared = True
+                print(
+                    f"[TensorRT] CUDA graph prewarmed for input {self._engine.input_shape}",
+                    flush=True,
+                )
+            except RuntimeError as exc:
+                self._cuda_graph_disabled_reason = f"{type(exc).__name__}: {exc}"
+                self._cuda_graph_prepared = False
+                self._engine.clear_graph()
+                try:
+                    torch.cuda.synchronize(self.device)
+                except Exception:
+                    pass
+                print(
+                    "\033[31m[TensorRT] CUDA graph prewarm failed; using native TensorRT enqueue: "
+                    f"{self._cuda_graph_disabled_reason}\033[0m",
+                    flush=True,
+                )
+                self.info = replace(
+                    self.info,
+                    depth_backend="tensorrt_native",
+                    runtime="tensorrt-native" + ("-profile-sync" if self.profile_sync else "-async"),
+                )
         return self._engine
 
     def predict(self, rgb: torch.Tensor) -> torch.Tensor:

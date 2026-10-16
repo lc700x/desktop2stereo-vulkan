@@ -97,6 +97,7 @@ class ModelOnnxPreprocessor:
         self._shape_cache: dict[tuple[int, int], tuple[int, int]] = {}
         self._is_infinidepth = _is_infinidepth_model(model_id)
         self._is_zipdepth = _is_zipdepth_model(model_id)
+        self._is_distill = "distill-any-depth" in model_id.casefold()
         self._patch_size = int(
             patch_size
             if patch_size is not None
@@ -141,13 +142,14 @@ class ModelOnnxPreprocessor:
         rgb = self._prepare_rgb(rgb)
         _, _, height, width = rgb.shape
         input_h, input_w = self.input_size(height, width)
-        use_bicubic = self.device.type == "cuda" and not self._is_zipdepth
+        use_antialias = self.device.type == "cuda" and not self._is_zipdepth
+        use_bicubic = use_antialias and not self._is_distill
         tensor = F.interpolate(
             rgb,
             size=(input_h, input_w),
             mode="bicubic" if use_bicubic else "bilinear",
             align_corners=False,
-            antialias=use_bicubic,
+            antialias=use_antialias,
         ).to(self.dtype)
         if self._is_infinidepth or self._is_zipdepth:
             return tensor
@@ -162,13 +164,14 @@ class ModelOnnxPreprocessor:
         input size computation.
         """
         rgb = self._prepare_rgb(rgb)
-        use_bicubic = self.device.type == "cuda" and not self._is_zipdepth
+        use_antialias = self.device.type == "cuda" and not self._is_zipdepth
+        use_bicubic = use_antialias and not self._is_distill
         tensor = F.interpolate(
             rgb,
             size=(height, width),
             mode="bicubic" if use_bicubic else "bilinear",
             align_corners=False,
-            antialias=use_bicubic,
+            antialias=use_antialias,
         ).to(self.dtype)
         if self._is_infinidepth or self._is_zipdepth:
             return tensor

@@ -138,7 +138,9 @@
       "spirv": "d2s_projection_screen_vert.spv",
       "stage": "vertex",
       "entry": "main",
-      "descriptor_bindings": [],
+      "descriptor_bindings": [
+        {"set": 0, "binding": 1, "kind": "storage_buffer", "access": "read_only", "format": null}
+      ],
       "push_constants_size": 128,
       "precision": "fp32"
     },

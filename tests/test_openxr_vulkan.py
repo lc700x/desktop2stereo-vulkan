@@ -317,6 +317,50 @@ def test_render_scale_is_bounded_by_runtime_limit() -> None:
     assert _scaled_dimension(1, 1, 0.1) == 1
 
 
+def test_projection_swapchain_retries_runtime_failure_once() -> None:
+    class RuntimeFailureError(Exception):
+        pass
+
+    attempts = []
+
+    class FakeXr:
+        exception = SimpleNamespace(RuntimeFailureError=RuntimeFailureError)
+        SwapchainUsageFlags = SimpleNamespace(
+            COLOR_ATTACHMENT_BIT=1,
+            SAMPLED_BIT=2,
+            TRANSFER_DST_BIT=16,
+            TRANSFER_SRC_BIT=32,
+        )
+        SwapchainImageVulkan2KHR = object()
+        SwapchainCreateInfo = staticmethod(lambda **kwargs: SimpleNamespace(**kwargs))
+
+    def create_swapchain(session, info):
+        attempts.append((session, info))
+        if len(attempts) == 1:
+            raise RuntimeFailureError("transient runtime failure")
+        return "projection-swapchain"
+
+    FakeXr.create_swapchain = staticmethod(create_swapchain)
+    FakeXr.enumerate_swapchain_images = staticmethod(
+        lambda *_args: [SimpleNamespace(image=object())]
+    )
+
+    presenter = OpenXrVulkanPresenter()
+    presenter.xr = FakeXr
+    presenter.session = object()
+    presenter.vulkan = object()
+    presenter.swapchain_format = 43
+    presenter._filament_multiview_layer_readback_requested = False
+    presenter._register_swapchain_images = lambda *_args: []
+
+    result = presenter._create_projection_swapchain(128, 128)
+
+    assert result.handle == "projection-swapchain"
+    assert len(attempts) == 2
+    assert attempts[0][0] is attempts[1][0] is presenter.session
+    assert attempts[0][1] is attempts[1][1]
+
+
 def test_projection_swapchains_use_runtime_recommendation_times_render_scale() -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._view_configuration_views = (
@@ -1919,6 +1963,128 @@ def test_filament_controller_overlay_runs_after_vulkan_composer() -> None:
     assert composer < overlay < output_commit
 
 
+@pytest.mark.parametrize("fail_right", [False, True])
+def test_controller_only_pass_updates_both_cameras_and_consumes_completion(monkeypatch, fail_right) -> None:
+    calls = []
+
+    class Bridge:
+        controller_overlay_abi_available = True
+        finished_drawing_semaphore_abi_available = True
+
+        def set_active_eye(self, eye_index):
+            self.eye_index = eye_index
+            calls.append(("eye", eye_index))
+
+        def set_acquired_image(self, image_index):
+            calls.append(("image", image_index))
+
+        def render_controller_overlay(self):
+            calls.append(("overlay", self.eye_index))
+            if fail_right and self.eye_index == 1:
+                raise RuntimeError("right eye failed")
+
+        def get_finished_drawing_semaphore(self):
+            return f"finished:{self.eye_index}"
+
+    def submit(role, record, **kwargs):
+        record(None)
+        calls.append(("drain", role, kwargs["wait_semaphore"]))
+        return 19
+
+    monkeypatch.setattr(
+        "xr_viewer.core_openxr_vulkan._update_filament_camera",
+        lambda _bridge, view, **_kwargs: calls.append(("camera", view)),
+    )
+    presenter = OpenXrVulkanPresenter()
+    presenter.filament_bridge = Bridge()
+    presenter.vulkan = SimpleNamespace(submit_on=submit)
+    def render():
+        return presenter._render_filament_controller_overlay(
+            [(object(), 3), (object(), 5)], lambda *_args: None, ["left", "right"]
+        )
+
+    if fail_right:
+        with pytest.raises(RuntimeError, match="right eye failed"):
+            render()
+    else:
+        assert render() == 19
+    assert calls == [
+        ("eye", 0), ("camera", "left"), ("image", 3), ("overlay", 0),
+        ("eye", 1), ("camera", "right"), ("image", 5), ("overlay", 1),
+        ("drain", "graphics", ("finished:0",) if fail_right else ("finished:0", "finished:1")),
+    ]
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [None, "startup", "room", "multiview", "passthrough", "projection_only", "legacy_order", "old_bridge"],
+)
+def test_empty_filament_background_skip_preserves_nonempty_and_legacy_paths(guard) -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter.filament_bridge = SimpleNamespace(controller_overlay_abi_available=True)
+    presenter._filament_background_frame_count = 8
+    if guard == "startup":
+        presenter._filament_background_frame_count = 0
+    elif guard == "room":
+        presenter.config = replace(presenter.config, filament_glb_path="room.glb")
+    elif guard == "multiview":
+        presenter._multiview_active = True
+    elif guard == "passthrough":
+        presenter._passthrough_backdrop = True
+    elif guard == "projection_only":
+        presenter._filament_projection_only = True
+    elif guard == "legacy_order":
+        presenter._filament_controller_overlay_after_composer = False
+    elif guard == "old_bridge":
+        presenter.filament_bridge.controller_overlay_abi_available = False
+    assert presenter._can_skip_filament_background() is (guard is None)
+
+
+def test_controller_only_warmup_counts_rendered_backgrounds_not_xr_ticks(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "xr_viewer.core_openxr_vulkan._update_filament_camera", lambda *_args, **_kwargs: None
+    )
+    presenter = OpenXrVulkanPresenter()
+    presenter.frame_count = 1000
+    presenter.filament_bridge = SimpleNamespace(
+        controller_overlay_abi_available=True,
+        background_frame_abi_available=True,
+        set_active_eye=lambda *_args: None,
+        set_acquired_image=lambda *_args: None,
+        begin_background_frame=lambda: None,
+        end_frame=lambda: None,
+    )
+    for _ in range(8):
+        assert not presenter._can_skip_filament_background()
+        presenter._render_filament_for_projection_composer(
+            [None, None], [(object(), 0), (object(), 1)], 0.0, lambda *_args: None
+        )
+    assert presenter._can_skip_filament_background()
+
+
+@pytest.mark.parametrize("guard", [None, "rocm", "glow", "panorama", "quality", "clear", "hidden"])
+def test_controller_precomposition_preserves_other_rendering_paths(guard) -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._rocm_backend = False
+    presenter._filament_background_frame_count = 8
+    presenter.filament_bridge = SimpleNamespace(
+        controller_overlay_abi_available=True, render_controller_overlay=lambda: None
+    )
+    if guard == "rocm":
+        presenter._rocm_backend = True
+    elif guard == "glow":
+        presenter._filament_glow_mode = "glow"
+    elif guard == "panorama":
+        presenter.config = replace(presenter.config, filament_panorama_path="room.hdr")
+    elif guard == "quality":
+        presenter._vulkan_projection_quality_chain_requested = True
+    elif guard == "clear":
+        presenter.config = replace(presenter.config, clear_color=(0.1, 0.0, 0.0, 1.0))
+    elif guard == "hidden":
+        presenter._filament_controller_overlay_empty = True
+    assert presenter._can_precompose_filament_controllers() is (guard is None)
+
+
 @pytest.mark.parametrize(
     "tracked_hand, guide_state, visibility_abi, expected_overlay",
     [
@@ -3218,6 +3384,91 @@ def test_non_windows_physical_input_generation_is_noop() -> None:
     assert windows_input._physical_input_generation() == 0
 
 
+def test_physical_takeover_preserves_screen_grab_and_blocks_cursor(monkeypatch) -> None:
+    presenter, generation = _prepare_pointer_priority_presenter(monkeypatch)
+    presenter._filament_screen = ((0.0, 0.0, -2.0), 2.4, 1.35, (0.0, 0.0, 0.0))
+    presenter._aim_mat_r = np.eye(4, dtype=np.float32)
+    presenter._grip_mat_r = np.eye(4, dtype=np.float32)
+    presenter._controller_inputs = ({}, {"grip": 1.0})
+    cursor_positions = []
+    del presenter._screen_ray_hit_for_hand
+    monkeypatch.setattr(core_openxr_vulkan, "_set_cursor_pos", lambda *p: cursor_positions.append(p))
+    presenter._handle_vulkan_pointer_input()
+    anchor = presenter._screen_hit_grab_anchor_r.copy()
+    cursor_positions.clear()
+
+    generation["value"] = 1
+    presenter._grip_mat_r[0, 3] = 0.2
+    presenter._handle_vulkan_pointer_input()
+
+    assert presenter._physical_input_override is True
+    assert presenter._grip_target_r == "screen"
+    assert presenter._screen_hit_grab_anchor_r == pytest.approx(anchor)
+    assert presenter._filament_screen[0] == pytest.approx((0.2, 0.0, -2.0))
+    assert cursor_positions == []
+
+
+@pytest.mark.parametrize("action", ["arrow_axes", "scroll_axes", "copy", "cut", "paste", "enter"])
+def test_physical_takeover_blocks_desktop_shortcuts_only(monkeypatch, action) -> None:
+    presenter, generation = _prepare_pointer_priority_presenter(monkeypatch)
+    generation["value"] = 1
+    assert presenter._physical_input_has_priority()
+    presenter._screen_ray_hit_for_hand = lambda _hand: (0.5, 0.5)
+    injected = []
+    presenter._send_arrow_impl = lambda *args, **kwargs: injected.append("arrow")
+    presenter._accum_scroll = lambda *args: injected.append("scroll")
+    monkeypatch.setattr(core_openxr_vulkan, "_send_key", lambda *args, **kwargs: injected.append("key"))
+
+    presenter._dispatch_controller_shortcut(action, horizontal=1.0, vertical=1.0, dt=0.016)
+    presenter._filament_screen = ((0.0, 0.0, -2.0), 2.4, 1.35, (0.0, 0.0, 0.0))
+    presenter._dispatch_controller_shortcut("rotate_screen", yaw_delta=5.0, pitch_delta=3.0)
+
+    assert injected == []
+    assert presenter._filament_screen[3] == pytest.approx((5.0, 3.0, 0.0))
+
+
+def test_physical_takeover_resumes_cursor_and_click_on_fresh_trigger(monkeypatch) -> None:
+    presenter, generation = _prepare_pointer_priority_presenter(monkeypatch)
+    generation["value"] = 1
+    presenter._handle_vulkan_pointer_input()
+    events = []
+    monkeypatch.setattr(core_openxr_vulkan, "_TOUCH_AVAILABLE", False)
+    monkeypatch.setattr(core_openxr_vulkan, "_set_cursor_pos", lambda *p: events.append(("cursor", p)))
+    monkeypatch.setattr(core_openxr_vulkan, "_send_mouse_flags", lambda f: events.append(("mouse", f)))
+    presenter._cursor_pixel_for_screen_uv = lambda *_args: (123, 456)
+    presenter._controller_inputs = ({}, {"trigger": 1.0})
+
+    presenter._handle_vulkan_pointer_input()
+
+    assert presenter._physical_input_override is False
+    assert events == [
+        ("cursor", (123, 456)),
+        ("mouse", core_openxr_vulkan._MOUSEEVENTF_LEFTDOWN),
+        ("mouse", core_openxr_vulkan._MOUSEEVENTF_LEFTUP),
+    ]
+
+
+def test_physical_takeover_keeps_xr_menu_scroll_available(monkeypatch) -> None:
+    presenter, generation = _prepare_pointer_priority_presenter(monkeypatch)
+    generation["value"] = 1
+    assert presenter._physical_input_has_priority()
+    menu_scroll = []
+    desktop_scroll = []
+    presenter._settings_menu = SimpleNamespace(
+        visible=True, active_key=None, scroll_viewport_contains=lambda _hit: True,
+        scroll_by_wheel_axis=lambda *args: menu_scroll.append(args),
+    )
+    presenter._settings_menu_ray_hit = lambda _hand: (0.5, 0.5)
+    presenter._accum_scroll = lambda *args: desktop_scroll.append(args)
+
+    presenter._dispatch_controller_shortcut("scroll_axes", horizontal=1.0, vertical=0.8, dt=0.016)
+
+    assert len(menu_scroll) == 1
+    assert menu_scroll[0][:2] == pytest.approx((-0.8, 0.016))
+    assert desktop_scroll == []
+    assert presenter._physical_input_override is True
+
+
 def test_right_grip_moves_keyboard_using_laser_local_anchor() -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._filament_screen = (
@@ -3440,6 +3691,30 @@ def test_right_grip_stick_x_resizes_screen_without_22m_cap() -> None:
     )
 
 
+@pytest.mark.parametrize("resize_mode", ["right_grip", "shortcut"])
+def test_screen_resize_keeps_off_center_laser_hit_anchored(resize_mode: str) -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_screen = (
+        (0.0, 0.0, -2.0), 4.0, 2.25, (0.0, 0.0, 0.0)
+    )
+    uv = (0.16, 0.68)
+    anchor = presenter._screen_uv_to_world(*uv)
+    ray_origin = anchor + np.asarray((0.0, 0.0, 1.0))
+
+    if resize_mode == "right_grip":
+        presenter._apply_right_grip_screen_resize(
+            -1.0, dt=0.1, laser_hit=(*uv, 2.0)
+        )
+    else:
+        presenter._adjust_shortcut_screen_size(-1.0, 0.0, laser_hit=(*uv, 2.0))
+
+    hit = presenter._screen_ray_hit(
+        np.eye(4), ray_origin=ray_origin, ray_direction=np.asarray((0.0, 0.0, -1.0))
+    )
+
+    assert hit == pytest.approx(uv, abs=1e-6)
+
+
 def test_screen_control_speed_ramps_from_precision_to_ten_meters_per_second() -> None:
     presenter = OpenXrVulkanPresenter()
 
@@ -3556,13 +3831,17 @@ def test_continuous_screen_shortcuts_apply_only_while_laser_hits_screen() -> Non
         "rotate_screen", yaw_delta=10.0, pitch_delta=5.0
     )
     presenter._dispatch_controller_shortcut(
-        "resize_screen", width_delta=0.6, distance_delta=0.5
+        "resize_screen", width_delta=0.6, distance_delta=0.0
+    )
+    anchored_distance = np.linalg.norm(np.asarray(presenter._filament_screen[0]))
+    presenter._dispatch_controller_shortcut(
+        "resize_screen", width_delta=0.0, distance_delta=0.5
     )
 
     position, width, _height, rotation = presenter._filament_screen
     assert rotation == pytest.approx((10.0, 5.0, 0.0))
     assert width == pytest.approx(3.0)
-    assert np.linalg.norm(np.asarray(position)) == pytest.approx(2.5)
+    assert np.linalg.norm(np.asarray(position)) == pytest.approx(anchored_distance + 0.5)
 
 
 def test_controller_brand_switch_and_calibration_save_use_live_profile(
@@ -4827,11 +5106,15 @@ def test_presenter_skips_end_frame_after_vulkan_device_loss() -> None:
     assert calls == ["begin"]
 
 
-def test_presenter_keeps_latest_output_during_non_renderable_xr_tick() -> None:
+@pytest.mark.parametrize("physical_override", [False, True])
+def test_presenter_keeps_latest_output_during_non_renderable_xr_tick(monkeypatch, physical_override) -> None:
     frame = object()
     ended_frames = []
     dropped_frames = []
     presented_frames = []
+    controls = []
+    monkeypatch.setattr(core_openxr_vulkan, "_physical_mouse_active", lambda **_kwargs: False)
+    monkeypatch.setattr(core_openxr_vulkan, "_physical_keyboard_active", lambda **_kwargs: False)
 
     class FakeXr:
         FrameEndInfo = staticmethod(lambda **kwargs: kwargs)
@@ -4852,6 +5135,9 @@ def test_presenter_keeps_latest_output_during_non_renderable_xr_tick() -> None:
     presenter.vulkan = SimpleNamespace(device_lost=False)
     presenter.xr = FakeXr()
     presenter._accept_output = True
+    presenter._physical_input_override = physical_override
+    presenter._physical_input_event_pending = lambda: False
+    presenter._controller_inputs = ({"grip": 1.0}, {})
     presenter._pending_output = frame
     presenter._drop_output_frames = lambda: dropped_frames.append(True)
     presenter._drain_presenter_commands = lambda: None
@@ -4863,12 +5149,11 @@ def test_presenter_keeps_latest_output_during_non_renderable_xr_tick() -> None:
     presenter._update_aim_poses = lambda *_args: None
     presenter._update_grip_poses = lambda *_args: None
     presenter._smooth_controller_poses = lambda: None
-    presenter._controller_input = lambda *_args: {}
-    presenter._handle_settings_menu_input = lambda: False
+    presenter._handle_settings_menu_input = lambda: controls.append("menu") or False
     presenter._handle_keyboard_input = lambda: None
-    presenter._handle_vulkan_pointer_input = lambda: None
-    presenter._handle_controller_shortcuts = lambda: None
-    presenter._handle_controller_guide_input = lambda *_args: None
+    presenter._handle_vulkan_pointer_input = lambda: controls.append("pointer")
+    presenter._handle_controller_shortcuts = lambda **_kwargs: controls.append("shortcuts")
+    presenter._handle_controller_guide_input = lambda *_args: controls.append("guide")
     presenter._persist_screen_state_if_changed = lambda: None
     presenter._record_xr_presented_frame = lambda: presented_frames.append(True)
 
@@ -4879,6 +5164,9 @@ def test_presenter_keeps_latest_output_during_non_renderable_xr_tick() -> None:
     assert dropped_frames == []
     assert presented_frames == []
     assert presenter.frame_count == 1
+    assert presenter._last_controller_input_error is None
+    assert presenter._grip_l_now is True
+    assert controls == ["menu", "pointer", "shortcuts", "guide"]
     assert ended_frames == [
         {
             "display_time": 123,
@@ -4889,8 +5177,10 @@ def test_presenter_keeps_latest_output_during_non_renderable_xr_tick() -> None:
     ]
 
 
-def test_projection_submit_stereo_records_both_eyes_in_one_graphics_submission() -> None:
+@pytest.mark.parametrize("underlay", [False, True])
+def test_projection_submit_stereo_records_both_eyes_in_one_graphics_submission(underlay) -> None:
     calls = []
+    pipelines = []
 
     class FakeContext:
         def submit_on(self, queue, record, **kwargs):
@@ -4901,14 +5191,18 @@ def test_projection_submit_stereo_records_both_eyes_in_one_graphics_submission()
 
     screen_pass = object.__new__(VulkanProjectionScreenPass)
     screen_pass.context = FakeContext()
+    screen_pass.vk = vk
+    screen_pass.underlay_pipeline = "underlay"
     screen_pass._prepare_draw = lambda source, target, **kwargs: {
         "source": source,
         "target": target,
         "eye_index": kwargs["eye_index"],
     }
-    screen_pass._record_draw = lambda command_buffer, draw: calls.append(
-        ("record", command_buffer, draw["eye_index"], draw["source"])
-    )
+    def record(command_buffer, draw):
+        calls.append(("record", command_buffer, draw["eye_index"], draw["source"]))
+        pipelines.append(draw.get("pipeline", "screen"))
+
+    screen_pass._record_draw = record
     screen_pass._complete_draw = lambda draw, timeline: calls.append(
         ("complete", draw["eye_index"], timeline)
     )
@@ -4924,6 +5218,7 @@ def test_projection_submit_stereo_records_both_eyes_in_one_graphics_submission()
                 "push_constants": b"left",
                 "clear_color": (0.0, 0.0, 0.0, 1.0),
                 "wait_semaphore": "left-ready",
+                "screen_underlay": underlay,
             },
             {
                 "source": "right-frame",
@@ -4934,9 +5229,11 @@ def test_projection_submit_stereo_records_both_eyes_in_one_graphics_submission()
                 "push_constants": b"right",
                 "clear_color": (0.0, 0.0, 0.0, 1.0),
                 "wait_semaphore": "right-ready",
+                "screen_underlay": underlay,
             },
         ],
         wait_for_timeline=9,
+        load_target=underlay,
     )
 
     assert timeline == 17
@@ -4948,6 +5245,7 @@ def test_projection_submit_stereo_records_both_eyes_in_one_graphics_submission()
         ("complete", 1, 17),
     ]
     assert screen_pass._last_submit_timeline == 17
+    assert pipelines == ["underlay" if underlay else "screen"] * 2
 
 
 def test_presenter_recovers_from_invalid_openxr_composition_rect(capsys) -> None:
@@ -5907,8 +6205,9 @@ def test_projection_updates_shared_filament_state_once_per_stereo_pair(
     assert calls.count("end") == 2
 
 
+@pytest.mark.parametrize("skip_background", [False, True])
 def test_projection_composer_failure_falls_back_to_filament_in_same_frame(
-    monkeypatch,
+    monkeypatch, skip_background,
 ) -> None:
     calls: list[str] = []
 
@@ -5975,6 +6274,8 @@ def test_projection_composer_failure_falls_back_to_filament_in_same_frame(
         ),
     ]
     presenter.filament_bridge = FakeBridge()
+    presenter.filament_bridge.controller_overlay_abi_available = skip_background
+    presenter._filament_background_frame_count = 8
     presenter._filament_screen = ((0.0, 0.0, -2.0), 2.0, 1.0, (0.0, 0.0, 0.0))
     presenter._apply_filament_profile = lambda views: views
     presenter._report_screen_resolution = lambda *_args: None
@@ -6019,6 +6320,13 @@ def test_projection_keeps_unsafe_stereo_batch_disabled(
 
     class TrackingLock:
         held = False
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.release()
 
         def acquire(self):
             self.held = True

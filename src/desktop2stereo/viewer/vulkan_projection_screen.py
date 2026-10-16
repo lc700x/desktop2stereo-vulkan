@@ -122,6 +122,7 @@ class VulkanProjectionScreenPass:
         self.overlay_render_pass = None
         self.pipeline_layout = None
         self.pipeline = None
+        self.underlay_pipeline = None
         self.glow_pipeline = None
         self.veil_pipeline = None
         self.surround_pipeline = None
@@ -348,7 +349,7 @@ class VulkanProjectionScreenPass:
                 DescriptorBinding(
                     1,
                     vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    stage_flags=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                    stage_flags=vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
                 ),
             ],
         )
@@ -395,10 +396,10 @@ class VulkanProjectionScreenPass:
             self._DESCRIPTOR_COUNT * 3:self._DESCRIPTOR_COUNT * 4
         ]
         self.screen_crop_buffers = [
-            VulkanStorageBuffer(self.context, 16)
+            VulkanStorageBuffer(self.context, 32)
             for _ in range(self._DESCRIPTOR_COUNT)
         ]
-        full_crop = struct.pack("<4f", 0.0, 0.0, 1.0, 1.0)
+        full_crop = struct.pack("<8f", 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0)
         for descriptor_set, buffer in zip(self.descriptor_sets, self.screen_crop_buffers):
             buffer.write_bytes(full_crop)
             vk.vkUpdateDescriptorSets(
@@ -413,7 +414,7 @@ class VulkanProjectionScreenPass:
                         descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                         pBufferInfo=[
                             vk.VkDescriptorBufferInfo(
-                                buffer=buffer.buffer, offset=0, range=16,
+                                buffer=buffer.buffer, offset=0, range=32,
                             )
                         ],
                     )
@@ -690,15 +691,30 @@ class VulkanProjectionScreenPass:
             ),
         ]
         self.creation_stage = "create_screen_pipeline"
-        self.pipeline = vk.vkCreateGraphicsPipelines(
+        underlay_stages = [
+            stages[0],
+            vk.VkPipelineShaderStageCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                stage=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                module=fragment_module,
+                pName="main",
+                pSpecializationInfo=vk.VkSpecializationInfo(
+                    mapEntryCount=1,
+                    pMapEntries=[vk.VkSpecializationMapEntry(constantID=0, offset=0, size=4)],
+                    dataSize=4,
+                    pData=vk.ffi.new("uint32_t *", 1),
+                ),
+            ),
+        ]
+        self.pipeline, self.underlay_pipeline = vk.vkCreateGraphicsPipelines(
             self.context.device,
             None,
-            1,
+            2,
             [
                 vk.VkGraphicsPipelineCreateInfo(
                     sType=vk.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
                     stageCount=len(stages),
-                    pStages=stages,
+                    pStages=underlay_stages if underlay else stages,
                     pVertexInputState=vk.VkPipelineVertexInputStateCreateInfo(
                         sType=vk.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
                     ),
@@ -728,11 +744,23 @@ class VulkanProjectionScreenPass:
                         pAttachments=[
                             vk.VkPipelineColorBlendAttachmentState(
                                 blendEnable=vk.VK_TRUE,
-                                srcColorBlendFactor=vk.VK_BLEND_FACTOR_SRC_ALPHA,
-                                dstColorBlendFactor=vk.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                                srcColorBlendFactor=(
+                                    vk.VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA
+                                    if underlay else vk.VK_BLEND_FACTOR_SRC_ALPHA
+                                ),
+                                dstColorBlendFactor=(
+                                    vk.VK_BLEND_FACTOR_ONE
+                                    if underlay else vk.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+                                ),
                                 colorBlendOp=vk.VK_BLEND_OP_ADD,
-                                srcAlphaBlendFactor=vk.VK_BLEND_FACTOR_ONE,
-                                dstAlphaBlendFactor=vk.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                                srcAlphaBlendFactor=(
+                                    vk.VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA
+                                    if underlay else vk.VK_BLEND_FACTOR_ONE
+                                ),
+                                dstAlphaBlendFactor=(
+                                    vk.VK_BLEND_FACTOR_ONE
+                                    if underlay else vk.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+                                ),
                                 alphaBlendOp=vk.VK_BLEND_OP_ADD,
                                 colorWriteMask=(
                                     vk.VK_COLOR_COMPONENT_R_BIT
@@ -756,9 +784,10 @@ class VulkanProjectionScreenPass:
                     subpass=0,
                     basePipelineIndex=-1,
                 )
+                for underlay in (False, True)
             ],
             None,
-        )[0]
+        )
         glow_stages = [
             vk.VkPipelineShaderStageCreateInfo(
                 sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -1664,6 +1693,8 @@ class VulkanProjectionScreenPass:
             )
             if load_target:
                 draw["target_old_layout"] = self.vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+            if item.get("screen_underlay", False):
+                draw["pipeline"] = self.underlay_pipeline
             prepared.append(draw)
         wait_semaphores = [item["wait_semaphore"] for item in draws]
         wait_semaphores = [item for item in wait_semaphores if item is not None]
@@ -3087,7 +3118,10 @@ class VulkanProjectionScreenPass:
             crop_width = max(0.1, min(1.0 - crop_x, crop_values[2]))
             crop_height = max(0.1, min(1.0 - crop_y, crop_values[3]))
             self.screen_crop_buffers[descriptor_index].write_bytes(
-                struct.pack("<4f", crop_x, crop_y, crop_width, crop_height)
+                struct.pack(
+                    "<8f", crop_x, crop_y, crop_width, crop_height,
+                    float(target.width), float(target.height), 0.0, 0.0,
+                )
             )
         self.vk.vkUpdateDescriptorSets(
             self.context.device,
@@ -3421,6 +3455,8 @@ class VulkanProjectionScreenPass:
                 self.vk.vkDestroyImageView(self.context.device, view, None)
             if self.pipeline is not None:
                 self.vk.vkDestroyPipeline(self.context.device, self.pipeline, None)
+            if self.underlay_pipeline is not None:
+                self.vk.vkDestroyPipeline(self.context.device, self.underlay_pipeline, None)
             if self.glow_pipeline is not None:
                 self.vk.vkDestroyPipeline(self.context.device, self.glow_pipeline, None)
             if self.veil_pipeline is not None:
@@ -3539,6 +3575,7 @@ class VulkanProjectionScreenPass:
         self.laser_descriptor_sets.clear()
         self.laser_param_buffers.clear()
         self.pipeline = None
+        self.underlay_pipeline = None
         self.glow_pipeline = None
         self.veil_pipeline = None
         self.surround_pipeline = None

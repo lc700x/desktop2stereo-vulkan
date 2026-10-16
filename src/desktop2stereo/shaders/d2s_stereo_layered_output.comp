@@ -168,23 +168,20 @@ vec3 sample_rgb_depth_class(float x, float y, float class_depth) {
     float w11 = fx * fy;
     vec3 total = vec3(0.0);
     float weight = 0.0;
+    float threshold = max(params.edge_threshold, 1.0e-6);
     float d = sampled_depth(float(x0), float(y0));
-    if (abs(d - class_depth) <= params.edge_threshold) {
-        total += sample_rgb(float(x0), float(y0)) * w00; weight += w00;
-    }
+    float keep = 1.0 - smoothstep(0.5 * threshold, threshold, abs(d - class_depth));
+    total += sample_rgb(float(x0), float(y0)) * w00 * keep; weight += w00 * keep;
     d = sampled_depth(float(x1), float(y0));
-    if (abs(d - class_depth) <= params.edge_threshold) {
-        total += sample_rgb(float(x1), float(y0)) * w10; weight += w10;
-    }
+    keep = 1.0 - smoothstep(0.5 * threshold, threshold, abs(d - class_depth));
+    total += sample_rgb(float(x1), float(y0)) * w10 * keep; weight += w10 * keep;
     d = sampled_depth(float(x0), float(y1));
-    if (abs(d - class_depth) <= params.edge_threshold) {
-        total += sample_rgb(float(x0), float(y1)) * w01; weight += w01;
-    }
+    keep = 1.0 - smoothstep(0.5 * threshold, threshold, abs(d - class_depth));
+    total += sample_rgb(float(x0), float(y1)) * w01 * keep; weight += w01 * keep;
     d = sampled_depth(float(x1), float(y1));
-    if (abs(d - class_depth) <= params.edge_threshold) {
-        total += sample_rgb(float(x1), float(y1)) * w11; weight += w11;
-    }
-    return weight > 1.0e-6 ? total / weight : sample_rgb(x, y);
+    keep = 1.0 - smoothstep(0.5 * threshold, threshold, abs(d - class_depth));
+    total += sample_rgb(float(x1), float(y1)) * w11 * keep; weight += w11 * keep;
+    return mix(sample_rgb(x, y), total / max(weight, 1.0e-6), min(weight, 1.0));
 }
 
 vec3 dibr_gather_at(float target_x, float target_y, float eye_sign) {
@@ -239,10 +236,15 @@ vec3 dibr_gather_at(float target_x, float target_y, float eye_sign) {
     if (right_error >= 1.0e5) {
         right_error = left_error; right_depth = left_depth; right_x = left_x;
     }
-    if (best_depth < 0.0) {
-        return left_depth <= right_depth
-            ? sample_rgb(left_x, target_y) : sample_rgb(right_x, target_y);
-    }
+    float threshold = max(params.edge_threshold, 1.0e-6);
+    vec3 left_color = sample_rgb_depth_class(left_x, target_y, left_depth);
+    vec3 right_color = sample_rgb_depth_class(right_x, target_y, right_depth);
+    float side_fraction = left_error / max(left_error + right_error, 1.0e-6);
+    vec3 background_linear = mix(left_color, right_color, side_fraction);
+    float background_edge = smoothstep(0.5 * threshold, threshold, abs(left_depth - right_depth));
+    vec3 background = mix(background_linear, left_depth <= right_depth ? left_color : right_color,
+                          background_edge);
+    if (best_depth < 0.0) return background;
 
     vec3 foreground = vec3(0.0);
     float foreground_coverage = 0.0;
@@ -250,24 +252,20 @@ vec3 dibr_gather_at(float target_x, float target_y, float eye_sign) {
         float source_x = best_x + float(offset);
         if (source_x >= 0.0 && source_x < float(params.width)) {
             float value = sampled_depth(source_x, target_y);
-            if (value >= best_depth - params.edge_threshold) {
-                float error = source_x - forward_shift(value) * eye_sign - target_x;
-                float coverage = max(0.0, 1.0 - abs(error));
-                if (coverage > 0.0) {
-                    foreground += sample_rgb_depth_class(source_x, target_y, best_depth) * coverage;
-                    foreground_coverage += coverage;
-                }
+            float error = source_x - forward_shift(value) * eye_sign - target_x;
+            float class_weight = 1.0 - smoothstep(0.5 * threshold, threshold, best_depth - value);
+            float coverage = max(0.0, 1.0 - abs(error)) * class_weight;
+            if (coverage > 0.0) {
+                foreground += sample_rgb_depth_class(source_x, target_y, best_depth) * coverage;
+                foreground_coverage += coverage;
             }
         }
     }
     foreground /= max(foreground_coverage, 1.0e-6);
-    bool has_background = min(left_depth, right_depth)
-        < best_depth - params.edge_threshold;
-    if (!has_background) return foreground;
-    vec3 background = left_depth <= right_depth
-        ? sample_rgb_depth_class(left_x, target_y, left_depth)
-        : sample_rgb_depth_class(right_x, target_y, right_depth);
-    return mix(background, foreground, clamp(foreground_coverage, 0.0, 1.0));
+    float background_confidence = smoothstep(0.5 * threshold, threshold,
+        best_depth - min(left_depth, right_depth));
+    return mix(foreground, background,
+        (1.0 - clamp(foreground_coverage, 0.0, 1.0)) * background_confidence);
 }
 
 vec3 dibr_warp_at(float target_x, float target_y, float eye_sign) {
@@ -284,22 +282,26 @@ vec3 dibr_warp_at(float target_x, float target_y, float eye_sign) {
     float refined_x = clamp(target_x + source_shift * eye_sign, 0.0,
                             float(params.width - 1u));
     float source_residual = abs(refined_x - source_x);
-    bool foreground_candidate = false;
+    float front_confidence = 0.0;
+    float threshold = max(params.edge_threshold, 1.0e-6);
     // No depth can occlude a sample already within the visibility threshold of 1.
-    if (source_depth < 1.0 - params.edge_threshold) {
+    if (source_depth < 1.0 - 0.5 * threshold) {
         float front_shift = -(1.0 - params.convergence) * max(params.foreground_scale, 0.0)
             * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5;
         float front_x = clamp(target_x + front_shift * eye_sign, 0.0,
                               float(params.width - 1u));
-        foreground_candidate = nearest_sampled_depth(front_x, target_y)
-            > source_depth + params.edge_threshold;
+        front_confidence = smoothstep(0.5 * threshold, threshold,
+            nearest_sampled_depth(front_x, target_y) - source_depth);
     }
 
-    bool source_depth_edge = abs(source_depth - target_depth) > params.edge_threshold;
-    if (source_depth_edge || source_residual > 0.5 || foreground_candidate) {
-        return dibr_gather_at(target_x, target_y, eye_sign);
+    float confidence = max(front_confidence,
+        max(smoothstep(0.5 * threshold, threshold, abs(source_depth - target_depth)),
+            smoothstep(0.125, 0.5, source_residual)));
+    vec3 linear = sample_rgb(refined_x, target_y);
+    if (confidence > 0.0) {
+        return mix(linear, dibr_gather_at(target_x, target_y, eye_sign), confidence);
     }
-    return sample_rgb(refined_x, target_y);
+    return linear;
 }
 
 vec3 layered_warp_at(int x, int y, float eye_sign) {

@@ -107,11 +107,57 @@ def test_native_output_resolution_depth_gaussian_runs_before_warp_without_color_
     warp = pack.index("[encoder setComputePipelineState:ctx->warp_pipeline]")
     assert "depth_upsample_pipeline" in pack[gaussian:warp]
     assert "depth_global_gaussian_pipeline" in pack[gaussian:warp]
+    gaussian_start = source.index("kernel void d2s_filter_depth_global_gaussian")
+    gaussian_end = source.index(")D2S_FILTER", gaussian_start)
+    gaussian_kernel = source[gaussian_start:gaussian_end]
+    assert "float weight = wx * wy;" in gaussian_kernel
+    assert "edge_threshold" not in gaussian_kernel
     assert "MTLSizeMake(source_width, source_height, 1)" in pack[gaussian:warp]
     assert "[gaussian_encoder setBuffer:warp_depth_buffer offset:0 atIndex:0]" in pack[gaussian:warp]
     assert gaussian < upsample < warp
     assert "fxaa" not in pack.lower()
     assert "memcpy(destination, destination_buffer.contents, output_bytes);" in pack
+
+
+def test_native_model_depth_filter_is_separable_and_skips_duplicate_output_aa() -> None:
+    source = _NATIVE_SOURCE.read_text()
+    filter_start = source.index("kernel void d2s_filter_depth_guided")
+    filter_end = source.index("struct DepthUpsampleParams", filter_start)
+    model_filter = source[filter_start:filter_end]
+
+    assert "int sx = int(gid.x) + (p.axis == 0 ? offset : 0);" in model_filter
+    assert "int sy = int(gid.y) + (p.axis == 1 ? offset : 0);" in model_filter
+    assert "smooth_sum / max(weight_sum" in model_filter
+    assert "texture2d<float" not in model_filter
+
+    pack_start = source.index("static int32_t d2s_coreml_io_pack_internal")
+    pack_end = source.index("int32_t d2s_coreml_io_pack(", pack_start)
+    pack = source[pack_start:pack_end]
+    assert "for (int axis = 0; axis < 2; ++axis)" in pack
+    assert "global_depth_gaussian = global_depth_gaussian && !model_depth_filtered;" in pack
+    assert "params.stereo.antialias_strength = -1.0f;" in pack
+
+    sample_start = source.index("static inline float dibr_depth_at(")
+    sample_end = source.index("float sx = clamp", sample_start)
+    filtered_sample = source[sample_start:sample_end]
+    assert "if (p.antialias_strength < 0.0f)" in filtered_sample
+    assert "return depth_pop(depth_at(depth, x, y, p), p);" in filtered_sample
+    assert "float front_depth = p.antialias_strength != 0.0f" in source
+
+
+def test_native_depth_upsample_uses_continuous_curvature_confidence() -> None:
+    source = _NATIVE_SOURCE.read_text()
+    start = source.index("static inline float d2s_upsample_curvature")
+    end = source.index("struct DepthGaussianParams", start)
+    upsample = source[start:end]
+
+    assert "return max(curvatureX, curvatureY)" in upsample
+    for weight, x, y in (("s00", "x0", "y0"), ("s10", "x1", "y0"),
+                         ("s01", "x0", "y1"), ("s11", "x1", "y1")):
+        assert f"{weight} * d2s_upsample_curvature(source_depth, {x}, {y}," in upsample
+    assert "float edgeWeight = smoothstep(" in upsample
+    assert "mix(bilinear, guided, edgeWeight * confidence)" in upsample
+    assert "maximum_depth - minimum_depth" not in upsample
 
 
 def test_native_metal_bridge_preserves_metal_logical_rgb_channel_order() -> None:
@@ -343,6 +389,8 @@ def test_runtime_native_warp_configuration_uses_vulkan_controls() -> None:
 
 
 def test_native_busy_code_is_explicit_not_a_cpu_fallback(monkeypatch) -> None:
+    pytest.importorskip("objc")
+
     class Library:
         def d2s_coreml_io_predict(self, *_args):
             return -2

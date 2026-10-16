@@ -64,7 +64,7 @@ class StereoConfig:
     auto_reset_temporal: bool = False
     scene_reset_threshold: float = 0.22
     depth_pop: float = 0.0
-    depth_antialias_strength: float = 0.0
+    depth_antialias_strength: float = 2.0
     edge_dilation: int = 2
     edge_threshold: float = 0.04
     mask_feather_radius: int = 3
@@ -136,6 +136,7 @@ def _layered_synthesis(
         depth_pop=config.depth_pop,
         antialias_strength=config.depth_antialias_strength,
         global_gaussian=output_edge_aa_enabled(),
+        edge_threshold=config.edge_threshold,
     )
     _record_cuda_event(cuda_events, "synth_depth_postprocess", rgb)
     base_shift = compute_shift_px(depth, rgb.shape[-1], params)
@@ -212,7 +213,7 @@ def _layered_synthesis(
         and not output_quality_requires_eye_images(
             config, int(rgb.shape[-1]), int(rgb.shape[-2])
         )
-        and os.environ.get("D2S_MAC_STREAM_MPS_FUSED", "0").strip().lower()
+        and os.environ.get("D2S_MAC_STREAM_MPS_FUSED", "1").strip().lower()
         in {"1", "true", "yes", "on"}
     )
     if direct_sbs is None and mps_direct_eligible:
@@ -245,7 +246,7 @@ def _layered_synthesis(
             warp_composite_backend = "torch_grid_sample"
         elif (
             rgb.device.type == "mps"
-            and os.environ.get("D2S_MAC_STREAM_MPS_FUSED", "0").strip().lower()
+            and os.environ.get("D2S_MAC_STREAM_MPS_FUSED", "1").strip().lower()
             in {"1", "true", "yes", "on"}
         ):
             warp_composite_backend = "metal_mps_warp_composite2"
@@ -399,7 +400,7 @@ def _try_fused_warp_composite2(
         rgb.device.type == "mps"
         and layers == 2
         and symmetric
-        and os.environ.get("D2S_MAC_STREAM_MPS_FUSED", "0").strip().lower()
+        and os.environ.get("D2S_MAC_STREAM_MPS_FUSED", "1").strip().lower()
         in {"1", "true", "yes", "on"}
     ):
         try:
@@ -476,6 +477,9 @@ def synthesize_stereo(
             depth_pop=config.depth_pop,
             antialias_strength=config.depth_antialias_strength,
             global_gaussian=output_edge_aa_enabled(),
+            edge_threshold=(
+                None if config.output_format == "depth_map" else config.edge_threshold
+            ),
         )
         _record_cuda_event(cuda_events, "synth_depth_shift", rgb)
         stage_times["fast_depth_postprocess_ms"] = (time.perf_counter() - stage_start) * 1000.0

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+import os
 
 import torch
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -16,6 +20,11 @@ class TemporalState:
     last_scene_delta: float = 0.0
     last_scene_reset: bool = False
     scene_check_counter: int = 0
+    motion_depth: torch.Tensor | None = None
+    motion_luma: torch.Tensor | None = None
+    motion_capture_frame_id: int | None = None
+    motion_depth_frame_id: int | None = None
+    motion_disabled: bool = False
 
     def reset(self) -> None:
         self.reset_stereo()
@@ -29,6 +38,125 @@ class TemporalState:
         self.left = None
         self.right = None
         self.mask = None
+        self.reset_motion_depth()
+
+    def reset_motion_depth(self) -> None:
+        self.motion_depth = None
+        self.motion_luma = None
+        self.motion_capture_frame_id = None
+        self.motion_depth_frame_id = None
+        self.motion_disabled = False
+
+
+def stabilize_captured_depth(
+    depth: torch.Tensor,
+    rgb: torch.Tensor,
+    state: TemporalState | None,
+    *,
+    capture_frame_id: int | None,
+    depth_frame_id: int | None = None,
+    strength: float = 0.65,
+    edge_threshold: float = 0.04,
+    enabled: bool = True,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Use current-frame optical flow to stabilize depth edges without pixel-space trails."""
+    if state is None:
+        return depth, {"motion_depth_stabilization": 0, "motion_depth_reason": "no_state"}
+    if not enabled or os.environ.get("D2S_DEPTH_TEMPORAL", "1").strip().lower() in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }:
+        state.reset_motion_depth()
+        return depth, {"motion_depth_stabilization": 0, "motion_depth_reason": "disabled"}
+    if state.motion_disabled:
+        return depth, {"motion_depth_stabilization": 0, "motion_depth_reason": "kernel_disabled"}
+    if capture_frame_id is None:
+        state.reset_motion_depth()
+        return depth, {"motion_depth_stabilization": 0, "motion_depth_reason": "capture_id_missing"}
+    try:
+        current_capture_id = int(capture_frame_id)
+        current_depth_id = current_capture_id if depth_frame_id is None else int(depth_frame_id)
+    except (TypeError, ValueError):
+        state.reset_motion_depth()
+        return depth, {"motion_depth_stabilization": 0, "motion_depth_reason": "invalid_frame_id"}
+    if current_depth_id != current_capture_id:
+        state.reset_motion_depth()
+        return depth, {"motion_depth_stabilization": 0, "motion_depth_reason": "depth_frame_mismatch"}
+
+    try:
+        from .temporal_triton import (
+            _downsample_motion_luma,
+            can_use_motion_depth_stabilization,
+            stabilize_depth_motion_compensated,
+        )
+
+        if not can_use_motion_depth_stabilization(depth, rgb):
+            state.reset_motion_depth()
+            return depth, {"motion_depth_stabilization": 0, "motion_depth_reason": "triton_unavailable"}
+        if state.motion_capture_frame_id == current_capture_id:
+            if (
+                state.motion_depth is not None
+                and state.motion_depth_frame_id == current_depth_id
+                and state.motion_depth.shape == depth.shape
+                and state.motion_depth.device == depth.device
+            ):
+                return state.motion_depth, {
+                    "motion_depth_stabilization": 0,
+                    "motion_depth_reason": "same_capture_reused",
+                }
+            state.reset_motion_depth()
+
+        previous_capture_id = state.motion_capture_frame_id
+        if previous_capture_id is not None and (
+            current_capture_id <= previous_capture_id
+            or current_capture_id - previous_capture_id > 3
+        ):
+            state.reset_motion_depth()
+
+        previous = state.motion_depth
+        previous_luma = state.motion_luma
+        if (
+            previous is None
+            or previous_luma is None
+            or previous.shape != depth.shape
+            or previous.device != depth.device
+            or previous_luma.device != rgb.device
+        ):
+            current_luma = _downsample_motion_luma(rgb)
+            state.motion_depth = depth.detach().contiguous().clone()
+            state.motion_luma = current_luma.detach()
+            state.motion_capture_frame_id = current_capture_id
+            state.motion_depth_frame_id = current_depth_id
+            return depth, {"motion_depth_stabilization": 0, "motion_depth_reason": "history_seeded"}
+
+        stabilized, current_luma = stabilize_depth_motion_compensated(
+            depth,
+            previous,
+            rgb,
+            previous_luma,
+            strength=strength,
+            edge_threshold=edge_threshold,
+        )
+    except Exception as exc:
+        state.reset_motion_depth()
+        state.motion_disabled = True
+        LOGGER.warning(
+            "Motion-compensated depth stabilization disabled after %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return depth, {"motion_depth_stabilization": 0, "motion_depth_reason": "kernel_failed"}
+
+    state.motion_depth = stabilized.detach()
+    state.motion_luma = current_luma.detach()
+    state.motion_capture_frame_id = current_capture_id
+    state.motion_depth_frame_id = current_depth_id
+    return stabilized, {
+        "motion_depth_stabilization": 1,
+        "motion_depth_backend": "triton_forward_backward_flow",
+    }
 
 
 def detect_scene_change(

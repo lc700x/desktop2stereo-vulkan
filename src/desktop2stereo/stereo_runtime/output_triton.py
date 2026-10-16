@@ -13,6 +13,12 @@ def _area_half2(value_0, value_1):
 
 
 @triton.jit
+def _lanczos2_half4(value_m1, value_0, value_1, value_2):
+    # The vertical TAB pack still uses the existing four-tap filter.
+    return (-value_m1 + 9.0 * value_0 + 9.0 * value_1 - value_2) * (1.0 / 16.0)
+
+
+@triton.jit
 def _half_sbs_kernel(
     left,
     right,

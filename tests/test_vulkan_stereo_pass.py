@@ -134,13 +134,13 @@ def test_vulkan_layered_params_match_shader_push_constant_layout():
     payload = VulkanLayeredStereoParams(layers=3, hole_fill_mode=VULKAN_HOLE_FILL_NONE).pack(3840, 2160)
 
     assert len(payload) == VulkanLayeredStereoPass.PUSH_CONSTANTS_SIZE
-    unpacked = struct.unpack("<IIfffffIIIIffffIIII", payload)
+    unpacked = struct.unpack("<IIfffffIIIIffffIIIII", payload)
     assert unpacked[:2] == (3840, 2160)
     assert unpacked[10] == 3
-    assert unpacked[-2:] == (VULKAN_HOLE_FILL_NONE, 1)
+    assert unpacked[-3:] == (VULKAN_HOLE_FILL_NONE, 1, 0)
     image_payload = VulkanLayeredStereoParams().pack_image(3840, 2160, packed_output=True)
-    assert len(image_payload) == 80
-    assert struct.unpack("<I", image_payload[-4:])[0] == 1
+    assert len(image_payload) == 84
+    assert struct.unpack("<II", image_payload[-8:]) == (1, 0)
 
 
 def test_vulkan_stereo_pass_uses_bounded_descriptor_sets(monkeypatch):
@@ -211,7 +211,7 @@ def test_vulkan_stereo_image_pass_writes_two_storage_images(monkeypatch):
         def __init__(self, context, shader_path, **kwargs):
             self.descriptor_set_layout = "layout"
             self.calls = []
-            assert kwargs["push_constants_size"] == 80
+            assert kwargs["push_constants_size"] == 84
             assert [item.descriptor_type for item in kwargs["descriptor_bindings"]] == [7, 7, 8, 8]
 
         def record_dispatch(self, command_buffer, **kwargs):

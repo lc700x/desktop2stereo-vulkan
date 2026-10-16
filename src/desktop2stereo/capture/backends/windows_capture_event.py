@@ -79,6 +79,9 @@ def _windows_capture_kwargs(config, capture_tool):
         kwargs = {"window_name": config.window_title}
     else:
         kwargs = {"monitor_index": config.monitor_index}
+    # The OpenXR pointer is a desktop cursor; keep it in the captured RGB
+    # frame so the presenter can show the arrow along with the laser/ring.
+    kwargs["cursor_capture"] = True
     if capture_tool in {"WindowsCaptureCUDA", "WindowsCaptureROCm"}:
         optional = {
             "minimum_update_interval": _fps_to_minimum_update_interval_ms(getattr(config, "fps", None)),
@@ -90,6 +93,60 @@ def _windows_capture_kwargs(config, capture_tool):
             )
         kwargs.update({key: value for key, value in optional.items() if value is not None})
     return kwargs
+
+
+def _capture_monitor_rect(monitor_index):
+    if os.name != "nt":
+        return None
+    try:
+        monitors = []
+
+        def _enumerate_monitor(_handle, _hdc, rect_ptr, _lparam):
+            if rect_ptr:
+                rect = rect_ptr.contents
+                monitors.append(
+                    (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+                )
+            return True
+
+        callback_type = ctypes.WINFUNCTYPE(
+            wintypes.BOOL,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.RECT),
+            wintypes.LPARAM,
+        )
+        callback = callback_type(_enumerate_monitor)
+        if not ctypes.windll.user32.EnumDisplayMonitors(None, None, callback, 0):
+            return None
+        index = max(0, int(monitor_index or 1) - 1)
+        return monitors[index] if index < len(monitors) else None
+    except Exception:
+        return None
+
+
+def _cursor_position_uv(monitor_rect):
+    if os.name != "nt" or monitor_rect is None:
+        return None
+    try:
+        point = wintypes.POINT()
+        if not ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+            return None
+        left, top, right, bottom = monitor_rect
+        width = right - left
+        height = bottom - top
+        if (
+            width <= 0
+            or height <= 0
+            or point.x < left
+            or point.x >= right
+            or point.y < top
+            or point.y >= bottom
+        ):
+            return None
+        return ((point.x - left) / width, (point.y - top) / height)
+    except Exception:
+        return None
 
 
 def _load_windows_capture(capture_tool):
@@ -192,6 +249,7 @@ class WindowsCaptureEventRunner:
         self._last_capture_ts = 0.0
         self._last_frame_emit_ts = 0.0
         self._replay_thread = None
+        self._capture_monitor_rect = None
 
     @property
     def session(self):
@@ -432,6 +490,10 @@ class WindowsCaptureEventRunner:
         on_tick=None,
     ):
         _setup_dpi_awareness()
+        if self.config.capture_mode == "Monitor":
+            self._capture_monitor_rect = _capture_monitor_rect(
+                self.config.monitor_index
+            )
         WindowsCapture, Frame, InternalCaptureControl = _load_windows_capture(self.capture_tool)
         self._start_keyboard_worker(shutdown_event)
         # A CUDA replay would enqueue the same depth inference again. The
@@ -538,6 +600,10 @@ class WindowsCaptureEventRunner:
                     metadata={
                         "backend": "windows_capture_event",
                         "capture_frame_id": capture_frame_id,
+                        "cursor_capture": bool(capture_kwargs.get("cursor_capture", True)),
+                        "cursor_position_uv": _cursor_position_uv(
+                            self._capture_monitor_rect
+                        ),
                         "native_resource_output": native_output,
                         "capture_gpu": bool(
                             copy_mode is FrameCopyMode.GPU_TENSOR

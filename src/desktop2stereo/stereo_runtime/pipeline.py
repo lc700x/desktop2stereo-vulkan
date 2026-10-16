@@ -400,18 +400,67 @@ def _enable_openxr_depth_cuda_graph_if_needed(
     if not openxr_full_synthesis:
         return
     # A graph first enabled here would be captured after frame acquisition.
-    # Keep graph selection explicit until capture-time warmup is available.
+    # WindowsCaptureCUDA can use it safely when the provider prepared it before
+    # capture startup; otherwise retain the existing enqueue fallback.
     if _captured_frame_uses_cuda_capture(captured_frame):
         config = getattr(ctx.stereo_runtime, "config", None)
         if config is not None and bool(getattr(config, "use_cuda_graph", False)):
+            depth_provider = getattr(ctx.stereo_runtime, "depth_provider", None)
+            depth_provider = getattr(depth_provider, "_provider", depth_provider)
+            if bool(getattr(depth_provider, "_cuda_graph_prepared", False)):
+                ctx.source_stat_inc("openxr_depth_cuda_graph_preserved_cuda_capture")
+                return
             # WindowsCaptureCUDA owns a blocking capture stream. Rebuilding the
-            # provider removes any graph captured before the capture backend was selected.
+            # provider avoids capturing a graph after frame acquisition begins.
             ctx.stereo_runtime.apply_settings_snapshot(
                 RuntimeSettingsSnapshot(version=int(time.time() * 1000), timestamp=time.time(), use_cuda_graph=False),
                 active_preset=ctx.stereo_active_preset,
             )
             ctx.source_stat_inc("openxr_depth_cuda_graph_disabled_cuda_capture")
         ctx.source_stat_inc("openxr_depth_cuda_graph_skipped_cuda_capture")
+
+
+def _prewarm_gpu_runtime_before_capture(ctx, render_config: RenderSizeConfig | None) -> None:
+    capture_hint = getattr(ctx, "capture_size_hint", None)
+    device = getattr(ctx, "device", None)
+    runtime = getattr(ctx, "stereo_runtime", None)
+    if capture_hint is None or device is None or runtime is None:
+        return
+    try:
+        import torch
+
+        device = torch.device(device)
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return
+        width, height = resolve_render_size(capture_hint, render_config)
+        if width <= 0 or height <= 0:
+            return
+        rgb = torch.zeros((1, 3, height, width), device=device, dtype=torch.float32)
+        depth_warmup = getattr(runtime, "_predict_depth_profile", None)
+        if callable(depth_warmup):
+            with torch.inference_mode():
+                depth_warmup(rgb)
+            torch.cuda.synchronize(device)
+        stereo_warmup = getattr(ctx, "warmup_stereo_once_for_frame", None)
+        if callable(stereo_warmup):
+            with torch.inference_mode():
+                stereo_warmup(rgb)
+            torch.cuda.synchronize(device)
+        print(
+            f"[RuntimePipeline] GPU inference and stereo warmup complete before capture: {width}x{height}",
+            flush=True,
+        )
+    except Exception as exc:
+        source_stat_inc = getattr(ctx, "source_stat_inc", None)
+        if callable(source_stat_inc):
+            source_stat_inc(
+                "runtime_gpu_prewarm_failed",
+                last_error=f"{type(exc).__name__}: {exc}",
+            )
+        print(
+            f"[RuntimePipeline] GPU prewarm skipped: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
 
 
 def _unpack_raw_queue_item(item):
@@ -624,7 +673,14 @@ def _capture_debug_fields(captured_frame: CapturedFrame | None, frame_rgb) -> di
     return {key: value for key, value in fields.items() if value is not None}
 
 
-def _attach_capture_debug(runtime_result, captured_frame: CapturedFrame | None, frame_rgb) -> None:
+def _attach_capture_debug(
+    runtime_result,
+    captured_frame: CapturedFrame | None,
+    frame_rgb,
+    *,
+    depth_source_frame_id: int | None = None,
+    depth_reused_cursor_only: bool = False,
+) -> None:
     debug_info = getattr(runtime_result, "debug_info", None)
     if isinstance(debug_info, dict):
         debug_info.update(_capture_debug_fields(captured_frame, frame_rgb))
@@ -641,7 +697,14 @@ def _attach_capture_debug(runtime_result, captured_frame: CapturedFrame | None, 
     except (TypeError, ValueError):
         return
     depth_finite = bool(getattr(runtime_result, "depth_finite", True))
-    depth_frame_id = capture_frame_id
+    try:
+        depth_frame_id = int(
+            capture_frame_id
+            if depth_source_frame_id is None
+            else depth_source_frame_id
+        )
+    except (TypeError, ValueError):
+        depth_frame_id = capture_frame_id
     depth_complete = depth_finite and getattr(runtime_result, "depth", None) is not None
     object.__setattr__(runtime_result, "capture_frame_id", capture_frame_id)
     object.__setattr__(runtime_result, "depth_frame_id", depth_frame_id)
@@ -655,6 +718,7 @@ def _attach_capture_debug(runtime_result, captured_frame: CapturedFrame | None, 
             depth_complete=int(depth_complete),
             depth_finite=int(depth_finite),
             depth_nonfinite_count=int(timing.get("depth_nonfinite_count", 0)),
+            depth_reused_cursor_only=int(bool(depth_reused_cursor_only)),
         )
 
 
@@ -1012,6 +1076,77 @@ def _motion_score(previous, current) -> float | None:
         return None
 
 
+def _cursor_rgb_sample(frame_rgb):
+    """Keep a small GPU-side RGB snapshot for cursor-only WGC frame checks."""
+    try:
+        import torch
+        import torch.nn.functional as F
+
+        if not isinstance(frame_rgb, torch.Tensor) or frame_rgb.device.type != "cuda":
+            return None
+        sample = frame_rgb.detach()
+        if sample.ndim == 3 and sample.shape[0] == 3:
+            sample = sample.unsqueeze(0)
+        if sample.ndim != 4 or sample.shape[0] != 1 or sample.shape[1] < 3:
+            return None
+        height, width = int(sample.shape[-2]), int(sample.shape[-1])
+        sample_size = (min(432, height), min(768, width))
+        sample = F.interpolate(
+            sample[:, :3], size=sample_size, mode="area"
+        )
+        return sample[0].to(dtype=torch.float16).contiguous()
+    except Exception:
+        return None
+
+
+def _cursor_only_rgb_change(
+    previous,
+    current,
+    previous_uv,
+    current_uv,
+    source_size: tuple[int, int],
+) -> bool:
+    """Return true only when sampled RGB changes stay inside cursor bounds."""
+    if (
+        previous is None
+        or current is None
+        or previous_uv is None
+        or current_uv is None
+        or tuple(getattr(previous, "shape", ())) != tuple(getattr(current, "shape", ()))
+    ):
+        return False
+    try:
+        import torch
+
+        changed = torch.any(current != previous, dim=0)
+        sample_height, sample_width = int(changed.shape[0]), int(changed.shape[1])
+        source_width, source_height = (int(source_size[0]), int(source_size[1]))
+        if source_width <= 0 or source_height <= 0:
+            return False
+        radius_x = max(2, int(round(48.0 * sample_width / source_width)))
+        radius_y = max(2, int(round(48.0 * sample_height / source_height)))
+        for u, v in (previous_uv, current_uv):
+            if not (0.0 <= float(u) <= 1.0 and 0.0 <= float(v) <= 1.0):
+                return False
+            center_x = int(round(float(u) * (sample_width - 1)))
+            center_y = int(round(float(v) * (sample_height - 1)))
+            left = max(0, center_x - radius_x)
+            right = min(sample_width, center_x + radius_x + 1)
+            top = max(0, center_y - radius_y)
+            bottom = min(sample_height, center_y + radius_y + 1)
+            changed[top:bottom, left:right] = False
+        has_changes = torch.any(changed)
+        if has_changes.device.type == "cuda":
+            # Cursor-only reuse is optional. Do not stall the inference loop
+            # waiting for the GPU comparison; if it is still pending, the
+            # caller conservatively runs inference for this capture frame.
+            if not torch.cuda.current_stream(has_changes.device).query():
+                return False
+        return not bool(has_changes.item())
+    except Exception:
+        return False
+
+
 def _is_fatal_runtime_preparation_error(exc: Exception) -> bool:
     if isinstance(exc, FileNotFoundError):
         return True
@@ -1107,6 +1242,11 @@ class RuntimePipelineLoop:
         self._pending_cuda_poll_interval_s = 0.001
         self._last_runtime_motion_sample = None
         self._last_algorithm_output_time = 0.0
+        self._cursor_depth_profile = None
+        self._cursor_depth_source_frame_id = None
+        self._cursor_depth_cache_key = None
+        self._cursor_rgb_reference = None
+        self._cursor_uv_reference = None
         self._prepared = False
         self._consecutive_runtime_errors = 0
         self._dual_pending_cooldown_until = 0.0
@@ -1118,6 +1258,120 @@ class RuntimePipelineLoop:
         self._preprocess_diagnostic_saved = False
         self._preprocess_diagnostic_first_frame_time = None
         self._backend_status_emitted = False
+
+    def _clear_cursor_depth_cache(self) -> None:
+        self._cursor_depth_profile = None
+        self._cursor_depth_source_frame_id = None
+        self._cursor_depth_cache_key = None
+        self._cursor_rgb_reference = None
+        self._cursor_uv_reference = None
+
+    @staticmethod
+    def _build_cursor_depth_cache_key(
+        ctx: RuntimePipelineContext,
+        captured_frame: CapturedFrame,
+        frame_rgb,
+        render_size: tuple[int, int],
+        source_target_key,
+    ):
+        runtime = ctx.stereo_runtime
+        depth_config = getattr(runtime, "depth_config", None)
+        runtime_config = getattr(runtime, "config", None)
+        return (
+            tuple(render_size),
+            tuple(captured_frame.capture_size or ()),
+            source_target_key,
+            int(getattr(runtime, "active_settings_version", 0) or 0),
+            str(getattr(depth_config, "model_name", getattr(runtime_config, "depth_model", ""))),
+            str(getattr(depth_config, "resolution", getattr(runtime_config, "depth_resolution", ""))),
+            str(getattr(depth_config, "backend", getattr(runtime_config, "backend", ""))),
+            str(getattr(frame_rgb, "device", "")),
+        )
+
+    def _cursor_depth_reuse_candidate(
+        self,
+        ctx: RuntimePipelineContext,
+        captured_frame: CapturedFrame | None,
+        frame_rgb,
+        render_size: tuple[int, int],
+        source_target_key,
+        *,
+        allow_reuse: bool = True,
+    ):
+        metadata = (
+            captured_frame.metadata
+            if captured_frame is not None and isinstance(captured_frame.metadata, dict)
+            else {}
+        )
+        runtime = ctx.stereo_runtime
+        stereo_config = getattr(runtime, "stereo_config", None)
+        if (
+            ctx.run_mode != "OpenXR"
+            or captured_frame is None
+            or captured_frame.capture_tool not in {"WindowsCaptureCUDA", "WindowsCaptureROCm"}
+            or str(captured_frame.capture_mode).lower() != "monitor"
+            or not metadata.get("cursor_capture")
+            or bool(getattr(stereo_config, "temporal", False))
+        ):
+            self._clear_cursor_depth_cache()
+            return None
+        cursor_uv = metadata.get("cursor_position_uv")
+        if not isinstance(cursor_uv, (tuple, list)) or len(cursor_uv) != 2:
+            self._clear_cursor_depth_cache()
+            return None
+        try:
+            cursor_uv = (float(cursor_uv[0]), float(cursor_uv[1]))
+        except (TypeError, ValueError):
+            self._clear_cursor_depth_cache()
+            return None
+        if not all(0.0 <= coordinate <= 1.0 for coordinate in cursor_uv):
+            self._clear_cursor_depth_cache()
+            return None
+        sample = _cursor_rgb_sample(frame_rgb)
+        if sample is None:
+            self._clear_cursor_depth_cache()
+            return None
+        cache_key = self._build_cursor_depth_cache_key(
+            ctx, captured_frame, frame_rgb, render_size, source_target_key
+        )
+        source_size = (int(render_size[0]), int(render_size[1]))
+        can_reuse = bool(
+            allow_reuse
+            and self._cursor_depth_profile is not None
+            and self._cursor_depth_cache_key == cache_key
+            and _cursor_only_rgb_change(
+                self._cursor_rgb_reference,
+                sample,
+                self._cursor_uv_reference,
+                cursor_uv,
+                source_size,
+            )
+        )
+        return {
+            "sample": sample,
+            "cursor_uv": cursor_uv,
+            "cache_key": cache_key,
+            "capture_frame_id": metadata.get("capture_frame_id"),
+            "reuse": can_reuse,
+        }
+
+    def _commit_cursor_depth_candidate(self, candidate, runtime_result, *, reused: bool) -> None:
+        if candidate is None:
+            return
+        self._cursor_rgb_reference = candidate["sample"]
+        self._cursor_uv_reference = candidate["cursor_uv"]
+        self._cursor_depth_cache_key = candidate["cache_key"]
+        if reused:
+            return
+        profile = getattr(runtime_result, "depth_profile", None)
+        if profile is None:
+            self._clear_cursor_depth_cache()
+            return
+        self._cursor_depth_profile = profile
+        try:
+            self._cursor_depth_source_frame_id = int(candidate["capture_frame_id"])
+        except (TypeError, ValueError):
+            self._cursor_depth_source_frame_id = None
 
     def _emit_backend_status_once(self, debug_info: dict | None) -> None:
         if self._backend_status_emitted or not isinstance(debug_info, dict):
@@ -1451,6 +1705,7 @@ class RuntimePipelineLoop:
         # seconds on the first run and must not consume the live-frame budget.
         ctx = self.context
         render_config = getattr(ctx, "render_size_config", None)
+        _prewarm_gpu_runtime_before_capture(ctx, render_config)
         native_ready = getattr(ctx.stereo_runtime, "native_coreml_io_ready", None)
         if (
             _native_coreml_capture_enabled(ctx)
@@ -1853,6 +2108,21 @@ class RuntimePipelineLoop:
                     ctx.breakdown_inc("runtime_diag_depth")
                     continue
 
+                cursor_check_start = time.perf_counter()
+                cursor_depth_candidate = self._cursor_depth_reuse_candidate(
+                    ctx,
+                    captured_frame,
+                    frame_rgb,
+                    render_size,
+                    source_target_key,
+                )
+                ctx.breakdown_add_time(
+                    "rt_cursor_frame_check",
+                    time.perf_counter() - cursor_check_start,
+                )
+                cursor_depth_reused = False
+                depth_source_frame_id = None
+
                 # A native Intel capture source may already have produced a
                 # DepthProfileResult from the borrowed D3D11 texture. Keep that
                 # result attached to the capture frame and bypass the tensor
@@ -1867,6 +2137,26 @@ class RuntimePipelineLoop:
                 # native capture did not provide a result. The caller then
                 # consumes the oldest completed job in order.
                 depth_profile = native_depth_profile
+                if (
+                    depth_profile is None
+                    and cursor_depth_candidate is not None
+                    and cursor_depth_candidate["reuse"]
+                ):
+                    cached_profile = self._cursor_depth_profile
+                    depth_profile = (
+                        replace(
+                            cached_profile,
+                            preprocess_ms=0.0,
+                            model_ms=0.0,
+                            postprocess_ms=0.0,
+                            cuda_timing_events={},
+                        )
+                        if is_dataclass(cached_profile)
+                        else cached_profile
+                    )
+                    cursor_depth_reused = depth_profile is not None
+                    if cursor_depth_reused:
+                        depth_source_frame_id = self._cursor_depth_source_frame_id
                 if depth_profile is None and self._parallel_depth_scheduler is not None:
                     scheduler = self._parallel_depth_scheduler
                     self._parallel_recover_if_ready()
@@ -1924,11 +2214,33 @@ class RuntimePipelineLoop:
                     ctx.source_stat_inc("runtime_parallel_processed")
                     ctx.source_stat_inc("runtime_parallel_reorder_wait", frame_reorder_wait=0)
                     parallel_frame_id = job.frame_id
+                    if not cursor_depth_reused:
+                        cursor_depth_candidate = self._cursor_depth_reuse_candidate(
+                            ctx,
+                            captured_frame,
+                            frame_rgb,
+                            render_size,
+                            _source_target_key(captured_frame),
+                            allow_reuse=False,
+                        )
                 else:
                     parallel_frame_id = None
                 ctx.log_stereo_runtime_mode_once()
                 ctx.apply_stereo_hot_reload_if_needed()
                 _apply_latest_settings_snapshot(ctx)
+                if cursor_depth_candidate is not None:
+                    current_cache_key = self._build_cursor_depth_cache_key(
+                        ctx,
+                        captured_frame,
+                        frame_rgb,
+                        render_size,
+                        _source_target_key(captured_frame),
+                    )
+                    if cursor_depth_reused and current_cache_key != cursor_depth_candidate["cache_key"]:
+                        cursor_depth_reused = False
+                        depth_profile = None
+                        depth_source_frame_id = None
+                    cursor_depth_candidate["cache_key"] = current_cache_key
                 openxr_full_synthesis = ctx.run_mode == "OpenXR" and _openxr_full_synthesis_enabled(ctx)
                 _enable_openxr_depth_cuda_graph_if_needed(
                     ctx, openxr_full_synthesis, captured_frame
@@ -1955,6 +2267,13 @@ class RuntimePipelineLoop:
                             runtime_rgb,
                             openxr_config,
                             depth_profile=depth_profile,
+                            capture_frame_id=(
+                                captured_frame.metadata.get("capture_frame_id")
+                                if captured_frame is not None
+                                and isinstance(captured_frame.metadata, dict)
+                                else None
+                            ),
+                            depth_frame_id=depth_source_frame_id,
                         )
                     finally:
                         if original_stereo_config is not None:
@@ -1973,6 +2292,7 @@ class RuntimePipelineLoop:
                                 and isinstance(captured_frame.metadata, dict)
                                 else None
                             ),
+                            depth_frame_id=depth_source_frame_id,
                         )
                     except Exception:
                         if not native_sck or native_capture is None:
@@ -2008,8 +2328,20 @@ class RuntimePipelineLoop:
                                 and isinstance(captured_frame.metadata, dict)
                                 else None
                             ),
+                            depth_frame_id=depth_source_frame_id,
                         )
                 ctx.breakdown_add_time("rt_call", time.perf_counter() - runtime_call_start_time)
+                if runtime_result.depth is None:
+                    self._clear_cursor_depth_cache()
+                elif cursor_depth_candidate is not None:
+                    if cursor_depth_reused:
+                        ctx.source_stat_inc("runtime_cursor_depth_reused")
+                        ctx.breakdown_inc("runtime_cursor_depth_reused")
+                    self._commit_cursor_depth_candidate(
+                        cursor_depth_candidate,
+                        runtime_result,
+                        reused=cursor_depth_reused,
+                    )
                 _attach_pipeline_debug(
                     runtime_result,
                     capture_size=size,
@@ -2059,7 +2391,13 @@ class RuntimePipelineLoop:
                         debug_info["application_runtime_target"] = ctx.application_runtime_target
                     if ctx.output_transport:
                         debug_info["output_transport"] = ctx.output_transport
-                _attach_capture_debug(runtime_result, captured_frame, frame_rgb)
+                _attach_capture_debug(
+                    runtime_result,
+                    captured_frame,
+                    frame_rgb,
+                    depth_source_frame_id=depth_source_frame_id,
+                    depth_reused_cursor_only=cursor_depth_reused,
+                )
                 if isinstance(debug_info, dict) and captured_frame is not None:
                     native_profile = captured_frame.metadata.get("native_depth_profile")
                     if native_profile is not None:

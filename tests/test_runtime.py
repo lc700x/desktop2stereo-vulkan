@@ -93,6 +93,7 @@ def test_runtime_process_rgb_frame_uses_persistent_provider_and_returns_report()
     assert first.debug_info["runtime_output_format"] == "half_sbs"
     assert first.debug_info["runtime_quality_mode"] == "fast"
     assert first.debug_info["stereo_synthesis_mode"] == "packed_synthesis"
+    assert first.debug_info["motion_depth_reason"] == "disabled"
     assert first.debug_info["output_format"] == "half_sbs"
     assert first.debug_info["max_disparity_px"] == 18.0
     assert first.debug_info["parallax_preset"] == "comfort"
@@ -265,6 +266,7 @@ def test_runtime_dynamic_convergence_uses_depth_quantile_in_debug_info():
         dynamic_convergence_strength=1.0,
         dynamic_convergence_target=1.0,
         dynamic_convergence_alpha=0.0,
+        depth_antialias_strength=0.0,
     )
     runtime = StereoRuntime(config, depth_provider=provider, stats_window=4, collect_memory_stats=False)
     rgb = torch.rand(1, 3, 8, 12)
@@ -725,4 +727,4 @@ def test_quality_direct_sbs_uint8_preserves_packed_stereo_views(monkeypatch):
         actual.sbs[..., :half_width],
         actual.sbs[..., half_width:],
     )
-    assert actual.debug_info["runtime_output_pack_backend"] == "torch_packed_sbs_to_uint8"
+    assert actual.debug_info["runtime_output_pack_backend"] == "triton_warp_composite2_half_sbs_uint8"

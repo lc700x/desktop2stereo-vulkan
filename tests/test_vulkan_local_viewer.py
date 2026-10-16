@@ -6,6 +6,7 @@ import threading
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 import viewer.vulkan_local_viewer as local_viewer_module
 from viewer.vulkan_local_viewer import (
@@ -20,6 +21,7 @@ from viewer.vulkan_local_viewer import (
     display_refresh_warning_needed,
     full_screen_exclusive_capability,
     fit_rect,
+    _choose_present_device_candidate,
     presentation_blit_regions,
     frame_to_cuda_rgba,
     frame_to_rgba_bytes,
@@ -75,6 +77,7 @@ class _VulkanPresentModes:
     VK_PRESENT_MODE_IMMEDIATE_KHR = 0
     VK_PRESENT_MODE_MAILBOX_KHR = 1
     VK_PRESENT_MODE_FIFO_KHR = 2
+    VK_PRESENT_MODE_FIFO_LATEST_READY_KHR = 1000361000
 
 
 class _GlfwKeys:
@@ -148,6 +151,54 @@ def test_capture_compatible_fullscreen_disables_exclusive_request() -> None:
 
 def test_display_fit_feature_is_enabled_by_default() -> None:
     assert VulkanLocalViewerConfig().display_fit_enabled is True
+
+
+def test_local_viewer_selects_inference_adapter_even_if_enumerated_later() -> None:
+    nvidia = (object(), "NVIDIA GeForce RTX 2070", 0)
+    amd = (object(), "AMD Radeon RX 9060 XT", 1)
+
+    selected, interop_allowed = _choose_present_device_candidate(
+        [nvidia, amd], "AMD Radeon RX 9060 XT"
+    )
+
+    assert selected is amd
+    assert interop_allowed
+
+
+def test_local_viewer_disables_interop_if_preferred_adapter_cannot_present() -> None:
+    nvidia = (object(), "NVIDIA GeForce RTX 2070", 0)
+
+    selected, interop_allowed = _choose_present_device_candidate(
+        [nvidia], "AMD Radeon RX 9060 XT"
+    )
+
+    assert selected is nvidia
+    assert not interop_allowed
+
+
+def test_local_viewer_uses_one_present_semaphore_per_swapchain_image() -> None:
+    destroyed = []
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    viewer.device = object()
+    viewer.swap_images = [object(), object(), object()]
+    viewer.vk = SimpleNamespace(
+        VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO=1,
+        VkSemaphoreCreateInfo=lambda **kwargs: kwargs,
+        vkCreateSemaphore=lambda *_args: object(),
+        vkDestroySemaphore=lambda _device, semaphore, _allocator: destroyed.append(
+            semaphore
+        ),
+    )
+
+    viewer._create_render_finished_semaphores()
+
+    assert len(viewer.render_finished) == len(viewer.swap_images)
+    assert len({id(semaphore) for semaphore in viewer.render_finished}) == 3
+
+    viewer._destroy_render_finished_semaphores()
+
+    assert len(destroyed) == 3
+    assert viewer.render_finished == []
 
 
 def test_display_fit_contain_adds_only_expected_letterbox_bars() -> None:
@@ -375,6 +426,7 @@ def test_present_mode_avoids_mailbox_for_win32_full_screen_exclusive() -> None:
         _VulkanPresentModes.VK_PRESENT_MODE_FIFO_KHR,
         _VulkanPresentModes.VK_PRESENT_MODE_MAILBOX_KHR,
         _VulkanPresentModes.VK_PRESENT_MODE_IMMEDIATE_KHR,
+        _VulkanPresentModes.VK_PRESENT_MODE_FIFO_LATEST_READY_KHR,
     }
     assert choose_present_mode(
         modes,
@@ -389,10 +441,25 @@ def test_present_mode_avoids_mailbox_for_win32_full_screen_exclusive() -> None:
         full_screen_exclusive=False,
     ) == _VulkanPresentModes.VK_PRESENT_MODE_MAILBOX_KHR
     assert choose_present_mode(
+        {
+            _VulkanPresentModes.VK_PRESENT_MODE_FIFO_KHR,
+            _VulkanPresentModes.VK_PRESENT_MODE_IMMEDIATE_KHR,
+        },
+        _VulkanPresentModes,
+        vsync=False,
+        full_screen_exclusive=False,
+    ) == _VulkanPresentModes.VK_PRESENT_MODE_IMMEDIATE_KHR
+    assert choose_present_mode(
         modes,
         _VulkanPresentModes,
         vsync=True,
         full_screen_exclusive=True,
+    ) == _VulkanPresentModes.VK_PRESENT_MODE_FIFO_LATEST_READY_KHR
+    assert choose_present_mode(
+        {_VulkanPresentModes.VK_PRESENT_MODE_FIFO_KHR},
+        _VulkanPresentModes,
+        vsync=True,
+        full_screen_exclusive=False,
     ) == _VulkanPresentModes.VK_PRESENT_MODE_FIFO_KHR
 
 
@@ -573,6 +640,62 @@ def test_local_viewer_counts_successful_depth_presentations_and_intervals(monkey
     assert [name for name, _ in timings].count("local_present_interval") == 1
 
 
+@pytest.mark.parametrize("vsync", [True, False])
+def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync) -> None:
+    shutdown = threading.Event()
+    frame = object()
+    timeouts = []
+    waits = []
+    clock = [1.0]
+
+    class FrameQueue:
+        def get(self, *, timeout):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                return SimpleNamespace(sbs=frame), 1.0
+            raise queue.Empty
+
+        def get_nowait(self):
+            raise queue.Empty
+
+    class FakeViewer:
+        calls = 0
+
+        def __init__(self, _config):
+            pass
+
+        def initialize(self):
+            pass
+
+        def present(self, value):
+            assert value is frame
+            self.calls += 1
+            clock[0] += .003
+            if self.calls == 2:
+                shutdown.set()
+            return True
+
+        def close(self):
+            pass
+
+    def wait(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+        return False
+
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(shutdown, "wait", wait)
+    run_vulkan_local_viewer(runtime_q=FrameQueue(), shutdown_event=shutdown,
+                            config=VulkanLocalViewerConfig(vsync=vsync))
+
+    assert timeouts == [.05, 0.0]
+    if vsync:
+        assert waits == []
+    else:
+        assert waits == pytest.approx([1 / 60 - .003])
+
+
 def test_local_viewer_passes_direct_source_without_host_payload(monkeypatch) -> None:
     class FakeSource:
         size = (4, 2)
@@ -600,6 +723,23 @@ def test_local_viewer_passes_direct_source_without_host_payload(monkeypatch) -> 
 
     viewer.present(frame)
     assert viewer._source.calls == [(None, True)]
+
+
+def test_cached_present_reuses_vulkan_image_without_pixel_conversion(monkeypatch) -> None:
+    calls = []
+    source = SimpleNamespace(present=lambda frame, **kwargs: calls.append((frame, kwargs)) or True)
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    viewer._source = viewer._last_present_source = source
+    monkeypatch.setattr(viewer, "poll_events", lambda: None)
+    monkeypatch.setattr(local_viewer_module, "frame_to_cuda_rgba",
+                        lambda _frame: (_ for _ in ()).throw(AssertionError("repacked cached frame")))
+
+    assert viewer._present_cached() is True
+    assert calls == [(None, {"reuse": True})]
+
+    viewer._source = None
+    assert viewer._present_cached() is False
+    assert len(calls) == 1
 
 
 def test_window_preview_duplicates_output_without_replacing_fullscreen(monkeypatch) -> None:

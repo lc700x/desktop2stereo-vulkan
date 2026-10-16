@@ -23,6 +23,8 @@ if triton is not None:
         total: tl.constexpr,
         WEIGHTS: tl.constexpr,
         RADIUS: tl.constexpr,
+        EDGE_AWARE: tl.constexpr,
+        EDGE_THRESHOLD: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -33,6 +35,8 @@ if triton is not None:
         y = pixel // width
         x = pixel % width
         result = tl.full((BLOCK,), 0.0, tl.float32)
+        weight_sum = tl.full((BLOCK,), 0.0, tl.float32)
+        center = tl.load(source + offset, mask=active, other=0.0).to(tl.float32)
 
         for dy in tl.static_range(-RADIUS, RADIUS + 1):
             yy = tl.minimum(tl.maximum(y + dy, 0), height - 1)
@@ -44,12 +48,38 @@ if triton is not None:
                 sample = tl.load(
                     source + base + yy * width + xx, mask=active, other=0.0
                 ).to(tl.float32)
-                result += sample * wx * wy
+                weight = wx * wy
+                if EDGE_AWARE:
+                    distance = tl.abs(sample - center)
+                    if EDGE_THRESHOLD > 1.0e-6:
+                        transition = tl.minimum(
+                            tl.maximum(
+                                (distance - 0.5 * EDGE_THRESHOLD)
+                                / (0.5 * EDGE_THRESHOLD),
+                                0.0,
+                            ),
+                            1.0,
+                        )
+                        edge_weight = 1.0 - transition * transition * (3.0 - 2.0 * transition)
+                    else:
+                        edge_weight = (distance <= 1.0e-6).to(tl.float32)
+                    weight = weight * edge_weight
+                    result += sample * weight
+                    weight_sum += weight
+                else:
+                    result += sample * weight
+                    weight_sum += weight
 
+        result = result / tl.maximum(weight_sum, 1.0e-8)
         tl.store(output + offset, tl.minimum(tl.maximum(result, 0.0), 1.0), mask=active)
 
 
-def gaussian_1(depth: torch.Tensor, *, spacing: float = 1.0) -> torch.Tensor:
+def gaussian_1(
+    depth: torch.Tensor,
+    *,
+    spacing: float = 1.0,
+    edge_threshold: float | None = None,
+) -> torch.Tensor:
     if (
         triton is None
         or not isinstance(depth, torch.Tensor)
@@ -74,6 +104,8 @@ def gaussian_1(depth: torch.Tensor, *, spacing: float = 1.0) -> torch.Tensor:
         total,
         WEIGHTS=weights,
         RADIUS=len(weights) // 2,
+        EDGE_AWARE=edge_threshold is not None,
+        EDGE_THRESHOLD=0.0 if edge_threshold is None else float(edge_threshold),
         BLOCK=block,
     )
     return output

@@ -40,6 +40,11 @@ DIRECT_DISPLAY_INSTANCE_EXTENSIONS = (
 DIRECT_DISPLAY_WIN32_DEVICE_EXTENSION = "VK_NV_acquire_winrt_display"
 FULL_SCREEN_EXCLUSIVE_INSTANCE_EXTENSION = "VK_KHR_get_surface_capabilities2"
 FULL_SCREEN_EXCLUSIVE_DEVICE_EXTENSION = "VK_EXT_full_screen_exclusive"
+FIFO_LATEST_READY_DEVICE_EXTENSIONS = (
+    "VK_KHR_present_mode_fifo_latest_ready",
+    "VK_EXT_present_mode_fifo_latest_ready",
+)
+VK_PRESENT_MODE_FIFO_LATEST_READY = 1000361000
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 LOCAL_VIEWER_ICON_PATH = Path(__file__).resolve().parents[1] / "icon2.ico"
@@ -111,13 +116,24 @@ def choose_present_mode(
     """Choose a non-blocking Windows-exclusive mode without changing windowed WSI."""
     available = set(modes)
     if vsync:
+        latest_ready = getattr(
+            vk,
+            "VK_PRESENT_MODE_FIFO_LATEST_READY_KHR",
+            VK_PRESENT_MODE_FIFO_LATEST_READY,
+        )
+        if latest_ready in available:
+            return latest_ready
         return vk.VK_PRESENT_MODE_FIFO_KHR
     preferred = (
         vk.VK_PRESENT_MODE_IMMEDIATE_KHR
         if full_screen_exclusive
         else vk.VK_PRESENT_MODE_MAILBOX_KHR
     )
-    return preferred if preferred in available else vk.VK_PRESENT_MODE_FIFO_KHR
+    if preferred in available:
+        return preferred
+    if not vsync and vk.VK_PRESENT_MODE_IMMEDIATE_KHR in available:
+        return vk.VK_PRESENT_MODE_IMMEDIATE_KHR
+    return vk.VK_PRESENT_MODE_FIFO_KHR
 
 
 def is_exclusive_fullscreen_toggle(key: int, action: int, mods: int, glfw: Any) -> bool:
@@ -620,6 +636,22 @@ def depth_preview_frame(result: Any) -> Any | None:
     return effective_disparity_to_red_blue_rgb(effective_disparity)
 
 
+def _choose_present_device_candidate(
+    candidates: list[tuple[Any, str, int]],
+    inference_gpu_name: str | None,
+) -> tuple[tuple[Any, str, int] | None, bool]:
+    """Prefer the Vulkan adapter that owns inference tensors for GPU interop."""
+    if not candidates:
+        return None, False
+    preferred = str(inference_gpu_name or "").strip().casefold()
+    if preferred:
+        for candidate in candidates:
+            if candidate[1].strip().casefold() == preferred:
+                return candidate, True
+        return candidates[0], False
+    return candidates[0], True
+
+
 @dataclass(frozen=True, slots=True)
 class VulkanLocalViewerConfig:
     title: str = "Desktop2Stereo Vulkan Viewer"
@@ -651,6 +683,7 @@ class VulkanLocalViewerConfig:
     on_breakdown_inc: Callable[[str, int | float], None] | None = None
     on_breakdown_add_time: Callable[[str, float], None] | None = None
     direct_staging: bool = True
+    inference_gpu_name: str | None = None
     window_width: int = 1280
     window_height: int = 720
 
@@ -727,13 +760,15 @@ class VulkanLocalViewer:
         self.window = self.instance = self.surface = None
         self.physical_device = self.device = self.queue = None
         self.queue_family = None
+        self._gpu_interop_allowed = True
         self.command_pool = self.command_buffer = None
         self.swapchain = None
         self.swap_images: list[Any] = []
         self._swap_image_initialized: list[bool] = []
         self.extent = (0, 0)
         self.source_format: int | None = None
-        self.image_available = self.render_finished = self.fence = None
+        self.image_available = self.fence = None
+        self.render_finished: list[Any] = []
         self._source: _TransferSource | None = None
         self._direct_sources: list[_TransferSource] = []
         self._interop_extensions: tuple[str, ...] = ()
@@ -1291,16 +1326,36 @@ class VulkanLocalViewer:
         if result != vk.VK_SUCCESS:
             raise RuntimeError(f"glfwCreateWindowSurface failed ({result})")
         self.surface = surface_ptr[0]
+        present_candidates: list[tuple[Any, str, int]] = []
         for candidate in vk.vkEnumeratePhysicalDevices(self.instance):
             available = {prop.extensionName for prop in vk.vkEnumerateDeviceExtensionProperties(candidate, None)}
             if "VK_KHR_swapchain" not in available:
                 continue
             for index, props in enumerate(vk.vkGetPhysicalDeviceQueueFamilyProperties(candidate)):
                 if props.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT and self._surface_support(candidate, index):
-                    self.physical_device, self.queue_family = candidate, index
+                    name = str(vk.vkGetPhysicalDeviceProperties(candidate).deviceName)
+                    present_candidates.append((candidate, name, index))
                     break
-            if self.physical_device is not None:
-                break
+        selected, self._gpu_interop_allowed = _choose_present_device_candidate(
+            present_candidates,
+            self.config.inference_gpu_name,
+        )
+        if selected is not None:
+            self.physical_device, selected_name, self.queue_family = selected
+            inference_name = str(self.config.inference_gpu_name or "").strip()
+            if inference_name and not self._gpu_interop_allowed:
+                print(
+                    "[VulkanLocalViewer] No present-capable Vulkan adapter matches "
+                    f"inference GPU '{inference_name}'; selected '{selected_name}' "
+                    "and disabled cross-adapter GPU interop",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[VulkanLocalViewer] Selected Vulkan adapter: {selected_name}"
+                    + (" (matches inference GPU)" if inference_name else ""),
+                    flush=True,
+                )
         if self.physical_device is None:
             raise RuntimeError("no Vulkan graphics/present queue available for local viewer")
         available = {
@@ -1349,6 +1404,12 @@ class VulkanLocalViewer:
                 flush=True,
             )
         enabled_extensions = ["VK_KHR_swapchain", *self._interop_extensions]
+        latest_ready_extension = next(
+            (name for name in FIFO_LATEST_READY_DEVICE_EXTENSIONS if name in available),
+            None,
+        )
+        if latest_ready_extension is not None:
+            enabled_extensions.append(latest_ready_extension)
         if self._full_screen_exclusive_enabled:
             enabled_extensions.append(FULL_SCREEN_EXCLUSIVE_DEVICE_EXTENSION)
         queue_info = vk.VkDeviceQueueCreateInfo(
@@ -1591,6 +1652,8 @@ class VulkanLocalViewer:
         get_images(self.device, self.swapchain, image_count, images)
         self.swap_images = list(images)
         self._swap_image_initialized = [False] * len(self.swap_images)
+        if self.image_available is not None:
+            self._create_render_finished_semaphores()
         self.extent = int(extent.width), int(extent.height)
         if overlay is not None:
             if overlay.available and overlay_supported:
@@ -1662,6 +1725,7 @@ class VulkanLocalViewer:
             self._full_screen_exclusive_acquired = False
 
     def _destroy_swapchain(self) -> None:
+        self._destroy_render_finished_semaphores()
         if self.swapchain is not None:
             if self._fps_overlay is not None:
                 self._fps_overlay.on_swapchain_destroyed()
@@ -1711,11 +1775,29 @@ class VulkanLocalViewer:
         vk = self.vk
         sem_info = vk.VkSemaphoreCreateInfo(sType=vk.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO)
         self.image_available = vk.vkCreateSemaphore(self.device, sem_info, None)
-        self.render_finished = vk.vkCreateSemaphore(self.device, sem_info, None)
+        self._create_render_finished_semaphores()
         self.fence = vk.vkCreateFence(self.device, vk.VkFenceCreateInfo(
             sType=vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
             flags=vk.VK_FENCE_CREATE_SIGNALED_BIT,
         ), None)
+
+    def _create_render_finished_semaphores(self) -> None:
+        vk = self.vk
+        sem_info = vk.VkSemaphoreCreateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+        )
+        self.render_finished = [
+            vk.vkCreateSemaphore(self.device, sem_info, None)
+            for _image in self.swap_images
+        ]
+
+    def _destroy_render_finished_semaphores(self) -> None:
+        if self.device is None or self.vk is None:
+            self.render_finished = []
+            return
+        for semaphore in self.render_finished:
+            self.vk.vkDestroySemaphore(self.device, semaphore, None)
+        self.render_finished = []
 
     def present(self, frame: Any) -> bool:
         if self.window is None:
@@ -1831,6 +1913,24 @@ class VulkanLocalViewer:
             if direct:
                 source._release_direct()
             return False
+        self._last_present_source = source
+        now = time.perf_counter()
+        self._fps_frames += 1
+        fps = present_fps_if_due(self._fps_frames, now - self._fps_started)
+        if fps is not None:
+            self._report_present_fps(fps, self._fps_frames)
+            self._fps_frames = 0
+            self._fps_started = now
+        return True
+
+    def _present_cached(self) -> bool:
+        """Present the existing Vulkan image without packing or copying pixels."""
+        self.poll_events()
+        source = getattr(self, "_last_present_source", None)
+        if source is None or not (source is self._source or source in self._direct_sources):
+            return False
+        if not source.present(None, reuse=True):
+            return False
         now = time.perf_counter()
         self._fps_frames += 1
         fps = present_fps_if_due(self._fps_frames, now - self._fps_started)
@@ -1872,9 +1972,11 @@ class VulkanLocalViewer:
                 for source in [self._source, *self._direct_sources]:
                     if source is not None:
                         source.close()
-                for semaphore in (self.image_available, self.render_finished):
-                    if semaphore is not None:
-                        self.vk.vkDestroySemaphore(self.device, semaphore, None)
+                if self.image_available is not None:
+                    self.vk.vkDestroySemaphore(
+                        self.device, self.image_available, None
+                    )
+                    self.image_available = None
                 if self.fence is not None:
                     self.vk.vkDestroyFence(self.device, self.fence, None)
                 if self.command_pool is not None:
@@ -1999,7 +2101,13 @@ class _TransferSource:
             *VulkanExportableImage.required_device_extensions(),
             *VulkanExportableSemaphore.required_device_extensions(),
         }
-        if required.issubset(set(self.owner._interop_extensions)):
+        if not self.owner._gpu_interop_allowed:
+            print(
+                "[VulkanLocalViewer] GPU external-memory interop disabled because "
+                "the inference and presentation adapters differ; using host upload",
+                flush=True,
+            )
+        elif required.issubset(set(self.owner._interop_extensions)):
             try:
                 self._interop_context = _LocalInteropContext(self.owner)
                 self._cuda_ready = VulkanExportableSemaphore(
@@ -2089,7 +2197,7 @@ class _TransferSource:
     def _transition(self, cmd: Any, image: Any, old: int, new: int) -> None:
         self.transition_image(self.owner.vk, cmd, image, old, new)
 
-    def present(self, pixels: Any, *, direct: bool = False) -> bool:
+    def present(self, pixels: Any, *, direct: bool = False, reuse: bool = False) -> bool:
         vk, o = self.owner.vk, self.owner
         frame_started = time.perf_counter()
         stage_started = frame_started
@@ -2118,7 +2226,7 @@ class _TransferSource:
         index = int(index_output[0])
         vk.vkResetFences(o.device, 1, [o.fence])
 
-        gpu_source = self._cuda_active and bool(getattr(pixels, "is_cuda", False))
+        gpu_source = not reuse and self._cuda_active and bool(getattr(pixels, "is_cuda", False))
         gpu_buffer_source = gpu_source and self._external_buffer is not None
         stage_started = time.perf_counter()
         if gpu_source:
@@ -2126,6 +2234,8 @@ class _TransferSource:
                 if not gpu_buffer_source:
                     raise RuntimeError("GPU external buffer is unavailable")
                 self._cuda_importer.copy_tensor_to_buffer(pixels, self._external_buffer)
+                if o.config.on_breakdown_inc is not None:
+                    o.config.on_breakdown_inc("local_gpu_buffer_copy", 1)
                 self._cuda_importer.signal_semaphore(self._cuda_ready)
                 # CUDA signals the Vulkan wait semaphore on the same CUDA
                 # stream as the copy.  Do not host-synchronize that stream:
@@ -2141,7 +2251,7 @@ class _TransferSource:
                 gpu_source = False
                 gpu_buffer_source = False
                 pixels, _width, _height = frame_to_rgba_bytes(pixels)
-        if not gpu_source and not direct:
+        if not gpu_source and not direct and not reuse:
             if not isinstance(pixels, (bytes, bytearray, memoryview)):
                 # CUDA/ROCm interop unavailable: the caller may hand us a GPU
                 # tensor; convert it to tightly packed RGBA8 host bytes first.
@@ -2154,6 +2264,8 @@ class _TransferSource:
             # bytes; cast through memoryview so the slice length is in bytes
             # (len(ndarray) is only its first dimension).
             payload = memoryview(pixels)
+            if o.config.on_breakdown_inc is not None:
+                o.config.on_breakdown_inc("local_host_pixel_upload", 1)
             if payload.format != "B":
                 payload = payload.cast("B")
             if self._mapped is not None:
@@ -2170,7 +2282,11 @@ class _TransferSource:
         vk.vkResetCommandBuffer(cmd, 0)
         vk.vkBeginCommandBuffer(cmd, vk.VkCommandBufferBeginInfo(sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO))
         source_image = self.image
-        if gpu_buffer_source:
+        if reuse:
+            # The previous fence has completed. Its image is already in
+            # TRANSFER_SRC_OPTIMAL, so only the final swapchain blit is needed.
+            pass
+        elif gpu_buffer_source:
             self._transition(
                 cmd,
                 self.image,
@@ -2211,6 +2327,8 @@ class _TransferSource:
             self._transition(cmd, self.image, vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL if self._image_initialized else vk.VK_IMAGE_LAYOUT_UNDEFINED, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
             vk.vkCmdCopyBufferToImage(cmd, self.buffer, self.image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, [vk.VkBufferImageCopy(bufferOffset=0, bufferRowLength=0, bufferImageHeight=0, imageSubresource=vk.VkImageSubresourceLayers(aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, mipLevel=0, baseArrayLayer=0, layerCount=1), imageOffset=vk.VkOffset3D(x=0, y=0, z=0), imageExtent=vk.VkExtent3D(width=self.size[0], height=self.size[1], depth=1))])
             self._transition(cmd, self.image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+        if not reuse and o.config.on_breakdown_inc is not None:
+            o.config.on_breakdown_inc("local_buffer_to_image_copy", 1)
         target = o.swap_images[index]
         target_old_layout = (
             vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
@@ -2372,7 +2490,8 @@ class _TransferSource:
         if gpu_source:
             waits.append(self._cuda_ready.semaphore)
             stages.append(vk.VK_PIPELINE_STAGE_TRANSFER_BIT)
-        submit = vk.VkSubmitInfo(sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO, waitSemaphoreCount=len(waits), pWaitSemaphores=waits, pWaitDstStageMask=stages, commandBufferCount=1, pCommandBuffers=[cmd], signalSemaphoreCount=1, pSignalSemaphores=[o.render_finished])
+        render_finished = o.render_finished[index]
+        submit = vk.VkSubmitInfo(sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO, waitSemaphoreCount=len(waits), pWaitSemaphores=waits, pWaitDstStageMask=stages, commandBufferCount=1, pCommandBuffers=[cmd], signalSemaphoreCount=1, pSignalSemaphores=[render_finished])
         stage_started = time.perf_counter()
         submit_value = vk.vkQueueSubmit(o.queue, 1, [submit], o.fence)
         submit_result = int(vk.VK_SUCCESS if submit_value is None else submit_value)
@@ -2381,7 +2500,7 @@ class _TransferSource:
         submit_ms = (time.perf_counter() - stage_started) * 1000.0
         if direct and submit_result == int(vk.VK_SUCCESS):
             self._mark_direct_submitted()
-        present_info = vk.VkPresentInfoKHR(sType=vk.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, waitSemaphoreCount=1, pWaitSemaphores=[o.render_finished], swapchainCount=1, pSwapchains=[o.swapchain], pImageIndices=[index])
+        present_info = vk.VkPresentInfoKHR(sType=vk.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, waitSemaphoreCount=1, pWaitSemaphores=[render_finished], swapchainCount=1, pSwapchains=[o.swapchain], pImageIndices=[index])
         present = o._device_function(b"vkQueuePresentKHR", "VkResult(*)(VkQueue, const VkPresentInfoKHR *)")
         stage_started = time.perf_counter()
         result = int(present(o.queue, vk.ffi.addressof(present_info)))
@@ -2441,12 +2560,22 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
     preview_disabled = not bool(config.window_preview)
     cached_result = None
     cached_frame = None
+    next_present_at = 0.0
     try:
         while not shutdown_event.is_set():
+            if cached_frame is not None and not config.vsync:
+                # Pace from the previous submission's start, so GPU work and
+                # queue waiting share one deadline instead of adding delays.
+                remaining = next_present_at - time.perf_counter()
+                if remaining > 0.0 and shutdown_event.wait(remaining):
+                    break
             reused = False
             try:
                 result, _started = runtime_q.get(
-                    timeout=(1.0 / 60.0) if cached_frame is not None else 0.05
+                    # FIFO VSync already waits for presentation. Adding a full
+                    # capture-queue wait here drops a 24 FPS video's presents
+                    # below 60 Hz and makes its reuse cadence uneven.
+                    timeout=0.0 if cached_frame is not None else 0.05
                 )
             except queue.Empty:
                 if viewer is not None and cached_frame is not None:
@@ -2575,8 +2704,10 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                 if callable(record_latency):
                     record_latency(_started)
             present_started = time.perf_counter()
-            presented = viewer.present(frame)
+            cached_present = getattr(viewer, "_present_cached", None)
+            presented = cached_present() if reused and callable(cached_present) else viewer.present(frame)
             presented_at = time.perf_counter()
+            next_present_at = present_started + 1.0 / 60.0
             if config.on_breakdown_add_time is not None:
                 config.on_breakdown_add_time(
                     "local_present", presented_at - present_started
