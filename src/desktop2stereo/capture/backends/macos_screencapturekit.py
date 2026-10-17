@@ -519,6 +519,39 @@ class DesktopGrabber:
 
         self._start_stream()
 
+    def _source_refresh_hz(self):
+        """Use the display ceiling so ProMotion cannot exceed a lower FPS cap."""
+        try:
+            display_id = int(self._display.displayID())
+        except Exception:
+            return 0.0
+        refresh = 0.0
+        try:
+            from Quartz import CGDisplayCopyDisplayMode, CGDisplayModeGetRefreshRate
+
+            mode = CGDisplayCopyDisplayMode(display_id)
+            if mode is not None:
+                refresh = float(CGDisplayModeGetRefreshRate(mode))
+        except Exception:
+            pass
+        try:
+            for screen in NSScreen.screens():
+                if int(screen.deviceDescription()["NSScreenNumber"]) == display_id:
+                    refresh = max(refresh, float(screen.maximumFramesPerSecond()))
+                    break
+        except Exception:
+            pass
+        return refresh
+
+    def _minimum_frame_interval(self, fps):
+        # A second 1/60 throttle on a 60 Hz source loses capture ticks on
+        # macOS. Let SCK follow the display clock when it fits the requested
+        # ceiling; retain explicit caps for lower targets/unknown displays.
+        refresh = self._source_refresh_hz()
+        if refresh > 0 and fps >= refresh:
+            return CMTimeMake(0, 1)
+        return CMTimeMake(1, fps)
+
     def _start_stream(self):
         if self.capture_mode == "Monitor":
             filt = SCK.SCContentFilter.alloc().initWithDisplay_excludingWindows_(
@@ -532,7 +565,7 @@ class DesktopGrabber:
         config.setHeight_(self.height)
         config.setShowsCursor_(self.with_cursor)
         config.setPixelFormat_(CV.kCVPixelFormatType_32BGRA)
-        config.setMinimumFrameInterval_(CMTimeMake(1, max(1, self.fps)))
+        config.setMinimumFrameInterval_(self._minimum_frame_interval(self.fps))
         # Keep the SCK producer low-latency. A bounded queue prevents retained
         # IOSurfaces from back-pressuring the display stream. The default
         # depth 3 is the ScreenCaptureKit setting verified on this host;
@@ -589,7 +622,7 @@ class DesktopGrabber:
         config.setHeight_(self.height)
         config.setShowsCursor_(self.with_cursor)
         config.setPixelFormat_(CV.kCVPixelFormatType_32BGRA)
-        config.setMinimumFrameInterval_(CMTimeMake(1, target_fps))
+        config.setMinimumFrameInterval_(self._minimum_frame_interval(target_fps))
         try:
             if hasattr(config, "setQueueDepth_"):
                 try:
