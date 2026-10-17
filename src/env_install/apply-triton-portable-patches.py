@@ -37,8 +37,68 @@ def main() -> int:
         return 0
     site_packages = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else None
     if site_packages is None or not site_packages.is_dir():
-        print("usage: apply-triton-portable-patches.py <site-packages dir>")
+        print("usage: apply-triton-portable-patches.py <site-packages dir> [--unicode-env-only]")
         return 2
+    valid = patch_file(
+        site_packages / "triton" / "knobs.py",
+        '''    def get(self) -> str:
+        env_val = getenv(self.key)
+        if env_val is None:
+            return self.default_factory()''',
+        '''    def get(self) -> str:
+        # Triton's C getenv decodes Windows environment values as UTF-8. Use
+        # Python's Unicode-aware environment mapping for paths such as caches.
+        env_val = os.environ.get(self.key)
+        if env_val is None:
+            return self.default_factory()''',
+        "knobs.py Unicode environment paths",
+    )
+    if len(sys.argv) > 2:
+        if sys.argv[2] != "--unicode-env-only" or len(sys.argv) != 3:
+            print("usage: apply-triton-portable-patches.py <site-packages dir> [--unicode-env-only]")
+            return 2
+        if not valid:
+            print("triton Unicode environment patch failed")
+            return 1
+        print("triton Unicode environment patch verified")
+        return 0
+
+    valid = patch_file(
+        site_packages / "triton" / "backends" / "amd" / "driver.py",
+        '''    # Try rocm-sdk path --root first (for Windows ROCm SDK)
+    try:
+        result = subprocess.check_output(["rocm-sdk", "path", "--root"], stderr=subprocess.DEVNULL)
+        root = result.decode().strip()
+        if root and os.path.isdir(root):
+            return root
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    # Fall back to environment variables
+    for env_var in ["ROCM_HOME", "HIP_PATH", "ROCM_PATH"]:
+        path = os.environ.get(env_var, "")
+        if path and os.path.isdir(path):
+            return path
+    return None''',
+        '''    # Prefer explicit SDK paths. The rocm-sdk CLI uses the Windows console
+    # code page, but this module decodes output as UTF-8; Unicode portable
+    # install paths can otherwise fail before the environment fallback.
+    for env_var in ["ROCM_HOME", "HIP_PATH", "ROCM_PATH"]:
+        path = os.environ.get(env_var, "")
+        if path and os.path.isdir(path):
+            return path
+
+    # Fall back to rocm-sdk only when no SDK path was supplied.
+    try:
+        result = subprocess.check_output(["rocm-sdk", "path", "--root"], stderr=subprocess.DEVNULL)
+        root = result.decode("utf-8", errors="replace").strip()
+        if root and os.path.isdir(root):
+            return root
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return None''',
+        "amd driver Unicode SDK path",
+    ) and valid
     valid = patch_file(
         site_packages / "triton" / "windows_utils.py",
         '''def find_msvc(env_only: bool) -> tuple[Optional[str], list[str], list[str]]:
