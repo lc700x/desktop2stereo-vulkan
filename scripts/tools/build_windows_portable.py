@@ -49,8 +49,8 @@ VARIANTS: dict[str, dict[str, Any]] = {
         },
         "expected_arches": ("gfx1200", "gfx1201"),
     },
-    "rocm-device-all": {
-        "title": "ROCm device-all",
+    "rocm-rdna1-3": {
+        "title": "ROCm RDNA1–3",
         "profile": "rocm",
         "requirements": "requirements-rocm7.txt",
         "constraints": {
@@ -60,7 +60,25 @@ VARIANTS: dict[str, dict[str, Any]] = {
             "triton-windows": "==3.8.0.post29",
             "wc-rocm": "==0.1.3.post1",
         },
-        "expected_arches": (),
+        "expected_arches": (
+            "gfx1152",
+            "gfx1151",
+            "gfx1150",
+            "gfx1103",
+            "gfx1102",
+            "gfx1101",
+            "gfx1100",
+            "gfx1030",
+            "gfx1031",
+            "gfx1032",
+            "gfx1033",
+            "gfx1034",
+            "gfx1035",
+            "gfx1036",
+            "gfx1010",
+            "gfx1011",
+            "gfx1012",
+        ),
     },
     "cuda": {
         "title": "CUDA 12.8",
@@ -247,13 +265,20 @@ def windows_short_path(path: Path) -> str:
     return short_path
 
 
-def validate_torch_compile(runtime: Path, profile: str, slug: str, package_root: Path) -> dict[str, Any]:
+def validate_torch_compile(
+    runtime: Path,
+    profile: str,
+    slug: str,
+    package_root: Path,
+    expected_arches: tuple[str, ...] = (),
+) -> dict[str, Any]:
     cache_root = package_root / "runtime-cache" / slug
     triton_cache = windows_short_path(cache_root / "triton")
     inductor_cache = windows_short_path(cache_root / "inductor")
     env = clean_environment(runtime, profile=profile, slug=slug)
     env["TRITON_CACHE_DIR"] = triton_cache
     env["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
+    env["D2S_PORTABLE_EXPECTED_ARCHES"] = json.dumps(expected_arches)
     if profile == "rocm":
         msvc_stub = package_root / "src" / "desktop2stereo" / "msvcstub"
         env["INCLUDE"] = str(msvc_stub)
@@ -261,23 +286,38 @@ def validate_torch_compile(runtime: Path, profile: str, slug: str, package_root:
         env["LIBPATH"] = env["LIB"]
     code = r"""
 import json
+import os
 import torch
 
 if not torch.cuda.is_available():
     print(json.dumps({"status": "skipped", "reason": "No supported GPU or driver is available"}))
 else:
-    sample = torch.randn((128, 128), device="cuda")
-    compiled = torch.compile(lambda value: torch.sin(value) * 2.0 + value, fullgraph=True)
-    result = compiled(sample)
-    torch.cuda.synchronize()
-    if not torch.isfinite(result).all().item():
-        raise RuntimeError("torch.compile produced non-finite values")
-    print(json.dumps({
-        "status": "passed",
-        "torch": torch.__version__,
-        "device": torch.cuda.get_device_name(0),
-        "finite": True,
-    }))
+    device = torch.cuda.get_device_name(0)
+    expected_arches = json.loads(os.environ.get("D2S_PORTABLE_EXPECTED_ARCHES", "[]"))
+    properties = torch.cuda.get_device_properties(0)
+    architecture = str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
+    if expected_arches and architecture and architecture not in expected_arches:
+        print(json.dumps({
+            "status": "skipped",
+            "reason": "Build host GPU architecture is not included in this package",
+            "device": device,
+            "architecture": architecture,
+            "package_architectures": expected_arches,
+        }))
+    else:
+        sample = torch.randn((128, 128), device="cuda")
+        compiled = torch.compile(lambda value: torch.sin(value) * 2.0 + value, fullgraph=True)
+        result = compiled(sample)
+        torch.cuda.synchronize()
+        if not torch.isfinite(result).all().item():
+            raise RuntimeError("torch.compile produced non-finite values")
+        print(json.dumps({
+            "status": "passed",
+            "torch": torch.__version__,
+            "device": device,
+            "architecture": architecture or None,
+            "finite": True,
+        }))
 """
     result = subprocess.run(
         [str(runtime / "python.exe"), "-c", code],
@@ -422,9 +462,15 @@ def make_constraints(variant: dict[str, Any], target: Path) -> None:
     target.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
-def make_official_requirements(source: Path, target: Path) -> None:
+def make_official_requirements(
+    source: Path,
+    target: Path,
+    *,
+    rocm_arches: tuple[str, ...] = (),
+) -> None:
     """Copy a requirements file while removing inherited indexes and mirror includes."""
     rows: list[str] = []
+    architecture_extras = ",".join(f"device-{architecture}" for architecture in rocm_arches)
     for original in source.read_text(encoding="utf-8").splitlines():
         line = original.strip()
         if not line or line.startswith("#"):
@@ -432,6 +478,8 @@ def make_official_requirements(source: Path, target: Path) -> None:
             continue
         if re.match(r"^(?:-r\s|--requirement\b|--index-url\b|--extra-index-url\b|--find-links\b)", line, re.I):
             continue
+        if architecture_extras:
+            line = re.sub(r"\bdevice-all\b", architecture_extras, line)
         line = line.replace("https://ghfast.top/github.com/", "https://github.com/")
         if re.search(r"(?:ghfast\.top|huaweicloud\.com|mirrors\.aliyun\.com)", line, re.I):
             raise ValueError(f"Non-official package source in requirements: {line}")
@@ -679,7 +727,7 @@ def readme_text(slug: str, variant: dict[str, Any], model: dict[str, Any], vc_fi
     backend = "ROCm 7 / Triton Windows 3.8.0.post29" if variant["profile"] == "rocm" else "CUDA 12.8 / Triton Windows 3.6.0.post26"
     arch = ""
     if variant["profile"] == "rocm":
-        arch = "\nDevice package set: " + (", ".join(variant["expected_arches"]) if variant["expected_arches"] else "device-all; see PORTABLE_MANIFEST.json for the resolved architecture packages") + "\n"
+        arch = "\nDevice package set: " + ", ".join(variant["expected_arches"]) + "\n"
     en = f"""Desktop2Stereo Windows Portable
 
 Build flavor: {slug}
@@ -910,7 +958,13 @@ def verify_package(
     probe = run_app_probe(runtime, app_root, variant["profile"], slug)
     if not probe["completed"]:
         raise RuntimeError(f"Application capability probe failed for {slug}")
-    compile_smoke = validate_torch_compile(runtime, variant["profile"], slug, package_root)
+    compile_smoke = validate_torch_compile(
+        runtime,
+        variant["profile"],
+        slug,
+        package_root,
+        tuple(variant["expected_arches"]),
+    )
     return {
         "dependency_check": pip_check or "No broken requirements found.",
         "imports": imports,
@@ -976,7 +1030,11 @@ def build_variant(
     requirements_dir = stage / "dependencies" / "official-requirements"
     backend_requirements = requirements_dir / variant["requirements"]
     common_requirements = requirements_dir / "requirements.txt"
-    make_official_requirements(ROOT / "src" / "env_install" / variant["requirements"], backend_requirements)
+    make_official_requirements(
+        ROOT / "src" / "env_install" / variant["requirements"],
+        backend_requirements,
+        rocm_arches=variant["expected_arches"] if variant["profile"] == "rocm" else (),
+    )
     make_official_requirements(ROOT / "src" / "env_install" / "requirements.txt", common_requirements)
     index_args = official_index_args(variant["profile"])
     pip = [
