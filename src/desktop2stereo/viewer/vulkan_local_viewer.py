@@ -6,7 +6,9 @@ separate GLFW/Vulkan swapchain and never creates an OpenGL context.
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass, replace
+import math
 from pathlib import Path
 import os
 import queue
@@ -45,9 +47,35 @@ FIFO_LATEST_READY_DEVICE_EXTENSIONS = (
     "VK_EXT_present_mode_fifo_latest_ready",
 )
 VK_PRESENT_MODE_FIFO_LATEST_READY = 1000361000
+VK_EXT_METAL_OBJECTS = "VK_EXT_metal_objects"
+VK_EXPORT_METAL_BUFFER_OBJECT = 0x00000004
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 LOCAL_VIEWER_ICON_PATH = Path(__file__).resolve().parents[1] / "icon2.ico"
+
+
+class _VkExportMetalObjectCreateInfoEXT(ctypes.Structure):
+    _fields_ = [
+        ("sType", ctypes.c_int32),
+        ("pNext", ctypes.c_void_p),
+        ("exportObjectType", ctypes.c_int32),
+    ]
+
+
+class _VkExportMetalBufferInfoEXT(ctypes.Structure):
+    _fields_ = [
+        ("sType", ctypes.c_int32),
+        ("pNext", ctypes.c_void_p),
+        ("memory", ctypes.c_uint64),
+        ("mtlBuffer", ctypes.c_void_p),
+    ]
+
+
+class _VkExportMetalObjectsInfoEXT(ctypes.Structure):
+    _fields_ = [
+        ("sType", ctypes.c_int32),
+        ("pNext", ctypes.c_void_p),
+    ]
 
 
 def direct_display_capability(
@@ -772,6 +800,8 @@ class VulkanLocalViewer:
         self._source: _TransferSource | None = None
         self._direct_sources: list[_TransferSource] = []
         self._interop_extensions: tuple[str, ...] = ()
+        self._metal_objects_enabled = False
+        self._metal_export_notice_reported = False
         self._target_monitor = None
         self._exclusive_fullscreen = False
         self._full_screen_exclusive_enabled = False
@@ -800,6 +830,12 @@ class VulkanLocalViewer:
         self._last_latency_ms = 0.0
         self._latency_history: list[float] = []
         self._latency_history_max = 300
+        self._latency_stage_history: list[dict[str, float]] = []
+        self._latency_stage_history_max = 300
+        self._present_ready_phases: list[float] = []
+        self._present_queue_wait_ms: list[float] = []
+        self._present_phase_adjustment_ms = 0.0
+        self._present_phase_target_ms: float | None = None
         self._present_total = 0
         self._present_reused = 0
         self._present_cumulative_total = 0
@@ -1186,6 +1222,7 @@ class VulkanLocalViewer:
         self, fps: float, capture_target: int | None
     ) -> None:
         """Emit stable key/value playback metrics for offline analysis."""
+        latency = sorted(self._latency_history)
         parts = [
             f"present_fps={float(fps):.2f}",
             f"content_fps={self.content_fps():.2f}",
@@ -1195,6 +1232,72 @@ class VulkanLocalViewer:
             f"latency_samples={len(self._latency_history)}",
             f"display_hz={int(self._output_refresh_hz)}",
         ]
+        if latency:
+            parts.extend(
+                (
+                    f"latency_p50_ms={self._sample_percentile(latency, 0.50):.2f}",
+                    f"latency_p95_ms={self._sample_percentile(latency, 0.95):.2f}",
+                    f"latency_p99_ms={self._sample_percentile(latency, 0.99):.2f}",
+                    f"latency_max_ms={latency[-1]:.2f}",
+                )
+            )
+        thread_counts = {
+            int(item["metal_warp_threads"])
+            for item in self._latency_stage_history
+            if item.get("metal_warp_threads", 0) > 0
+        }
+        if len(thread_counts) == 1:
+            parts.append(f"metal_warp_threads={next(iter(thread_counts))}")
+        if self._latency_stage_history:
+            alias_samples = [
+                item["native_coreml_metal_vulkan_alias"]
+                for item in self._latency_stage_history
+                if "native_coreml_metal_vulkan_alias" in item
+            ]
+            if alias_samples:
+                parts.append(
+                    f"metal_vulkan_alias_ratio={sum(alias_samples) / len(alias_samples):.3f}"
+                )
+                parts.append(
+                    "metal_vulkan_ring_fallbacks="
+                    f"{sum(item.get('native_coreml_ring_fallback', 0.0) for item in self._latency_stage_history)}"
+                )
+        if self._present_phase_target_ms is not None:
+            parts.extend(
+                (
+                    f"present_phase_target_ms={self._present_phase_target_ms:.2f}",
+                    f"present_phase_adjustment_ms={self._present_phase_adjustment_ms:.3f}",
+                )
+            )
+        if self._latency_stage_history:
+            source_time = self._latency_stage_history[-1].get(
+                "sck_presentation_time"
+            )
+            if source_time is not None:
+                parts.append(f"sck_presentation_time={source_time:.6f}")
+        for name in (
+            "capture_to_runtime_start_ms",
+            "capture_to_runtime_ready_ms",
+            "capture_wait_ms",
+            "sck_callback_to_runtime_ms",
+            "runtime_execution_ms",
+            "depth_preprocess_ms",
+            "depth_model_ms",
+            "depth_postprocess_ms",
+            "metal_synthesis_gpu_ms",
+            "metal_handoff_copy_ms",
+            "viewer_queue_ms",
+            "present_call_ms",
+        ):
+            samples = sorted(
+                item[name]
+                for item in self._latency_stage_history
+                if name in item
+            )
+            if samples:
+                parts.append(
+                    f"{name}_p95={self._sample_percentile(samples, 0.95):.2f}"
+                )
         if capture_target is not None:
             parts.append(f"capture_target={int(capture_target)}")
         parts.extend(
@@ -1205,8 +1308,23 @@ class VulkanLocalViewer:
         )
         print(f"[D2S_METRICS] {' '.join(parts)}", flush=True)
 
-    def record_frame_latency(self, capture_start_time: float | None) -> None:
-        """Record capture-to-present age for a newly delivered frame."""
+    @staticmethod
+    def _sample_percentile(samples: list[float], quantile: float) -> float:
+        if not samples:
+            return 0.0
+        position = (len(samples) - 1) * min(1.0, max(0.0, float(quantile)))
+        lower = int(position)
+        upper = min(lower + 1, len(samples) - 1)
+        fraction = position - lower
+        return samples[lower] + (samples[upper] - samples[lower]) * fraction
+
+    def record_frame_latency(
+        self,
+        capture_start_time: float | None,
+        *,
+        stage_timing: dict[str, float] | None = None,
+    ) -> None:
+        """Record capture-start through successful present submission."""
         if capture_start_time is None:
             return
         try:
@@ -1225,6 +1343,88 @@ class VulkanLocalViewer:
         self._latency_history.append(latency_ms)
         if len(self._latency_history) > self._latency_history_max:
             del self._latency_history[0]
+        if stage_timing:
+            sample = {}
+            for key in (
+                "capture_to_runtime_start_ms",
+                "capture_to_runtime_ready_ms",
+                "capture_wait_ms",
+                "sck_callback_to_runtime_ms",
+                "runtime_execution_ms",
+                "depth_preprocess_ms",
+                "depth_model_ms",
+                "depth_postprocess_ms",
+                "metal_synthesis_gpu_ms",
+                "metal_handoff_copy_ms",
+                "metal_warp_threads",
+                "native_coreml_metal_vulkan_alias",
+                "native_coreml_ring_fallback",
+                "native_coreml_host_handoff_copy_count",
+                "native_coreml_gpu_copy_count",
+                "sck_presentation_time",
+                "viewer_queue_ms",
+                "present_call_ms",
+            ):
+                try:
+                    value = float(stage_timing[key])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if value >= 0.0 and value < 10_000.0:
+                    sample[key] = value
+            if sample:
+                self._latency_stage_history.append(sample)
+                if len(self._latency_stage_history) > self._latency_stage_history_max:
+                    del self._latency_stage_history[0]
+                if "viewer_queue_ms" in sample:
+                    self._present_queue_wait_ms.append(sample["viewer_queue_ms"])
+                    if len(self._present_queue_wait_ms) > 120:
+                        del self._present_queue_wait_ms[0]
+                ready_at = stage_timing.get("viewer_ready_at")
+                if ready_at is not None:
+                    try:
+                        phase = float(ready_at) % (1.0 / 60.0)
+                    except (TypeError, ValueError):
+                        phase = None
+                    if phase is not None:
+                        self._present_ready_phases.append(phase)
+                        if len(self._present_ready_phases) > 120:
+                            del self._present_ready_phases[0]
+
+    def calibrate_present_deadline(self, next_deadline: float) -> float:
+        """Nudge deadline phase toward the recent producer phase when needed."""
+        if len(self._present_ready_phases) < 120 or len(self._present_queue_wait_ms) < 120:
+            return next_deadline
+        queue_wait_p95 = self._sample_percentile(
+            sorted(self._present_queue_wait_ms), 0.95
+        )
+        if queue_wait_p95 <= 2.0:
+            return next_deadline
+        interval = 1.0 / 60.0
+        angles = [phase * (2.0 * math.pi / interval) for phase in self._present_ready_phases]
+        sine = sum(math.sin(angle) for angle in angles)
+        cosine = sum(math.cos(angle) for angle in angles)
+        if math.hypot(sine, cosine) / len(angles) < 0.1:
+            return next_deadline
+        ready_phase = (math.atan2(sine, cosine) % (2.0 * math.pi)) * interval / (
+            2.0 * math.pi
+        )
+        # Target the recent 99th-percentile preparation phase instead of the
+        # circular mean. A lower percentile can leave late frames just past
+        # the deadline, forcing a full refresh of added latency.
+        phase_offsets = sorted(
+            (phase - ready_phase + interval / 2.0) % interval - interval / 2.0
+            for phase in self._present_ready_phases
+        )
+        ready_p99 = self._sample_percentile(phase_offsets, 0.99)
+        target_phase = (ready_phase + ready_p99 + 0.001) % interval
+        self._present_phase_target_ms = target_phase * 1000.0
+        current_phase = next_deadline % interval
+        if current_phase < 1e-9 or interval - current_phase < 1e-9:
+            current_phase = 0.0
+        delta = (target_phase - current_phase + interval / 2.0) % interval - interval / 2.0
+        adjustment = min(0.0001, max(-0.0001, delta))
+        self._present_phase_adjustment_ms = adjustment * 1000.0
+        return next_deadline + adjustment
 
     def record_present(self, reused: bool) -> None:
         """Count successful submissions and those that replay cached content."""
@@ -1372,6 +1572,9 @@ class VulkanLocalViewer:
             *VulkanExportableSemaphore.required_device_extensions(),
         )
         self._interop_extensions = tuple(name for name in interop if name in available)
+        self._metal_objects_enabled = bool(
+            sys.platform == "darwin" and VK_EXT_METAL_OBJECTS in available
+        )
         exclusive_capable, exclusive_missing = full_screen_exclusive_capability(
             available_instance_extensions,
             available,
@@ -1409,6 +1612,8 @@ class VulkanLocalViewer:
                 flush=True,
             )
         enabled_extensions = ["VK_KHR_swapchain", *self._interop_extensions]
+        if self._metal_objects_enabled:
+            enabled_extensions.append(VK_EXT_METAL_OBJECTS)
         latest_ready_extension = next(
             (name for name in FIFO_LATEST_READY_DEVICE_EXTENSIONS if name in available),
             None,
@@ -1834,11 +2039,58 @@ class VulkanLocalViewer:
                     or self._source.format != self.source_format
                 ):
                     self._reset_sources(*target_size)
-                direct_source, direct_view = DIRECT_SINK.acquire(*target_size)
-                if direct_source is None or direct_view is None:
-                    raise RuntimeError("no Vulkan direct staging slot is available")
                 pack_started = time.perf_counter()
-                native_frame.pack(direct_view, target_size, output_format)
+                direct_source = DIRECT_SINK.pack_native(
+                    native_frame,
+                    target_size,
+                    output_format,
+                    fallback_source=self._source,
+                )
+                ring_fallback = direct_source is self._source
+                if direct_source is None:
+                    # If the persistent map is unavailable too, preserve the
+                    # frame through the standard host-upload path instead of
+                    # dropping it when the three-slot ring is exhausted.
+                    fallback_bytes = bytearray(
+                        int(target_size[0]) * int(target_size[1]) * 4
+                    )
+                    native_frame.pack(
+                        memoryview(fallback_bytes), target_size, output_format
+                    )
+                    ring_fallback = True
+                    object.__setattr__(
+                        frame,
+                        "viewer_frame_np",
+                        (fallback_bytes, target_size[0], target_size[1]),
+                    )
+                pack_metrics = dict(
+                    getattr(native_frame, "last_pack_metrics", {}) or {}
+                )
+                debug_info = getattr(frame, "debug_info", None)
+                if isinstance(debug_info, dict):
+                    alias_active = bool(
+                        pack_metrics.get("metal_buffer_alias", False)
+                    )
+                    debug_info["metal_synthesis_gpu_ms"] = float(
+                        pack_metrics.get("metal_gpu_ms", 0.0) or 0.0
+                    )
+                    debug_info["metal_handoff_copy_ms"] = float(
+                        pack_metrics.get("host_handoff_copy_ms", 0.0) or 0.0
+                    )
+                    debug_info["metal_warp_threads"] = int(
+                        pack_metrics.get("warp_threads", 0) or 0
+                    )
+                    debug_info["native_coreml_metal_vulkan_alias"] = int(
+                        alias_active
+                    )
+                    debug_info["native_coreml_host_handoff_copy_count"] = (
+                        0 if alias_active else 1
+                    )
+                    debug_info["native_coreml_gpu_copy_count"] = 1
+                    debug_info["native_coreml_ring_fallback"] = int(
+                        ring_fallback
+                        or bool(pack_metrics.get("metal_vulkan_ring_fallback", False))
+                    )
                 if self.config.on_breakdown_inc is not None:
                     self.config.on_breakdown_inc("direct_staging_claim", 1)
                 if self.config.on_breakdown_add_time is not None:
@@ -1849,7 +2101,8 @@ class VulkanLocalViewer:
                 native_frame = None
                 # The native slot is no longer needed after Metal completed its
                 # write. The Vulkan source now owns the present payload.
-                object.__setattr__(frame, "viewer_frame_direct", direct_source)
+                if direct_source is not None:
+                    object.__setattr__(frame, "viewer_frame_direct", direct_source)
                 object.__setattr__(frame, "viewer_native", None)
             except Exception as exc:
                 if direct_source is not None:
@@ -2033,6 +2286,8 @@ class _TransferSource:
         self._slow_present_count = 0
         self._input_monitor_size_cache: tuple[int, float, tuple[int, int]] | None = None
         self._direct_enabled = bool(direct_enabled)
+        self._metal_buffer: ctypes.c_void_p | None = None
+        self._metal_buffer_capacity = 0
         self._direct_lock = threading.Lock()
         self._direct_state = "available"
         self._create()
@@ -2074,12 +2329,92 @@ class _TransferSource:
                 return index
         raise RuntimeError("no compatible Vulkan memory type for local viewer")
 
+    def _export_metal_buffer(self):
+        vk = self.owner.vk
+        buffer_info = _VkExportMetalBufferInfoEXT(
+            vk.VK_STRUCTURE_TYPE_EXPORT_METAL_BUFFER_INFO_EXT,
+            None,
+            int(vk.ffi.cast("uint64_t", self.memory)),
+            None,
+        )
+        objects_info = _VkExportMetalObjectsInfoEXT(
+            vk.VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+            ctypes.addressof(buffer_info),
+        )
+        export = self.owner._device_function(
+            b"vkExportMetalObjectsEXT", "void(*)(VkDevice, void*)"
+        )
+        export(
+            self.owner.device,
+            vk.ffi.cast("void*", ctypes.addressof(objects_info)),
+        )
+        return ctypes.c_void_p(buffer_info.mtlBuffer) if buffer_info.mtlBuffer else None
+
     def _create(self) -> None:
         vk, device = self.owner.vk, self.owner.device
         self.buffer = vk.vkCreateBuffer(device, vk.VkBufferCreateInfo(sType=vk.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, size=self.capacity, usage=vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE), None)
         req = vk.vkGetBufferMemoryRequirements(device, self.buffer)
-        self.memory = vk.vkAllocateMemory(device, vk.VkMemoryAllocateInfo(sType=vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, allocationSize=req.size, memoryTypeIndex=self._memory_type(req.memoryTypeBits, vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)), None)
+        export_create_info = None
+        allocation_pnext = vk.ffi.NULL
+        if self._direct_enabled and self.owner._metal_objects_enabled:
+            export_create_info = _VkExportMetalObjectCreateInfoEXT(
+                vk.VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+                None,
+                VK_EXPORT_METAL_BUFFER_OBJECT,
+            )
+            allocation_pnext = vk.ffi.cast(
+                "void*", ctypes.addressof(export_create_info)
+            )
+        allocation_info = vk.VkMemoryAllocateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext=allocation_pnext,
+            allocationSize=req.size,
+            memoryTypeIndex=self._memory_type(
+                req.memoryTypeBits,
+                vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            ),
+        )
+        try:
+            self.memory = vk.vkAllocateMemory(device, allocation_info, None)
+        except Exception as exc:
+            if export_create_info is None:
+                raise
+            # Some MoltenVK/device combinations advertise the extension but
+            # cannot export this allocation. Keep the original staging path.
+            print(
+                "[VulkanLocalViewer] Metal-exportable allocation unavailable; "
+                f"using ordinary mapped staging ({exc})",
+                flush=True,
+            )
+            fallback_info = vk.VkMemoryAllocateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                allocationSize=req.size,
+                memoryTypeIndex=allocation_info.memoryTypeIndex,
+            )
+            self.memory = vk.vkAllocateMemory(device, fallback_info, None)
+            export_create_info = None
         vk.vkBindBufferMemory(device, self.buffer, self.memory, 0)
+        if export_create_info is not None:
+            try:
+                self._metal_buffer = self._export_metal_buffer()
+                if self._metal_buffer is not None:
+                    self._metal_buffer_capacity = int(req.size)
+                    if not self.owner._metal_export_notice_reported:
+                        self.owner._metal_export_notice_reported = True
+                        print(
+                            "[VulkanLocalViewer] Vulkan staging MTLBuffer export active",
+                            flush=True,
+                        )
+            except Exception as exc:
+                self._metal_buffer = None
+                if not self.owner._metal_export_notice_reported:
+                    self.owner._metal_export_notice_reported = True
+                    print(
+                        "[VulkanLocalViewer] Vulkan staging MTLBuffer export "
+                        f"unavailable; keeping mapped-buffer handoff ({exc})",
+                        flush=True,
+                    )
         # Persistent mapping for zero-copy present path: keep host-visible staging
         # buffer mapped for the lifetime of the source. This eliminates
         # per-frame vkMapMemory/vkUnmapMemory and the extra tobytes() copy
@@ -2590,28 +2925,38 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
     next_present_at = 0.0
     try:
         while not shutdown_event.is_set():
-            if cached_frame is not None and not config.vsync:
-                # Pace from the previous submission's start, so GPU work and
-                # queue waiting share one deadline instead of adding delays.
-                remaining = next_present_at - time.perf_counter()
+            paced = cached_frame is not None and not config.vsync
+            frame_grace = (
+                0.002
+                if paced and getattr(runtime_q, "_d2s_packer", None) is not None
+                else 0.0
+            )
+            scheduled_deadline = next_present_at
+            if paced:
+                # Leave the 2 ms latest-frame grace before the absolute
+                # deadline. A result that arrives early is held until the
+                # deadline, then the latest queued result is selected.
+                remaining = (
+                    scheduled_deadline - frame_grace - time.perf_counter()
+                )
                 if remaining > 0.0 and shutdown_event.wait(remaining):
                     break
             reused = False
             try:
+                if paced:
+                    queue_timeout = max(
+                        0.0, scheduled_deadline - time.perf_counter()
+                    )
+                elif cached_frame is not None:
+                    queue_timeout = 0.0
+                else:
+                    queue_timeout = 0.05
                 result, _started = runtime_q.get(
                     # FIFO VSync already waits for presentation. Adding a full
                     # capture-queue wait here drops a 24 FPS video's presents
-                    # below 60 Hz and makes its reuse cadence uneven.
-                    # A worker's completed pack may trail the display deadline
-                    # slightly. A bounded grace period avoids reusing a frame
-                    # just before its replacement arrives; the absolute clock
-                    # below compensates this wait on the following iteration.
-                    timeout=(
-                        0.002
-                        if cached_frame is not None and not config.vsync
-                        and getattr(runtime_q, "_d2s_packer", None) is not None
-                        else 0.0 if cached_frame is not None else 0.05
-                    )
+                    # below 60 Hz and makes its reuse cadence uneven. The
+                    # bounded grace is already positioned before the deadline.
+                    timeout=queue_timeout
                 )
             except queue.Empty:
                 if viewer is not None and cached_frame is not None:
@@ -2632,6 +2977,23 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                             preview_viewer = None
                             preview_disabled = True
                     continue
+            if not reused and paced:
+                remaining = scheduled_deadline - time.perf_counter()
+                if remaining > 0.0 and shutdown_event.wait(remaining):
+                    break
+                # Keep latest-wins semantics at the deadline, even if another
+                # prepared frame replaced the one received during the grace.
+                if not bool(getattr(runtime_q, "_d2s_ordered", False)):
+                    while True:
+                        try:
+                            candidate = runtime_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        _release_item(result)
+                        result, _started = candidate
+                        if config.on_breakdown_inc is not None:
+                            config.on_breakdown_inc("viewer_get", 1)
+                            config.on_breakdown_inc("viewer_drop", 1)
             if not reused:
                 if config.on_breakdown_inc is not None:
                     config.on_breakdown_inc("viewer_get", 1)
@@ -2735,10 +3097,6 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                         f"{type(exc).__name__}: {exc}",
                         flush=True,
                     )
-            if not reused:
-                record_latency = getattr(viewer, "record_frame_latency", None)
-                if callable(record_latency):
-                    record_latency(_started)
             present_started = time.perf_counter()
             frame_path = (
                 cached_path if reused else
@@ -2748,12 +3106,60 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             cached_present = getattr(viewer, "_present_cached", None)
             presented = cached_present() if reused and callable(cached_present) else viewer.present(frame)
             presented_at = time.perf_counter()
+            if presented is not False and not reused:
+                debug_info = getattr(result, "debug_info", None)
+                stage_timing: dict[str, float] = {}
+                if isinstance(debug_info, dict):
+                    for key in (
+                        "capture_to_runtime_start_ms",
+                        "capture_to_runtime_ready_ms",
+                        "capture_wait_ms",
+                        "sck_callback_to_runtime_ms",
+                        "runtime_execution_ms",
+                        "depth_preprocess_ms",
+                        "depth_model_ms",
+                        "depth_postprocess_ms",
+                        "metal_synthesis_gpu_ms",
+                        "metal_handoff_copy_ms",
+                        "metal_warp_threads",
+                        "native_coreml_metal_vulkan_alias",
+                        "native_coreml_ring_fallback",
+                        "native_coreml_host_handoff_copy_count",
+                        "native_coreml_gpu_copy_count",
+                        "sck_presentation_time",
+                    ):
+                        try:
+                            stage_timing[key] = float(debug_info[key])
+                        except (KeyError, TypeError, ValueError):
+                            pass
+                    ready_at = debug_info.get("viewer_ready_at")
+                    try:
+                        ready_at = float(ready_at)
+                    except (TypeError, ValueError):
+                        ready_at = None
+                    if ready_at is not None:
+                        stage_timing["viewer_ready_at"] = ready_at
+                        stage_timing["viewer_queue_ms"] = max(
+                            0.0, (present_started - ready_at) * 1000.0
+                        )
+                stage_timing["present_call_ms"] = max(
+                    0.0, (presented_at - present_started) * 1000.0
+                )
+                record_latency = getattr(viewer, "record_frame_latency", None)
+                if callable(record_latency):
+                    record_latency(_started, stage_timing=stage_timing)
             # Preserve the clock: relative waits accumulate scheduler oversleep
             # and turn 60 Hz into roughly 57 FPS on macOS.
             if next_present_at == 0.0:
                 next_present_at = present_started
             interval = 1.0 / 60.0
             next_present_at += interval
+            if presented is not False and not reused:
+                calibrate_phase = getattr(
+                    viewer, "calibrate_present_deadline", None
+                )
+                if callable(calibrate_phase):
+                    next_present_at = calibrate_phase(next_present_at)
             if next_present_at <= presented_at:
                 # Drop elapsed slots. Immediately catching up after a stall
                 # produces a short burst followed by another uneven gap.

@@ -656,6 +656,8 @@ def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync, 
             timeouts.append(timeout)
             if len(timeouts) == 1:
                 return SimpleNamespace(sbs=frame), 1.0
+            if timeout > 0.0:
+                clock[0] += timeout
             raise queue.Empty
 
         def get_nowait(self):
@@ -692,11 +694,84 @@ def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync, 
     run_vulkan_local_viewer(runtime_q=FrameQueue(), shutdown_event=shutdown,
                             config=VulkanLocalViewerConfig(vsync=vsync))
 
-    assert timeouts == [.05, .002 if packer and not vsync else 0.0]
+    assert timeouts == pytest.approx(
+        [.05, .002 if packer and not vsync else 0.0]
+    )
     if vsync:
         assert waits == []
     else:
-        assert waits == pytest.approx([1 / 60 - .003])
+        grace = .002 if packer else 0.0
+        assert waits == pytest.approx([1 / 60 - .003 - grace])
+
+
+def test_local_viewer_latency_ends_after_successful_present(monkeypatch) -> None:
+    shutdown = threading.Event()
+    clock = [1.0]
+    latency_owner = VulkanLocalViewer(VulkanLocalViewerConfig())
+
+    class FakeViewer:
+        record_frame_latency = latency_owner.record_frame_latency
+
+        def __init__(self, _config):
+            pass
+
+        def initialize(self):
+            pass
+
+        def present(self, _frame):
+            clock[0] += .008
+            shutdown.set()
+            return True
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: clock[0])
+    runtime_q = queue.Queue()
+    runtime_q.put(
+        (SimpleNamespace(sbs=object(), debug_info={"viewer_ready_at": .998}), .990)
+    )
+    run_vulkan_local_viewer(
+        runtime_q=runtime_q,
+        shutdown_event=shutdown,
+        config=VulkanLocalViewerConfig(),
+    )
+
+    assert latency_owner._latency_history == pytest.approx([18.0])
+    stage = latency_owner._latency_stage_history[-1]
+    assert stage["viewer_queue_ms"] == pytest.approx(2.0)
+    assert stage["present_call_ms"] == pytest.approx(8.0)
+
+
+def test_present_deadline_calibration_is_bounded_and_keeps_one_ms_margin() -> None:
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    interval = 1.0 / 60.0
+    ready_phase = .006
+    viewer._present_ready_phases = [ready_phase] * 120
+    viewer._present_queue_wait_ms = [2.1] * 120
+    deadline = 20 * interval
+
+    adjusted = viewer.calibrate_present_deadline(deadline)
+
+    assert adjusted - deadline == pytest.approx(.0001)
+    phase_error_before = ready_phase + .001
+    phase_error_after = abs(
+        (ready_phase + .001 - adjusted % interval + interval / 2) % interval
+        - interval / 2
+    )
+    assert phase_error_after < phase_error_before
+
+
+def test_present_deadline_calibration_tracks_slow_ready_phase_tail() -> None:
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    interval = 1.0 / 60.0
+    viewer._present_ready_phases = [0.006] * 118 + [0.010] * 2
+    viewer._present_queue_wait_ms = [3.0] * 120
+
+    viewer.calibrate_present_deadline(20 * interval)
+
+    assert viewer._present_phase_target_ms > 10.0
 
 
 def test_local_viewer_pacing_does_not_accumulate_timer_oversleep(monkeypatch) -> None:

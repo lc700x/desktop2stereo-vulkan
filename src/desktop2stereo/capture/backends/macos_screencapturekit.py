@@ -13,6 +13,7 @@ from Quartz import CoreVideo as CV
 from CoreMedia import (
     CMTimeMake,
     CMSampleBufferGetImageBuffer,
+    CMSampleBufferGetPresentationTimeStamp,
     CMSampleBufferGetSampleAttachmentsArray,
 )
 from AppKit import NSScreen
@@ -131,12 +132,28 @@ class _OwnedSCKFrame:
     them, so frames dropped anywhere along the queue chain cannot leak.
     """
 
-    __slots__ = ("texture", "pixel_buffer", "frame_status", "_released")
+    __slots__ = (
+        "texture",
+        "pixel_buffer",
+        "frame_status",
+        "callback_time",
+        "presentation_time",
+        "_released",
+    )
 
-    def __init__(self, cv_texture, pixel_buffer, frame_status=None):
+    def __init__(
+        self, cv_texture, pixel_buffer, frame_status=None,
+        callback_time=None, presentation_time=None,
+    ):
         self.texture = cv_texture
         self.pixel_buffer = pixel_buffer
         self.frame_status = frame_status
+        self.callback_time = (
+            float(callback_time) if callback_time is not None else None
+        )
+        self.presentation_time = (
+            float(presentation_time) if presentation_time is not None else None
+        )
         self._released = False
         CV.CVPixelBufferRetain(pixel_buffer)
         if cv_texture is not None:
@@ -205,12 +222,25 @@ class _SCKFrameReceiver(NSObject):
         return self
 
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, outputType):
+        callback_time = time.perf_counter()
         if outputType != 0:
             return
         try:
             imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
             if imageBuffer is None:
                 return
+            sck_presentation_time = None
+            try:
+                presentation_time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                if int(presentation_time.timescale) > 0:
+                    sck_presentation_time = (
+                        float(presentation_time.value)
+                        / float(presentation_time.timescale)
+                    )
+            except Exception:
+                # Source-clock metadata is diagnostic only; a PyObjC CMTime
+                # shape difference must not discard an otherwise valid frame.
+                pass
             frame_status = None
             try:
                 attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, False)
@@ -247,7 +277,10 @@ class _SCKFrameReceiver(NSObject):
                 # Native Core ML creates the CVMetalTexture from this same
                 # IOSurface at consumption time. Avoid wrapping it once here
                 # and again in the bridge on the SCK callback thread.
-                owned = _OwnedSCKFrame(None, imageBuffer, frame_status)
+                owned = _OwnedSCKFrame(
+                    None, imageBuffer, frame_status, callback_time,
+                    sck_presentation_time,
+                )
                 replaced = None
                 with self._condition:
                     replaced = self._latest_owned
@@ -296,7 +329,13 @@ class _SCKFrameReceiver(NSObject):
                                         flush=True,
                                     )
                                 if zc_enabled:
-                                    owned = _OwnedSCKFrame(cv_tex, imageBuffer, frame_status)
+                                    owned = _OwnedSCKFrame(
+                                        cv_tex,
+                                        imageBuffer,
+                                        frame_status,
+                                        callback_time,
+                                        sck_presentation_time,
+                                    )
                                     replaced = None
                                     with self._condition:
                                         replaced = self._latest_owned

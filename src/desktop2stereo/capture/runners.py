@@ -108,6 +108,14 @@ class PollingCaptureRunner:
                             sck_zero_copy=zero_copy,
                             metadata={
                                 "backend": type(self._source).__name__,
+                                "capture_poll_started_at": capture_start_time,
+                                "capture_poll_returned_at": time.perf_counter(),
+                                "sck_callback_time": getattr(
+                                    zero_copy, "callback_time", None
+                                ),
+                                "sck_presentation_time": getattr(
+                                    zero_copy, "presentation_time", None
+                                ),
                                 "capture_frame_status": getattr(
                                     zero_copy, "frame_status", None
                                 ),

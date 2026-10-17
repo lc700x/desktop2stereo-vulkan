@@ -44,6 +44,13 @@ typedef struct {
 } D2SCoreMLIOResult;
 
 typedef struct {
+    double metal_gpu_ms;
+    double host_handoff_copy_ms;
+    int32_t metal_buffer_alias;
+    int32_t warp_threads;
+} D2SCoreMLIOPackResult;
+
+typedef struct {
     float depth_strength;
     float max_disparity_px;
     float convergence;
@@ -79,14 +86,26 @@ int32_t d2s_coreml_io_pack(void *handle, int32_t slot, void *destination,
                            int32_t output_height, int32_t output_format,
                            const D2SCoreMLIOWarpConfig *warp_config,
                            float eye_offset, float depth_strength,
-                           float convergence, float smooth_texels);
+                           float convergence, float smooth_texels,
+                           D2SCoreMLIOPackResult *result);
 
 int32_t d2s_coreml_io_pack_rgb(void *handle, int32_t slot, void *destination,
                                size_t destination_size, int32_t output_width,
                                int32_t output_height, int32_t output_format,
                                const D2SCoreMLIOWarpConfig *warp_config,
                                float eye_offset, float depth_strength,
-                               float convergence, float smooth_texels);
+                               float convergence, float smooth_texels,
+                               D2SCoreMLIOPackResult *result);
+
+int32_t d2s_coreml_io_pack_metal(void *handle, int32_t slot,
+                                 void *metal_destination,
+                                 size_t destination_size,
+                                 int32_t output_width, int32_t output_height,
+                                 int32_t output_format,
+                                 const D2SCoreMLIOWarpConfig *warp_config,
+                                 float eye_offset, float depth_strength,
+                                 float convergence, float smooth_texels,
+                                 D2SCoreMLIOPackResult *result);
 
 int32_t d2s_coreml_io_release(void *handle, int32_t slot);
 const char *d2s_coreml_io_last_error(void *handle);

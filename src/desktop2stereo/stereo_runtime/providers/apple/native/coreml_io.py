@@ -72,6 +72,15 @@ class _NativeResult(ctypes.Structure):
     ]
 
 
+class _NativePackResult(ctypes.Structure):
+    _fields_ = [
+        ("metal_gpu_ms", ctypes.c_double),
+        ("host_handoff_copy_ms", ctypes.c_double),
+        ("metal_buffer_alias", ctypes.c_int32),
+        ("warp_threads", ctypes.c_int32),
+    ]
+
+
 class _NativeWarpConfig(ctypes.Structure):
     _fields_ = [
         ("depth_strength", ctypes.c_float),
@@ -239,6 +248,9 @@ class NativeCoreMLFrame:
     normalization_history_reset: bool = False
     warp_config: dict[str, float | int | str] | None = None
     released: bool = False
+    last_pack_metrics: dict[str, float | bool] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
     _lifetime_lock: Any = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
@@ -258,7 +270,7 @@ class NativeCoreMLFrame:
         output_format: str,
         *,
         rgb: bool = False,
-    ) -> None:
+    ) -> dict[str, float | bool]:
         # The native slot owns Metal buffers used until pack's command buffer
         # completes. Serialize release with the whole pack call so a queue
         # drop or shutdown cannot free those buffers while Metal is using them.
@@ -269,9 +281,39 @@ class NativeCoreMLFrame:
             width, height = (int(output_size[0]), int(output_size[1]))
             arguments = (self, pointer, len(view), width, height, output_format)
             if rgb:
-                self.bridge.pack(*arguments, rgb=True)
+                metrics = self.bridge.pack(*arguments, rgb=True)
             else:
-                self.bridge.pack(*arguments)
+                metrics = self.bridge.pack(*arguments)
+            self.last_pack_metrics = metrics
+            return metrics
+
+    def pack_metal(
+        self,
+        metal_buffer: Any,
+        destination_size: int,
+        output_size: tuple[int, int],
+        output_format: str,
+    ) -> dict[str, float | bool]:
+        """Write the native warp into the MTLBuffer exported from Vulkan memory."""
+        with self._lifetime_lock:
+            if self.released:
+                raise RuntimeError("native CoreML frame was already released")
+            pointer_value = getattr(metal_buffer, "value", metal_buffer)
+            pointer = ctypes.c_void_p(int(pointer_value or 0))
+            if not pointer.value:
+                raise ValueError("exported Vulkan Metal buffer is null")
+            width, height = (int(output_size[0]), int(output_size[1]))
+            metrics = self.bridge.pack(
+                self,
+                None,
+                int(destination_size),
+                width,
+                height,
+                output_format,
+                metal_buffer=pointer,
+            )
+            self.last_pack_metrics = metrics
+            return metrics
 
     def configure_warp(self, **values: float | int | str) -> None:
         """Attach the shared stereo parameters before presenter-side packing."""
@@ -331,11 +373,14 @@ class NativeCoreMLIOBridge:
             ctypes.c_float,
             ctypes.c_float,
             ctypes.c_float,
+            ctypes.POINTER(_NativePackResult),
         ]
         self._library.d2s_coreml_io_pack.argtypes = pack_argtypes
         self._library.d2s_coreml_io_pack.restype = ctypes.c_int32
         self._library.d2s_coreml_io_pack_rgb.argtypes = pack_argtypes
         self._library.d2s_coreml_io_pack_rgb.restype = ctypes.c_int32
+        self._library.d2s_coreml_io_pack_metal.argtypes = pack_argtypes
+        self._library.d2s_coreml_io_pack_metal.restype = ctypes.c_int32
         self._library.d2s_coreml_io_release.argtypes = [ctypes.c_void_p, ctypes.c_int32]
         self._library.d2s_coreml_io_release.restype = ctypes.c_int32
         self._library.d2s_coreml_io_last_error.argtypes = [ctypes.c_void_p]
@@ -478,7 +523,8 @@ class NativeCoreMLIOBridge:
         output_format: str,
         *,
         rgb: bool = False,
-    ) -> None:
+        metal_buffer: ctypes.c_void_p | None = None,
+    ) -> dict[str, float | bool]:
         try:
             eye_offset = float(os.environ.get("D2S_METAL_WARP_IPD", "0.064")) / 2.0
             depth_strength = 0.1 * float(
@@ -519,14 +565,17 @@ class NativeCoreMLIOBridge:
         handle = self._begin_call(allow_closing=True)
         try:
             pack_function = (
-                self._library.d2s_coreml_io_pack_rgb
+                self._library.d2s_coreml_io_pack_metal
+                if metal_buffer is not None
+                else self._library.d2s_coreml_io_pack_rgb
                 if rgb
                 else self._library.d2s_coreml_io_pack
             )
+            pack_result = _NativePackResult()
             code = pack_function(
                 handle,
                 int(frame.slot),
-                destination,
+                metal_buffer if metal_buffer is not None else destination,
                 int(destination_size),
                 int(output_width),
                 int(output_height),
@@ -536,12 +585,19 @@ class NativeCoreMLIOBridge:
                 depth_strength,
                 convergence,
                 1.5,
+                ctypes.byref(pack_result),
             )
             if code != 0:
                 self._update_error(handle)
                 raise RuntimeError(
                     self.last_error or f"native Metal pack failed ({code})"
                 )
+            return {
+                "metal_gpu_ms": float(pack_result.metal_gpu_ms),
+                "host_handoff_copy_ms": float(pack_result.host_handoff_copy_ms),
+                "metal_buffer_alias": bool(pack_result.metal_buffer_alias),
+                "warp_threads": int(pack_result.warp_threads),
+            }
         finally:
             self._end_call()
 

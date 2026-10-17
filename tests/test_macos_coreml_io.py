@@ -325,6 +325,45 @@ def test_native_frame_can_request_gpu_rgb24_pack() -> None:
     assert bridge.rgb is True
 
 
+def test_native_frame_can_write_directly_to_an_exported_metal_buffer() -> None:
+    class RecordingBridge:
+        def __init__(self):
+            self.pack_call = None
+
+        def pack(
+            self, frame, destination, destination_size, width, height,
+            output_format, *, metal_buffer=None,
+        ):
+            self.pack_call = (
+                destination, destination_size, width, height, output_format,
+                metal_buffer.value,
+            )
+            return {
+                "metal_gpu_ms": 0.7,
+                "host_handoff_copy_ms": 0.0,
+                "metal_buffer_alias": True,
+                "warp_threads": 128,
+            }
+
+        def release(self, _slot):
+            pass
+
+    bridge = RecordingBridge()
+    frame = _native_frame(bridge)
+    buffer = ctypes.create_string_buffer(64)
+
+    metrics = frame.pack_metal(
+        ctypes.addressof(buffer), 64, (4, 2), "half_sbs"
+    )
+
+    assert bridge.pack_call == (
+        None, 64, 4, 2, "half_sbs", ctypes.addressof(buffer)
+    )
+    assert metrics["metal_buffer_alias"] is True
+    assert metrics["warp_threads"] == 128
+    assert frame.last_pack_metrics == metrics
+
+
 def test_native_frame_accepts_shared_layered_warp_configuration() -> None:
     bridge = object()
     frame = _native_frame(bridge)

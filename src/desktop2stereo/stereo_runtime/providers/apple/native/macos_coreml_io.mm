@@ -1915,14 +1915,17 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
 }
 
 static int32_t d2s_coreml_io_pack_internal(
-    void *handle, int32_t slot_index, void *destination, size_t destination_size,
+    void *handle, int32_t slot_index, void *destination,
+    void *metal_destination, size_t destination_size,
     int32_t output_width, int32_t output_height, int32_t output_format,
     const D2SCoreMLIOWarpConfig *warp_config, float eye_offset,
     float depth_strength, float convergence, float smooth_texels,
-    uint32_t output_channels) {
+    uint32_t output_channels, D2SCoreMLIOPackResult *result) {
     @autoreleasepool {
         D2SCoreMLIO *ctx = (D2SCoreMLIO *)handle;
-        if (ctx == NULL || destination == NULL || slot_index < 0 || slot_index >= 3 ||
+        if (result != NULL) memset(result, 0, sizeof(*result));
+        if (ctx == NULL || (destination == NULL && metal_destination == NULL) ||
+            slot_index < 0 || slot_index >= 3 ||
             output_width <= 0 || output_height <= 0 || output_format < D2S_OUTPUT_HALF_SBS ||
             output_format > D2S_OUTPUT_LEIA ||
             (output_channels != 3u && output_channels != 4u)) {
@@ -1967,11 +1970,22 @@ static int32_t d2s_coreml_io_pack_internal(
         // allocation and command use ordered if more than one caller packs.
         D2SLockGuard pack_lock(&ctx->pack_mutex);
         size_t output_bytes = (size_t)output_width * (size_t)output_height * output_channels;
-        if (slot->packed_buffer == nil || slot->packed_buffer.length < output_bytes) {
-            slot->packed_buffer = [ctx->device newBufferWithLength:(NSUInteger)output_bytes
-                                                               options:MTLResourceStorageModeShared];
+        id<MTLBuffer> destination_buffer = nil;
+        if (metal_destination != NULL) {
+            destination_buffer = (__bridge id<MTLBuffer>)metal_destination;
+            if (destination_buffer.length < output_bytes ||
+                (destination_size > 0 && destination_size < output_bytes)) {
+                d2s_set_error(ctx, @"exported Metal destination is smaller than the packed frame");
+                return D2S_COREML_ERROR;
+            }
+            if (result != NULL) result->metal_buffer_alias = 1;
+        } else {
+            if (slot->packed_buffer == nil || slot->packed_buffer.length < output_bytes) {
+                slot->packed_buffer = [ctx->device newBufferWithLength:(NSUInteger)output_bytes
+                                                                   options:MTLResourceStorageModeShared];
+            }
+            destination_buffer = slot->packed_buffer;
         }
-        id<MTLBuffer> destination_buffer = slot->packed_buffer;
         if (destination_buffer == nil) {
             d2s_set_error(ctx, @"Metal native warp output buffer allocation failed");
             return D2S_COREML_ERROR;
@@ -2144,6 +2158,18 @@ static int32_t d2s_coreml_io_pack_internal(
         [encoder setBuffer:warp_destination offset:0 atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         NSUInteger threads = 64;
+        const char *thread_override = getenv("D2S_METAL_WARP_THREADS");
+        if (thread_override != NULL && thread_override[0] != '\0') {
+            char *end = NULL;
+            long requested = strtol(thread_override, &end, 10);
+            if (end != thread_override && end != NULL && *end == '\0' &&
+                (requested == 64 || requested == 128 || requested == 256) &&
+                (NSUInteger)requested <=
+                    ctx->warp_pipeline.maxTotalThreadsPerThreadgroup) {
+                threads = (NSUInteger)requested;
+            }
+        }
+        if (result != NULL) result->warp_threads = (int32_t)threads;
         MTLSize grid = MTLSizeMake((NSUInteger)output_width * output_height, 1, 1);
         [encoder dispatchThreads:grid
           threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
@@ -2154,10 +2180,20 @@ static int32_t d2s_coreml_io_pack_internal(
             d2s_set_error(ctx, @"Metal native warp command failed");
             return D2S_COREML_ERROR;
         }
-        // Vulkan's mapped MoltenVK allocation is CPU-visible but is not a
-        // valid Metal bytesNoCopy GPU resource. Keep the warp GPU-side, then
-        // perform one explicit handoff into Vulkan's mapped transfer buffer.
-        memcpy(destination, destination_buffer.contents, output_bytes);
+        if (result != NULL && command.GPUEndTime >= command.GPUStartTime &&
+            command.GPUStartTime > 0.0) {
+            result->metal_gpu_ms =
+                (command.GPUEndTime - command.GPUStartTime) * 1000.0;
+        }
+        if (metal_destination == NULL) {
+            // Keep the established mapped-memory handoff as a safe fallback
+            // when the Vulkan allocation could not be exported to Metal.
+            double copy_started = d2s_now_ms();
+            memcpy(destination, destination_buffer.contents, output_bytes);
+            if (result != NULL) {
+                result->host_handoff_copy_ms = d2s_now_ms() - copy_started;
+            }
+        }
         return D2S_COREML_OK;
     }
 }
@@ -2167,11 +2203,12 @@ int32_t d2s_coreml_io_pack(void *handle, int32_t slot_index, void *destination,
                            int32_t output_height, int32_t output_format,
                            const D2SCoreMLIOWarpConfig *warp_config,
                            float eye_offset, float depth_strength,
-                           float convergence, float smooth_texels) {
+                           float convergence, float smooth_texels,
+                           D2SCoreMLIOPackResult *result) {
     return d2s_coreml_io_pack_internal(
-        handle, slot_index, destination, destination_size, output_width,
-        output_height, output_format, warp_config, eye_offset, depth_strength,
-        convergence, smooth_texels, 4u);
+        handle, slot_index, destination, NULL, destination_size,
+        output_width, output_height, output_format, warp_config, eye_offset,
+        depth_strength, convergence, smooth_texels, 4u, result);
 }
 
 int32_t d2s_coreml_io_pack_rgb(void *handle, int32_t slot_index, void *destination,
@@ -2179,11 +2216,24 @@ int32_t d2s_coreml_io_pack_rgb(void *handle, int32_t slot_index, void *destinati
                                int32_t output_height, int32_t output_format,
                                const D2SCoreMLIOWarpConfig *warp_config,
                                float eye_offset, float depth_strength,
-                               float convergence, float smooth_texels) {
+                               float convergence, float smooth_texels,
+                               D2SCoreMLIOPackResult *result) {
     return d2s_coreml_io_pack_internal(
-        handle, slot_index, destination, destination_size, output_width,
-        output_height, output_format, warp_config, eye_offset, depth_strength,
-        convergence, smooth_texels, 3u);
+        handle, slot_index, destination, NULL, destination_size,
+        output_width, output_height, output_format, warp_config, eye_offset,
+        depth_strength, convergence, smooth_texels, 3u, result);
+}
+
+int32_t d2s_coreml_io_pack_metal(
+    void *handle, int32_t slot_index, void *metal_destination,
+    size_t destination_size, int32_t output_width, int32_t output_height,
+    int32_t output_format, const D2SCoreMLIOWarpConfig *warp_config,
+    float eye_offset, float depth_strength, float convergence,
+    float smooth_texels, D2SCoreMLIOPackResult *result) {
+    return d2s_coreml_io_pack_internal(
+        handle, slot_index, NULL, metal_destination, destination_size,
+        output_width, output_height, output_format, warp_config, eye_offset,
+        depth_strength, convergence, smooth_texels, 4u, result);
 }
 
 int32_t d2s_coreml_io_release(void *handle, int32_t slot_index) {

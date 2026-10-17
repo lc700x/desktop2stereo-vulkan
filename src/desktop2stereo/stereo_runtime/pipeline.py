@@ -1752,6 +1752,8 @@ class RuntimePipelineLoop:
         queue_put_start_time = time.perf_counter()
         if not _add_cuda_event_timings(ctx, runtime_result):
             self._pending_cuda_timing_results.append(runtime_result)
+        if isinstance(debug_info, dict):
+            debug_info["viewer_ready_at"] = time.perf_counter()
         try:
             runtime_q_was_full = ctx.runtime_q.full()
         except Exception:
@@ -2452,6 +2454,42 @@ class RuntimePipelineLoop:
                 runtime_latency = time.perf_counter() - runtime_start_time
                 ctx.thread_latencies["resize"] = process_latency
                 ctx.thread_latencies["runtime"] = runtime_latency
+                debug_info = getattr(runtime_result, "debug_info", None)
+                if isinstance(debug_info, dict):
+                    runtime_ready_at = time.perf_counter()
+                    debug_info["capture_poll_started_at"] = float(capture_start_time)
+                    debug_info["capture_to_runtime_ready_ms"] = max(
+                        0.0, (runtime_ready_at - capture_start_time) * 1000.0
+                    )
+                    debug_info["capture_to_runtime_start_ms"] = max(
+                        0.0, process_latency * 1000.0
+                    )
+                    debug_info["runtime_execution_ms"] = max(
+                        0.0, runtime_latency * 1000.0
+                    )
+                    debug_info["runtime_ready_at"] = runtime_ready_at
+                    metadata = getattr(captured_frame, "metadata", None)
+                    sck_callback_time = metadata.get("sck_callback_time") if isinstance(metadata, dict) else None
+                    sck_presentation_time = metadata.get("sck_presentation_time") if isinstance(metadata, dict) else None
+                    if sck_presentation_time is not None:
+                        try:
+                            debug_info["sck_presentation_time"] = float(sck_presentation_time)
+                        except (TypeError, ValueError):
+                            pass
+                    if sck_callback_time is not None:
+                        try:
+                            sck_callback_time = float(sck_callback_time)
+                            debug_info["sck_callback_time"] = sck_callback_time
+                            debug_info["capture_wait_ms"] = max(
+                                0.0,
+                                (sck_callback_time - capture_start_time) * 1000.0,
+                            )
+                            debug_info["sck_callback_to_runtime_ms"] = max(
+                                0.0,
+                                (runtime_ready_at - sck_callback_time) * 1000.0,
+                            )
+                        except (TypeError, ValueError):
+                            pass
 
                 if not _cuda_event_ready(self._last_cuda_ready_event):
                     self._pending_runtime_items.append(

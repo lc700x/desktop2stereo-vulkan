@@ -94,6 +94,30 @@ class HostFramePacker:
                     _release_item(result)
                     continue
                 if source is not None:
+                    pack_metrics = dict(
+                        getattr(native, "last_pack_metrics", {}) or {}
+                    )
+                    debug_info = getattr(result, "debug_info", None)
+                    if isinstance(debug_info, dict):
+                        alias_active = bool(
+                            pack_metrics.get("metal_buffer_alias", False)
+                        )
+                        debug_info["metal_synthesis_gpu_ms"] = float(
+                            pack_metrics.get("metal_gpu_ms", 0.0) or 0.0
+                        )
+                        debug_info["metal_handoff_copy_ms"] = float(
+                            pack_metrics.get("host_handoff_copy_ms", 0.0) or 0.0
+                        )
+                        debug_info["metal_warp_threads"] = int(
+                            pack_metrics.get("warp_threads", 0) or 0
+                        )
+                        debug_info["native_coreml_metal_vulkan_alias"] = int(
+                            alias_active
+                        )
+                        debug_info["native_coreml_host_handoff_copy_count"] = (
+                            0 if alias_active else 1
+                        )
+                        debug_info["native_coreml_gpu_copy_count"] = 1
                     native.release()
                     object.__setattr__(result, "viewer_native", None)
                     object.__setattr__(result, "viewer_frame_direct", source)
@@ -351,6 +375,14 @@ class HostFramePacker:
 
     def _forward(self, result: Any) -> None:
         # Mirror the pipeline's latest-wins semantics on the consumer queue.
+        ready_result = (
+            result[0]
+            if isinstance(result, tuple) and len(result) == 2
+            else result
+        )
+        debug_info = getattr(ready_result, "debug_info", None)
+        if isinstance(debug_info, dict):
+            debug_info["viewer_ready_at"] = time.perf_counter()
         custom_put = getattr(self.out_q, "put_latest", None)
         try:
             if callable(custom_put):
