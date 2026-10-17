@@ -809,6 +809,11 @@ class VulkanLocalViewer:
         self._reuse_ratio = 0.0
 
     def initialize(self) -> None:
+        if sys.platform == "darwin":
+            # MoltenVK can wait for CAMetalLayer drawables while encoding a
+            # submit. Dispatch encoding off the NSApp thread so window events
+            # keep flowing; the existing fence still protects staging memory.
+            os.environ.setdefault("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0")
         # Without DPI awareness the OS scales the fullscreen window's
         # framebuffer down (e.g. 1920x1200 -> 1280x800 at 150%), leaving the
         # swapchain at the scaled extent and the image in the top-left corner.
@@ -1868,6 +1873,7 @@ class VulkanLocalViewer:
         if direct_source is not None and not (
             direct_source is self._source or direct_source in self._direct_sources
         ):
+            object.__setattr__(frame, "viewer_frame_direct", None)
             try:
                 direct_source._release_direct()
             except Exception:
@@ -1913,6 +1919,7 @@ class VulkanLocalViewer:
             direct=direct,
         ):
             if direct:
+                object.__setattr__(frame, "viewer_frame_direct", None)
                 source._release_direct()
             return False
         if direct:
@@ -2207,24 +2214,31 @@ class _TransferSource:
         vk, o = self.owner.vk, self.owner
         frame_started = time.perf_counter()
         stage_started = frame_started
-        fence_value = vk.vkWaitForFences(
-            o.device, 1, [o.fence], True, 1_000_000_000
-        )
+        # Keep the macOS event loop responsive if a drawable/GPU completion
+        # is late. Never reset a command buffer whose submission is pending.
+        wait_ns = 2_000_000 if sys.platform == "darwin" else 1_000_000_000
+        try:
+            fence_value = vk.vkWaitForFences(o.device, 1, [o.fence], True, wait_ns)
+        except vk.VkTimeout:
+            return False
         fence_result = int(vk.VK_SUCCESS if fence_value is None else fence_value)
         fence_ms = (time.perf_counter() - stage_started) * 1000.0
-        if fence_result == int(vk.VK_SUCCESS):
-            for source in [o._source, *o._direct_sources]:
-                if source is not None:
-                    source._complete_direct()
+        if fence_result == int(vk.VK_TIMEOUT):
+            return False
+        if fence_result != int(vk.VK_SUCCESS):
+            raise RuntimeError(f"Vulkan local-viewer fence failed ({fence_result})")
+        for source in [o._source, *o._direct_sources]:
+            if source is not None:
+                source._complete_direct()
         index_output = vk.ffi.new("uint32_t *")
         acquire = o._device_function(b"vkAcquireNextImageKHR", "VkResult(*)(VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t *)")
         stage_started = time.perf_counter()
-        acquire_result = int(acquire(o.device, o.swapchain, 1_000_000_000, o.image_available, vk.ffi.NULL, index_output))
+        acquire_result = int(acquire(o.device, o.swapchain, wait_ns, o.image_available, vk.ffi.NULL, index_output))
         acquire_ms = (time.perf_counter() - stage_started) * 1000.0
+        if acquire_result in (int(vk.VK_TIMEOUT), int(vk.VK_NOT_READY)):
+            return False
         if o.is_swapchain_out_of_date(acquire_result):
             o.recreate_swapchain()
-            if direct:
-                self._release_direct()
             return False
         recreate_after_present = o.is_swapchain_recreate_result(acquire_result)
         if acquire_result != int(vk.VK_SUCCESS) and not recreate_after_present:
@@ -2284,6 +2298,7 @@ class _TransferSource:
                 vk.vkUnmapMemory(o.device, self.memory)
         upload_ms = (time.perf_counter() - stage_started) * 1000.0
         stage_started = time.perf_counter()
+        record_cpu_started = time.thread_time()
         cmd = o.command_buffer
         vk.vkResetCommandBuffer(cmd, 0)
         vk.vkBeginCommandBuffer(cmd, vk.VkCommandBufferBeginInfo(sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO))
@@ -2491,6 +2506,7 @@ class _TransferSource:
             self._transition(cmd, source_image, vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.VK_IMAGE_LAYOUT_GENERAL)
         vk.vkEndCommandBuffer(cmd)
         record_ms = (time.perf_counter() - stage_started) * 1000.0
+        record_cpu_ms = (time.thread_time() - record_cpu_started) * 1000.0
         waits = [o.image_available]
         stages = [vk.VK_PIPELINE_STAGE_TRANSFER_BIT]
         if gpu_source:
@@ -2499,11 +2515,13 @@ class _TransferSource:
         render_finished = o.render_finished[index]
         submit = vk.VkSubmitInfo(sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO, waitSemaphoreCount=len(waits), pWaitSemaphores=waits, pWaitDstStageMask=stages, commandBufferCount=1, pCommandBuffers=[cmd], signalSemaphoreCount=1, pSignalSemaphores=[render_finished])
         stage_started = time.perf_counter()
+        submit_cpu_started = time.thread_time()
         submit_value = vk.vkQueueSubmit(o.queue, 1, [submit], o.fence)
         submit_result = int(vk.VK_SUCCESS if submit_value is None else submit_value)
         if direct and submit_result != int(vk.VK_SUCCESS):
             self._release_direct()
         submit_ms = (time.perf_counter() - stage_started) * 1000.0
+        submit_cpu_ms = (time.thread_time() - submit_cpu_started) * 1000.0
         if direct and submit_result == int(vk.VK_SUCCESS):
             self._mark_direct_submitted()
         present_info = vk.VkPresentInfoKHR(sType=vk.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, waitSemaphoreCount=1, pWaitSemaphores=[render_finished], swapchainCount=1, pSwapchains=[o.swapchain], pImageIndices=[index])
@@ -2521,10 +2539,12 @@ class _TransferSource:
                     f"fence_result={fence_result} acquire={acquire_ms:.1f}ms "
                     f"acquire_result={acquire_result} "
                     f"upload={upload_ms:.1f}ms record={record_ms:.1f}ms "
+                    f"record_cpu={record_cpu_ms:.1f}ms "
                     f"monitor_size={monitor_size_ms:.1f}ms "
                     f"overlay={overlay_ms:.1f}ms "
                     f"overlay_upload={overlay_upload_ms:.1f}ms "
                     f"submit={submit_ms:.1f}ms submit_result={submit_result} "
+                    f"submit_cpu={submit_cpu_ms:.1f}ms "
                     f"present={present_ms:.1f}ms present_result={result} "
                     f"gpu={gpu_source} rocm={self._rocm_interop} fit={fit_mode}",
                     flush=True,
@@ -2732,7 +2752,14 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             # and turn 60 Hz into roughly 57 FPS on macOS.
             if next_present_at == 0.0:
                 next_present_at = present_started
-            next_present_at = max(next_present_at + 1.0 / 60.0, presented_at)
+            interval = 1.0 / 60.0
+            next_present_at += interval
+            if next_present_at <= presented_at:
+                # Drop elapsed slots. Immediately catching up after a stall
+                # produces a short burst followed by another uneven gap.
+                next_present_at += (
+                    int((presented_at - next_present_at) / interval) + 1
+                ) * interval
             if config.on_breakdown_add_time is not None:
                 config.on_breakdown_add_time(
                     "local_present", presented_at - present_started
@@ -2767,6 +2794,9 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                 cached_result = result
                 cached_frame = frame
                 cached_path = frame_path
+            elif presented is False and not reused:
+                _release_item(result)
+                continue
             if preview_viewer is not None and not reused:
                 preview_frame = depth_preview_frame(result)
                 if preview_frame is None:

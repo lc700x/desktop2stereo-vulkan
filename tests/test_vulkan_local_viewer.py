@@ -744,6 +744,39 @@ def test_local_viewer_pacing_does_not_accumulate_timer_oversleep(monkeypatch) ->
     assert starts[-1] - starts[0] == pytest.approx(2.0, abs=.002)
 
 
+def test_local_viewer_skips_missed_deadlines_after_a_stall(monkeypatch) -> None:
+    shutdown = threading.Event()
+    clock = [1.0]
+    starts = []
+    ends = []
+    runtime_q = queue.Queue()
+    runtime_q.put((SimpleNamespace(sbs=object()), 1.0))
+
+    class FakeViewer:
+        def __init__(self, _config): pass
+        def initialize(self): pass
+        def present(self, _frame):
+            starts.append(clock[0])
+            clock[0] += .040 if len(starts) == 2 else .003
+            ends.append(clock[0])
+            if len(starts) == 4:
+                shutdown.set()
+            return True
+        def close(self): pass
+
+    def wait(seconds):
+        clock[0] += seconds
+        return False
+
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(shutdown, "wait", wait)
+    run_vulkan_local_viewer(runtime_q=runtime_q, shutdown_event=shutdown,
+                            config=VulkanLocalViewerConfig(vsync=False))
+    assert starts[2] - ends[1] >= .005
+    assert starts[3] - starts[2] == pytest.approx(1 / 60)
+
+
 def test_local_viewer_passes_direct_source_without_host_payload(monkeypatch) -> None:
     from utils.queue_utils import _release_item
 
@@ -800,6 +833,93 @@ def test_cached_present_reuses_vulkan_image_without_pixel_conversion(monkeypatch
     viewer._source = None
     assert viewer._present_cached() is False
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("throws", [False, True])
+def test_gpu_fence_timeout_does_not_reuse_pending_commands(monkeypatch, throws) -> None:
+    waits = []
+    class VkTimeout(Exception): pass
+
+    def wait(*args):
+        waits.append(args[-1])
+        if throws:
+            raise VkTimeout
+        return 2
+
+    vk = SimpleNamespace(
+        VK_SUCCESS=0, VK_TIMEOUT=2, VkTimeout=VkTimeout, vkWaitForFences=wait,
+    )
+    source = local_viewer_module._TransferSource.__new__(local_viewer_module._TransferSource)
+    source.owner = SimpleNamespace(vk=vk, device=object(), fence=object())
+    monkeypatch.setattr(local_viewer_module.sys, "platform", "darwin")
+
+    assert source.present(None, reuse=True) is False
+    assert waits == [2_000_000]
+
+
+@pytest.mark.parametrize("result", [1, 2])
+def test_image_acquire_timeout_does_not_reset_submission_fence(monkeypatch, result) -> None:
+    waits = []
+    vk = SimpleNamespace(
+        VK_SUCCESS=0, VK_NOT_READY=1, VK_TIMEOUT=2,
+        vkWaitForFences=lambda *a: None,
+        ffi=SimpleNamespace(new=lambda _: [None], NULL=None),
+    )
+
+    def acquire(*args):
+        waits.append(args[2])
+        return result
+
+    source = local_viewer_module._TransferSource.__new__(local_viewer_module._TransferSource)
+    source.owner = SimpleNamespace(
+        vk=vk, device=object(), fence=object(), _source=None, _direct_sources=[],
+        _device_function=lambda *a: acquire, swapchain=object(), image_available=object(),
+    )
+    monkeypatch.setattr(local_viewer_module.sys, "platform", "darwin")
+
+    assert source.present(None, reuse=True) is False
+    assert waits == [2_000_000]
+
+
+def test_failed_direct_present_releases_lease_only_once(monkeypatch) -> None:
+    from utils.queue_utils import _release_item
+
+    releases = []
+    source = SimpleNamespace(size=(4, 2), format=None,
+                             present=lambda *a, **kw: False,
+                             _release_direct=lambda: releases.append(1))
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    viewer.window = object()
+    viewer._source = source
+    monkeypatch.setattr(viewer, "poll_events", lambda: None)
+    frame = SimpleNamespace(viewer_frame_direct=source)
+
+    assert viewer.present(frame) is False
+    _release_item(frame)
+    assert frame.viewer_frame_direct is None
+    assert releases == [1]
+
+
+def test_failed_frame_is_retired_by_viewer_loop(monkeypatch) -> None:
+    shutdown = threading.Event()
+    releases = []
+    runtime_q = queue.Queue()
+    frame = SimpleNamespace(sbs=object(), native_resource=SimpleNamespace(
+        release=lambda: releases.append(1)))
+    runtime_q.put((frame, 0.0))
+
+    class FakeViewer:
+        def __init__(self, _config): pass
+        def initialize(self): pass
+        def present(self, _frame):
+            shutdown.set()
+            return False
+        def close(self): pass
+
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    run_vulkan_local_viewer(runtime_q=runtime_q, shutdown_event=shutdown,
+                            config=VulkanLocalViewerConfig())
+    assert releases == [1]
 
 
 def test_queued_direct_frame_from_retired_ring_is_dropped(monkeypatch) -> None:
