@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from utils.queue_utils import _release_item
+from utils.queue_utils import _release_item, drain_latest, put_latest
 
 
 class HostFramePacker:
@@ -50,6 +50,8 @@ class HostFramePacker:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join()
 
     # -- worker -------------------------------------------------------------
     def _run(self) -> None:
@@ -58,6 +60,9 @@ class HostFramePacker:
                 item = self.in_q.get(timeout=0.05)
             except queue.Empty:
                 continue
+            item = drain_latest(
+                self.in_q, item, on_drop=lambda: self.on_stat("packer_drop", 1)
+            )
             # Pipeline publishes (runtime_result, capture_start_time).
             if isinstance(item, tuple) and len(item) == 2:
                 result, stamp = item
@@ -74,14 +79,34 @@ class HostFramePacker:
                 )
             started = time.perf_counter()
             packed = None
+            native = getattr(result, "viewer_native", None)
+            if native is not None:
+                from stereo_runtime._fused_warp_mps import pack_target
+                from viewer.direct_sink import DIRECT_SINK
+
+                output_format = str(getattr(result, "output_format", None) or "half_sbs")
+                size = pack_target(*native.source_size, output_format)
+                try:
+                    source = DIRECT_SINK.pack_native(native, size, output_format)
+                except Exception as exc:
+                    self.on_stat("direct_staging_pack_error", 1)
+                    print(f"[HostFramePacker] native pack failed: {exc}", flush=True)
+                    _release_item(result)
+                    continue
+                if source is not None:
+                    native.release()
+                    object.__setattr__(result, "viewer_native", None)
+                    object.__setattr__(result, "viewer_frame_direct", source)
+                    self.on_stat("direct_staging_claim", 1)
+                    self.on_stat("native_pack_ms", (time.perf_counter() - started) * 1000.0)
+                # The first native frame initializes the viewer's staging ring.
+                self._forward((result, stamp) if stamp is not None else result)
+                continue
             sbs = getattr(result, "sbs", None)
             deferred = (
                 getattr(result, "viewer_rgb", None) is not None
                 or getattr(result, "viewer_bgra", None) is not None
                 or getattr(result, "viewer_frame_np", None) is not None
-                # Native Core ML frames own their Metal color/depth resources
-                # and are packed directly by the Vulkan presenter.
-                or getattr(result, "viewer_native", None) is not None
             )
             # Fused warp-pack for DEFERRED frames (darwin+vulkan): one Metal
             # kernel turns the shipped rgb+depth tensors into final Half-SBS
@@ -325,25 +350,15 @@ class HostFramePacker:
             self._forward((result, stamp) if stamp is not None else result)
 
     def _forward(self, result: Any) -> None:
-        out_put = getattr(self.out_q, "put", None)
         # Mirror the pipeline's latest-wins semantics on the consumer queue.
-        put_latest = getattr(self.out_q, "put_latest", None)
+        custom_put = getattr(self.out_q, "put_latest", None)
         try:
-            if callable(put_latest):
-                put_latest(result)
-                return
-            if out_put is None:
-                return
-            try:
-                out_put(result, timeout=0.05)
-            except queue.Full:
-                try:
-                    _release_item(self.out_q.get_nowait())  # drop oldest, keep newest
-                    self.on_stat("packer_drop", 1)
-                except queue.Empty:
-                    pass
-                out_put(result, timeout=0.05)
+            if callable(custom_put):
+                custom_put(result)
+            else:
+                put_latest(self.out_q, result)
         except Exception:
+            _release_item(result)
             self.on_stat("packer_error", 1)
 
 
@@ -399,8 +414,8 @@ def maybe_install_local_viewer_packer(
             f"[packer-gate] installing host frame packer in_q_id={id(pipeline_q):x}",
             flush=True,
         )
-    packed_q: "queue.Queue[Any]" = queue.Queue(maxsize=4)
-    install_host_frame_packer(
+    packed_q: "queue.Queue[Any]" = queue.Queue(maxsize=1)
+    packed_q._d2s_packer = install_host_frame_packer(
         pipeline_q, packed_q, on_stat=on_stat
     )
     local_viewer_kwargs["runtime_q"] = packed_q

@@ -61,5 +61,21 @@ class DirectSinkRegistry:
         if callable(release):
             release()
 
+    def pack_native(self, frame, size: tuple[int, int], output_format: str):
+        """Pack under the registry lock so unregister/unmap waits for writes."""
+        if not direct_staging_enabled():
+            return None
+        with self._lock:
+            for source in self._sources:
+                if source.size != size or not source.claim_direct():
+                    continue
+                try:
+                    frame.pack(source.direct_view, size, output_format)
+                except Exception:
+                    source._release_direct()
+                    raise
+                return source
+        return None
+
 
 DIRECT_SINK = DirectSinkRegistry()

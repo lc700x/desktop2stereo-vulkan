@@ -1873,6 +1873,8 @@ class VulkanLocalViewer:
             except Exception:
                 pass
             direct_source = None
+            # A queued frame can outlive a resize/replacement of the ring.
+            return False
         direct = direct_source is not None
         # Runtime-packed host frame: pure memcpy, no device sync. A direct
         # source already contains the final fused output in mapped pages.
@@ -1913,6 +1915,10 @@ class VulkanLocalViewer:
             if direct:
                 source._release_direct()
             return False
+        if direct:
+            # The submission fence now owns this lease. A cached result must
+            # not release a later packer's claim of the same recycled source.
+            object.__setattr__(frame, "viewer_frame_direct", None)
         self._last_present_source = source
         now = time.perf_counter()
         self._fps_frames += 1
@@ -2560,6 +2566,7 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
     preview_disabled = not bool(config.window_preview)
     cached_result = None
     cached_frame = None
+    cached_path = "host"
     next_present_at = 0.0
     try:
         while not shutdown_event.is_set():
@@ -2575,7 +2582,16 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     # FIFO VSync already waits for presentation. Adding a full
                     # capture-queue wait here drops a 24 FPS video's presents
                     # below 60 Hz and makes its reuse cadence uneven.
-                    timeout=0.0 if cached_frame is not None else 0.05
+                    # A worker's completed pack may trail the display deadline
+                    # slightly. A bounded grace period avoids reusing a frame
+                    # just before its replacement arrives; the absolute clock
+                    # below compensates this wait on the following iteration.
+                    timeout=(
+                        0.002
+                        if cached_frame is not None and not config.vsync
+                        and getattr(runtime_q, "_d2s_packer", None) is not None
+                        else 0.0 if cached_frame is not None else 0.05
+                    )
                 )
             except queue.Empty:
                 if viewer is not None and cached_frame is not None:
@@ -2704,10 +2720,19 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                 if callable(record_latency):
                     record_latency(_started)
             present_started = time.perf_counter()
+            frame_path = (
+                cached_path if reused else
+                "direct" if getattr(result, "viewer_frame_direct", None) is not None else
+                "native" if getattr(result, "viewer_native", None) is not None else "host"
+            )
             cached_present = getattr(viewer, "_present_cached", None)
             presented = cached_present() if reused and callable(cached_present) else viewer.present(frame)
             presented_at = time.perf_counter()
-            next_present_at = present_started + 1.0 / 60.0
+            # Preserve the clock: relative waits accumulate scheduler oversleep
+            # and turn 60 Hz into roughly 57 FPS on macOS.
+            if next_present_at == 0.0:
+                next_present_at = present_started
+            next_present_at = max(next_present_at + 1.0 / 60.0, presented_at)
             if config.on_breakdown_add_time is not None:
                 config.on_breakdown_add_time(
                     "local_present", presented_at - present_started
@@ -2721,12 +2746,7 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     config.on_breakdown_inc("local_depth_presented_frame", 1)
                 if reused:
                     config.on_breakdown_inc("local_reused_presented", 1)
-                if bool(getattr(result, "viewer_frame_direct", None) is not None):
-                    config.on_breakdown_inc("local_direct_presented", 1)
-                elif bool(getattr(result, "viewer_native", None) is not None):
-                    config.on_breakdown_inc("local_native_presented", 1)
-                else:
-                    config.on_breakdown_inc("local_host_presented", 1)
+                config.on_breakdown_inc(f"local_{frame_path}_presented", 1)
             if presented is not False:
                 record_present = getattr(viewer, "record_present", None)
                 if callable(record_present):
@@ -2746,6 +2766,7 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     _release_item(cached_result)
                 cached_result = result
                 cached_frame = frame
+                cached_path = frame_path
             if preview_viewer is not None and not reused:
                 preview_frame = depth_preview_frame(result)
                 if preview_frame is None:
@@ -2772,6 +2793,13 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
     except StopIteration:
         shutdown_event.set()
     finally:
+        packer = getattr(runtime_q, "_d2s_packer", None)
+        if packer is not None:
+            # Stop native writes before the viewer unmaps its staging ring.
+            packer.stop()
+            from utils.queue_utils import clear_nonblocking
+
+            clear_nonblocking(runtime_q)
         if cached_result is not None:
             _release_item(cached_result)
         if preview_viewer is not None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+import threading
 import types
 import time
 from dataclasses import replace
@@ -132,6 +133,30 @@ class CoreMLEngine:
     """
 
     def __init__(self, model_path: str | Path, device: str | torch.device) -> None:
+        self._model_path = str(model_path)
+        self._model = None
+        self._model_lock = threading.Lock()
+        self._compute_units_choice = os.environ.get("D2S_COREML_COMPUTE_UNITS", "all").strip().lower()
+        self.device = torch.device(device)
+        self.native_io = None
+        self.native_io_reason = "not_attempted"
+
+    @property
+    def model(self):
+        # The native bridge owns its MLModel. Load a second model only when a
+        # caller actually needs Python prediction (including native fallback).
+        if self._model is not None:
+            return self._model
+        with self._model_lock:
+            if self._model is None:
+                self._model = self._load_python_model()
+        return self._model
+
+    @model.setter
+    def model(self, value):
+        self._model = value
+
+    def _load_python_model(self):
         import coremltools as ct
 
         # ComputeUnit.ALL lets CoreML schedule depth on the GPU, whose Metal
@@ -139,21 +164,15 @@ class CoreMLEngine:
         # (frame N's host pull drains frame N-1's CoreML-GPU tail). Pinning
         # to ANE(+CPU) frees the GPU for torch MPS entirely.
         # D2S_COREML_COMPUTE_UNITS: all (default) | ane | cpu_and_gpu
-        import os
-
-        choice = os.environ.get("D2S_COREML_COMPUTE_UNITS", "all").strip().lower()
         units = {
             "ane": getattr(ct.ComputeUnit, "CPU_AND_NE", ct.ComputeUnit.ALL),
             "cpu_and_gpu": ct.ComputeUnit.CPU_AND_GPU,
             "cpu": ct.ComputeUnit.CPU_ONLY,
-        }.get(choice, ct.ComputeUnit.ALL)
-        self.model = ct.models.MLModel(
-            str(model_path),
+        }.get(self._compute_units_choice, ct.ComputeUnit.ALL)
+        return ct.models.MLModel(
+            self._model_path,
             compute_units=units,
         )
-        self.device = torch.device(device)
-        self.native_io = None
-        self.native_io_reason = "not_attempted"
 
     def enable_native_io(
         self, model_path: str | Path, input_width: int, input_height: int
@@ -675,8 +694,11 @@ class _CoreMLMixin:
         else:
             print(f"[CoreML] Using cached model {model_path.name}", flush=True)
 
+        print("[CoreML] Loading inference runtime and Metal pipelines...", flush=True)
         engine = CoreMLEngine(model_path, self.device)
         engine.enable_native_io(model_path, input_w, input_h)
+        if engine.native_io is None:
+            _ = engine.model  # Finish fallback loading before announcing Ready.
         self._set_coreml_info()
         self.info = replace(
             self.info,

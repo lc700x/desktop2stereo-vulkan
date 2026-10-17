@@ -20,6 +20,43 @@ def test_is_coreml_available_returns_bool() -> None:
     assert isinstance(is_coreml_available(), bool)
 
 
+def test_native_coreml_startup_does_not_load_a_second_python_model(monkeypatch) -> None:
+    from stereo_runtime.providers.apple.native import NativeCoreMLIOBridge
+
+    calls = []
+    bridge = SimpleNamespace(predict=lambda buffer, frame_id: (buffer, frame_id))
+    monkeypatch.setattr("stereo_runtime.providers.apple.pytorch_mps.sys.platform", "darwin")
+    monkeypatch.setenv("D2S_COREML_NATIVE_IO", "1")
+    monkeypatch.setattr(NativeCoreMLIOBridge, "try_create", lambda *_: (bridge, None))
+    monkeypatch.setattr(CoreMLEngine, "_load_python_model", lambda _: calls.append("load"))
+
+    engine = CoreMLEngine("cached.mlpackage", "cpu")
+    engine.enable_native_io("cached.mlpackage", 336, 196)
+
+    assert engine.predict_native("pixel_buffer", 7) == ("pixel_buffer", 7)
+    assert calls == []
+
+
+def test_python_coreml_fallback_loads_once_on_first_prediction(monkeypatch) -> None:
+    import numpy as np
+    import torch
+
+    calls = []
+    model = SimpleNamespace(predict=lambda _: {"depth": np.ones((1, 2, 2), dtype=np.float32)})
+
+    def load(_engine):
+        calls.append("load")
+        return model
+
+    monkeypatch.setattr(CoreMLEngine, "_load_python_model", load)
+    engine = CoreMLEngine("cached.mlpackage", "cpu")
+    assert calls == []
+    for _ in range(2):
+        result = engine(torch.zeros(1, 3, 2, 2))
+        assert bool((result.predicted_depth == 1).all())
+    assert calls == ["load"]
+
+
 def test_generic_provider_accepts_coreml_flags() -> None:
     provider = GenericAutoDepthMpsProvider(
         model_id="xingyang1/Distill-Any-Depth-Small-hf",

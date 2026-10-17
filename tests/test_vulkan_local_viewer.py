@@ -641,7 +641,8 @@ def test_local_viewer_counts_successful_depth_presentations_and_intervals(monkey
 
 
 @pytest.mark.parametrize("vsync", [True, False])
-def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync) -> None:
+@pytest.mark.parametrize("packer", [True, False])
+def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync, packer) -> None:
     shutdown = threading.Event()
     frame = object()
     timeouts = []
@@ -649,6 +650,8 @@ def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync) 
     clock = [1.0]
 
     class FrameQueue:
+        _d2s_packer = SimpleNamespace(stop=lambda: None) if packer else None
+
         def get(self, *, timeout):
             timeouts.append(timeout)
             if len(timeouts) == 1:
@@ -689,14 +692,63 @@ def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync) 
     run_vulkan_local_viewer(runtime_q=FrameQueue(), shutdown_event=shutdown,
                             config=VulkanLocalViewerConfig(vsync=vsync))
 
-    assert timeouts == [.05, 0.0]
+    assert timeouts == [.05, .002 if packer and not vsync else 0.0]
     if vsync:
         assert waits == []
     else:
         assert waits == pytest.approx([1 / 60 - .003])
 
 
+def test_local_viewer_pacing_does_not_accumulate_timer_oversleep(monkeypatch) -> None:
+    shutdown = threading.Event()
+    clock = [1.0]
+    starts = []
+    frame = object()
+
+    class FrameQueue:
+        def get(self, *, timeout):
+            if not starts:
+                return SimpleNamespace(sbs=frame), 1.0
+            raise queue.Empty
+
+        def get_nowait(self):
+            raise queue.Empty
+
+    class FakeViewer:
+        def __init__(self, _config):
+            pass
+
+        def initialize(self):
+            pass
+
+        def present(self, value):
+            starts.append(clock[0])
+            clock[0] += .003
+            if len(starts) == 121:
+                shutdown.set()
+            return True
+
+        def close(self):
+            pass
+
+    def wait(seconds):
+        clock[0] += seconds + .001  # A real macOS timer can wake late.
+        return False
+
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(shutdown, "wait", wait)
+    run_vulkan_local_viewer(runtime_q=FrameQueue(), shutdown_event=shutdown,
+                            config=VulkanLocalViewerConfig(vsync=False))
+
+    assert starts[-1] - starts[0] == pytest.approx(2.0, abs=.002)
+
+
 def test_local_viewer_passes_direct_source_without_host_payload(monkeypatch) -> None:
+    from utils.queue_utils import _release_item
+
+    releases = []
+
     class FakeSource:
         size = (4, 2)
         format = None
@@ -707,6 +759,9 @@ def test_local_viewer_passes_direct_source_without_host_payload(monkeypatch) -> 
         def present(self, pixels, *, direct=False):
             self.calls.append((pixels, direct))
             return True
+
+        def _release_direct(self):
+            releases.append(self)
 
     viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
     viewer.window = object()
@@ -722,7 +777,12 @@ def test_local_viewer_passes_direct_source_without_host_payload(monkeypatch) -> 
     monkeypatch.setattr(local_viewer_module, "frame_to_rgba_bytes", lambda _frame: (_ for _ in ()).throw(AssertionError("host fallback used")))
 
     viewer.present(frame)
+    # The source may already have been claimed for another frame when the
+    # cached result is eventually retired. Retirement cannot cancel that claim.
+    _release_item(frame)
     assert viewer._source.calls == [(None, True)]
+    assert frame.viewer_frame_direct is None
+    assert releases == []
 
 
 def test_cached_present_reuses_vulkan_image_without_pixel_conversion(monkeypatch) -> None:
@@ -740,6 +800,19 @@ def test_cached_present_reuses_vulkan_image_without_pixel_conversion(monkeypatch
     viewer._source = None
     assert viewer._present_cached() is False
     assert len(calls) == 1
+
+
+def test_queued_direct_frame_from_retired_ring_is_dropped(monkeypatch) -> None:
+    releases = []
+    retired = SimpleNamespace(_release_direct=lambda: releases.append(1))
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    viewer.window = object()
+    monkeypatch.setattr(viewer, "poll_events", lambda: None)
+    monkeypatch.setattr(local_viewer_module, "frame_to_cuda_rgba",
+                        lambda _: (_ for _ in ()).throw(AssertionError("retired payload converted")))
+
+    assert viewer.present(SimpleNamespace(viewer_frame_direct=retired)) is False
+    assert releases == [1]
 
 
 def test_window_preview_duplicates_output_without_replacing_fullscreen(monkeypatch) -> None:

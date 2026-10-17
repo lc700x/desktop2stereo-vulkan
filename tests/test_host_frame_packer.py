@@ -1,10 +1,13 @@
 """Host frame packer gate tests (ported macOS pipeline)."""
 
 import sys
+import queue
+import threading
 from types import SimpleNamespace
 
 from viewer.direct_sink import DirectSinkRegistry
 from viewer.host_frame_packer import maybe_install_local_viewer_packer
+from viewer.host_frame_packer import HostFramePacker
 
 
 def test_packer_gated_off_off_darwin(monkeypatch) -> None:
@@ -86,3 +89,70 @@ def test_dropping_a_queue_item_releases_its_direct_source() -> None:
     _release_item(SimpleNamespace(viewer_frame_direct=source))
 
     assert source.claimed is False
+
+
+def test_native_packing_runs_on_worker_and_releases_frame_after_write(monkeypatch) -> None:
+    from viewer.direct_sink import DIRECT_SINK
+
+    source = _DirectSource()
+    registry = DirectSinkRegistry()
+    monkeypatch.setattr("viewer.direct_sink.sys.platform", "darwin")
+    registry.register(source)
+    monkeypatch.setattr(DIRECT_SINK, "pack_native", registry.pack_native)
+    calls = []
+
+    class Native:
+        source_size = (4, 2)
+
+        def pack(self, view, size, output_format):
+            calls.append((threading.current_thread().name, size, output_format))
+            assert view is source.direct_view
+            assert calls[-1][0] == "HostFramePacker"
+
+        def release(self):
+            calls.append("release")
+
+    result = SimpleNamespace(viewer_native=Native(), output_format="half_sbs")
+    in_q, out_q = queue.Queue(), queue.Queue(maxsize=1)
+    in_q.put((result, 42.0))
+    packer = HostFramePacker(in_q, out_q)
+    packer.start()
+    try:
+        completed, stamp = out_q.get(timeout=2)
+    finally:
+        packer.stop()
+
+    assert completed is result and stamp == 42.0
+    assert calls == [("HostFramePacker", (4, 2), "half_sbs"), "release"]
+    assert result.viewer_native is None
+    assert result.viewer_frame_direct is source
+    assert source.claimed
+
+
+def test_native_pack_failure_returns_staging_slot(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr("viewer.direct_sink.sys.platform", "darwin")
+    registry = DirectSinkRegistry()
+    source = _DirectSource()
+    registry.register(source)
+
+    def fail(*_args):
+        raise RuntimeError("GPU failure")
+
+    with pytest.raises(RuntimeError, match="GPU failure"):
+        registry.pack_native(SimpleNamespace(pack=fail), (4, 2), "half_sbs")
+    assert registry.acquire(4, 2)[0] is source
+
+
+def test_packer_replaces_queued_frame_without_waiting_for_viewer() -> None:
+    released = []
+    out_q = queue.Queue(maxsize=1)
+    out_q.put(SimpleNamespace(viewer_native=SimpleNamespace(release=lambda: released.append(1))))
+    packer = HostFramePacker(queue.Queue(), out_q)
+    newest = object()
+
+    packer._forward(newest)
+
+    assert out_q.get_nowait() is newest
+    assert released == [1]

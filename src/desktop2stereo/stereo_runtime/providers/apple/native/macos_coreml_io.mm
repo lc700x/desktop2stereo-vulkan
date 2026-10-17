@@ -625,7 +625,9 @@ static inline float3 dibr_warp_at(
     return linear;
 }
 
-static inline float3 layered_warp_at(
+// Avoid expanding the gather, nested occlusion, and per-eye routines at every
+// output-mode call site: that made Metal pipeline compilation take minutes.
+static __attribute__((noinline)) float3 layered_warp_at(
     texture2d<float, access::sample> color, device float *depth,
     float x, float y, float eye_sign, constant WarpParams& p) {
     return dibr_warp_at(color, depth, x, y, eye_sign, p);
@@ -667,7 +669,7 @@ static inline bool antialias_edge_at(device float *depth, float x, float y,
            shift_edge / max_shift_magnitude(p) > 0.025f;
 }
 
-static inline float occlusion_at(device float *depth, float x, float y,
+static __attribute__((noinline)) float occlusion_at(device float *depth, float x, float y,
                                  constant WarpParams& p) {
     if (p.occlusion_enabled == 0) return 0.0f;
     int radius = min(p.edge_dilation, 3);
@@ -760,7 +762,7 @@ static inline float3 fill_eye(texture2d<float, access::sample> color,
     return mix(original, content_aware, blend);
 }
 
-static inline float3 eye_pixel(texture2d<float, access::sample> color,
+static __attribute__((noinline)) float3 eye_pixel(texture2d<float, access::sample> color,
                                device float *depth, float x, float y,
                                float eye_sign, bool screen_edge,
                                constant WarpParams& p) {
