@@ -598,13 +598,26 @@ class GUIHandlerMixin:
             if button is not None:
                 button.disabled = not enabled
 
+    def _sync_moonlight_macos_help(self):
+        help_button = getattr(self, "moonlight_macos_help", None)
+        if help_button is None:
+            return
+        help_button.tooltip = UI_MESSAGES[self.locale].get(
+            "tooltip_moonlight_macos_setup", ""
+        )
+        help_button.visible = (
+            OS_NAME == "Darwin" and self.run_mode_key == "Moonlight Streamer"
+        )
+
     def _sync_moonlight_encoder_options(self):
         dropdown = getattr(self, "video_backend_dd", None)
         if dropdown is None:
             return
 
         if self.run_mode_key == "Moonlight Streamer":
-            if devices_module.IS_ROCM:
+            if OS_NAME == "Darwin":
+                options = ["Auto", "Apple VideoToolbox"]
+            elif devices_module.IS_ROCM:
                 options = ["Auto", "AMD AMF"]
             elif "CUDA" in str(getattr(self.device_dd, "value", "")):
                 options = ["Auto", "PyNvVideoCodec"]
@@ -615,7 +628,7 @@ class GUIHandlerMixin:
                 self.set_status(
                     UI_MESSAGES[self.locale].get(
                         "moonlight_encoder_fallback",
-                        "Moonlight uses the native NVIDIA or AMD encoder; unsupported selection reset to Auto.",
+                        "Moonlight uses the native platform encoder; unsupported selection reset to Auto.",
                     )
                 )
         else:
@@ -627,6 +640,8 @@ class GUIHandlerMixin:
                 "PyNvVideoCodec",
                 "AMD AMF",
             ]
+            if dropdown.value not in options:
+                dropdown.value = "Auto"
 
         if list(dropdown.options) != options:
             dropdown.options = options
@@ -635,14 +650,9 @@ class GUIHandlerMixin:
     async def open_moonlight_pairing(self, e=None):
         del e
         import json
-        from pathlib import Path
+        from streaming.moonlight_paths import moonlight_state_directory
 
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        state_dir = (
-            Path(local_app_data)
-            if local_app_data
-            else Path.home() / "AppData" / "Local"
-        ) / "Desktop2Stereo" / "Moonlight"
+        state_dir = moonlight_state_directory()
         messages = UI_MESSAGES.get(self.locale, UI_MESSAGES["EN"])
         self.set_status(messages.get("sunshine_settings_loading", "Loading Sunshine settings..."))
         try:
@@ -679,6 +689,7 @@ class GUIHandlerMixin:
             )
             self.set_status("")
         except (AttributeError, OSError, RuntimeError, TimeoutError, TypeError, ValueError) as exc:
+            logger.exception("Could not load Sunshine settings")
             self.set_status(
                 messages.get(
                     "sunshine_settings_load_failed",
@@ -1097,16 +1108,10 @@ class GUIHandlerMixin:
 
     async def _watch_moonlight_pairing_requests(self, process):
         import http.client
-        from pathlib import Path
-
         from streaming.moonlight_output import request_sunshine_api
+        from streaming.moonlight_paths import moonlight_state_directory
 
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        state_dir = (
-            Path(local_app_data)
-            if local_app_data
-            else Path.home() / "AppData" / "Local"
-        ) / "Desktop2Stereo" / "Moonlight"
+        state_dir = moonlight_state_directory()
         announced_ids = set()
         while process.returncode is None and not getattr(self, "_closed", False):
             try:
@@ -1367,6 +1372,7 @@ class GUIHandlerMixin:
             stereo_full or display_fit_visible
         )
         self.moonlight_controls_row.visible = mode == "Moonlight Streamer"
+        self._sync_moonlight_macos_help()
         self._sync_moonlight_button_state()
         self._sync_moonlight_encoder_options()
         row_map = self._get_streamer_row_map()
@@ -1656,7 +1662,9 @@ class GUIHandlerMixin:
         run_mode_texts = {}
         if OS_NAME == "Darwin":
             run_mode_texts = {
-                "Local Viewer": t["Local Viewer"], "RTMP Streamer": t["RTMP Streamer"],
+                "Local Viewer": t["Local Viewer"],
+                "Moonlight Streamer": t.get("Moonlight Streamer", "Moonlight Streamer"),
+                "RTMP Streamer": t["RTMP Streamer"],
                 "MJPEG Streamer": t["MJPEG Streamer"],
             }
         elif OS_NAME == "Windows":

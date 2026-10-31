@@ -12,6 +12,7 @@ import secrets
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -20,6 +21,11 @@ from typing import Any
 
 from streaming.aspect import normalize_display_fit_mode
 from streaming.moonlight_bridge import MoonlightBridgeServer, MoonlightClientConfig
+from streaming.moonlight_paths import (
+    moonlight_state_directory,
+    sunshine_executable,
+    sunshine_working_directory,
+)
 
 _SUNSHINE_DEFAULT_PORT = 47989
 _SUNSHINE_MIN_PORT = 1019
@@ -91,6 +97,12 @@ def _request_sunshine_api(
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
+    # The GUI runtime injects truststore globally. Its wrapper verifies the
+    # macOS system trust chain even for CERT_NONE contexts, while Sunshine's
+    # local self-signed certificate is intentionally validated by the exact
+    # certificate fingerprint below. Use truststore's underlying stdlib
+    # context when present so the explicit pin remains the sole trust check.
+    context = getattr(context, "_ctx", context)
     connection = http.client.HTTPSConnection(
         "127.0.0.1",
         base_port + 1,
@@ -190,9 +202,7 @@ class MoonlightSbsOutput:
         self._bridge: MoonlightBridgeServer | None = None
         self._state_dir = self._state_directory()
         self._server_dir = Path(__file__).resolve().parent / "moonlight_server"
-        self._sunshine_exe = Path(
-            os.environ.get("D2S_SUNSHINE_EXE", str(self._server_dir / "sunshine.exe"))
-        )
+        self._sunshine_exe = sunshine_executable(self._server_dir)
         self._sunshine_config = self._state_dir / "sunshine.conf"
         self._sunshine_apps = self._state_dir / "apps.json"
         self._sunshine_credentials = self._state_dir / "web_credentials"
@@ -215,9 +225,7 @@ class MoonlightSbsOutput:
 
     @staticmethod
     def _state_directory() -> Path:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        root = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
-        return root / "Desktop2Stereo" / "Moonlight"
+        return moonlight_state_directory()
 
     @property
     def current_network_bitrate_mbps(self) -> float:
@@ -236,6 +244,7 @@ class MoonlightSbsOutput:
             "file_apps": self._sunshine_apps.as_posix(),
             "log_path": (self._state_dir / "sunshine.log").as_posix(),
         }
+        default_audio_sink = "" if sys.platform == "darwin" else "default_audio_sink"
         if self._sunshine_config.exists():
             lines = self._sunshine_config.read_text(encoding="utf-8").splitlines()
             found = set()
@@ -245,6 +254,17 @@ class MoonlightSbsOutput:
                 normalized_key = key.strip().casefold()
                 if normalized_key == "log_file":
                     continue
+                if (
+                    sys.platform == "darwin"
+                    and separator
+                    and normalized_key == "audio_sink"
+                    and _value.split("#", 1)[0].strip().strip('"').casefold()
+                    == "default_audio_sink"
+                ):
+                    # On macOS, Sunshine uses an empty sink to select its
+                    # native system-audio tap. The generic sentinel is instead
+                    # treated as the name of a microphone and disables audio.
+                    line = "audio_sink ="
                 if separator and normalized_key in managed_values:
                     line = f"{normalized_key} = {managed_values[normalized_key]}"
                     found.add(normalized_key)
@@ -261,10 +281,14 @@ class MoonlightSbsOutput:
                 "origin_web_ui_allowed": "pc",
                 "hevc_mode": 2,
                 "av1_mode": 1,
-                "audio_sink": "default_audio_sink",
+                "audio_sink": default_audio_sink,
             }
             self._sunshine_config.write_text(
-                "\n".join(f"{key} = {value}" for key, value in values.items()) + "\n",
+                "\n".join(
+                    f"{key} = {value}" if value != "" else f"{key} ="
+                    for key, value in values.items()
+                )
+                + "\n",
                 encoding="utf-8",
             )
         if not self._sunshine_apps.exists():
@@ -307,7 +331,7 @@ class MoonlightSbsOutput:
                 username,
                 password,
             ],
-            cwd=str(self._server_dir),
+            cwd=str(sunshine_working_directory(self._sunshine_exe)),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -519,7 +543,7 @@ class MoonlightSbsOutput:
         try:
             self._sunshine = subprocess.Popen(
                 [str(self._sunshine_exe), str(self._sunshine_config)],
-                cwd=str(self._server_dir),
+                cwd=str(sunshine_working_directory(self._sunshine_exe)),
                 env=environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -560,6 +584,32 @@ class MoonlightSbsOutput:
         if config.width > 8192 or config.height > 8192 or config.fps > 120:
             return None
         try:
+            if sys.platform == "darwin":
+                if self.encoder_backend not in {"auto", "videotoolbox"}:
+                    raise RuntimeError(
+                        "Moonlight on macOS requires the Apple VideoToolbox encoder"
+                    )
+                from streaming.videotoolbox_encoder import VideoToolboxEncoder
+
+                with self._encoder_lock:
+                    self._close_encoder_locked()
+                    self._encoder = VideoToolboxEncoder(
+                        config.width,
+                        config.height,
+                        round(config.fps),
+                        config.bitrate_kbps * 1000,
+                        hevc=config.codec == "hevc",
+                        fit_mode=self.fit_mode,
+                        display_mode=self.display_mode,
+                        input_size=self.input_size,
+                    )
+                    self._encoder_config = config
+                    self._frame_index = 0
+                    self._frame_timestamps.clear()
+                    self._amd_pending_frames.clear()
+                    self._force_idr.set()
+                return {"accepted_width": config.width, "accepted_height": config.height}
+
             import torch
 
             if not torch.cuda.is_available() or torch.device(self.device).type != "cuda":
@@ -698,6 +748,51 @@ class MoonlightSbsOutput:
         return any(((nal >> 1) & 0x3F) in {19, 20, 21} for nal in nals)
 
     def submit_runtime_result(self, runtime_result: Any, capture_timestamp: float) -> None:
+        if sys.platform == "darwin":
+            native_frame = getattr(runtime_result, "native_stream_frame", None)
+            try:
+                bridge = self._bridge
+                if bridge is None or not bridge.connected:
+                    return
+                if native_frame is None:
+                    raise RuntimeError(
+                        "GPU-resident Moonlight streaming on macOS needs the native "
+                        "CoreML/Metal stream path. Enable CoreML and grant Screen Recording permission."
+                    )
+                with self._encoder_lock:
+                    encoder = self._encoder
+                    config = self._encoder_config
+                    if encoder is None or config is None:
+                        return
+                    frame_index = self._frame_index
+                    self._frame_index += 1
+                    force_idr = self._force_idr.is_set()
+                    self._force_idr.clear()
+                    capture_ns = max(0, int(float(capture_timestamp) * 1_000_000_000))
+                    access_unit = encoder.encode_native_frame(
+                        native_frame,
+                        output_format=str(
+                            getattr(runtime_result, "output_format", "half_sbs")
+                            or "half_sbs"
+                        ),
+                        frame_index=frame_index,
+                        force_keyframe=force_idr,
+                    )
+                    bridge.send_access_unit(
+                        frame_index,
+                        capture_ns,
+                        bytes(access_unit["data"]),
+                        idr=bool(access_unit.get("idr")),
+                    )
+            finally:
+                if native_frame is not None:
+                    native_frame.release()
+                    try:
+                        object.__setattr__(runtime_result, "native_stream_frame", None)
+                    except (AttributeError, TypeError):
+                        pass
+            return
+
         frame = getattr(runtime_result, "sbs", None)
         if frame is None or not bool(getattr(frame, "is_cuda", False)):
             raise RuntimeError("Moonlight streaming requires a GPU-resident D2S SBS frame")

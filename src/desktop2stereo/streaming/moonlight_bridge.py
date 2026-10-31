@@ -86,6 +86,7 @@ class MoonlightBridgeServer:
         self.on_client_stop = on_client_stop
         self.on_idr_request = on_idr_request
         self._socket_lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._client_socket: socket.socket | None = None
         self._client_config: MoonlightClientConfig | None = None
         self._client_reserved = False
@@ -199,8 +200,14 @@ class MoonlightBridgeServer:
         )
         with self._socket_lock:
             client = self._client_socket
-            if client is None:
-                return False
+        if client is None:
+            return False
+        # Do not hold _socket_lock while sendall applies network backpressure.
+        # close() must be able to shut down the socket and unblock this writer.
+        with self._send_lock:
+            with self._socket_lock:
+                if self._client_socket is not client:
+                    return False
             client.sendall(header + data)
         return True
 

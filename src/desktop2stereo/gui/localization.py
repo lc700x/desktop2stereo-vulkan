@@ -212,6 +212,14 @@ MESSAGE_CATALOGS = {
         "MJPEG Streamer": "Basic Streaming",
         "RTMP Streamer": "Advanced Streaming",
         "Moonlight Streamer": "Moonlight Streaming",
+        "tooltip_moonlight_macos_setup": (
+            "Mac setup: enable CoreML and allow Screen & System Audio Recording for Desktop2Stereo and Sunshine in "
+            "System Settings → Privacy & Security. If Sunshine logs 'No screen capture permission' or 'Platform failed "
+            "to initialize', grant Sunshine access there and restart Moonlight Streaming. If keyboard/mouse input is "
+            "blocked, open Sunshine Settings → Troubleshooting → "
+            "Permissions. System audio uses Audio Tap on macOS 14.2+ (leave Audio Sink blank); older versions may need "
+            "an existing loopback device such as BlackHole. D2S will not install or select one. Gamepads are unsupported."
+        ),
         "Open Moonlight pairing": "Sunshine Settings",
         "Moonlight Pairing PIN": "PIN shown by Moonlight:",
         "Pair Moonlight Client": "Pair device",
@@ -665,6 +673,7 @@ MESSAGE_CATALOGS = {
         "MJPEG Streamer": "低级网络推流",
         "RTMP Streamer": "高级网络推流",
         "Moonlight Streamer": "Moonlight推流",
+        "tooltip_moonlight_macos_setup": "Mac 设置：启用 CoreML，并在系统设置 → 隐私与安全性 → 屏幕与系统音频录制中允许 Desktop2Stereo 和 Sunshine。如果 Sunshine 日志显示“没有屏幕录制权限”或“平台初始化失败”，请授予 Sunshine 权限并重新启动 Moonlight 推流。如果键盘/鼠标输入不可用，请在 Sunshine 设置 → 故障排除 → 权限中检查。macOS 14.2 及更新版本使用 Audio Tap 采集系统音频（音频输出设备留空）；较早版本可能需要现有的回环设备，例如 BlackHole。D2S 不会安装或选择回环设备。不支持游戏手柄。",
         "Open Moonlight pairing": "Sunshine设置",
         "Moonlight Pairing PIN": "配对码",
         "Pair Moonlight Client": "配对设备",

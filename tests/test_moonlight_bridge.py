@@ -118,3 +118,61 @@ def test_moonlight_bridge_rejects_bad_token_and_unsupported_configuration():
             assert "unsupported" in response["error"]
     finally:
         bridge.close()
+
+
+def test_moonlight_bridge_close_unblocks_a_backpressured_writer():
+    class _BlockedSocket:
+        def __init__(self):
+            self.write_started = threading.Event()
+            self.closed = threading.Event()
+
+        def sendall(self, _payload):
+            self.write_started.set()
+            if not self.closed.wait(2.0):
+                raise TimeoutError("test socket was not closed")
+            raise OSError("socket closed")
+
+        def shutdown(self, _how):
+            self.closed.set()
+
+        def close(self):
+            self.closed.set()
+
+    bridge = MoonlightBridgeServer(
+        "c" * 64,
+        on_client_start=lambda _config: {"ok": True},
+        on_client_stop=lambda: None,
+        on_idr_request=lambda: None,
+    )
+    bridge.start()
+    blocked_socket = _BlockedSocket()
+    with bridge._socket_lock:
+        bridge._client_socket = blocked_socket
+
+    def write_frame():
+        try:
+            bridge.send_access_unit(0, 0, b"frame", idr=True)
+        except OSError:
+            pass
+
+    writer = threading.Thread(target=write_frame)
+    writer.start()
+    assert blocked_socket.write_started.wait(1.0)
+
+    close_finished = threading.Event()
+
+    def close_bridge():
+        bridge.close()
+        close_finished.set()
+
+    closer = threading.Thread(target=close_bridge)
+    closer.start()
+    try:
+        assert close_finished.wait(1.5), "close waited for the blocked socket writer"
+    finally:
+        blocked_socket.closed.set()
+        writer.join(timeout=1.0)
+        closer.join(timeout=1.0)
+
+    assert not writer.is_alive()
+    assert not closer.is_alive()

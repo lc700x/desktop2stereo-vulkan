@@ -20,7 +20,7 @@ def test_moonlight_mode_is_a_separate_windows_streamer():
     assert not supports_network_calibration("Moonlight Streamer", "WebRTC")
 
 
-def test_moonlight_mode_is_not_enabled_on_macos():
+def test_moonlight_mode_uses_the_viewer_runtime_on_macos():
     config = resolve_run_mode(
         "Moonlight Streamer",
         os_name="Darwin",
@@ -28,5 +28,5 @@ def test_moonlight_mode_is_not_enabled_on_macos():
         lossless_scaling_support=False,
     )
 
-    assert config.run_mode == "Streamer"
-    assert config.stream_mode is None
+    assert config.run_mode == "Viewer"
+    assert config.stream_mode == "MOONLIGHT"

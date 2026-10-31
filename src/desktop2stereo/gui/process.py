@@ -1576,14 +1576,10 @@ class GUIProcessMixin:
                 child_env.setdefault("D2S_FPS_BREAKDOWN", "1")
                 child_env.setdefault("D2S_OPENXR_DEBUG", "1")
                 child_env.setdefault("D2S_OPENXR_ASYNC_EFFECTS", "0")
-            elif self.run_mode_key == "Moonlight Streamer" and OS_NAME == "Windows":
-                local_app_data = os.environ.get("LOCALAPPDATA")
-                state_dir = (
-                    local_app_data
-                    if local_app_data
-                    else os.path.join(os.path.expanduser("~"), "AppData", "Local")
-                )
-                state_dir = os.path.join(state_dir, "Desktop2Stereo", "Moonlight")
+            elif self.run_mode_key == "Moonlight Streamer" and OS_NAME in ("Windows", "Darwin"):
+                from streaming.moonlight_paths import moonlight_state_directory
+
+                state_dir = moonlight_state_directory()
                 os.makedirs(state_dir, exist_ok=True)
                 request_token = f"{os.getpid()}-{time.time_ns()}"
                 request_path = os.path.join(
@@ -1611,7 +1607,7 @@ class GUIProcessMixin:
             self._sync_moonlight_button_state()
             self._diag(f"process started, pid={self.process.pid}, log={LOG_FILE}")
             asyncio.create_task(self._pump_child_output(self.process))
-            if self.run_mode_key == "Moonlight Streamer" and OS_NAME == "Windows":
+            if self.run_mode_key == "Moonlight Streamer" and OS_NAME in ("Windows", "Darwin"):
                 asyncio.create_task(
                     self._watch_moonlight_pairing_requests(self.process)
                 )

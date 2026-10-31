@@ -125,6 +125,38 @@ def test_moonlight_buttons_require_a_running_moonlight_process():
     assert gui.moonlight_pair_btn.disabled is True
 
 
+def test_macos_moonlight_setup_help_is_a_mode_specific_tooltip():
+    gui = object.__new__(GUIHandlerMixin)
+    gui.locale = "EN"
+    gui.run_mode_key = "Moonlight Streamer"
+    gui.moonlight_macos_help = ft.IconButton(icon=ft.Icons.INFO_OUTLINE)
+
+    with patch("gui.handlers.OS_NAME", "Darwin"):
+        gui._sync_moonlight_macos_help()
+
+    assert gui.moonlight_macos_help.visible is True
+    assert gui.moonlight_macos_help.tooltip == UI_MESSAGES["EN"][
+        "tooltip_moonlight_macos_setup"
+    ]
+
+    gui.locale = "CN"
+    with patch("gui.handlers.OS_NAME", "Darwin"):
+        gui._sync_moonlight_macos_help()
+    assert gui.moonlight_macos_help.tooltip == UI_MESSAGES["CN"][
+        "tooltip_moonlight_macos_setup"
+    ]
+
+    gui.run_mode_key = "RTMP Streamer"
+    with patch("gui.handlers.OS_NAME", "Darwin"):
+        gui._sync_moonlight_macos_help()
+    assert gui.moonlight_macos_help.visible is False
+
+    gui.run_mode_key = "Moonlight Streamer"
+    with patch("gui.handlers.OS_NAME", "Windows"):
+        gui._sync_moonlight_macos_help()
+    assert gui.moonlight_macos_help.visible is False
+
+
 def test_moonlight_encoder_options_match_the_selected_gpu_backend():
     gui = object.__new__(GUIHandlerMixin)
     gui.locale = "EN"
@@ -137,7 +169,9 @@ def test_moonlight_encoder_options_match_the_selected_gpu_backend():
     gui.set_status = lambda *_args, **_kwargs: None
     gui._safe_update = lambda *_controls: None
 
-    with patch("gui.handlers.devices_module.IS_ROCM", False):
+    with patch("gui.handlers.OS_NAME", "Windows"), patch(
+        "gui.handlers.devices_module.IS_ROCM", False
+    ):
         gui._sync_moonlight_encoder_options()
         assert gui.video_backend_dd.options == ["Auto", "PyNvVideoCodec"]
         assert gui.video_backend_dd.value == "Auto"
@@ -147,7 +181,9 @@ def test_moonlight_encoder_options_match_the_selected_gpu_backend():
         assert gui.video_backend_dd.value == "PyNvVideoCodec"
 
     gui.device_dd.value = "CUDA 0: AMD Radeon RX 9060 XT"
-    with patch("gui.handlers.devices_module.IS_ROCM", True):
+    with patch("gui.handlers.OS_NAME", "Windows"), patch(
+        "gui.handlers.devices_module.IS_ROCM", True
+    ):
         gui._sync_moonlight_encoder_options()
         assert gui.video_backend_dd.options == ["Auto", "AMD AMF"]
         assert gui.video_backend_dd.value == "Auto"
@@ -163,6 +199,30 @@ def test_moonlight_encoder_options_match_the_selected_gpu_backend():
 
 def test_video_encoder_label_has_chinese_translation():
     assert UI_MESSAGES["CN"]["Video Encoder:"] == "视频编码器:"
+
+
+def test_moonlight_encoder_options_expose_videotoolbox_on_macos():
+    gui = object.__new__(GUIHandlerMixin)
+    gui.locale = "EN"
+    gui.run_mode_key = "Moonlight Streamer"
+    gui.device_dd = SimpleNamespace(value="MPS")
+    gui.video_backend_dd = SimpleNamespace(
+        options=["Auto", "FFmpeg"], value="Auto"
+    )
+    gui.set_status = lambda *_args, **_kwargs: None
+    gui._safe_update = lambda *_controls: None
+
+    with patch("gui.handlers.OS_NAME", "Darwin"):
+        gui._sync_moonlight_encoder_options()
+
+    assert gui.video_backend_dd.options == ["Auto", "Apple VideoToolbox"]
+    assert gui.video_backend_dd.value == "Auto"
+
+    gui.video_backend_dd.value = "Apple VideoToolbox"
+    gui.run_mode_key = "RTMP Streamer"
+    gui._sync_moonlight_encoder_options()
+    assert "Apple VideoToolbox" not in gui.video_backend_dd.options
+    assert gui.video_backend_dd.value == "Auto"
 
 
 def test_sunshine_settings_manage_paired_clients(tmp_path):

@@ -1,0 +1,32 @@
+diff --git a/src/platform/macos/av_audio.mm b/src/platform/macos/av_audio.mm
+index cf45436..5282585 100644
+--- a/src/platform/macos/av_audio.mm
++++ b/src/platform/macos/av_audio.mm
+@@ -483,7 +483,9 @@ namespace platf {
+   }
+
+   if (self->tapObjectID != kAudioObjectUnknown) {
+-    AudioHardwareDestroyProcessTap(self->tapObjectID);
++    if (@available(macOS 14.2, *)) {
++      AudioHardwareDestroyProcessTap(self->tapObjectID);
++    }
+     self->tapObjectID = kAudioObjectUnknown;
+     BOOST_LOG(debug) << "Process tap destroyed"sv;
+   }
+@@ -657,7 +659,15 @@ namespace platf {
+   BOOST_LOG(debug) << "Creating process tap with name: "sv << [uniqueName UTF8String];
+
+   // Use direct API call like the reference implementation
+-  OSStatus status = AudioHardwareCreateProcessTap(tapDescription, &self->tapObjectID);
++  OSStatus status = noErr;
++  if (@available(macOS 14.2, *)) {
++    status = AudioHardwareCreateProcessTap(tapDescription, &self->tapObjectID);
++  } else {
++    BOOST_LOG(error) << "System audio taps require macOS 14.2 or newer"sv;
++    [uniqueUUID release];
++    [tapDescription release];
++    return nil;
++  }
+
+   [uniqueUUID release];
+

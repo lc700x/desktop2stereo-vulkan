@@ -72,7 +72,7 @@ def resolve_run_mode(
         stream_mode = "RTMP"
         if os_name == "Windows":
             resolved_lossless_scaling = lossless_scaling_support
-    elif raw_run_mode == "Moonlight Streamer" and os_name == "Windows":
+    elif raw_run_mode == "Moonlight Streamer" and os_name in {"Windows", "Darwin"}:
         run_mode = "Viewer"
         stream_mode = "MOONLIGHT"
     elif raw_run_mode == "OpenXR Link":

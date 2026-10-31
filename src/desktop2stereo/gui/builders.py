@@ -867,7 +867,8 @@ class GUIBuilderMixin:
         # window is shorter than the rows.
         device_content = ft.Column([row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, self.row6b, self.row6d, self.row6g, self.row6e, self.row6f,
                        self.row7a, self.xr_headset_row, self.row7b, row8, self.row6c, self.row9,
-                       self.moonlight_controls_row, self.stream_url_row], spacing=S(6), scroll=ft.ScrollMode.AUTO,
+                       self.moonlight_controls_row,
+                       self.stream_url_row], spacing=S(6), scroll=ft.ScrollMode.AUTO,
                        tight=True)
         device_group = ft.Container(
             device_content,
@@ -1071,15 +1072,16 @@ class GUIBuilderMixin:
             size=FONT_SIZE,
             width=S(110 if self.locale == "CN" else 130),
         )
+        video_backend_options = [
+            "Auto",
+            "Intel QSV (D3D11)",
+            "FFmpeg",
+            "Vulkan Video",
+            "PyNvVideoCodec",
+            "AMD AMF",
+        ]
         self.video_backend_dd = CompactDropdown(
-            options=[
-                "Auto",
-                "Intel QSV (D3D11)",
-                "FFmpeg",
-                "Vulkan Video",
-                "PyNvVideoCodec",
-                "AMD AMF",
-            ],
+            options=video_backend_options,
             value="Auto",
             min_width=S(130),
         )
@@ -1226,6 +1228,14 @@ class GUIBuilderMixin:
             disabled=True,
         )
         self.moonlight_pair_btn.width = S(95 if self.locale == "CN" else 120)
+        self.moonlight_macos_help = ft.IconButton(
+            icon=ft.Icons.INFO_OUTLINE,
+            icon_size=S(18),
+            tooltip=UI_MESSAGES[self.locale].get(
+                "tooltip_moonlight_macos_setup", ""
+            ),
+            visible=False,
+        )
         self.moonlight_controls_row = ft.Row(
             [
                 self.video_backend_label,
@@ -1234,6 +1244,7 @@ class GUIBuilderMixin:
                 self.moonlight_pairing_btn,
                 ft.Container(width=S(8)),
                 self.moonlight_pair_btn,
+                self.moonlight_macos_help,
             ],
             spacing=S(1),
             visible=False,

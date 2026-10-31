@@ -268,7 +268,7 @@ class GUIConfigMixin:
             run_mode = "Local Viewer"
         if run_mode == "OpenXR Link" and OS_NAME == "Darwin":
             run_mode = "Local Viewer"
-        if run_mode == "Moonlight Streamer" and OS_NAME != "Windows":
+        if run_mode == "Moonlight Streamer" and OS_NAME not in ("Windows", "Darwin"):
             run_mode = "Local Viewer"
         self.run_mode_key = run_mode
         self.stream_protocol_key = cfg.get("Stream Protocol", DEFAULTS.get("Stream Protocol", "WebRTC"))
@@ -303,6 +303,7 @@ class GUIConfigMixin:
             "qsv": "Intel QSV (D3D11)",
             "ffmpeg": "FFmpeg",
             "vulkan": "Vulkan Video",
+            "videotoolbox": "Apple VideoToolbox",
         }.get(str(cfg.get("Video Encoder Backend", "auto")).casefold(), "Auto")
         self.crf_tf.value = str(cfg.get("CRF", DEFAULTS["CRF"]))
         self.audio_delay_tf.value = str(cfg.get("Audio Delay", DEFAULTS["Audio Delay"]))
@@ -492,6 +493,7 @@ class GUIConfigMixin:
                 "Intel QSV (D3D11)": "intel",
                 "FFmpeg": "ffmpeg",
                 "Vulkan Video": "vulkan",
+                "Apple VideoToolbox": "videotoolbox",
             }.get(self.video_backend_dd.value, "ffmpeg"),
             "CRF": self._parse_int(self.crf_tf.value, DEFAULTS["CRF"]),
             "Audio Delay": self._parse_float(self.audio_delay_tf.value, DEFAULTS["Audio Delay"]),
