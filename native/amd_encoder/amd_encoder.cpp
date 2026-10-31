@@ -54,11 +54,19 @@ struct HipExternalMipmappedArrayDesc {
     unsigned int num_levels;
 };
 using HipImportExternalMemory = int (*)(void**, const HipExternalMemoryHandleDesc*);
+using HipDeviceGetLuid = int (*)(char*, unsigned int*, int);
 using HipGetMappedMipmappedArray = int (*)(void**, void*, const HipExternalMipmappedArrayDesc*);
 using HipGetMipmappedArrayLevel = int (*)(void**, void*, unsigned int);
 using HipMemcpy2DToArrayAsync = int (*)(void*, std::size_t, std::size_t, const void*, std::size_t, std::size_t, std::size_t, int, void*);
 using HipDestroyExternalMemory = int (*)(void*);
 using HipStreamSynchronize = int (*)(void*);
+
+HMODULE load_hip_runtime() {
+    for (const auto* name : {L"amdhip64_7.dll", L"amdhip64_6.dll", L"amdhip64_5.dll", L"amdhip64.dll"}) {
+        if (auto module = LoadLibraryW(name)) return module;
+    }
+    return nullptr;
+}
 
 struct AmdEncoder {
     amf::AMFContextPtr context;
@@ -67,11 +75,13 @@ struct AmdEncoder {
     int height = 0;
     int fps = 0;
     bool hevc = false;
+    int hip_device_index = -1;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* device_context = nullptr;
     ID3D11Texture2D* shared_texture = nullptr;
     HANDLE shared_handle = nullptr;
     HMODULE hip_runtime = nullptr;
+    HipDeviceGetLuid hip_device_get_luid = nullptr;
     void* hip_external_memory = nullptr;
     void* hip_array = nullptr;
     HipImportExternalMemory hip_import_external_memory = nullptr;
@@ -84,9 +94,54 @@ struct AmdEncoder {
 
 bool create_shared_rgba_texture(AmdEncoder* state) {
     D3D_FEATURE_LEVEL feature_level{};
+    IDXGIAdapter1* selected_adapter = nullptr;
+    if (state->hip_device_index >= 0) {
+        if (!state->hip_runtime) state->hip_runtime = load_hip_runtime();
+        if (!state->hip_runtime) {
+            set_error("amdhip64.dll was not found; ROCm is required for adapter matching");
+            return false;
+        }
+        state->hip_device_get_luid = reinterpret_cast<HipDeviceGetLuid>(
+            GetProcAddress(state->hip_runtime, "hipDeviceGetLuid"));
+        if (!state->hip_device_get_luid) {
+            set_error("ROCm cannot report a device LUID; refusing an ambiguous adapter");
+            return false;
+        }
+        char hip_luid[8]{};
+        unsigned int node_mask = 0;
+        if (state->hip_device_get_luid(hip_luid, &node_mask, state->hip_device_index) != 0) {
+            set_error("ROCm failed to query the selected HIP device LUID");
+            return false;
+        }
+        IDXGIFactory1* factory = nullptr;
+        const HRESULT factory_result = CreateDXGIFactory1(
+            __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
+        if (FAILED(factory_result) || !factory) {
+            set_error("DXGI factory creation failed during HIP adapter matching");
+            return false;
+        }
+        for (UINT index = 0; ; ++index) {
+            IDXGIAdapter1* adapter = nullptr;
+            const HRESULT enum_result = factory->EnumAdapters1(index, &adapter);
+            if (enum_result == DXGI_ERROR_NOT_FOUND) break;
+            if (FAILED(enum_result) || !adapter) continue;
+            DXGI_ADAPTER_DESC1 desc{};
+            if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
+                std::memcmp(&desc.AdapterLuid, hip_luid, sizeof(desc.AdapterLuid)) == 0) {
+                selected_adapter = adapter;
+                break;
+            }
+            adapter->Release();
+        }
+        factory->Release();
+        if (!selected_adapter) {
+            set_error("No DXGI adapter matches the selected HIP device LUID");
+            return false;
+        }
+    }
     const auto hr = D3D11CreateDevice(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
+        selected_adapter,
+        selected_adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
         nullptr,
         D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         nullptr,
@@ -95,6 +150,7 @@ bool create_shared_rgba_texture(AmdEncoder* state) {
         &state->device,
         &feature_level,
         &state->device_context);
+    if (selected_adapter) selected_adapter->Release();
     if (FAILED(hr) || !state->device || !state->device_context) {
         set_error("D3D11 device creation failed");
         return false;
@@ -108,9 +164,12 @@ bool create_shared_rgba_texture(AmdEncoder* state) {
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
-    if (FAILED(state->device->CreateTexture2D(&desc, nullptr, &state->shared_texture))) {
-        set_error("shared D3D11 RGBA texture creation failed");
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                     D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    const HRESULT texture_result = state->device->CreateTexture2D(&desc, nullptr, &state->shared_texture);
+    if (FAILED(texture_result)) {
+        set_error((std::string("shared D3D11 RGBA texture creation failed, HRESULT=") +
+                   std::to_string(static_cast<unsigned long>(texture_result))).c_str());
         return false;
     }
     IDXGIResource1* resource = nullptr;
@@ -131,20 +190,23 @@ bool create_shared_rgba_texture(AmdEncoder* state) {
 }
 
 bool import_shared_texture_into_hip(AmdEncoder* state) {
-    state->hip_runtime = LoadLibraryW(L"amdhip64.dll");
+    if (!state->hip_runtime) state->hip_runtime = load_hip_runtime();
     if (!state->hip_runtime) {
         set_error("amdhip64.dll was not found; ROCm is required for AMD GPU surface import");
         return false;
     }
-#define D2S_HIP_PROC(name, type) \
-    state->name = reinterpret_cast<type>(GetProcAddress(state->hip_runtime, #name))
-    D2S_HIP_PROC(hip_import_external_memory, HipImportExternalMemory);
-    D2S_HIP_PROC(hip_get_mapped_mipmapped_array, HipGetMappedMipmappedArray);
-    D2S_HIP_PROC(hip_get_mipmapped_array_level, HipGetMipmappedArrayLevel);
-    D2S_HIP_PROC(hip_memcpy_2d_to_array_async, HipMemcpy2DToArrayAsync);
-    D2S_HIP_PROC(hip_destroy_external_memory, HipDestroyExternalMemory);
-    D2S_HIP_PROC(hip_stream_synchronize, HipStreamSynchronize);
-#undef D2S_HIP_PROC
+    state->hip_import_external_memory = reinterpret_cast<HipImportExternalMemory>(
+        GetProcAddress(state->hip_runtime, "hipImportExternalMemory"));
+    state->hip_get_mapped_mipmapped_array = reinterpret_cast<HipGetMappedMipmappedArray>(
+        GetProcAddress(state->hip_runtime, "hipExternalMemoryGetMappedMipmappedArray"));
+    state->hip_get_mipmapped_array_level = reinterpret_cast<HipGetMipmappedArrayLevel>(
+        GetProcAddress(state->hip_runtime, "hipGetMipmappedArrayLevel"));
+    state->hip_memcpy_2d_to_array_async = reinterpret_cast<HipMemcpy2DToArrayAsync>(
+        GetProcAddress(state->hip_runtime, "hipMemcpy2DToArrayAsync"));
+    state->hip_destroy_external_memory = reinterpret_cast<HipDestroyExternalMemory>(
+        GetProcAddress(state->hip_runtime, "hipDestroyExternalMemory"));
+    state->hip_stream_synchronize = reinterpret_cast<HipStreamSynchronize>(
+        GetProcAddress(state->hip_runtime, "hipStreamSynchronize"));
     if (!state->hip_import_external_memory || !state->hip_get_mapped_mipmapped_array ||
         !state->hip_get_mipmapped_array_level || !state->hip_memcpy_2d_to_array_async ||
         !state->hip_destroy_external_memory || !state->hip_stream_synchronize) {
@@ -239,6 +301,10 @@ extern "C" D2S_AMD_API int d2s_amd_encoder_probe() {
     return 1;
 }
 
+extern "C" D2S_AMD_API int d2s_amd_encoder_abi_version() {
+    return 2;
+}
+
 extern "C" D2S_AMD_API int d2s_amd_encoder_last_error(char* output, int capacity) {
     if (!output || capacity <= 0) {
         return static_cast<int>(g_last_error.size());
@@ -250,16 +316,17 @@ extern "C" D2S_AMD_API int d2s_amd_encoder_last_error(char* output, int capacity
     return count;
 }
 
-extern "C" D2S_AMD_API void* d2s_amd_encoder_create(
-    int width, int height, int fps, int bitrate, int hevc) {
+static void* d2s_amd_encoder_create_impl(
+    int width, int height, int fps, int bitrate, int hevc, int hip_device_index) {
 #ifndef D2S_AMF_SDK
-    (void)width; (void)height; (void)fps; (void)bitrate; (void)hevc;
+    (void)width; (void)height; (void)fps; (void)bitrate; (void)hevc; (void)hip_device_index;
     set_error("AMD bridge was built without the AMF SDK headers");
     return nullptr;
 #else
     if (!amf_runtime_present()) return nullptr;
     auto* state = new AmdEncoder();
     state->width = width; state->height = height; state->fps = fps; state->hevc = hevc != 0;
+    state->hip_device_index = hip_device_index;
     AMF_RESULT result = g_AMFFactory.Init();
     if (result != AMF_OK) {
         set_error("AMF factory initialization failed");
@@ -303,6 +370,12 @@ extern "C" D2S_AMD_API void* d2s_amd_encoder_create(
     state->encoder->SetProperty(AMF_VIDEO_ENCODER_FRAMESIZE, AMFConstructSize(width, height));
     state->encoder->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, AMFConstructRate(fps, 1));
     state->encoder->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, rate);
+    if (hevc) {
+        state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, static_cast<amf_int64>(fps));
+        state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, static_cast<amf_int64>(1));
+    } else {
+        state->encoder->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, static_cast<amf_int64>(fps));
+    }
     result = state->encoder->Init(amf::AMF_SURFACE_RGBA, width, height);
     if (result != AMF_OK) {
         set_error("AMF encoder initialization failed");
@@ -316,6 +389,16 @@ extern "C" D2S_AMD_API void* d2s_amd_encoder_create(
     g_last_error.clear();
     return state;
 #endif
+}
+
+extern "C" D2S_AMD_API void* d2s_amd_encoder_create(
+    int width, int height, int fps, int bitrate, int hevc) {
+    return d2s_amd_encoder_create_impl(width, height, fps, bitrate, hevc, -1);
+}
+
+extern "C" D2S_AMD_API void* d2s_amd_encoder_create_for_hip_device(
+    int width, int height, int fps, int bitrate, int hevc, int hip_device_index) {
+    return d2s_amd_encoder_create_impl(width, height, fps, bitrate, hevc, hip_device_index);
 }
 
 extern "C" D2S_AMD_API int d2s_amd_encoder_submit_texture(void* handle, void* d3d11_texture) {
@@ -333,9 +416,9 @@ extern "C" D2S_AMD_API int d2s_amd_encoder_submit_texture(void* handle, void* d3
 }
 
 extern "C" D2S_AMD_API int d2s_amd_encoder_submit_hip_rgba(
-    void* handle, const void* device_pointer, int pitch_bytes, void* stream) {
+    void* handle, const void* device_pointer, int pitch_bytes, void* stream, int force_idr) {
 #ifndef D2S_AMF_SDK
-    (void)handle; (void)device_pointer; (void)pitch_bytes; (void)stream; return -1;
+    (void)handle; (void)device_pointer; (void)pitch_bytes; (void)stream; (void)force_idr; return -1;
 #else
     auto* state = static_cast<AmdEncoder*>(handle);
     if (!state || !device_pointer || pitch_bytes < state->width * 4 || !state->hip_array) {
@@ -354,7 +437,26 @@ extern "C" D2S_AMD_API int d2s_amd_encoder_submit_hip_rgba(
         set_error("HIP stream synchronization failed before AMF submit");
         return -1;
     }
-    return d2s_amd_encoder_submit_texture(state, state->shared_texture);
+    if (force_idr) {
+        const wchar_t* property = state->hevc
+            ? AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE
+            : AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE;
+        const amf_int64 picture_type = state->hevc
+            ? AMF_VIDEO_ENCODER_HEVC_PICTURE_TYPE_IDR
+            : AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR;
+        if (state->encoder->SetProperty(property, picture_type) != AMF_OK) {
+            set_error("AMF rejected the forced IDR request");
+            return -1;
+        }
+    }
+    const int submitted = d2s_amd_encoder_submit_texture(state, state->shared_texture);
+    if (force_idr) {
+        const wchar_t* property = state->hevc
+            ? AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE
+            : AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE;
+        state->encoder->SetProperty(property, static_cast<amf_int64>(0));
+    }
+    return submitted;
 #endif
 }
 

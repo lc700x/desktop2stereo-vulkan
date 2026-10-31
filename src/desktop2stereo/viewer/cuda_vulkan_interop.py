@@ -143,6 +143,8 @@ class CudaVulkanImageImporter:
     _CUDA_OPAQUE_WIN32 = 2
     _CUDA_TIMELINE_SEMAPHORE_FD = 9
     _CUDA_TIMELINE_SEMAPHORE_WIN32 = 10
+    _CUDA_D3D12_FENCE = 4
+    _CUDA_D3D12_HEAP = 4
     _CUDA_ARRAY_COLOR_ATTACHMENT = 0x20
     _CUDA_MEMCPY_DEVICE_TO_DEVICE = 3
 
@@ -459,6 +461,17 @@ class CudaVulkanImageImporter:
         lib.cudaExternalMemoryGetMappedBuffer.restype = ctypes.c_int
         lib.cudaMemcpy2DToArrayAsync.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
         lib.cudaMemcpy2DToArrayAsync.restype = ctypes.c_int
+        lib.cudaMemcpy2DAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        lib.cudaMemcpy2DAsync.restype = ctypes.c_int
         lib.cudaMemcpyAsync.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p,
@@ -604,7 +617,13 @@ class CudaVulkanImageImporter:
         if handle is None or allocation_size < 1:
             raise CudaVulkanInteropError("exportable Vulkan buffer has no memory handle")
         desc = _ExternalMemoryHandleDesc(
-            type=self._CUDA_OPAQUE_WIN32 if os.name == "nt" else self._CUDA_OPAQUE_FD,
+            type=int(
+                getattr(
+                    target,
+                    "cuda_external_memory_handle_type",
+                    self._CUDA_OPAQUE_WIN32 if os.name == "nt" else self._CUDA_OPAQUE_FD,
+                )
+            ),
             size=allocation_size,
             flags=0,
         )
@@ -674,6 +693,51 @@ class CudaVulkanImageImporter:
             "cudaMemcpyAsync(buffer)",
         )
 
+    def copy_tensor_to_pitched_buffer(
+        self,
+        tensor: Any,
+        target: Any,
+        *,
+        row_pitch: int,
+        stream: int | None = None,
+    ) -> None:
+        """Copy an HxWx4 CUDA byte tensor to a pitched D3D12 shared buffer."""
+        self.register_buffer(target)
+        if getattr(tensor, "device", None) is None or str(tensor.device.type) != "cuda":
+            raise CudaVulkanInteropError("CUDA D3D12 buffer copy requires a CUDA tensor")
+        if str(getattr(tensor, "dtype", "")) != "torch.uint8":
+            raise CudaVulkanInteropError("CUDA D3D12 buffer copy requires a torch.uint8 RGBA tensor")
+        shape = tuple(int(value) for value in getattr(tensor, "shape", ()))
+        if len(shape) != 3 or shape[-1] != 4:
+            raise CudaVulkanInteropError("CUDA D3D12 buffer copy requires an HxWx4 tensor")
+        height, width, _channels = shape
+        source_pitch = width * 4
+        if int(row_pitch) < source_pitch:
+            raise CudaVulkanInteropError("D3D12 destination row pitch is smaller than the image row")
+        byte_count = int(row_pitch) * height
+        if byte_count > int(getattr(target, "allocation_size", 0)):
+            raise CudaVulkanInteropError("CUDA RGBA tensor does not fit in the D3D12 shared buffer")
+        if not bool(tensor.is_contiguous()):
+            raise CudaVulkanInteropError("CUDA D3D12 buffer copy requires a contiguous tensor")
+        if stream is None:
+            import torch
+
+            stream = int(torch.cuda.current_stream(device=tensor.device).cuda_stream)
+        slot = self._buffer_slots[id(target)]
+        self._check(
+            self._cudart.cudaMemcpy2DAsync(
+                slot.pointer,
+                int(row_pitch),
+                ctypes.c_void_p(int(tensor.data_ptr())),
+                source_pitch,
+                source_pitch,
+                height,
+                self._CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                ctypes.c_void_p(int(stream)),
+            ),
+            "cudaMemcpy2DAsync(D3D12 buffer)",
+        )
+
     def synchronize(self, *, stream: int | None = None) -> None:
         if stream is None:
             import torch
@@ -699,7 +763,13 @@ class CudaVulkanImageImporter:
                 self._CUDA_OPAQUE_WIN32 if os.name == "nt" else self._CUDA_OPAQUE_FD
             )
         desc = _ExternalSemaphoreHandleDesc(
-            type=handle_type,
+            type=int(
+                getattr(
+                    target,
+                    "cuda_external_semaphore_handle_type",
+                    handle_type,
+                )
+            ),
             flags=0,
         )
         if os.name == "nt":

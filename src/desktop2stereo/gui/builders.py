@@ -713,20 +713,24 @@ class GUIBuilderMixin:
         # Row 8: Run mode + Display mode / Controller
         self.run_mode_label = ft.Text("Run Mode:", size=FONT_SIZE, width=S(130))
         self.run_mode_dd = CompactDropdown(on_select=self.on_run_mode_change, width=S(130))
-        self.stream_settings_cb = ft.Checkbox(
-            scale=SCALE,
-            visual_density=ft.VisualDensity.COMPACT,
-            label="Stream Settings",
-            value=False,
-            visible=False,
-            on_change=self.on_stream_settings_change,
-        )
         self.xr_headset_label = ft.Text("Headset Model:", size=FONT_SIZE, width=S(130))
         self.xr_headset_dd = CompactDropdown(
             options=xr_headset_options(self.locale),
             value=xr_headset_to_display(DEFAULTS.get("XR Headset Model"), self.locale),
             on_select=self.on_xr_headset_change,
             width=S(130))
+        self.openxr_controls_button = ft.Button(
+            content=ft.Text(
+                UI_MESSAGES[self.locale].get("OpenXR Controls", "OpenXR Controls"),
+                size=FONT_SIZE,
+                no_wrap=True,
+            ),
+            width=S(150),
+            height=S(32),
+            on_click=self.open_openxr_controls,
+            disabled=True,
+            visible=False,
+        )
         self.display_mode_label = ft.Text("Display Mode:", size=FONT_SIZE, width=S(130))
         self.display_mode_dd = CompactDropdown(
             options=["Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB", "Depth Map", "Anaglyph", "Interleaved", "Mono", "Leia"],
@@ -770,11 +774,19 @@ class GUIBuilderMixin:
         )
         self.row7a = ft.Row([
             self.run_mode_label, self.run_mode_dd, self.lossless_cb, self.lsfg_cb,
-            ft.Container(width=S(40)), self.stream_settings_cb,
         ], spacing=1)
         self.xr_headset_row = ft.Row(
-            [self.xr_headset_label, self.xr_headset_dd, ft.Container(width=S(40)),
-             self.display_mode_label, self.display_mode_dd], spacing=1)
+            [
+                self.xr_headset_label,
+                self.xr_headset_dd,
+                ft.Container(width=S(8)),
+                self.openxr_controls_button,
+                ft.Container(width=S(40)),
+                self.display_mode_label,
+                self.display_mode_dd,
+            ],
+            spacing=1,
+        )
         self.row7b = ft.Row([self.controller_label, self.ctrl_model_dd, ft.Container(width=S(40)),
             self.environment_label, self.env_model_dd], spacing=1)
 
@@ -855,7 +867,7 @@ class GUIBuilderMixin:
         # window is shorter than the rows.
         device_content = ft.Column([row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, self.row6b, self.row6d, self.row6g, self.row6e, self.row6f,
                        self.row7a, self.xr_headset_row, self.row7b, row8, self.row6c, self.row9,
-                       self.stream_url_row], spacing=S(6), scroll=ft.ScrollMode.AUTO,
+                       self.moonlight_controls_row, self.stream_url_row], spacing=S(6), scroll=ft.ScrollMode.AUTO,
                        tight=True)
         device_group = ft.Container(
             device_content,
@@ -960,7 +972,12 @@ class GUIBuilderMixin:
         )
 
 
-        btn_row = ft.Row([self.reset_btn, ft.Container(expand=True), self.stop_btn, self.run_btn], spacing=S(20))
+        btn_row = ft.Row([
+            self.reset_btn,
+            ft.Container(expand=True),
+            self.stop_btn,
+            self.run_btn,
+        ], spacing=S(20))
         self._btn_bar = btn_row
         self._status_bar = ft.Row([
             ft.Container(content=self.status_text, bgcolor=ft.Colors.SURFACE_CONTAINER,
@@ -1049,14 +1066,22 @@ class GUIBuilderMixin:
         self.audio_dd = CompactDropdown(options=[], min_width=S(130),
             on_select=self.on_audio_device_change)
         self.audio_row = ft.Row([self.audio_label, self.audio_dd], spacing=1)
-        self.video_backend_label = ft.Text("Video Encoder:", size=FONT_SIZE, width=S(150))
+        self.video_backend_label = ft.Text(
+            UI_MESSAGES[self.locale]["Video Encoder:"],
+            size=FONT_SIZE,
+            width=S(110 if self.locale == "CN" else 130),
+        )
         self.video_backend_dd = CompactDropdown(
-            options=["Auto", "Intel QSV (D3D11)", "FFmpeg", "Vulkan Video", "PyNvVideoCodec"],
+            options=[
+                "Auto",
+                "Intel QSV (D3D11)",
+                "FFmpeg",
+                "Vulkan Video",
+                "PyNvVideoCodec",
+                "AMD AMF",
+            ],
             value="Auto",
             min_width=S(130),
-        )
-        self.video_backend_row = ft.Row(
-            [self.video_backend_label, self.video_backend_dd], spacing=1
         )
         self.stream_calibration_label = ft.Text(
             "Transmission Profile:", size=FONT_SIZE, width=S(150)
@@ -1163,9 +1188,59 @@ class GUIBuilderMixin:
             tooltip=fit_tooltip,
         )
         self.stream_fit_row = ft.Row([self.stream_display_fit_label, self.stream_display_fit_dd], spacing=1)
+        self.moonlight_pairing_btn = ft.Button(
+            content=ft.Text(
+                UI_MESSAGES[self.locale].get("Open Moonlight pairing", "Open Moonlight pairing"),
+                size=FONT_SIZE,
+                max_lines=1,
+                no_wrap=True,
+            ),
+            width=S(145 if self.locale == "CN" else 170),
+            style=ft.ButtonStyle(
+                padding=ft.Padding(S(10), S(4), S(10), S(4))
+            ),
+            on_click=self.open_moonlight_pairing,
+            disabled=True,
+        )
+        self.moonlight_pin_tf = ft.TextField(
+            label=UI_MESSAGES[self.locale].get(
+                "Moonlight Pairing PIN", "Pairing PIN:"
+            ),
+            value="",
+            width=S(320),
+            max_length=4,
+            input_filter=ft.InputFilter(regex_string=r"[0-9]", allow=True),
+            autofocus=True,
+        )
+        self.moonlight_pair_btn = ft.Button(
+            content=ft.Text(
+                UI_MESSAGES[self.locale].get("Pair Moonlight Client", "Pair device"),
+                size=FONT_SIZE,
+                max_lines=1,
+                no_wrap=True,
+            ),
+            style=ft.ButtonStyle(
+                padding=ft.Padding(S(10), S(4), S(10), S(4))
+            ),
+            on_click=self.open_moonlight_pairing_pin_dialog,
+            disabled=True,
+        )
+        self.moonlight_pair_btn.width = S(95 if self.locale == "CN" else 120)
+        self.moonlight_controls_row = ft.Row(
+            [
+                self.video_backend_label,
+                self.video_backend_dd,
+                ft.Container(width=S(8)),
+                self.moonlight_pairing_btn,
+                ft.Container(width=S(8)),
+                self.moonlight_pair_btn,
+            ],
+            spacing=S(1),
+            visible=False,
+        )
         self._streamer_rows = [
             self.stream_port_quality_row, self.stream_proto_row,
-            self.crf_row, self.audio_row, self.video_backend_row,
+            self.crf_row, self.audio_row,
             self.stream_fit_row,
             self.stream_calibration_row,
             self.stream_calibration_warning_row,
@@ -1194,8 +1269,9 @@ class GUIBuilderMixin:
     def _get_streamer_row_map():
         return {
             "Local Viewer": [], "3D Monitor": [], "OpenXR Link": [],
-            "MJPEG Streamer": [0, 5],
-            "RTMP Streamer": [0, 1, 2, 3, 5, 6, 7, 8, 10],
+            "MJPEG Streamer": [0, 4],
+            "RTMP Streamer": [0, 1, 2, 3, 4, 5, 6, 7, 9],
+            "Moonlight Streamer": [],
         }
 
     # ── data population ──

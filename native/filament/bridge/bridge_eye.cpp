@@ -466,6 +466,7 @@ int bridge_eye_begin_frame_impl(
     bridge->eyes[bridge->active_eye].frame_active = bridge->frame_active;
     if (!bridge->frame_active) {
         bridge_set_error(bridge, "Filament Renderer::beginFrame failed");
+        return 0;
     }
     if (bridge->diagnostic_frame_count < 8) {
         std::fprintf(stderr,
@@ -482,7 +483,7 @@ int bridge_eye_begin_frame_impl(
     if (render_controller_layers && !bridge->multiview_active) {
         bridge->renderer->render(eye.controller_view);
     }
-    return bridge->frame_active ? 1 : 0;
+    return 1;
 }
 
 }  // namespace
@@ -516,8 +517,11 @@ int bridge_eye_render_controller_overlay(FilamentBridge* bridge) {
         bridge->engine->flushAndWait();
     }
     filament::Renderer::ClearOptions clear_options;
+    // Vulkan interprets sRGB attachment clear values as linear RGB. Convert
+    // the requested sRGB green (0, 153, 51) before clearing the eye swapchain.
     clear_options.clearColor = bridge->passthrough_backdrop
-            ? filament::math::double4{0.0, 0.6, 0.2, 1.0}
+            ? filament::math::double4{
+                    0.0, 0.31854677812509186, 0.033104766570885055, 1.0}
             : filament::math::double4{0.0, 0.0, 0.0, 1.0};
     clear_options.clear = true;
     clear_options.discard = true;

@@ -12,6 +12,7 @@ def adaptive_capture_enabled_for_mode(run_mode: str, target_fps: int) -> bool:
         "viewer",
         "openxr",
         "openxr link",
+        "moonlight streamer",
         "rtmp streamer",
         "nvidia gpu streamer",
     }

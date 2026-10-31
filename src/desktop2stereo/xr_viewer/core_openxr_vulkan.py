@@ -761,6 +761,7 @@ class OpenXrVulkanPresenter(
         self._panorama_size: tuple[int, int] | None = None
         self._panorama_layer: Any = None
         self._openxr_equirect_supported = False
+        self._openxr_cylinder_supported = False
         self._panorama_skip_logged = False
         self._panorama_failed = False
         self._vulkan_panorama_image = None
@@ -1290,6 +1291,7 @@ class OpenXrVulkanPresenter(
         self._screen_operation_guide_visible = False
         self._hand_fps_visible = False
         self._hand_operation_guide_visible = False
+        self._fps_curve_mode_logged = False
         self._aperture_visible = False
         self._init_controller_shortcuts()
         self._init_controller_guide_input()
@@ -1694,17 +1696,34 @@ class OpenXrVulkanPresenter(
         optional_equirect = getattr(
             xr, "KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME", None
         )
+        optional_cylinder = getattr(
+            xr, "KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME", None
+        )
         enabled_extensions = [self._VULKAN_EXTENSION]
         if optional_equirect and optional_equirect in available_extensions:
             enabled_extensions.append(optional_equirect)
             self._openxr_equirect_supported = hasattr(
                 xr, "CompositionLayerEquirect2KHR"
             )
+        self._openxr_cylinder_supported = bool(
+            optional_cylinder
+            and optional_cylinder in available_extensions
+            and hasattr(xr, "CompositionLayerCylinderKHR")
+        )
+        if self._openxr_cylinder_supported:
+            enabled_extensions.append(optional_cylinder)
         print(
             "[OpenXRViewer] Equirect background capability: "
             f"extension={bool(optional_equirect and optional_equirect in available_extensions)} "
             f"binding={hasattr(xr, 'CompositionLayerEquirect2KHR')} "
             f"active={self._openxr_equirect_supported}",
+            flush=True,
+        )
+        print(
+            "[OpenXRViewer] Cylinder overlay capability: "
+            f"extension={bool(optional_cylinder and optional_cylinder in available_extensions)} "
+            f"binding={hasattr(xr, 'CompositionLayerCylinderKHR')} "
+            f"active={self._openxr_cylinder_supported}",
             flush=True,
         )
         try:
@@ -1795,6 +1814,7 @@ class OpenXrVulkanPresenter(
     def _recreate_reference_space_after_runtime_change(self) -> None:
         """Recreate the base XR space after a runtime relocation event."""
         self._reset_settings_menu_grab()
+        self._filament_screen_head_initialized = False
         if self.xr is None or self.session is None or self._reference_space_type is None:
             self._profile_space_applied = False
             return
@@ -1852,6 +1872,7 @@ class OpenXrVulkanPresenter(
         if self._vulkan_device_is_lost():
             self._request_fatal_device_loss()
             return False
+        self._pump_main_gui_openxr_controls_request()
         if not self.session_running:
             self._notify_headset_waiting()
             time.sleep(0.01)
@@ -1897,6 +1918,15 @@ class OpenXrVulkanPresenter(
         # shouldRender is a per-frame runtime hint, not a headset disconnect.
         # Preserve the latest stereo output for the next renderable XR tick;
         # session/form-factor loss is handled by the explicit waiting paths.
+        # Begin promptly after the runtime's pacing decision; sample controller
+        # input within the frame budget instead of delaying xr.begin_frame.
+        begin_started = time.perf_counter()
+        with getattr(self.vulkan, "_lock", nullcontext()):
+            xr.begin_frame(self.session)
+        if self._on_breakdown_add_time is not None:
+            self._on_breakdown_add_time(
+                "openxr_begin_frame", time.perf_counter() - begin_started
+            )
         controls_started = time.perf_counter()
         try:
             # Physical input must release injected holds even if xrSyncActions
@@ -1956,13 +1986,6 @@ class OpenXrVulkanPresenter(
                 self._on_breakdown_add_time(
                     "openxr_controls", time.perf_counter() - controls_started
                 )
-        begin_started = time.perf_counter()
-        with getattr(self.vulkan, "_lock", nullcontext()):
-            xr.begin_frame(self.session)
-        if self._on_breakdown_add_time is not None:
-            self._on_breakdown_add_time(
-                "openxr_begin_frame", time.perf_counter() - begin_started
-            )
         layer_structures: list[Any] = []
         layer_pointers: list[Any] = []
         primary_layer_pointers: list[Any] = []
@@ -2602,6 +2625,67 @@ class OpenXrVulkanPresenter(
             f"  @ {float(distance):.2f} m"
         )
         self._preset_osd_show_t = time.perf_counter()
+
+    def _recenter_filament_screen_to_head(self) -> None:
+        """Face the current head direction while preserving screen size and distance."""
+        if (
+            self._filament_screen is None
+            or self._head_position_w is None
+            or self._head_forward_w is None
+        ):
+            return
+        try:
+            position, width, height, _rotation = self._filament_screen
+            position = np.asarray(position, dtype=np.float64)
+            head = np.asarray(self._head_position_w, dtype=np.float64)
+            forward = np.asarray(self._head_forward_w, dtype=np.float64)
+        except (TypeError, ValueError):
+            return
+        if (
+            position.shape != (3,)
+            or head.shape != (3,)
+            or forward.shape != (3,)
+            or not np.all(np.isfinite(position))
+            or not np.all(np.isfinite(head))
+            or not np.all(np.isfinite(forward))
+        ):
+            return
+
+        forward_xz = forward[[0, 2]].copy()
+        forward_length = float(np.linalg.norm(forward_xz))
+        if not np.isfinite(forward_length) or forward_length <= 1e-4:
+            forward_xz = np.asarray((0.0, -1.0), dtype=np.float64)
+        else:
+            forward_xz /= forward_length
+
+        distance = float(np.linalg.norm(position[[0, 2]] - head[[0, 2]]))
+        if not np.isfinite(distance) or distance < 0.25 or distance > 50.0:
+            try:
+                distance = float(self._shortcut_screen_presets[5][2])
+            except (IndexError, TypeError, ValueError):
+                distance = 2.5
+            distance = max(0.25, distance)
+
+        fx, fz = (float(value) for value in forward_xz)
+        yaw = math.degrees(math.atan2(-fx, -fz))
+        self._filament_screen = (
+            (
+                float(head[0]) + fx * distance,
+                float(head[1]),
+                float(head[2]) + fz * distance,
+            ),
+            float(width),
+            float(height),
+            (yaw, 0.0, 0.0),
+        )
+        self._reset_orientation_offsets()
+        self._clear_screen_grab_anchors()
+        self._anim_target_pan_x = None
+        self._persist_screen_state(force=True)
+        self._preset_name_overlay = "Screen Recentered"
+        self._preset_osd_show_t = time.perf_counter()
+        if self._keyboard_visible:
+            self._anchor_keyboard_below_screen()
 
     def _controller_callback_depth_strength(self) -> float | None:
         """Read the synchronously updated runtime value when available."""
@@ -5317,6 +5401,9 @@ class OpenXrVulkanPresenter(
         self._settings_menu_values["screen:section"] = str(
             self._settings_menu.screen_section
         )
+        self._settings_menu_values["screen:toggle_passthrough"] = bool(
+            self._passthrough_backdrop
+        )
         self._settings_menu_values["screen:crop_width"] = float(
             self._screen_crop_width_percent
         )
@@ -5362,6 +5449,70 @@ class OpenXrVulkanPresenter(
         window = self._desktop_settings_window
         if window is not None:
             window.toggle_icon_visibility()
+
+    def _pump_main_gui_openxr_controls_request(self) -> None:
+        request_path = str(
+            os.environ.get("D2S_OPENXR_CONTROLS_REQUEST_FILE", "") or ""
+        ).strip()
+        if not request_path:
+            return
+        now = time.monotonic()
+        if now < float(getattr(self, "_openxr_controls_request_poll_at", 0.0)):
+            return
+        self._openxr_controls_request_poll_at = now + 0.1
+        request_file = Path(request_path)
+        claimed_path = request_file.with_name(
+            f"{request_file.name}.{os.getpid()}.{time.monotonic_ns()}.processing"
+        )
+        try:
+            os.replace(request_file, claimed_path)
+        except OSError:
+            return
+        try:
+            request = claimed_path.read_text(encoding="utf-8").split()
+        except (OSError, UnicodeError):
+            return
+        finally:
+            try:
+                claimed_path.unlink()
+            except OSError:
+                pass
+        if len(request) not in (2, 3):
+            return
+        try:
+            requested_pid = int(request[0])
+            if len(request) == 3:
+                revision = int(request[1])
+                visible_value = int(request[2])
+            else:
+                revision = time.monotonic_ns()
+                visible_value = int(request[1])
+        except ValueError:
+            return
+        if requested_pid != os.getpid() or visible_value not in (0, 1):
+            return
+        last_revision = int(getattr(self, "_openxr_controls_request_revision", 0))
+        if revision <= last_revision:
+            return
+        self._openxr_controls_request_revision = revision
+
+        visible = bool(visible_value)
+        if visible and self._desktop_settings_window is None:
+            self._ensure_desktop_settings_window()
+        window = self._desktop_settings_window
+        if window is None:
+            print(
+                f"[D2S_OPENXR_CONTROLS] visible=0 revision={revision}",
+                flush=True,
+            )
+            return
+        if visible:
+            self._publish_desktop_settings_snapshot(force=True)
+        if not window.set_panel_visible(visible, revision=revision):
+            print(
+                f"[D2S_OPENXR_CONTROLS] visible=0 revision={revision}",
+                flush=True,
+            )
 
     def _desktop_settings_snapshot(self) -> dict[str, Any]:
         self._refresh_settings_menu_values()
@@ -5419,6 +5570,9 @@ class OpenXrVulkanPresenter(
     def _apply_desktop_settings_action(
         self, key: str, value: float | None
     ) -> None:
+        if key == "screen:reset_to_front":
+            self._recenter_filament_screen_to_head()
+            return
         if key.startswith("tab:"):
             self._settings_menu.set_tab(key.split(":", 1)[1])
             return
@@ -5532,6 +5686,11 @@ class OpenXrVulkanPresenter(
         if key.startswith("screen:section:"):
             self._settings_menu.set_screen_section(key.rsplit(":", 1)[1])
             self._refresh_settings_menu_values()
+            return
+        if key == "screen:toggle_passthrough":
+            self._dispatch_controller_shortcut("toggle_passthrough")
+            self._settings_menu_values[key] = bool(self._passthrough_backdrop)
+            self._settings_menu.mark_dirty()
             return
         if key.startswith("step:"):
             _prefix, operation, target_key = key.split(":", 2)
@@ -10532,45 +10691,57 @@ class OpenXrVulkanPresenter(
                 flush=True,
             )
             self._rocm_deferred_filament_logged = True
-        for eye_index, (eye, image_index) in enumerate(acquired_images):
-            state_started = time.perf_counter()
-            bridge.set_active_eye(eye_index)
-            _update_filament_camera(
-                bridge,
-                render_views[eye_index],
-                near_plane=self._profile_near_plane,
-                far_plane=self._profile_far_plane,
-            )
-            record_time(f"openxr_filament_eye{eye_index}_state", state_started)
-            bridge.set_acquired_image(image_index)
-            queue_started = time.perf_counter()
-            if (
-                self._filament_controller_overlay_after_composer
-                and bool(getattr(bridge, "controller_overlay_abi_available", False))
-                and bool(getattr(bridge, "background_frame_abi_available", False))
-            ):
-                bridge.begin_background_frame()
-            else:
-                bridge.begin_frame()
-            record_time(f"openxr_filament_eye{eye_index}_queue", queue_started)
-            finish_started = time.perf_counter()
-            if deferred:
-                bridge.end_frame_deferred()
-            else:
-                bridge.end_frame()
-            record_time(
-                f"openxr_filament_eye{eye_index}_finish_wait", finish_started
-            )
-            if finished_available:
-                semaphore = bridge.get_finished_drawing_semaphore()
-                if semaphore is not None:
-                    semaphores.append(semaphore)
-            if eye_index < len(self._filament_depth_attachments):
-                adopt_depth = getattr(
-                    self.vulkan, "adopt_external_depth_attachment", None
+        try:
+            for eye_index, (eye, image_index) in enumerate(acquired_images):
+                state_started = time.perf_counter()
+                bridge.set_active_eye(eye_index)
+                _update_filament_camera(
+                    bridge,
+                    render_views[eye_index],
+                    near_plane=self._profile_near_plane,
+                    far_plane=self._profile_far_plane,
                 )
-                if callable(adopt_depth):
-                    adopt_depth(self._filament_depth_attachments[eye_index].resource)
+                record_time(f"openxr_filament_eye{eye_index}_state", state_started)
+                bridge.set_acquired_image(image_index)
+                queue_started = time.perf_counter()
+                if (
+                    self._filament_controller_overlay_after_composer
+                    and bool(getattr(bridge, "controller_overlay_abi_available", False))
+                    and bool(getattr(bridge, "background_frame_abi_available", False))
+                ):
+                    bridge.begin_background_frame()
+                else:
+                    bridge.begin_frame()
+                record_time(f"openxr_filament_eye{eye_index}_queue", queue_started)
+                finish_started = time.perf_counter()
+                if deferred:
+                    bridge.end_frame_deferred()
+                else:
+                    bridge.end_frame()
+                record_time(
+                    f"openxr_filament_eye{eye_index}_finish_wait", finish_started
+                )
+                if finished_available:
+                    semaphore = bridge.get_finished_drawing_semaphore()
+                    if semaphore is not None:
+                        semaphores.append(semaphore)
+                if eye_index < len(self._filament_depth_attachments):
+                    adopt_depth = getattr(
+                        self.vulkan, "adopt_external_depth_attachment", None
+                    )
+                    if callable(adopt_depth):
+                        adopt_depth(self._filament_depth_attachments[eye_index].resource)
+        except Exception:
+            if semaphores:
+                try:
+                    self.vulkan.submit_on(
+                        "graphics",
+                        lambda _command_buffer: None,
+                        wait_semaphore=tuple(semaphores),
+                    )
+                except Exception:
+                    pass
+            raise
         self._filament_background_frame_count += 1
         return semaphores
 
@@ -10984,41 +11155,89 @@ class OpenXrVulkanPresenter(
                     filament_hdr_sources: tuple[Any, ...] = ()
                     skip_filament_background = self._can_skip_filament_background()
                     controller_underlay = self._can_precompose_filament_controllers()
+                    controller_underlay_failed = False
                     if controller_underlay:
-                        self._clear_projection_targets(
-                            acquired_images, clear_color=(0.0, 0.0, 0.0, 0.0)
-                        )
-                        self._render_filament_controller_overlay(
-                            acquired_images, record_time, render_views=render_views
-                        )
-                    if self.filament_bridge is not None and not skip_filament_background:
-                        if self._multiview_active:
-                            finished = self._render_filament_multiview(
-                                render_views,
-                                presentation_frame,
-                                finished_semaphore_available,
-                                record_time,
+                        try:
+                            self._clear_projection_targets(
+                                acquired_images, clear_color=(0.0, 0.0, 0.0, 0.0)
                             )
-                            filament_composer_wait_semaphores = (
-                                [finished] if finished is not None else []
+                            self._render_filament_controller_overlay(
+                                acquired_images, record_time, render_views=render_views
                             )
-                            if self._filament_multiview_current is None:
-                                raise RuntimeError(
-                                    "Filament multiview HDR frame was not published"
+                        except Exception as exc:
+                            controller_underlay = False
+                            controller_underlay_failed = True
+                            if not getattr(self, "_filament_pair_failure_logged", False):
+                                self._filament_pair_failure_logged = True
+                                print(
+                                    "[OpenXRViewer] Filament controller underlay skipped; "
+                                    f"keeping stereo screen pair: {type(exc).__name__}: {exc}",
+                                    flush=True,
                                 )
-                            filament_hdr_sources = tuple(
-                                self._filament_multiview_current.layer_resources
-                            )
-                        else:
-                            filament_composer_wait_semaphores = (
-                                self._render_filament_for_projection_composer(
+                    filament_background_failed = False
+                    if self.filament_bridge is not None and not skip_filament_background:
+                        try:
+                            if self._multiview_active:
+                                finished = self._render_filament_multiview(
                                     render_views,
-                                    acquired_images,
-                                    animation_time,
+                                    presentation_frame,
+                                    finished_semaphore_available,
                                     record_time,
                                 )
+                                filament_composer_wait_semaphores = (
+                                    [finished] if finished is not None else []
+                                )
+                                if self._filament_multiview_current is None:
+                                    raise RuntimeError(
+                                        "Filament multiview HDR frame was not published"
+                                    )
+                                filament_hdr_sources = tuple(
+                                    self._filament_multiview_current.layer_resources
+                                )
+                            else:
+                                filament_composer_wait_semaphores = (
+                                    self._render_filament_for_projection_composer(
+                                        render_views,
+                                        acquired_images,
+                                        animation_time,
+                                        record_time,
+                                    )
+                                )
+                            filament_composer_rendered = True
+                        except Exception as exc:
+                            filament_background_failed = True
+                            filament_composer_wait_semaphores = []
+                            filament_hdr_sources = ()
+                            filament_composer_rendered = False
+                            controller_underlay = False
+                            deferred_finish = getattr(
+                                self.filament_bridge, "finish_frame_batch", None
                             )
-                        filament_composer_rendered = True
+                            if (
+                                callable(deferred_finish)
+                                and self._rocm_deferred_filament_eye_end_enabled(
+                                    self.filament_bridge,
+                                    finished_available=finished_semaphore_available,
+                                )
+                            ):
+                                try:
+                                    deferred_finish()
+                                except Exception:
+                                    pass
+                            if not getattr(self, "_filament_pair_failure_logged", False):
+                                self._filament_pair_failure_logged = True
+                                print(
+                                    "[OpenXRViewer] Filament eye pair skipped; "
+                                    f"keeping stereo screen pair: {type(exc).__name__}: {exc}",
+                                    flush=True,
+                                )
+                    if filament_background_failed or (
+                        controller_underlay_failed and not filament_composer_rendered
+                    ):
+                        # A failed per-eye Filament pass may have touched only
+                        # one swapchain image. Clear the pair before the Vulkan
+                        # screen pass so no half-updated eye reaches xrEndFrame.
+                        self._clear_projection_targets(acquired_images)
                     if filament_composer_wait_semaphores or filament_hdr_sources or controller_underlay:
                         composer_timeline = self._render_vulkan_projection_composer(
                             composer_frame,
@@ -11032,13 +11251,47 @@ class OpenXrVulkanPresenter(
                         composer_timeline = self._render_vulkan_projection_composer(
                             composer_frame, acquired_images, composition_views
                         )
+                    # The screen submission consumes the Filament completion
+                    # semaphores as a single stereo pair. Do not wait them again
+                    # if an optional later overlay stage fails.
+                    filament_composer_wait_semaphores = []
                     overlay_timeline = None
                     if not controller_underlay:
-                        overlay_timeline = self._render_filament_controller_overlay(
-                            acquired_images,
-                            record_time,
-                            render_views=render_views if skip_filament_background else None,
-                        )
+                        try:
+                            overlay_timeline = self._render_filament_controller_overlay(
+                                acquired_images,
+                                record_time,
+                                render_views=render_views if skip_filament_background else None,
+                            )
+                        except Exception as exc:
+                            if not getattr(self, "_filament_overlay_failure_logged", False):
+                                self._filament_overlay_failure_logged = True
+                                print(
+                                    "[OpenXRViewer] Filament controller overlay skipped; "
+                                    f"restoring the stereo screen pair: {type(exc).__name__}: {exc}",
+                                    flush=True,
+                                )
+                            self._clear_projection_targets(acquired_images)
+                            composer_timeline = self._render_vulkan_projection_composer(
+                                composer_frame, acquired_images, composition_views
+                            )
+                            self._vulkan_projection_composer_frame_id = int(
+                                composer_frame.frame_id
+                            )
+                            self._vulkan_projection_composer_active = True
+                            filament_composer_rendered = False
+                            controller_underlay = False
+                            if isinstance(composer_frame.metadata, dict):
+                                composer_frame.metadata[
+                                    "_vulkan_consumer_release_timeline"
+                                ] = max(
+                                    int(
+                                        composer_frame.metadata.get(
+                                            "_vulkan_consumer_release_timeline", 0
+                                        )
+                                    ),
+                                    int(composer_timeline),
+                                )
                     elif self._on_breakdown_inc is not None:
                         self._on_breakdown_inc("openxr_controllers_precomposed", 1)
                     composer_timeline = max(int(composer_timeline), int(overlay_timeline or 0))
@@ -12830,8 +13083,16 @@ class OpenXrVulkanPresenter(
             )
         msdf_atlas = self._msdf_font_atlas
         controller_model_name = self._controller_model_display_name()
+        fps_screen_width = float(width)
+        fps_screen_height = float(height)
+        if self._screen_curved:
+            effective_screen = self._effective_filament_screen()
+            if effective_screen is not None:
+                fps_screen_width = float(effective_screen[1])
+                fps_screen_height = float(effective_screen[2])
         fps_key = (
-            "fps", language, environment_mode, round(width, 3), round(height, 3),
+            "fps", language, environment_mode,
+            round(fps_screen_width, 3), round(fps_screen_height, 3),
             round(self._tool_overlay_xr_fps, 1), round(self._tool_overlay_sbs_fps, 1),
             round(self._tool_overlay_capture_fps, 1),
             round(self._tool_overlay_latency_ms, 1),
@@ -12850,8 +13111,8 @@ class OpenXrVulkanPresenter(
                         sbs_fps=self._tool_overlay_sbs_fps,
                         capture_fps=self._tool_overlay_capture_fps,
                         latency_ms=self._tool_overlay_latency_ms,
-                        screen_width=width,
-                        screen_height=height,
+                        screen_width=fps_screen_width,
+                        screen_height=fps_screen_height,
                         screen_distance=screen_distance,
                         depth_strength=self._tool_overlay_depth_strength,
                         vr_res=vr_res,
@@ -12877,8 +13138,8 @@ class OpenXrVulkanPresenter(
                         sbs_fps=self._tool_overlay_sbs_fps,
                         capture_fps=self._tool_overlay_capture_fps,
                         latency_ms=self._tool_overlay_latency_ms,
-                        screen_width=width,
-                        screen_height=height,
+                        screen_width=fps_screen_width,
+                        screen_height=fps_screen_height,
                         screen_distance=screen_distance,
                         depth_strength=self._tool_overlay_depth_strength,
                         vr_res=vr_res,
@@ -12890,12 +13151,12 @@ class OpenXrVulkanPresenter(
                 self._tool_quad_texture_keys["fps"] = fps_key
 
         if self._fps_overlay_visible:
-            overlay_h = height / 8.0
+            overlay_h = fps_screen_height / 8.0
             overlay_w = overlay_h * float(rgba.shape[1]) / max(1.0, float(rgba.shape[0]))
             local = np.eye(4, dtype=np.float64)
             local[:3, 3] = (
-                -width / 2.0 + overlay_w / 2.0,
-                -height / 2.0 - height * 0.02 - overlay_h / 2.0,
+                -fps_screen_width / 2.0 + overlay_w / 2.0,
+                -fps_screen_height / 2.0 - fps_screen_height * 0.02 - overlay_h / 2.0,
                 0.0,
             )
             fps_position, fps_rotation = self._screen_overlay_pose(local)
@@ -13143,7 +13404,10 @@ class OpenXrVulkanPresenter(
                 )
                 break
             if layer is not None:
-                layers.append(layer)
+                if isinstance(layer, list):
+                    layers.extend(item for item in layer if item is not None)
+                else:
+                    layers.append(layer)
         if self._on_breakdown_add_time is not None:
             self._on_breakdown_add_time(
                 "openxr_quad_upload", time.perf_counter() - specs_ready
@@ -13191,20 +13455,91 @@ class OpenXrVulkanPresenter(
             flush=True,
         )
 
+    def _screen_pose_in_front_of_head(self, screen_pose):
+        if (
+            screen_pose is None
+            or self._head_position_w is None
+            or self._head_forward_w is None
+        ):
+            return screen_pose
+        try:
+            position, width, height, _rotation = screen_pose
+            position = np.asarray(position, dtype=np.float64)
+            head = np.asarray(self._head_position_w, dtype=np.float64)
+            forward = np.asarray(self._head_forward_w, dtype=np.float64)
+        except (TypeError, ValueError):
+            return screen_pose
+        if (
+            position.shape != (3,)
+            or head.shape != (3,)
+            or forward.shape != (3,)
+            or not np.all(np.isfinite(position))
+            or not np.all(np.isfinite(head))
+            or not np.all(np.isfinite(forward))
+        ):
+            return screen_pose
+
+        forward_xz = forward[[0, 2]].copy()
+        forward_length = float(np.linalg.norm(forward_xz))
+        if not np.isfinite(forward_length) or forward_length <= 1e-4:
+            forward_xz = np.asarray((0.0, -1.0), dtype=np.float64)
+        else:
+            forward_xz /= forward_length
+        offset_xz = position[[0, 2]] - head[[0, 2]]
+        forward_distance = float(np.dot(offset_xz, forward_xz))
+        if np.isfinite(forward_distance) and forward_distance > 0.05:
+            return screen_pose
+
+        distance = float(np.linalg.norm(offset_xz))
+        if not np.isfinite(distance) or distance < 0.25 or distance > 50.0:
+            try:
+                distance = float(self._shortcut_screen_presets[5][2])
+            except (IndexError, TypeError, ValueError):
+                distance = 2.5
+            distance = max(0.25, distance)
+        fx, fz = (float(value) for value in forward_xz)
+        yaw = math.degrees(math.atan2(-fx, -fz))
+        return (
+            (
+                float(head[0]) + fx * distance,
+                float(head[1]),
+                float(head[2]) + fz * distance,
+            ),
+            float(width),
+            float(height),
+            (yaw, 0.0, 0.0),
+        )
+
     def _initialize_filament_screen_from_head(self) -> None:
-        """Initialize an unauthored screen with the legacy head-centered preset."""
+        """Initialize a screen pose and repair stale positions behind the head."""
         if (
             self._filament_screen_head_initialized
-            or self._filament_screen_profile_authored
             or self._filament_screen is None
             or self._head_position_w is None
             or self._head_forward_w is None
         ):
             return
-        self._shortcut_screen_preset_index = 5
-        self._apply_shortcut_screen_preset(5)
-        self._filament_screen_initial = self._filament_screen
-        self._apply_persisted_screen_state()
+        if not self._filament_screen_profile_authored:
+            self._shortcut_screen_preset_index = 5
+            self._apply_shortcut_screen_preset(5)
+            self._filament_screen_initial = self._filament_screen
+            self._apply_persisted_screen_state()
+        elif self._filament_screen_initial is None:
+            self._filament_screen_initial = self._filament_screen
+
+        if self._filament_screen_initial is not None:
+            self._filament_screen_initial = self._screen_pose_in_front_of_head(
+                self._filament_screen_initial
+            )
+        current_screen = self._filament_screen
+        front_screen = self._screen_pose_in_front_of_head(current_screen)
+        if front_screen is not current_screen:
+            self._filament_screen = front_screen
+            self._persist_screen_state(force=True)
+            print(
+                "[OpenXRViewer] Recentered initial screen in front of the headset",
+                flush=True,
+            )
         if self._filament_screen_last_persisted_signature is None:
             self._filament_screen_last_persisted_signature = self._screen_state_signature()
         self._filament_screen_head_initialized = True
@@ -13352,15 +13687,67 @@ class OpenXrVulkanPresenter(
         local[:3] = button_local
         return (model_matrix @ local)[:3]
 
-    def _make_tool_quad_layer(
-        self, entry: dict[str, Any], width: int, height: int,
-        position, size, rotation,
+    def _screen_fps_cylinder_layer(
+        self,
+        entry: dict[str, Any],
+        width: int,
+        height: int,
+        position,
+        size,
     ):
-        if len(rotation) == 4:
-            qx, qy, qz, qw = (float(value) for value in rotation)
-        else:
-            qx, qy, qz, qw = _euler_degrees_to_quaternion(rotation)
-        return self.xr.CompositionLayerQuad(
+        if not self._openxr_cylinder_supported or not self._screen_curved:
+            return None
+        screen = self._effective_filament_screen()
+        if screen is None:
+            return None
+        screen_position, screen_width, _screen_height, _screen_rotation = screen
+        half_angle = self._effective_screen_curve_half_angle()
+        panel_width, panel_height = (float(value) for value in size)
+        if (
+            half_angle <= 1e-6
+            or screen_width <= 0.0
+            or panel_width <= 0.0
+            or panel_height <= 0.0
+        ):
+            return None
+
+        radius = float(screen_width) / (2.0 * half_angle)
+        central_angle = min(panel_width / radius, 2.0 * half_angle)
+        if not math.isfinite(radius) or not math.isfinite(central_angle) or central_angle <= 1e-6:
+            return None
+
+        screen_pose = self._filament_screen_pose_mat4()
+        flat_position = np.asarray(position, dtype=np.float64)
+        local_position = screen_pose[:3, :3].T @ (
+            flat_position - screen_pose[:3, 3]
+        )
+        theta = float(local_position[0]) / radius
+        theta_limit = max(0.0, half_angle - central_angle / 2.0)
+        theta = max(-theta_limit, min(theta_limit, theta))
+        tangent = np.asarray(
+            (math.cos(theta), 0.0, math.sin(theta)), dtype=np.float64
+        )
+        up = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
+        normal = np.cross(tangent, up)
+        curved_basis = np.column_stack((tangent, up, normal))
+        local_surface = np.asarray(
+            (
+                radius * math.sin(theta),
+                float(local_position[1]),
+                radius * (1.0 - math.cos(theta)),
+            ),
+            dtype=np.float64,
+        )
+        pose_matrix = np.eye(4, dtype=np.float64)
+        pose_matrix[:3, :3] = screen_pose[:3, :3] @ curved_basis
+        pose_matrix[:3, 3] = (
+            np.asarray(screen_position, dtype=np.float64)
+            + screen_pose[:3, :3] @ (local_surface + normal * 0.003)
+        )
+        pose_position, pose_rotation = self._overlay_pose_from_matrix(pose_matrix)
+        qx, qy, qz, qw = pose_rotation
+        arc_width = radius * central_angle
+        return self.xr.CompositionLayerCylinderKHR(
             layer_flags=(
                 self.xr.CompositionLayerFlags.BLEND_TEXTURE_SOURCE_ALPHA_BIT
                 | self.xr.CompositionLayerFlags.UNPREMULTIPLIED_ALPHA_BIT
@@ -13378,11 +13765,159 @@ class OpenXrVulkanPresenter(
             pose=self.xr.Posef(
                 orientation=self.xr.Quaternionf(x=qx, y=qy, z=qz, w=qw),
                 position=self.xr.Vector3f(
+                    x=float(pose_position[0]),
+                    y=float(pose_position[1]),
+                    z=float(pose_position[2]),
+                ),
+            ),
+            radius=radius,
+            central_angle=central_angle,
+            aspect_ratio=arc_width / panel_height,
+        )
+
+    def _make_tool_quad_layer(
+        self, entry: dict[str, Any], width: int, height: int,
+        position, size, rotation, *, key: str | None = None,
+        sub_image_rect: tuple[int, int, int, int] | None = None,
+    ):
+        if key == "screen_fps":
+            cylinder_layer = self._screen_fps_cylinder_layer(
+                entry, width, height, position, size
+            )
+            if cylinder_layer is not None:
+                return cylinder_layer
+            if self._screen_curved:
+                segmented_layers = self._screen_fps_segmented_quad_layers(
+                    entry, width, height, position, size
+                )
+                if segmented_layers:
+                    return segmented_layers
+        if len(rotation) == 4:
+            qx, qy, qz, qw = (float(value) for value in rotation)
+        else:
+            qx, qy, qz, qw = _euler_degrees_to_quaternion(rotation)
+        if sub_image_rect is None:
+            rect_x, rect_y, rect_width, rect_height = 0, 0, width, height
+        else:
+            rect_x, rect_y, rect_width, rect_height = (
+                int(value) for value in sub_image_rect
+            )
+        return self.xr.CompositionLayerQuad(
+            layer_flags=(
+                self.xr.CompositionLayerFlags.BLEND_TEXTURE_SOURCE_ALPHA_BIT
+                | self.xr.CompositionLayerFlags.UNPREMULTIPLIED_ALPHA_BIT
+            ),
+            space=self.reference_space,
+            eye_visibility=self.xr.EyeVisibility.BOTH,
+            sub_image=self.xr.SwapchainSubImage(
+                swapchain=entry["swapchain"],
+                image_rect=self.xr.Rect2Di(
+                    offset=self.xr.Offset2Di(x=rect_x, y=rect_y),
+                    extent=self.xr.Extent2Di(width=rect_width, height=rect_height),
+                ),
+                image_array_index=0,
+            ),
+            pose=self.xr.Posef(
+                orientation=self.xr.Quaternionf(x=qx, y=qy, z=qz, w=qw),
+                position=self.xr.Vector3f(
                     x=float(position[0]), y=float(position[1]), z=float(position[2])
                 ),
             ),
             size=self.xr.Extent2Df(width=float(size[0]), height=float(size[1])),
         )
+
+    def _screen_fps_segmented_quad_layers(
+        self,
+        entry: dict[str, Any],
+        width: int,
+        height: int,
+        position,
+        size,
+    ) -> list[Any]:
+        screen = self._effective_filament_screen()
+        if screen is None:
+            return []
+        screen_position, screen_width, _screen_height, _screen_rotation = screen
+        half_angle = self._effective_screen_curve_half_angle()
+        panel_width, panel_height = (float(value) for value in size)
+        if (
+            half_angle <= 1e-6
+            or screen_width <= 0.0
+            or panel_width <= 0.0
+            or panel_height <= 0.0
+        ):
+            return []
+
+        radius = float(screen_width) / (2.0 * half_angle)
+        total_angle = min(panel_width / radius, 2.0 * half_angle)
+        if not math.isfinite(radius) or not math.isfinite(total_angle) or total_angle <= 1e-6:
+            return []
+        segment_count = max(4, min(8, int(math.ceil(total_angle / 0.08))))
+        screen_pose = self._filament_screen_pose_mat4()
+        local_position = screen_pose[:3, :3].T @ (
+            np.asarray(position, dtype=np.float64) - screen_pose[:3, 3]
+        )
+        theta_center = float(local_position[0]) / radius
+        theta_start = max(
+            -half_angle,
+            min(half_angle - total_angle, theta_center - total_angle / 2.0),
+        )
+        layers = []
+        for index in range(segment_count):
+            x0 = index * width // segment_count
+            x1 = (index + 1) * width // segment_count
+            if x1 <= x0:
+                continue
+            theta0 = theta_start + total_angle * (x0 / width)
+            theta1 = theta_start + total_angle * (x1 / width)
+            delta = theta1 - theta0
+            theta = (theta0 + theta1) / 2.0
+            tangent = np.asarray(
+                (math.cos(theta), 0.0, math.sin(theta)), dtype=np.float64
+            )
+            up = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
+            normal = np.cross(tangent, up)
+            sagitta = radius * (1.0 - math.cos(delta / 2.0))
+            local_midpoint = np.asarray(
+                (
+                    radius * math.sin(theta),
+                    float(local_position[1]),
+                    radius * (1.0 - math.cos(theta)),
+                ),
+                dtype=np.float64,
+            ) + normal * (sagitta + 0.003)
+            pose_matrix = np.eye(4, dtype=np.float64)
+            pose_matrix[:3, :3] = screen_pose[:3, :3] @ np.column_stack(
+                (tangent, up, normal)
+            )
+            pose_matrix[:3, 3] = (
+                np.asarray(screen_position, dtype=np.float64)
+                + screen_pose[:3, :3] @ local_midpoint
+            )
+            segment_position, segment_rotation = self._overlay_pose_from_matrix(
+                pose_matrix
+            )
+            segment_width = 2.0 * radius * math.sin(delta / 2.0)
+            layers.append(
+                self._make_tool_quad_layer(
+                    entry,
+                    width,
+                    height,
+                    segment_position,
+                    (segment_width, panel_height),
+                    segment_rotation,
+                    key="screen_fps_segment",
+                    sub_image_rect=(x0, 0, x1 - x0, height),
+                )
+            )
+        if layers and not self._fps_curve_mode_logged:
+            print(
+                "[OpenXRViewer] Curved FPS overlay uses "
+                f"{len(layers)} tangent quad segments (cylinder extension unavailable)",
+                flush=True,
+            )
+            self._fps_curve_mode_logged = True
+        return layers
 
     def _upload_msdf_tool_quad(self, key, request, position, size, rotation):
         renderer = self._vulkan_msdf_quad_renderer
@@ -13489,7 +14024,7 @@ class OpenXrVulkanPresenter(
             entry["content"] = request
             entry["content_size"] = (width, height)
         return self._make_tool_quad_layer(
-            entry, width, height, position, size, rotation
+            entry, width, height, position, size, rotation, key=key
         )
 
     def _destroy_tool_quad_entry(self, entry: dict[str, Any]) -> None:
@@ -13593,7 +14128,7 @@ class OpenXrVulkanPresenter(
             entry["content"] = rgba
             entry["content_size"] = (width, height)
         return self._make_tool_quad_layer(
-            entry, width, height, position, size, rotation
+            entry, width, height, position, size, rotation, key=key
         )
 
     def _tool_quad_format(self) -> int:

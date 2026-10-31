@@ -6,8 +6,8 @@ import sys
 from dataclasses import dataclass
 
 
-NETWORK_STREAM_MODES = frozenset({"RTMP Streamer"})
-CALIBRATABLE_STREAM_MODES = NETWORK_STREAM_MODES
+NETWORK_STREAM_MODES = frozenset({"RTMP Streamer", "Moonlight Streamer"})
+CALIBRATABLE_STREAM_MODES = frozenset({"RTMP Streamer"})
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="auto">
+
+<head>
+      <!-- TEMPLATE_HEADER - Used by Every UI Page -->
+<meta charset="UTF-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sunshine</title>
+<link rel="icon" type="image/x-icon" href="./images/sunshine.ico">
+
+  <script type="module" crossorigin src="./assets/troubleshooting-gFkdktK-.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/logo-sunshine-45-jSIapha2.js">
+  <link rel="modulepreload" crossorigin href="./assets/trash-hacRL4Qy.js">
+  <link rel="modulepreload" crossorigin href="./assets/Notification-CkJkKBnN.js">
+  <link rel="modulepreload" crossorigin href="./assets/Navbar-Dibp9hT2.js">
+  <link rel="modulepreload" crossorigin href="./assets/download-C00N41CV.js">
+  <link rel="modulepreload" crossorigin href="./assets/external-link-kMaZrGpA.js">
+  <link rel="modulepreload" crossorigin href="./assets/gamepad-2-CH-kKcrZ.js">
+  <link rel="modulepreload" crossorigin href="./assets/rotate-ccw-eOcd-nKf.js">
+  <link rel="modulepreload" crossorigin href="./assets/fetch_utils-COCp1DR8.js">
+  <link rel="stylesheet" crossorigin href="./assets/logo-sunshine-45-2HJRdqau.css">
+  <link rel="stylesheet" crossorigin href="./assets/Notification-DmToSpaP.css">
+  <link rel="stylesheet" crossorigin href="./assets/Navbar-SNHnNuEx.css">
+</head>
+
+<body id="app" v-cloak>
+  <Navbar></Navbar>
+  <div id="content" class="container">
+    <h1 class="my-4">{{ $t('troubleshooting.troubleshooting') }}</h1>
+    <!-- Virtual input driver and license -->
+    <div class="card my-4 virtual-gamepad-card" v-if="platform === 'windows'">
+      <div class="card-body">
+        <header class="virtual-gamepad-hero">
+          <div class="virtual-gamepad-heading-icon" aria-hidden="true">
+            <gamepad-2 :size="28"></gamepad-2>
+          </div>
+          <div>
+            <h2 id="virtualhid" class="mb-1">{{ $t('troubleshooting.virtual_gamepad') }}</h2>
+            <p class="mb-0">{{ $t(virtualInputDescriptionKey) }}</p>
+            <a v-if="gamepadDriver === 'vigembus'"
+               class="btn btn-primary mt-3"
+               href="./config#gamepad_driver">
+              <gamepad-2 :size="18" class="icon"></gamepad-2>
+              {{ $t('troubleshooting.change_gamepad_driver') }}
+            </a>
+          </div>
+        </header>
+
+        <div class="virtual-gamepad-feature-grid"
+             v-if="showVirtualhidBenefits"
+             :aria-label="$t('troubleshooting.virtualhid_benefits_title')">
+          <article class="virtual-gamepad-feature">
+            <div class="virtual-gamepad-feature-icon" aria-hidden="true">
+              <gamepad-2 :size="21"></gamepad-2>
+            </div>
+            <div>
+              <h3>{{ $t('troubleshooting.virtualhid_benefit_gamepads_title') }}</h3>
+              <p>{{ $t('troubleshooting.virtualhid_benefit_gamepads') }}</p>
+            </div>
+          </article>
+          <article class="virtual-gamepad-feature">
+            <div class="virtual-gamepad-feature-icon" aria-hidden="true">
+              <mouse-pointer-2 :size="21"></mouse-pointer-2>
+            </div>
+            <div>
+              <h3>{{ $t('troubleshooting.virtualhid_benefit_mouse_title') }}</h3>
+              <p>{{ $t('troubleshooting.virtualhid_benefit_mouse') }}</p>
+            </div>
+          </article>
+          <article class="virtual-gamepad-feature">
+            <div class="virtual-gamepad-feature-icon" aria-hidden="true">
+              <sparkles :size="21"></sparkles>
+            </div>
+            <div>
+              <h3>{{ $t('troubleshooting.virtualhid_benefit_features_title') }}</h3>
+              <p>{{ $t('troubleshooting.virtualhid_benefit_features') }}</p>
+            </div>
+          </article>
+          <article class="virtual-gamepad-feature">
+            <div class="virtual-gamepad-feature-icon" aria-hidden="true">
+              <shield-check :size="21"></shield-check>
+            </div>
+            <div>
+              <h3>{{ $t('troubleshooting.virtualhid_benefit_maintained_title') }}</h3>
+              <p>{{ $t('troubleshooting.virtualhid_benefit_maintained') }}</p>
+            </div>
+          </article>
+        </div>
+
+        <section class="virtual-gamepad-section">
+          <div class="virtual-gamepad-section-heading">
+            <div>
+              <h3 class="h4 mb-1">{{ $t('troubleshooting.virtual_gamepad_drivers') }}</h3>
+              <p class="mb-0">{{ $t('troubleshooting.virtual_gamepad_drivers_desc') }}</p>
+            </div>
+            <button class="btn btn-outline-secondary driver-refresh-button"
+                    type="button"
+                    @click="refreshDriverInformation">
+              <refresh-cw :size="17" :class="{ 'driver-release-spinning': driverReleaseLoading }"></refresh-cw>
+              {{ $t('troubleshooting.driver_refresh') }}
+            </button>
+          </div>
+
+          <div class="table-responsive driver-table-shell">
+            <table class="table align-middle mb-0">
+              <thead>
+                <tr>
+                  <th scope="col">{{ $t('troubleshooting.driver_name') }}</th>
+                  <th scope="col">{{ $t('troubleshooting.driver_installed_version') }}</th>
+                  <th scope="col">{{ $t('troubleshooting.driver_latest_version') }}</th>
+                  <th scope="col">{{ $t('troubleshooting.driver_supported_versions') }}</th>
+                  <th scope="col">{{ $t('troubleshooting.driver_status') }}</th>
+                  <th scope="col" class="driver-download-column">
+                    <span class="visually-hidden">{{ $t('troubleshooting.driver_download') }}</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-if="showVirtualhid">
+                  <th scope="row">{{ $t('troubleshooting.virtualhid_driver') }}</th>
+                  <td>{{ driverVersion(virtualhid) }}</td>
+                  <td>
+                    <div class="driver-release-state"
+                         :class="driverReleaseStateClass(virtualhid, virtualhidRelease)"
+                         :title="driverReleaseStatusText(virtualhid, virtualhidRelease)"
+                         aria-live="polite">
+                      <refresh-cw v-if="virtualhidRelease.loading"
+                                  :size="17"
+                                  class="driver-release-spinning"></refresh-cw>
+                      <check-circle v-else-if="driverReleaseState(virtualhid, virtualhidRelease) === 'current'"
+                                    :size="17"></check-circle>
+                      <alert-triangle v-else-if="driverReleaseState(virtualhid, virtualhidRelease) === 'outdated'"
+                                      :size="17"></alert-triangle>
+                      <alert-circle v-else :size="17"></alert-circle>
+                      <span>{{ driverLatestVersion(virtualhidRelease) }}</span>
+                    </div>
+                    <small class="driver-release-detail">{{ driverReleaseStatusText(virtualhid, virtualhidRelease) }}</small>
+                  </td>
+                  <td>{{ virtualhid.supported_versions }}</td>
+                  <td>
+                    <span :class="driverStatusClass(virtualhid)">
+                      {{ driverStatusText(virtualhid) }}
+                    </span>
+                  </td>
+                  <td class="driver-download-column">
+                    <a class="btn btn-outline-primary driver-download-button"
+                       :href="virtualhidRelease.url"
+                       target="_blank"
+                       rel="noopener noreferrer">
+                      <download :size="17"></download>
+                      {{ $t('troubleshooting.driver_download') }}
+                    </a>
+                  </td>
+                </tr>
+                <tr id="vigembus" v-if="showVigembus">
+                  <th scope="row">{{ $t('troubleshooting.vigembus_driver') }}</th>
+                  <td>{{ driverVersion(vigembus) }}</td>
+                  <td>
+                    <div class="driver-release-state driver-release-neutral">
+                      <alert-circle :size="17"></alert-circle>
+                      <span>{{ $t('troubleshooting.driver_release_eol') }}</span>
+                    </div>
+                  </td>
+                  <td>{{ vigembus.supported_versions }}</td>
+                  <td>
+                    <span :class="driverStatusClass(vigembus)">
+                      {{ driverStatusText(vigembus) }}
+                    </span>
+                  </td>
+                  <td class="driver-download-column">
+                    <a class="btn btn-outline-primary driver-download-button"
+                       href="https://github.com/nefarius/ViGEmBus/releases/latest"
+                       target="_blank"
+                       rel="noopener noreferrer">
+                      <download :size="17"></download>
+                      {{ $t('troubleshooting.driver_download') }}
+                    </a>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="virtualhid-license-section" aria-labelledby="virtualhid-license" v-if="showVirtualhid">
+          <div class="virtualhid-license-heading">
+            <div>
+              <h3 id="virtualhid-license" class="h4 mb-1">{{ $t('troubleshooting.virtualhid_license') }}</h3>
+              <p class="mb-0">{{ $t('troubleshooting.virtualhid_license_desc') }}</p>
+            </div>
+            <span :class="licenseStatusClass()">{{ licenseStatusText() }}</span>
+          </div>
+
+          <div class="alert alert-danger alert-inline" role="alert" v-if="licenseError">
+            <alert-circle :size="18" class="icon flex-shrink-0"></alert-circle>
+            <span>{{ licenseError }}</span>
+          </div>
+          <div class="alert alert-warning alert-inline" role="alert" v-else-if="!virtualhidLicense.service_available">
+            <alert-triangle :size="18" class="icon flex-shrink-0"></alert-triangle>
+            <span>{{ virtualhidLicense.message || $t('troubleshooting.virtualhid_license_unavailable') }}</span>
+          </div>
+
+          <div class="virtualhid-license-stats">
+            <dl class="virtualhid-license-stat" v-if="virtualhidLicense.plan_name">
+              <dt>{{ $t('troubleshooting.virtualhid_license_plan') }}</dt>
+              <dd>{{ virtualhidLicense.plan_name }}</dd>
+            </dl>
+            <dl class="virtualhid-license-stat">
+              <dt>{{ $t('troubleshooting.virtualhid_license_activations') }}</dt>
+              <dd>{{ licenseActivationText() }}</dd>
+            </dl>
+            <dl class="virtualhid-license-stat">
+              <dt>{{ $t('troubleshooting.virtualhid_license_active_devices') }}</dt>
+              <dd>{{ virtualhidLicense.active_devices }}</dd>
+            </dl>
+            <dl class="virtualhid-license-stat" v-if="virtualhidLicense.customer_email">
+              <dt>{{ $t('troubleshooting.virtualhid_license_customer') }}</dt>
+              <dd>{{ virtualhidLicense.customer_email }}</dd>
+            </dl>
+          </div>
+
+          <p class="virtualhid-license-message"
+             v-if="virtualhidLicense.message && virtualhidLicense.service_available">
+            {{ virtualhidLicense.message }}
+          </p>
+
+          <div class="virtualhid-license-toolbar">
+            <button class="btn btn-secondary"
+                    type="button"
+                    :disabled="licenseBusy || !virtualhidLicense.service_available"
+                    @click="updateLicense('validate')">
+              <refresh-cw :size="18" :class="{ 'driver-release-spinning': licenseBusy }"></refresh-cw>
+              {{ $t('troubleshooting.virtualhid_license_refresh') }}
+            </button>
+            <a class="btn btn-outline-primary"
+               v-if="virtualhidLicense.manage_account_url"
+               :href="virtualhidLicense.manage_account_url"
+               target="_blank"
+               rel="noopener noreferrer">
+              <external-link :size="18"></external-link>
+              {{ $t('troubleshooting.virtualhid_license_manage') }}
+            </a>
+            <a class="btn btn-success"
+               v-if="virtualhidLicense.purchase_url && !virtualhidLicense.licensed"
+               :href="virtualhidLicense.purchase_url"
+               target="_blank"
+               rel="noopener noreferrer">
+              {{ $t('troubleshooting.virtualhid_license_buy') }}
+            </a>
+            <button class="btn btn-outline-danger"
+                    type="button"
+                    v-if="virtualhidLicense.licensed"
+                    :disabled="licenseBusy || !virtualhidLicense.service_available"
+                    @click="updateLicense('deactivate')">
+              {{ $t('troubleshooting.virtualhid_license_deactivate') }}
+            </button>
+          </div>
+
+          <div class="virtualhid-license-activation" v-if="!virtualhidLicense.licensed">
+            <label for="virtualhid-license-key" class="form-label">
+              {{ $t('troubleshooting.virtualhid_license_key') }}
+            </label>
+            <div class="input-group virtualhid-license-input">
+              <input id="virtualhid-license-key"
+                     class="form-control"
+                     type="password"
+                     v-model="licenseKey"
+                     :placeholder="$t('troubleshooting.virtualhid_license_key_placeholder')"
+                     :disabled="licenseBusy || !virtualhidLicense.service_available"
+                     autocomplete="off"
+                     autocapitalize="off"
+                     spellcheck="false"
+                     @keyup.enter="updateLicense('activate')" />
+              <button class="btn btn-primary"
+                      type="button"
+                      :disabled="licenseBusy || !virtualhidLicense.service_available || !licenseKey.trim()"
+                      @click="updateLicense('activate')">
+                <key-round :size="18"></key-round>
+                {{ $t('troubleshooting.virtualhid_license_activate') }}
+              </button>
+            </div>
+            <div class="form-text">{{ $t('troubleshooting.virtualhid_license_key_desc') }}</div>
+          </div>
+
+          <div class="virtualhid-license-active" v-else>
+            <check-circle :size="22" aria-hidden="true"></check-circle>
+            <div>
+              <strong>{{ $t('troubleshooting.virtualhid_license_machine_activated') }}</strong>
+              <p class="mb-0">{{ $t('troubleshooting.virtualhid_license_machine_activated_desc') }}</p>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+    <!-- Force Close App -->
+    <div class="card my-4">
+      <div class="card-body">
+        <h2 id="close_apps">{{ $t('troubleshooting.force_close') }}</h2>
+        <p>{{ $t('troubleshooting.force_close_desc') }}</p>
+        <div class="alert alert-success" v-if="closeAppStatus === true">
+          <check-circle :size="18" class="icon"></check-circle>
+          {{ $t('troubleshooting.force_close_success') }}
+        </div>
+        <div class="alert alert-danger" v-if="closeAppStatus === false">
+          <alert-circle :size="18" class="icon"></alert-circle>
+          {{ $t('troubleshooting.force_close_error') }}
+        </div>
+        <div>
+          <button class="btn btn-warning" :disabled="closeAppPressed" @click="closeApp">
+            <x-circle :size="18" class="icon"></x-circle>
+            {{ $t('troubleshooting.force_close') }}
+          </button>
+        </div>
+      </div>
+    </div>
+    <!-- Restart Sunshine -->
+    <div class="card my-4">
+      <div class="card-body">
+        <h2 id="restart">{{ $t('troubleshooting.restart_sunshine') }}</h2>
+        <p>{{ $t('troubleshooting.restart_sunshine_desc') }}</p>
+        <div class="alert alert-success" v-if="restartPressed === true">
+          <check-circle :size="18" class="icon"></check-circle>
+          {{ $t('troubleshooting.restart_sunshine_success') }}
+        </div>
+        <div>
+          <button class="btn btn-warning" :disabled="restartPressed" @click="restart">
+            <refresh-cw :size="18" class="icon"></refresh-cw>
+            {{ $t('troubleshooting.restart_sunshine') }}
+          </button>
+        </div>
+      </div>
+    </div>
+    <!-- Reset XDG Portal restore token -->
+    <div class="card my-4" v-if="platform === 'linux' || platform === 'freebsd'">
+      <div class="card-body">
+        <h2 id="portal_reset">{{ $t('troubleshooting.portal_reset') }}</h2>
+        <p>{{ $t('troubleshooting.portal_reset_desc') }}</p>
+        <div class="alert alert-success" v-if="portalResetStatus === true">
+          <check-circle :size="18" class="icon"></check-circle>
+          {{ $t('troubleshooting.portal_reset_success') }}
+        </div>
+        <div class="alert alert-danger" v-if="portalResetStatus === false">
+          <alert-circle :size="18" class="icon"></alert-circle>
+          {{ $t('troubleshooting.portal_reset_error') }}
+        </div>
+        <div>
+          <button class="btn btn-warning" :disabled="portalResetPressed" @click="resetPortalToken">
+            <rotate-ccw :size="18" class="icon"></rotate-ccw>
+            {{ $t('troubleshooting.portal_reset') }}
+          </button>
+        </div>
+      </div>
+    </div>
+    <!-- Reset persistent display device settings -->
+    <div class="card my-4" v-if="platform === 'windows'">
+      <div class="card-body">
+        <h2 id="dd_reset">{{ $t('troubleshooting.dd_reset') }}</h2>
+        <p style="white-space: pre-line">{{ $t('troubleshooting.dd_reset_desc') }}</p>
+        <div class="alert alert-success" v-if="ddResetStatus === true">
+          <check-circle :size="18" class="icon"></check-circle>
+          {{ $t('troubleshooting.dd_reset_success') }}
+        </div>
+        <div class="alert alert-danger" v-if="ddResetStatus === false">
+          <alert-circle :size="18" class="icon"></alert-circle>
+          {{ $t('troubleshooting.dd_reset_error') }}
+        </div>
+        <div>
+          <button class="btn btn-warning" :disabled="ddResetPressed" @click="ddResetPersistence">
+            <rotate-ccw :size="18" class="icon"></rotate-ccw>
+            {{ $t('troubleshooting.dd_reset') }}
+          </button>
+        </div>
+      </div>
+    </div>
+    <!-- Unpair Clients -->
+    <div class="card my-4">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <h2 id="unpair" class="mb-0">{{ $t('troubleshooting.unpair_title') }}</h2>
+          <button class="btn btn-danger" :disabled="unpairAllPressed" @click="unpairAll">
+            <trash-2 :size="18" class="icon"></trash-2>
+            {{ $t('troubleshooting.unpair_all') }}
+          </button>
+        </div>
+        <p>{{ $t('troubleshooting.unpair_desc') }}</p>
+        <div class="alert alert-success d-flex align-items-center" v-if="showApplyMessage">
+          <check-circle :size="18" class="icon"></check-circle>
+          <div><b>{{ $t('_common.success') }}</b> {{ $t('troubleshooting.unpair_single_success') }}</div>
+          <button class="btn btn-success ms-auto" @click="clickedApplyBanner">{{ $t('_common.dismiss') }}</button>
+        </div>
+        <div class="alert alert-success" v-if="unpairAllStatus === true">
+          <check-circle :size="18" class="icon"></check-circle>
+          {{ $t('troubleshooting.unpair_all_success') }}
+        </div>
+        <div class="alert alert-danger" v-if="unpairAllStatus === false">
+          <alert-circle :size="18" class="icon"></alert-circle>
+          {{ $t('troubleshooting.unpair_all_error') }}
+        </div>
+      </div>
+      <ul class="list-group list-group-flush" v-if="clients && clients.length > 0">
+        <li v-for="client in clients" :key="client.uuid" class="list-group-item d-flex align-items-center">
+          <div class="flex-grow-1">
+            {{ client.name !== "" ? client.name : $t('troubleshooting.unpair_single_unknown') }}
+          </div>
+          <div class="form-check form-switch ms-2 mb-0">
+            <input class="form-check-input" type="checkbox" role="switch"
+                   :id="'toggle-' + client.uuid"
+                   :checked="client.enabled"
+                   :aria-checked="client.enabled.toString()"
+                   @change="toggleClient(client.uuid, !client.enabled)">
+          </div>
+          <button class="btn btn-danger btn-sm ms-2" @click="unpairSingle(client.uuid)">
+            <trash-2 :size="18" class="icon"></trash-2>
+          </button>
+        </li>
+      </ul>
+      <ul v-else class="list-group list-group-flush">
+        <li class="list-group-item p-3 text-center">
+          <em>{{ $t('troubleshooting.unpair_single_no_devices') }}</em>
+        </li>
+      </ul>
+    </div>
+    <!-- Logs -->
+    <div class="card my-4">
+      <div class="card-body">
+        <h2 id="logs">{{ $t('troubleshooting.logs') }}</h2>
+        <div class="d-flex justify-content-between align-items-baseline py-2">
+          <p>{{ $t('troubleshooting.logs_desc') }}</p>
+          <div class="input-group" style="max-width: 300px">
+            <span class="input-group-text">
+              <search :size="18" class="icon"></search>
+            </span>
+            <input type="text" class="form-control" v-model="logFilter" :placeholder="$t('troubleshooting.logs_find')" />
+          </div>
+        </div>
+        <div>
+          <div class="troubleshooting-logs" ref="logsContainer">
+            <div class="log-nav-overlay">
+              <div class="log-nav-controls">
+                <button class="log-nav-btn" @click="scrollLogsTo('top')" title="Jump to Top">
+                  <chevrons-up :size="18" class="icon"></chevrons-up>
+                </button>
+                <button class="log-nav-btn" @click="navigateToLog('prev')" :disabled="!hasPrevLog" title="Previous Warning/Error">
+                  <chevron-up :size="18" class="icon"></chevron-up>
+                </button>
+                <button class="log-nav-btn" @click="navigateToLog('next')" :disabled="!hasNextLog" title="Next Warning/Error">
+                  <chevron-down :size="18" class="icon"></chevron-down>
+                </button>
+                <button class="log-nav-btn" @click="scrollLogsTo('bottom')" title="Jump to Bottom">
+                  <chevrons-down :size="18" class="icon"></chevrons-down>
+                </button>
+                <button class="log-nav-btn" @click="copyLogs" title="Copy Logs">
+                  <check :size="18" class="icon text-success" v-if="logsCopied"></check>
+                  <copy :size="18" class="icon" v-else></copy>
+                </button>
+              </div>
+            </div>
+            <pre class="mb-0" v-html="highlightedLogs"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+
+</body>

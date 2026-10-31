@@ -65,6 +65,27 @@ def _bgr_to_rgb_resize_norm_kernel(
 
 
 @triton.jit
+def _bgra_to_rgb_same_size_norm_kernel(
+    src,
+    out,
+    total_pixels: tl.constexpr,
+    block: tl.constexpr,
+):
+    pixel = tl.program_id(0) * block + tl.arange(0, block)
+    active = pixel < total_pixels
+    packed_src = src.to(tl.pointer_type(tl.uint32))
+    bgra = tl.load(packed_src + pixel, mask=active, other=0)
+    blue = (bgra & 0xFF).to(tl.float32) * (1.0 / 255.0)
+    green = ((bgra >> 8) & 0xFF).to(tl.float32) * (1.0 / 255.0)
+    red = ((bgra >> 16) & 0xFF).to(tl.float32) * (1.0 / 255.0)
+
+    plane_size = total_pixels
+    tl.store(out + pixel, red, mask=active)
+    tl.store(out + plane_size + pixel, green, mask=active)
+    tl.store(out + 2 * plane_size + pixel, blue, mask=active)
+
+
+@triton.jit
 def _bgr_to_rgb_area_resize_norm_kernel(
     src,
     out,
@@ -147,9 +168,25 @@ def bgr_to_rgb_resize_norm(frame_raw: torch.Tensor, out_height: int, out_width: 
 
     total = out.numel()
     block = 256
-    grid = (triton.cdiv(total, block),)
     scale_y = float(in_h) / float(out_height)
     scale_x = float(in_w) / float(out_width)
+
+    if (
+        torch.version.cuda is not None
+        and channels == 4
+        and in_h == out_height
+        and in_w == out_width
+    ):
+        pixels = in_h * in_w
+        _bgra_to_rgb_same_size_norm_kernel[(triton.cdiv(pixels, block),)](
+            frame_raw,
+            out,
+            pixels,
+            block,
+        )
+        return out
+
+    grid = (triton.cdiv(total, block),)
     kernel = _bgr_to_rgb_resize_norm_kernel
     if 1.0 < scale_y <= 2.0 and 1.0 < scale_x <= 2.0:
         kernel = _bgr_to_rgb_area_resize_norm_kernel

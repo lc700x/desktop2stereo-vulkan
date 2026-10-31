@@ -1,0 +1,528 @@
+diff --git a/cmake/dependencies/Boost_Sunshine.cmake b/cmake/dependencies/Boost_Sunshine.cmake
+index f0ff9a7..d5bc0d5 100644
+--- a/cmake/dependencies/Boost_Sunshine.cmake
++++ b/cmake/dependencies/Boost_Sunshine.cmake
+@@ -3,7 +3,7 @@
+ #
+ include_guard(GLOBAL)
+ 
+-set(BOOST_VERSION "1.89.0")
++set(BOOST_VERSION "1.92.0")
+ set(BOOST_COMPONENTS
+         filesystem
+         log
+diff --git a/cmake/dependencies/windows.cmake b/cmake/dependencies/windows.cmake
+index a9e5630..476e5a9 100644
+--- a/cmake/dependencies/windows.cmake
++++ b/cmake/dependencies/windows.cmake
+@@ -1,7 +1,7 @@
+ # windows specific dependencies
+ 
+ # MinHook setup - use installed minhook for AMD64, otherwise download minhook-detours for ARM64
+-if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64")
++if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "AMD64|amd64|x86_64|X64")
+     # Make sure MinHook is installed for x86/x64
+     find_library(MINHOOK_LIBRARY libMinHook.a REQUIRED)
+     find_path(MINHOOK_INCLUDE_DIR MinHook.h PATH_SUFFIXES include REQUIRED)
+diff --git a/cmake/packaging/windows.cmake b/cmake/packaging/windows.cmake
+index 27a33d4..77ea078 100644
+--- a/cmake/packaging/windows.cmake
++++ b/cmake/packaging/windows.cmake
+@@ -100,4 +100,6 @@ set(CPACK_COMPONENT_FIREWALL_GROUP "Scripts")
+ 
+ # include specific packaging
+ include(${CMAKE_MODULE_PATH}/packaging/windows_nsis.cmake)
+-include(${CMAKE_MODULE_PATH}/packaging/windows_wix.cmake)
++if(SUNSHINE_BUILD_WIX_INSTALLER)
++    include(${CMAKE_MODULE_PATH}/packaging/windows_wix.cmake)
++endif()
+diff --git a/cmake/prep/options.cmake b/cmake/prep/options.cmake
+index a7f2e90..d19b5b0 100644
+--- a/cmake/prep/options.cmake
++++ b/cmake/prep/options.cmake
+@@ -17,6 +17,7 @@ option(BUILD_WERROR "Enable -Werror flag." OFF)
+ option(SUNSHINE_CONFIGURE_ONLY "Configure special files only, then exit." OFF)
+ 
+ option(SUNSHINE_ENABLE_TRAY "Enable system tray icon." ON)
++option(SUNSHINE_BUILD_WIX_INSTALLER "Build the Windows WiX installer." ON)
+ 
+ if(WIN32)
+     option(SUNSHINE_USE_STATIC_QT
+diff --git a/src/platform/windows/publish.cpp b/src/platform/windows/publish.cpp
+index f4a954d..977bc49 100644
+--- a/src/platform/windows/publish.cpp
++++ b/src/platform/windows/publish.cpp
+@@ -154,7 +154,8 @@ namespace platf::publish {
+     std::wstring domain = utf_utils::from_utf8(SERVICE_TYPE_DOMAIN);
+ 
+     auto hostname = platf::get_host_name();
+-    auto name = utf_utils::from_utf8(net::mdns_instance_name(hostname) + '.') + domain;
++    auto service_name = config::nvhttp.sunshine_name;
++    auto name = utf_utils::from_utf8(net::mdns_instance_name(service_name) + '.') + domain;
+     auto host = utf_utils::from_utf8(hostname + ".local");
+ 
+     DNS_SERVICE_INSTANCE instance {};
+diff --git a/src/video.cpp b/src/video.cpp
+index 843a19a..fd130a4 100644
+--- a/src/video.cpp
++++ b/src/video.cpp
+@@ -7,12 +7,18 @@
+ #include <array>
+ #include <atomic>
+ #include <bitset>
++#include <charconv>
++#include <cstdlib>
++#include <cstring>
++#include <istream>
+ #include <list>
+ #include <thread>
+ #include <utility>
+ 
+ // lib includes
+ #include <boost/pointer_cast.hpp>
++#include <boost/asio.hpp>
++#include <nlohmann/json.hpp>
+ 
+ extern "C" {
+ #include <libavutil/imgutils.h>
+@@ -1947,6 +1953,246 @@ namespace video {
+     return -1;
+   }
+ 
++  /**
++   * @brief Receive D2S encoded frames and submit them to the normal Moonlight packet queue.
++   *
++   * D2S owns screen capture, stereo synthesis, and hardware encoding. This bridge
++   * deliberately carries only encoded access units over loopback, so Sunshine
++   * continues to own pairing, audio, input, FEC, and network packetization.
++   */
++  int capture_d2s_bridge(
++    safe::mail_t mail,
++    const config_t &config,
++    void *channel_data
++  ) {
++    namespace asio = boost::asio;
++    using tcp = asio::ip::tcp;
++
++    auto shutdown_event = mail->event<bool>(mail::shutdown);
++    auto idr_events = mail->event<bool>(mail::idr);
++    auto invalidation_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
++    auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
++    auto packets = mail::man->queue<packet_t>(mail::video_packets);
++
++    const char *port_value = std::getenv("D2S_MOONLIGHT_BRIDGE_PORT");
++    const char *token = std::getenv("D2S_MOONLIGHT_BRIDGE_TOKEN");
++    const char *source_width_value = std::getenv("D2S_MOONLIGHT_SOURCE_WIDTH");
++    const char *source_height_value = std::getenv("D2S_MOONLIGHT_SOURCE_HEIGHT");
++    const char *source_left_value = std::getenv("D2S_MOONLIGHT_SOURCE_LEFT");
++    const char *source_top_value = std::getenv("D2S_MOONLIGHT_SOURCE_TOP");
++    const char *desktop_width_value = std::getenv("D2S_MOONLIGHT_DESKTOP_WIDTH");
++    const char *desktop_height_value = std::getenv("D2S_MOONLIGHT_DESKTOP_HEIGHT");
++    if (!port_value || !token || !source_width_value || !source_height_value ||
++        !source_left_value || !source_top_value || !desktop_width_value || !desktop_height_value) {
++      BOOST_LOG(error) << "Moonlight bridge environment is incomplete";
++      shutdown_event->raise(true);
++      return -1;
++    }
++
++    auto parse_positive = [](const char *value, int &result) {
++      const char *end = value + std::strlen(value);
++      auto parsed = std::from_chars(value, end, result);
++      return parsed.ec == std::errc {} && parsed.ptr == end && result > 0;
++    };
++    int port = 0;
++    int source_width = 0;
++    int source_height = 0;
++    int source_left = 0;
++    int source_top = 0;
++    int desktop_width = 0;
++    int desktop_height = 0;
++    // Multi-monitor desktop coordinates can have negative left/top offsets.
++    auto parse_offset = [](const char *value, int &result) {
++      const char *end = value + std::strlen(value);
++      auto parsed = std::from_chars(value, end, result);
++      return parsed.ec == std::errc {} && parsed.ptr == end;
++    };
++    if (!parse_positive(port_value, port) || port > 65535 ||
++        !parse_positive(source_width_value, source_width) ||
++        !parse_positive(source_height_value, source_height) ||
++        !parse_offset(source_left_value, source_left) ||
++        !parse_offset(source_top_value, source_top) ||
++        !parse_positive(desktop_width_value, desktop_width) ||
++        !parse_positive(desktop_height_value, desktop_height)) {
++      BOOST_LOG(error) << "Moonlight bridge dimensions or port are invalid";
++      shutdown_event->raise(true);
++      return -1;
++    }
++    if (source_width > desktop_width || source_height > desktop_height) {
++      BOOST_LOG(error) << "Moonlight bridge dimensions or port are invalid";
++      shutdown_event->raise(true);
++      return -1;
++    }
++
++    try {
++      asio::io_context io;
++      tcp::socket socket(io);
++      socket.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), static_cast<unsigned short>(port)));
++
++      nlohmann::json hello {
++        {"type", "hello"},
++        {"token", token},
++        {"width", config.width},
++        {"height", config.height},
++        {"fps_x100", config.framerateX100 > 0 ? config.framerateX100 : config.framerate * 100},
++        {"bitrate_kbps", config.bitrate},
++        {"codec", config.videoFormat == 0 ? "h264" : config.videoFormat == 1 ? "hevc" : "unsupported"},
++        {"source_width", source_width},
++        {"source_height", source_height},
++        {"source_left", source_left},
++        {"source_top", source_top},
++        {"desktop_width", desktop_width},
++        {"desktop_height", desktop_height},
++        {"dynamic_range", config.dynamicRange}
++      };
++      const auto hello_line = hello.dump() + "\n";
++      asio::write(socket, asio::buffer(hello_line));
++
++      asio::streambuf response;
++      asio::read_until(socket, response, '\n');
++      std::istream response_stream(&response);
++      std::string response_line;
++      std::getline(response_stream, response_line);
++      auto ready = nlohmann::json::parse(response_line);
++      if (!ready.value("ok", false)) {
++        BOOST_LOG(error) << "D2S Moonlight bridge rejected the negotiated stream: "sv
++                         << ready.value("error", "unknown error");
++        shutdown_event->raise(true);
++        return -1;
++      }
++
++      const char *fit_mode = std::getenv("D2S_MOONLIGHT_FIT_MODE");
++      const bool stretch = fit_mode && std::strcmp(fit_mode, "stretch") == 0;
++      const bool cover = fit_mode && std::strcmp(fit_mode, "cover") == 0;
++      const float scale = cover
++        ? std::max(
++            static_cast<float>(config.width) / source_width,
++            static_cast<float>(config.height) / source_height
++          )
++        : std::min(
++            static_cast<float>(config.width) / source_width,
++            static_cast<float>(config.height) / source_height
++          );
++      const float client_offset_x = stretch ? 0.0f : (config.width - source_width * scale) * 0.5f;
++      const float client_offset_y = stretch ? 0.0f : (config.height - source_height * scale) * 0.5f;
++      const int touch_width = stretch ? source_width : config.width;
++      const int touch_height = stretch ? source_height : config.height;
++      touch_port_event->raise(input::touch_port_t {
++        {source_left, source_top, touch_width, touch_height, source_width, source_height},
++        desktop_width,
++        desktop_height,
++        client_offset_x,
++        client_offset_y,
++        stretch ? 1.0f : 1.0f / scale,
++        1.0f,
++        desktop_width,
++        desktop_height
++      });
++
++      BOOST_LOG(info) << "Moonlight D2S encoded-frame bridge connected "sv
++                      << config.width << "x"sv << config.height << "@"sv
++                      << static_cast<float>(config.framerateX100 > 0 ? config.framerateX100 : config.framerate * 100) / 100.0f
++                      << " codec="sv << hello["codec"];
++
++      auto read_u32 = [](const char *data) {
++        return (static_cast<uint32_t>(static_cast<unsigned char>(data[0])) << 24)
++          | (static_cast<uint32_t>(static_cast<unsigned char>(data[1])) << 16)
++          | (static_cast<uint32_t>(static_cast<unsigned char>(data[2])) << 8)
++          | static_cast<uint32_t>(static_cast<unsigned char>(data[3]));
++      };
++      auto read_u64 = [](const char *data) {
++        uint64_t value = 0;
++        for (int i = 0; i < 8; ++i) {
++          value = (value << 8) | static_cast<unsigned char>(data[i]);
++        }
++        return value;
++      };
++      auto write_command = [&](char command) {
++        asio::write(socket, asio::buffer(&command, sizeof(command)));
++      };
++
++      socket.non_blocking(true);
++      std::vector<char> pending;
++      pending.reserve(1024 * 1024);
++      std::array<char, 256 * 1024> receive_buffer {};
++      constexpr std::size_t HEADER_SIZE = 28;
++      constexpr uint32_t MAX_ACCESS_UNIT_SIZE = 32 * 1024 * 1024;
++
++      while (!shutdown_event->peek()) {
++        if (idr_events->peek()) {
++          idr_events->pop(0ms);
++          write_command('I');
++        }
++        while (invalidation_events->peek()) {
++          if (invalidation_events->pop(0ms)) {
++            write_command('I');
++          }
++        }
++
++        boost::system::error_code socket_error;
++        const auto received = socket.read_some(asio::buffer(receive_buffer), socket_error);
++        if (socket_error == asio::error::would_block || socket_error == asio::error::try_again) {
++          std::this_thread::sleep_for(1ms);
++          continue;
++        }
++        if (socket_error == asio::error::eof) {
++          break;
++        }
++        if (socket_error) {
++          throw boost::system::system_error(socket_error);
++        }
++        pending.insert(pending.end(), receive_buffer.begin(), receive_buffer.begin() + received);
++
++        std::size_t consumed = 0;
++        while (pending.size() - consumed >= HEADER_SIZE) {
++          const auto *record = pending.data() + consumed;
++          if (std::memcmp(record, "D2SF", 4) != 0) {
++            BOOST_LOG(error) << "Invalid D2S Moonlight frame marker";
++            shutdown_event->raise(true);
++            return -1;
++          }
++          const auto frame_index = read_u64(record + 4);
++          const auto capture_ns = read_u64(record + 12);
++          const auto flags = read_u32(record + 20);
++          const auto payload_size = read_u32(record + 24);
++          if (payload_size == 0 || payload_size > MAX_ACCESS_UNIT_SIZE) {
++            BOOST_LOG(error) << "Invalid D2S Moonlight access-unit size: "sv << payload_size;
++            shutdown_event->raise(true);
++            return -1;
++          }
++          const auto record_size = HEADER_SIZE + static_cast<std::size_t>(payload_size);
++          if (pending.size() - consumed < record_size) {
++            break;
++          }
++          std::vector<uint8_t> access_unit(payload_size);
++          std::memcpy(access_unit.data(), record + HEADER_SIZE, payload_size);
++          consumed += record_size;
++
++          auto packet = std::make_unique<packet_raw_generic>(
++            std::move(access_unit),
++            static_cast<int64_t>(frame_index),
++            (flags & 1U) != 0
++          );
++          packet->channel_data = channel_data;
++          packet->frame_timestamp = std::chrono::steady_clock::time_point {
++            std::chrono::nanoseconds {static_cast<int64_t>(capture_ns)}
++          };
++          packets->raise(std::move(packet));
++        }
++        if (consumed != 0) {
++          pending.erase(pending.begin(), pending.begin() + consumed);
++        }
++      }
++
++      shutdown_event->raise(true);
++      return 0;
++    } catch (const std::exception &exception) {
++      BOOST_LOG(error) << "D2S Moonlight bridge failed: "sv << exception.what();
++      shutdown_event->raise(true);
++      return -1;
++    }
++  }
++
+   /**
+    * @brief Create an AVCodec encode session.
+    *
+@@ -2968,6 +3214,11 @@ namespace video {
+     config_t config,
+     void *channel_data
+   ) {
++    if (std::getenv("D2S_MOONLIGHT_BRIDGE_PORT")) {
++      capture_d2s_bridge(std::move(mail), config, channel_data);
++      return;
++    }
++
+     config = resolve_dynamic_range(*chosen_encoder, config);
+ 
+     auto idr_events = mail->event<bool>(mail::idr);
+
+diff --git a/src/nvhttp.cpp b/src/nvhttp.cpp
+index 8e33cad..ab6d2a7 100644
+--- a/src/nvhttp.cpp
++++ b/src/nvhttp.cpp
+@@ -182,6 +182,46 @@ namespace nvhttp {
+     std::vector<named_cert_t> named_devices;  ///< Persisted Moonlight clients allowed to pair or reconnect.
+   };
+ 
++  /**
++   * @brief Merge duplicate records for the same canonical client certificate.
++   *
++   * Duplicate records can make an otherwise paired certificate appear ambiguous
++   * during TLS authorization. A disabled duplicate keeps the merged identity
++   * disabled so this repair never overrides a user's disable action.
++   *
++   * @param client Pairing state to normalize.
++   * @return Number of duplicate records removed from the in-memory state.
++   */
++  std::size_t deduplicate_client_certificates(client_t &client) {
++    std::vector<named_cert_t> unique;
++    unique.reserve(client.named_devices.size());
++
++    for (auto &named_cert : client.named_devices) {
++      auto existing = std::find_if(
++        unique.begin(),
++        unique.end(),
++        [&](const named_cert_t &candidate) {
++          return candidate.cert == named_cert.cert;
++        }
++      );
++      if (existing == unique.end()) {
++        unique.emplace_back(std::move(named_cert));
++        continue;
++      }
++
++      existing->enabled = existing->enabled && named_cert.enabled;
++      if (existing->name.empty() && !named_cert.name.empty()) {
++        existing->name = std::move(named_cert.name);
++      }
++    }
++
++    const auto removed = client.named_devices.size() - unique.size();
++    if (removed > 0) {
++      client.named_devices = std::move(unique);
++    }
++    return removed;
++  }
++
+   // uniqueID, session
+   std::unordered_map<std::string, pair_session_t> map_id_sess;  ///< Pairing sessions keyed by temporary unique ID.
+ 
+@@ -426,6 +466,12 @@ namespace nvhttp {
+       }
+     }
+ 
++    const auto removed_duplicates = deduplicate_client_certificates(client);
++    if (removed_duplicates > 0) {
++      BOOST_LOG(info) << "Merged "sv << removed_duplicates
++                      << " duplicate paired-client certificate records"sv;
++    }
++
+     std::lock_guard lock {client_auth_mutex()};
+     client_root = std::move(client);
+     rebuild_client_cert_chain();
+@@ -444,12 +490,55 @@ namespace nvhttp {
+       return {};
+     }
+ 
++    std::lock_guard lock {client_auth_mutex()};
++    auto existing = std::find_if(
++      client_root.named_devices.begin(),
++      client_root.named_devices.end(),
++      [&](const named_cert_t &named_cert) {
++        return named_cert.cert == canonical_certificate;
++      }
++    );
++    if (existing != client_root.named_devices.end()) {
++      const auto existing_uuid = existing->uuid;
++      const auto existing_certificate = existing->cert;
++      existing->name = name;
++      existing->enabled = true;
++
++      bool kept_existing = false;
++      const auto new_end = std::remove_if(
++        client_root.named_devices.begin(),
++        client_root.named_devices.end(),
++        [&](const named_cert_t &named_cert) {
++          if (named_cert.cert != existing_certificate) {
++            return false;
++          }
++          if (!kept_existing) {
++            kept_existing = true;
++            return false;
++          }
++          return true;
++        }
++      );
++      const auto removed_duplicates = static_cast<std::size_t>(
++        std::distance(new_end, client_root.named_devices.end())
++      );
++      client_root.named_devices.erase(new_end, client_root.named_devices.end());
++      rebuild_client_cert_chain();
++
++      if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
++        save_state();
++      }
++      if (removed_duplicates > 0) {
++        BOOST_LOG(info) << "Reused paired-client identity and removed "
++                        << removed_duplicates << " duplicate certificate records"sv;
++      }
++      return existing_uuid;
++    }
++
+     named_cert_t named_cert;
+     named_cert.name = name;
+     named_cert.cert = std::move(canonical_certificate);
+     named_cert.uuid = uuid_util::uuid_t::generate().string();
+-
+-    std::lock_guard lock {client_auth_mutex()};
+     client_root.named_devices.emplace_back(std::move(named_cert));
+     rebuild_client_cert_chain();
+ 
+
+diff --git a/src/main.cpp b/src/main.cpp
+index f349a23..4638280 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -6,6 +6,7 @@
+ #include <cerrno>
+ #include <codecvt>
+ #include <csignal>
++#include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
+@@ -300,8 +301,8 @@ int main(int argc, char *argv[]) {
+   }
+ 
+ #ifdef _WIN32
+-  // Modify relevant NVIDIA control panel settings if the system has corresponding gpu
+-  if (nvprefs_instance.load()) {
++  // Bundled D2S mode must not change system NVIDIA control panel settings.
++  if (!std::getenv("D2S_MOONLIGHT_BRIDGE_PORT") && nvprefs_instance.load()) {
+     // Restore global settings to the undo file left by improper termination of sunshine.exe
+     nvprefs_instance.restore_from_and_delete_undo_file_if_exists();
+     // Modify application settings for sunshine.exe
+@@ -526,8 +527,9 @@ int main(int argc, char *argv[]) {
+   task_pool.join();
+ 
+ #ifdef _WIN32
+-  // Restore global NVIDIA control panel settings
+-  if (nvprefs_instance.owning_undo_file() && nvprefs_instance.load()) {
++  // Restore global NVIDIA control panel settings when the normal Sunshine path owned them.
++  if (!std::getenv("D2S_MOONLIGHT_BRIDGE_PORT") &&
++      nvprefs_instance.owning_undo_file() && nvprefs_instance.load()) {
+     nvprefs_instance.restore_global_profile();
+     nvprefs_instance.unload();
+   }
+diff --git a/src/platform/windows/misc.cpp b/src/platform/windows/misc.cpp
+index a03f56d..24ebc10 100644
+--- a/src/platform/windows/misc.cpp
++++ b/src/platform/windows/misc.cpp
+@@ -4,6 +4,7 @@
+  */
+ // standard includes
+ #include <csignal>
++#include <cstdlib>
+ #include <filesystem>
+ #include <iomanip>
+ #include <iterator>
+@@ -1183,8 +1184,8 @@ namespace platf {
+     // Promote ourselves to high priority class
+     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+ 
+-    // Modify NVIDIA control panel settings again, in case they have been changed externally since sunshine launch
+-    if (nvprefs_instance.load()) {
++    // Preserve user NVIDIA control panel settings in the bundled D2S host.
++    if (!std::getenv("D2S_MOONLIGHT_BRIDGE_PORT") && nvprefs_instance.load()) {
+       if (!nvprefs_instance.owning_undo_file()) {
+         nvprefs_instance.restore_from_and_delete_undo_file_if_exists();
+       }

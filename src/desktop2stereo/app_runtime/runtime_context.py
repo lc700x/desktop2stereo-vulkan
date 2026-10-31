@@ -210,6 +210,11 @@ def create_runtime_context(
             capture_mode=capture_mode,
             monitor_index=monitor_index,
             capture_tool=capture_tool,
+            device_id=(
+                int(getattr(device, "index", None) or 0)
+                if str(getattr(device, "type", "") or str(device).split(":", 1)[0]) == "cuda"
+                else None
+            ),
             os_name=os_name,
             fps_provider=capture_fps_provider,
         ),

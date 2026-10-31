@@ -118,7 +118,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$" OR CMAKE_OSX_ARCHITECTURES
 endif()
 
 if(WIN32)
-    set(_filament_lib_dir "${FILAMENT_SDK_ROOT}/lib/${_filament_arch}/md")
+    set(_filament_lib_dir "${FILAMENT_SDK_ROOT}/lib/${_filament_arch}/mt")
     # Filament's Windows static backend contains PlatformWGL symbols even
     # when the selected engine backend is Vulkan.
     target_link_libraries(filament_bridge PRIVATE user32 gdi32 shlwapi opengl32)
@@ -140,9 +140,28 @@ else()
     message(FATAL_ERROR "Unsupported platform")
 endif()
 
-file(GLOB_RECURSE _filament_libraries CONFIGURE_DEPENDS
-    "${FILAMENT_SDK_ROOT}/lib/*.lib"
-    "${FILAMENT_SDK_ROOT}/lib/*.a")
+if(WIN32)
+    # Link only the SDK libraries required by this bridge. The SDK directory
+    # also contains app/viewer/resource archives that are not interchangeable
+    # with Filament's runtime libraries.
+    set(_filament_library_names
+        abseil backend basis_transcoder bluegl bluevk dracodec filabridge
+        filaflat filamat filament filament-generatePrefilterMipmap geometry
+        gltfio gltfio_core ibl ktxreader meshoptimizer shaders smol-v stb
+        uberzlib utils zstd)
+    set(_filament_libraries)
+    foreach(_filament_library IN LISTS _filament_library_names)
+        set(_filament_library_path "${_filament_lib_dir}/${_filament_library}.lib")
+        if(NOT EXISTS "${_filament_library_path}")
+            message(FATAL_ERROR "Required Filament library not found: ${_filament_library_path}")
+        endif()
+        list(APPEND _filament_libraries "${_filament_library_path}")
+    endforeach()
+else()
+    file(GLOB _filament_libraries CONFIGURE_DEPENDS
+        "${_filament_lib_dir}/*.lib"
+        "${_filament_lib_dir}/*.a")
+endif()
 if(NOT _filament_libraries)
     message(FATAL_ERROR "No Filament libraries found in ${_filament_lib_dir}")
 endif()

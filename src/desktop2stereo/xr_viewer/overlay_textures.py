@@ -316,6 +316,8 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
             return key.rsplit(":", 1)[1] == getattr(menu, "screen_section", "layout")
         if key == "screen:dynamic_crop":
             return bool(values.get("screen:dynamic_crop", False))
+        if key == "screen:toggle_passthrough":
+            return bool(values.get(key, False))
         return False
 
     def draw_group(target, group):

@@ -268,6 +268,8 @@ class GUIConfigMixin:
             run_mode = "Local Viewer"
         if run_mode == "OpenXR Link" and OS_NAME == "Darwin":
             run_mode = "Local Viewer"
+        if run_mode == "Moonlight Streamer" and OS_NAME != "Windows":
+            run_mode = "Local Viewer"
         self.run_mode_key = run_mode
         self.stream_protocol_key = cfg.get("Stream Protocol", DEFAULTS.get("Stream Protocol", "WebRTC"))
         self.stream_proto_dd.value = self.stream_protocol_key
@@ -296,6 +298,7 @@ class GUIConfigMixin:
         self.video_backend_dd.value = {
             "auto": "Auto",
             "pynv": "PyNvVideoCodec",
+            "amd": "AMD AMF",
             "intel": "Intel QSV (D3D11)",
             "qsv": "Intel QSV (D3D11)",
             "ffmpeg": "FFmpeg",
@@ -485,6 +488,7 @@ class GUIConfigMixin:
             "Video Encoder Backend": {
                 "Auto": "auto",
                 "PyNvVideoCodec": "pynv",
+                "AMD AMF": "amd",
                 "Intel QSV (D3D11)": "intel",
                 "FFmpeg": "ffmpeg",
                 "Vulkan Video": "vulkan",

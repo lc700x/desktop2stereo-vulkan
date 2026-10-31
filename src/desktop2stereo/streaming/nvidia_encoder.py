@@ -79,6 +79,7 @@ class PyNvVideoCodecEncoder:
         bitrate: int,
         gpu_id: int = 0,
     ):
+        self._nvc = nvc
         codec = "hevc" if hevc else "h264"
         frame_rate = max(1, int(fps))
         target_bitrate = max(1, int(bitrate))
@@ -103,11 +104,80 @@ class PyNvVideoCodecEncoder:
             bf=0,
             repeatspspps=1,
         )
+        self._pending_nv12_frames: dict[int, tuple[Any, Any]] = {}
 
     def encode(self, rgb_cuda: Any) -> bytes:
         y, uv = rgb_cuda_to_nv12(rgb_cuda)
         packet = self._encoder.Encode(Nv12CudaFrame(y, uv))
         return self._packet_bytes(packet)
+
+    def encode_access_units(
+        self,
+        rgb_cuda: Any,
+        *,
+        frame_index: int,
+        force_idr: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Encode a CUDA frame and preserve packet timestamps for GameStream."""
+        y, uv = rgb_cuda_to_nv12(rgb_cuda)
+        frame_index = max(0, int(frame_index))
+        # NVENC can return an access unit several Encode() calls after the
+        # corresponding input was submitted. Keep its CUDA planes alive until
+        # that output timestamp proves the encoder has consumed them.
+        self._pending_nv12_frames[frame_index] = (y, uv)
+        params = self._nvc.NV_ENC_PIC_PARAMS()
+        params.inputTimeStamp = frame_index
+        params.frameIdx = frame_index
+        params.encodePicFlags = (
+            self._nvc.NV_ENC_PIC_FLAGS.FORCEIDR if force_idr else 0
+        )
+        packets = self._encoder.Encode(Nv12CudaFrame(y, uv), params)
+        access_units = []
+        for packet in packets or ():
+            if isinstance(packet, dict):
+                payload = bytes(packet.get("data", b""))
+                timestamp = int(packet.get("timestamp", frame_index))
+                picture_type = int(packet.get("picture_type", -1))
+            else:
+                payload = bytes(packet)
+                timestamp = int(frame_index)
+                picture_type = -1
+            if payload:
+                for pending_index in tuple(self._pending_nv12_frames):
+                    if pending_index <= timestamp:
+                        self._pending_nv12_frames.pop(pending_index, None)
+                access_units.append(
+                    {
+                        "data": payload,
+                        "frame_index": timestamp,
+                        "idr": picture_type == 3,
+                    }
+                )
+        return access_units
+
+    def flush_access_units(self) -> list[dict[str, Any]]:
+        """Return delayed encoder packets at the end of a Moonlight session."""
+        packets = self._encoder.EndEncode()
+        self._pending_nv12_frames.clear()
+        access_units = []
+        for packet in packets or ():
+            if isinstance(packet, dict):
+                payload = bytes(packet.get("data", b""))
+                timestamp = int(packet.get("timestamp", 0))
+                picture_type = int(packet.get("picture_type", -1))
+            else:
+                payload = bytes(packet)
+                timestamp = 0
+                picture_type = -1
+            if payload:
+                access_units.append(
+                    {
+                        "data": payload,
+                        "frame_index": timestamp,
+                        "idr": picture_type == 3,
+                    }
+                )
+        return access_units
 
     def flush(self) -> bytes:
         return self._packet_bytes(self._encoder.EndEncode())

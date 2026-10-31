@@ -99,14 +99,14 @@ def _depth_backend_hot_reload(settings_dict: dict, config):
         return None
     import torch
 
-    # Mirror adapter.runtime_config_from_d2s_settings: TensorRT is NVIDIA-only,
-    # so on AMD ROCm the stale "TensorRT" flag must not select tensorrt_native
-    # (that would diverge from the runtime's migraphx_rocm and request a
-    # pipeline rebuild on every hot reload).
+    # Mirror adapter.runtime_config_from_d2s_settings: MIGraphX is ROCm-only
+    # and TensorRT is CUDA-only. Ignore stale flags on every other device.
     is_rocm = bool(getattr(torch.version, "hip", None))
-    if to_bool_hot_reload(settings_dict.get("MIGraphX", False)):
+    device_type = torch.device(getattr(config, "device", "cuda")).type
+    is_nvidia_cuda = device_type == "cuda" and not is_rocm
+    if is_rocm and to_bool_hot_reload(settings_dict.get("MIGraphX", False)):
         return "migraphx_rocm"
-    if to_bool_hot_reload(settings_dict.get("TensorRT", False)) and not is_rocm:
+    if to_bool_hot_reload(settings_dict.get("TensorRT", False)) and is_nvidia_cuda:
         return "tensorrt_native"
     if to_bool_hot_reload(settings_dict.get("ONNX", False)):
         return "onnx_cuda"

@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="auto">
+
+<head>
+  <!-- TEMPLATE_HEADER - Used by Every UI Page -->
+<meta charset="UTF-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sunshine</title>
+<link rel="icon" type="image/x-icon" href="./images/sunshine.ico">
+
+  <script type="module" crossorigin src="./assets/welcome-D0ZmWQXD.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/logo-sunshine-45-jSIapha2.js">
+  <link rel="modulepreload" crossorigin href="./assets/Notification-CkJkKBnN.js">
+  <link rel="modulepreload" crossorigin href="./assets/file-text-uKISzAQu.js">
+  <link rel="modulepreload" crossorigin href="./assets/SimpleIcon-GjJFNaNU.js">
+  <link rel="modulepreload" crossorigin href="./assets/ResourceCard-BiQzsCtb.js">
+  <link rel="modulepreload" crossorigin href="./assets/NavbarSimple-BMWya-LV.js">
+  <link rel="modulepreload" crossorigin href="./assets/fetch_utils-COCp1DR8.js">
+  <link rel="stylesheet" crossorigin href="./assets/logo-sunshine-45-2HJRdqau.css">
+  <link rel="stylesheet" crossorigin href="./assets/Notification-DmToSpaP.css">
+</head>
+
+<body id="app" v-cloak>
+  <Navbar-Simple></Navbar-Simple>
+  <Notification></Notification>
+  <main id="content" class="container" role="main">
+    <h1 class="my-4">{{ $t('welcome.greeting') }}</h1>
+    <p>{{ $t('welcome.create_creds') }}</p>
+    <div class="d-flex gap-4 align-items-start">
+      <div class="card">
+        <div class="card-body">
+          <div class="alert alert-warning">
+            {{ $t('welcome.create_creds_alert') }}
+          </div>
+          <form @submit.prevent="save">
+            <div class="mb-3">
+              <label for="usernameInput" class="form-label">{{ $t('_common.username') }}</label>
+              <input type="text" class="form-control" id="usernameInput" autocomplete="username"
+                v-model="passwordData.newUsername" />
+            </div>
+            <div class="mb-3">
+              <label for="passwordInput" class="form-label">{{ $t('_common.password') }}</label>
+              <input type="password" class="form-control" id="passwordInput" autocomplete="new-password"
+                v-model="passwordData.newPassword" required />
+            </div>
+            <div class="mb-3">
+              <label for="confirmPasswordInput" class="form-label">{{ $t('welcome.confirm_password') }}</label>
+              <input type="password" class="form-control" id="confirmPasswordInput" autocomplete="new-password"
+                v-model="passwordData.confirmNewPassword" required />
+            </div>
+            <button type="submit" class="btn btn-primary" v-bind:disabled="loading">
+              <log-in :size="18" class="icon"></log-in>
+              {{ $t('welcome.login') }}
+            </button>
+            <div class="alert alert-danger mt-3 mb-0" v-if="error"><b>{{ $t('_common.error') }}</b> {{error}}</div>
+            <div class="alert alert-success mt-3 mb-0" v-if="success">
+              <b>{{ $t('_common.success') }}</b> {{ $t('welcome.welcome_success') }}
+            </div>
+          </form>
+        </div>
+      </div>
+      <div>
+        <Resource-Card></Resource-Card>
+      </div>
+    </div>
+  </main>
+</body>
+
+
+</html>

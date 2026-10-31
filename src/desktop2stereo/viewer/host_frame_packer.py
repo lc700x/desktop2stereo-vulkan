@@ -38,6 +38,10 @@ class HostFramePacker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._shape_logged = False
+        self._published_lock = threading.Lock()
+        self._published = 0
+        self._published_at = time.perf_counter()
+        self._published_ready = False
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
@@ -389,9 +393,24 @@ class HostFramePacker:
                 custom_put(result)
             else:
                 put_latest(self.out_q, result)
+            with self._published_lock:
+                self._published += 1
         except Exception:
             _release_item(result)
             self.on_stat("packer_error", 1)
+
+    def take_published_fps(self) -> float:
+        """Return the previous ready-frame publication rate."""
+        now = time.perf_counter()
+        with self._published_lock:
+            elapsed = now - self._published_at
+            published = self._published
+            self._published = 0
+            self._published_at = now
+        if not self._published_ready:
+            self._published_ready = True
+            return 0.0
+        return published / elapsed if elapsed > 0.0 else 0.0
 
 
 def install_host_frame_packer(

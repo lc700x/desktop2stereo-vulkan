@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+import app_runtime.runtime_output as runtime_output_module
 from app_runtime.runtime_output import VulkanHostOutputAdapter
 
 
@@ -47,3 +48,37 @@ def test_vulkan_host_output_adapter_preserves_uint8_bytes():
 
     assert rgba[0, 0].tolist() == [1, 5, 9, 255]
     assert rgba[1, 1].tolist() == [4, 8, 12, 255]
+
+
+def test_vulkan_host_output_adapter_uses_sampleable_staging_images(monkeypatch):
+    calls = {}
+    result = object()
+
+    class FakeStagingAdapter:
+        def __init__(self, presenter, *, force_host_staging):
+            calls["presenter"] = presenter
+            calls["force_host_staging"] = force_host_staging
+            self.closed = False
+
+        def convert(self, runtime_result, *, frame_id, timestamp):
+            calls["frame"] = (runtime_result, frame_id, timestamp)
+            return result
+
+        def close(self):
+            self.closed = True
+            calls["closed"] = True
+
+    monkeypatch.setattr(
+        runtime_output_module, "RocmVulkanOutputAdapter", FakeStagingAdapter
+    )
+    presenter = object()
+    runtime_result = object()
+    adapter = VulkanHostOutputAdapter(presenter)
+
+    assert adapter.convert(runtime_result, frame_id=7, timestamp=1.25) is result
+    assert calls["presenter"] is presenter
+    assert calls["force_host_staging"] is True
+    assert calls["frame"] == (runtime_result, 7, 1.25)
+
+    adapter.close()
+    assert calls["closed"] is True

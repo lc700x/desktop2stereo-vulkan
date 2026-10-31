@@ -12,22 +12,29 @@ import os
 from pathlib import Path
 
 
-def _library_candidates() -> list[Path]:
+def _library_candidates(library_path: str | os.PathLike[str] | None = None) -> list[Path]:
+    if library_path is not None:
+        return [Path(library_path)]
     root = Path(__file__).resolve().parents[1]
-    return [
+    override = str(os.environ.get("D2S_AMD_ENCODER_DLL", "") or "").strip()
+    candidates = [
         Path(__file__).resolve().with_name("amd_encoder") / "d2s_amd_encoder.dll",
         root / "native" / "windows" / "d2s_amd_encoder.dll",
         root / "native" / "amd_encoder" / "d2s_amd_encoder.dll",
-        Path(os.environ.get("D2S_AMD_ENCODER_DLL", "")),
     ]
+    if override:
+        candidates.insert(0, Path(override))
+    return candidates
 
 
-def probe_amd_amf() -> tuple[bool, str]:
+def probe_amd_amf(
+    library_path: str | os.PathLike[str] | None = None,
+) -> tuple[bool, str]:
     """Return (available, diagnostic) without importing any GPU Python package."""
 
     if os.name != "nt":
         return False, "AMD AMF bridge is Windows-only"
-    for candidate in _library_candidates():
+    for candidate in _library_candidates(library_path):
         if not candidate or not candidate.exists():
             continue
         try:
@@ -53,27 +60,56 @@ class AmdAmfSurfaceEncoder:
     cannot provide a GPU surface must use the normal FFmpeg fallback.
     """
 
-    def __init__(self, width: int, height: int, fps: int, bitrate: int, *, hevc: bool = False):
-        available, detail = probe_amd_amf()
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        fps: int,
+        bitrate: int,
+        *,
+        hevc: bool = False,
+        device_index: int = 0,
+        library_path: str | os.PathLike[str] | None = None,
+    ):
+        available, detail = probe_amd_amf(library_path)
         if not available:
             raise RuntimeError(detail)
-        dll = next(path for path in _library_candidates() if path and path.exists())
+        dll = next(path for path in _library_candidates(library_path) if path and path.exists())
         self._dll = ctypes.WinDLL(str(dll))
+        self._abi_version = 1
+        abi_probe = getattr(self._dll, "d2s_amd_encoder_abi_version", None)
+        if abi_probe is not None:
+            abi_probe.restype = ctypes.c_int
+            self._abi_version = int(abi_probe())
         self._dll.d2s_amd_encoder_create.restype = ctypes.c_void_p
         self._dll.d2s_amd_encoder_create.argtypes = [ctypes.c_int] * 4 + [ctypes.c_int]
+        create_for_device = getattr(self._dll, "d2s_amd_encoder_create_for_hip_device", None)
+        if create_for_device is not None:
+            create_for_device.restype = ctypes.c_void_p
+            create_for_device.argtypes = [ctypes.c_int] * 4 + [ctypes.c_int, ctypes.c_int]
         self._dll.d2s_amd_encoder_submit_texture.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         self._dll.d2s_amd_encoder_submit_texture.restype = ctypes.c_int
-        self._dll.d2s_amd_encoder_submit_hip_rgba.argtypes = [
+        submit_hip_argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_int,
             ctypes.c_void_p,
         ]
+        if self._abi_version >= 2:
+            submit_hip_argtypes.append(ctypes.c_int)
+        self._dll.d2s_amd_encoder_submit_hip_rgba.argtypes = submit_hip_argtypes
         self._dll.d2s_amd_encoder_submit_hip_rgba.restype = ctypes.c_int
         self._dll.d2s_amd_encoder_read_packet.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
         self._dll.d2s_amd_encoder_read_packet.restype = ctypes.c_int
         self._dll.d2s_amd_encoder_destroy.argtypes = [ctypes.c_void_p]
-        self._handle = self._dll.d2s_amd_encoder_create(width, height, fps, bitrate, int(hevc))
+        if self._abi_version >= 2 and create_for_device is not None:
+            self._handle = create_for_device(
+                width, height, fps, bitrate, int(hevc), max(0, int(device_index))
+            )
+        else:
+            self._handle = self._dll.d2s_amd_encoder_create(
+                width, height, fps, bitrate, int(hevc)
+            )
         if not self._handle:
             raise RuntimeError("AMF surface encoder initialization failed")
 
@@ -81,13 +117,27 @@ class AmdAmfSurfaceEncoder:
         if self._dll.d2s_amd_encoder_submit_texture(self._handle, ctypes.c_void_p(texture_pointer)) <= 0:
             raise RuntimeError("AMF rejected the D3D11 texture")
 
-    def submit_hip_rgba(self, device_pointer: int, pitch_bytes: int, stream: int) -> None:
-        result = self._dll.d2s_amd_encoder_submit_hip_rgba(
+    def submit_hip_rgba(
+        self,
+        device_pointer: int,
+        pitch_bytes: int,
+        stream: int,
+        *,
+        force_idr: bool = False,
+    ) -> None:
+        if force_idr and self._abi_version < 2:
+            raise RuntimeError(
+                "AMD AMF bridge is too old for Moonlight IDR requests; rebuild d2s_amd_encoder.dll"
+            )
+        args = (
             self._handle,
             ctypes.c_void_p(int(device_pointer)),
             int(pitch_bytes),
             ctypes.c_void_p(int(stream)),
         )
+        if self._abi_version >= 2:
+            args = (*args, int(force_idr))
+        result = self._dll.d2s_amd_encoder_submit_hip_rgba(*args)
         if result <= 0:
             raise RuntimeError("AMF rejected the HIP RGBA surface")
 

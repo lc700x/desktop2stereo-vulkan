@@ -217,7 +217,7 @@ class OpenXrSettingsMenu:
         return True
 
     def set_screen_section(self, section: str) -> bool:
-        if section not in {"layout", "crop"} or section == self.screen_section:
+        if section not in {"layout", "crop", "passthrough"} or section == self.screen_section:
             return False
         self.screen_section = section
         self.hover_key = None
@@ -343,8 +343,8 @@ class OpenXrSettingsMenu:
             (_SIDEBAR_CONTROL_LEFT, 704, _SIDEBAR_CONTROL_WIDTH, 64),
             group="navigation_actions", enabled=not self.stopping, fixed=True,
         )
-        # Screen Layout/Crop is true secondary navigation and stays pinned
-        # while its longer settings page scrolls.
+        # Screen sections are true secondary navigation and stay pinned while
+        # their settings pages scroll.
         if self.tab == "screen":
             add_group(
                 "screen_page_heading", _CONTENT_PANEL_LEFT, 32,
@@ -355,7 +355,7 @@ class OpenXrSettingsMenu:
                 "screen_navigation", _CONTENT_PANEL_LEFT, 56,
                 _CONTENT_PANEL_WIDTH, 48, title="", fixed=True,
             )
-            navigation_width = _CONTENT_WIDTH // 2
+            navigation_width = (_CONTENT_WIDTH // 3) & ~1
             add_button(
                 "screen:section:layout", "Layout",
                 (_CONTENT_LEFT, 56, navigation_width, 48),
@@ -366,6 +366,14 @@ class OpenXrSettingsMenu:
                 (
                     _CONTENT_LEFT + navigation_width,
                     56, navigation_width, 48,
+                ),
+                group="screen_navigation", fixed=True,
+            )
+            add_button(
+                "screen:section:passthrough", "Passthrough",
+                (
+                    _CONTENT_LEFT + 2 * navigation_width,
+                    56, _CONTENT_WIDTH - 2 * navigation_width, 48,
                 ),
                 group="screen_navigation", fixed=True,
             )
@@ -636,6 +644,16 @@ class OpenXrSettingsMenu:
                 "screen:reset_crop", "Reset Crop",
                 (_CONTENT_RIGHT - 160, 424, 160, 48),
                 group="screen_crop",
+            )
+        elif self.tab == "screen" and self.screen_section == "passthrough":
+            add_group(
+                "screen_passthrough", _CONTENT_PANEL_LEFT, 120,
+                _CONTENT_PANEL_WIDTH, 160, title="Passthrough",
+            )
+            add_button(
+                "screen:toggle_passthrough", "VD Green Passthrough",
+                (_CONTENT_LEFT, 176, _CONTENT_WIDTH, 48),
+                group="screen_passthrough", kind="toggle",
             )
         elif self.tab == "screen":
             add_group(

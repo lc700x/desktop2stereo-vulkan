@@ -6,6 +6,8 @@ import os
 import queue
 import threading
 import time
+from dataclasses import replace
+from typing import Any
 
 from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
 from viewer.rocm_vulkan_interop import RocmVulkanImageImporter
@@ -20,6 +22,7 @@ from viewer.vulkan_resources import (
 )
 
 from .gpu_producer import GpuProducerAdapter, register_gpu_producer_adapter
+from .interop import validate_adapter_luid
 from .output_contract import VulkanStereoOutputFrame
 
 
@@ -29,6 +32,50 @@ def _rocm_glow_vulkan_compute_enabled(context: Any) -> bool:
     if value.strip().lower() in {"0", "false", "off", "no", "disabled"}:
         return False
     return int(getattr(context, "compute_queue_index", 0) or 0) != 0
+
+
+def _rocm_tensor_adapter_luid(tensor) -> tuple[int, str | None]:
+    try:
+        device_index = getattr(getattr(tensor, "device", None), "index", None)
+        if device_index is None:
+            import torch
+
+            device_index = int(torch.cuda.current_device())
+        from wc_rocm import get_luid
+
+        luid = get_luid(int(device_index))
+        if isinstance(luid, (tuple, list)) and len(luid) == 2:
+            low, high = (int(value) & 0xFFFFFFFF for value in luid)
+            packed = (high << 32) | low
+        else:
+            packed = int(luid or 0)
+        if packed:
+            return packed, None
+        return 0, "ROCm adapter LUID is unavailable"
+    except Exception as exc:  # noqa: BLE001 - identity lookup failure must select the safe host path.
+        return 0, f"ROCm adapter identity lookup failed: {type(exc).__name__}: {exc}"
+
+
+def _cuda_tensor_adapter_luid(tensor) -> tuple[int, str | None]:
+    try:
+        device_index = getattr(getattr(tensor, "device", None), "index", None)
+        if device_index is None:
+            import torch
+
+            device_index = int(torch.cuda.current_device())
+        from wc_cuda import get_luid
+
+        luid = get_luid(int(device_index))
+        if isinstance(luid, (tuple, list)) and len(luid) == 2:
+            low, high = (int(value) & 0xFFFFFFFF for value in luid)
+            packed = (high << 32) | low
+        else:
+            packed = int(luid or 0)
+        if packed:
+            return packed, None
+        return 0, "CUDA adapter LUID is unavailable"
+    except Exception as exc:  # noqa: BLE001 - identity lookup failure selects the safe host path.
+        return 0, f"CUDA adapter identity lookup failed: {type(exc).__name__}: {exc}"
 
 
 class CudaVulkanOutputAdapter(GpuProducerAdapter):
@@ -95,9 +142,327 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         self._source_frames: dict[int, tuple[object, object, int]] = {}
         self._released_source_frames: set[int] = set()
         self._prepared_source_eyes: set[tuple[int, int]] = set()
-
+        self._cuda_adapter_luid = 0
+        self._vulkan_adapter_luid = 0
+        self._cuda_adapter_transfer_decision = None
+        self._cuda_transfer_path = None
+        self._cuda_transfer_fallback_reason = None
+        self._cross_adapter_host_output = None
+        self._cross_adapter_gpu_bridge = None
+        self._cross_adapter_gpu_bridge_attempted = False
+        self._cross_adapter_gpu_bridge_error = None
+        self._cross_adapter_cuda_stream = None
 
         self._screen_light_last_submit = 0.0
+
+    def _configure_adapter_transfer(self, tensor):
+        if self._cuda_adapter_transfer_decision is not None:
+            return self._cuda_adapter_transfer_decision
+        self._cuda_adapter_luid, identity_error = _cuda_tensor_adapter_luid(tensor)
+        context = getattr(self.presenter, "vulkan", None)
+        device_info = getattr(context, "device_info", None)
+        self._vulkan_adapter_luid = int(
+            getattr(device_info, "adapter_luid", 0) or 0
+        )
+        decision = validate_adapter_luid(
+            self._cuda_adapter_luid,
+            self._vulkan_adapter_luid,
+        )
+        self._cuda_adapter_transfer_decision = decision
+        if decision.allowed:
+            self._cuda_transfer_path = "cuda_vulkan_same_adapter"
+        elif self._cuda_adapter_luid and self._vulkan_adapter_luid:
+            self._cuda_transfer_path = "cuda_d3d12_cross_adapter_gpu_pending"
+            self._cuda_transfer_fallback_reason = (
+                "D3D12 cross-adapter GPU bridge has not been initialized"
+            )
+        else:
+            self._cuda_transfer_path = "cuda_host_eye_staging"
+            reasons = [decision.reason]
+            if identity_error:
+                reasons.append(identity_error)
+            self._cuda_transfer_fallback_reason = "; ".join(reasons)
+        cuda_text = (
+            f"0x{self._cuda_adapter_luid:016x}" if self._cuda_adapter_luid else "unknown"
+        )
+        vulkan_text = (
+            f"0x{self._vulkan_adapter_luid:016x}" if self._vulkan_adapter_luid else "unknown"
+        )
+        print(
+            "[VulkanOutput] CUDA/OpenXR adapters: "
+            f"cuda_luid={cuda_text} vulkan_luid={vulkan_text} "
+            f"transfer={self._cuda_transfer_path} "
+            f"fallback={self._cuda_transfer_fallback_reason or 'none'}",
+            flush=True,
+        )
+        return decision
+
+    def _adapter_transfer_metadata(self) -> dict[str, object]:
+        decision = self._cuda_adapter_transfer_decision
+        return {
+            "cuda_adapter_luid": self._cuda_adapter_luid or None,
+            "openxr_vulkan_adapter_luid": self._vulkan_adapter_luid or None,
+            "cuda_vulkan_adapter_match": bool(decision and decision.allowed),
+            "cuda_vulkan_transfer_path": self._cuda_transfer_path,
+            "cuda_vulkan_fallback_reason": self._cuda_transfer_fallback_reason,
+        }
+
+    def _convert_cross_adapter_host_staging(
+        self, runtime_result, *, frame_id: int, timestamp: float
+    ) -> VulkanStereoOutputFrame:
+        left = getattr(runtime_result, "left_eye", None)
+        self._wait_for_runtime_cuda_event(runtime_result, left)
+        host_output = self._cross_adapter_host_output
+        if host_output is None:
+            host_output = VulkanHostOutputAdapter(self.presenter)
+            self._cross_adapter_host_output = host_output
+        frame = host_output.convert(
+            runtime_result, frame_id=frame_id, timestamp=timestamp
+        )
+        delegate = getattr(host_output, "_delegate", None)
+        direct_host_transfer = bool(
+            getattr(delegate, "_cuda_direct_host_transfer_enabled", False)
+        )
+        if direct_host_transfer:
+            self._cuda_transfer_path = "cuda_registered_vulkan_host_memory"
+            self._cuda_transfer_fallback_reason = None
+        metadata = dict(frame.metadata)
+        metadata.update(self._adapter_transfer_metadata())
+        metadata.update(
+            {
+                "cuda_vulkan_direct_host_transfer": direct_host_transfer,
+                "cuda_vulkan_host_transfer_error": getattr(
+                    delegate, "_cuda_host_transfer_error", None
+                ),
+                "vulkan_output_path": (
+                    "cuda_registered_vulkan_host_memory"
+                    if direct_host_transfer
+                    else "cuda_host_eye_staging"
+                ),
+                "vulkan_gpu_to_cpu": True,
+                "vulkan_zero_cpu_readback": False,
+                "vulkan_zero_copy": False,
+            }
+        )
+        return replace(frame, metadata=metadata)
+
+    def _ensure_cross_adapter_gpu_bridge(self, width: int, height: int):
+        if self._cross_adapter_gpu_bridge_attempted:
+            return (
+                None
+                if self._cross_adapter_gpu_bridge_error
+                else self._cross_adapter_gpu_bridge
+            )
+        self._cross_adapter_gpu_bridge_attempted = True
+        if not self._cuda_adapter_luid or not self._vulkan_adapter_luid:
+            self._cross_adapter_gpu_bridge_error = "adapter LUID is unknown"
+            return None
+        bridge = None
+        left_visible = []
+        right_visible = []
+        try:
+            from viewer.cuda_d3d12_bridge import CudaD3D12OutputBridge
+
+            if self.importer is None:
+                self.importer = self._create_importer()
+            bridge = CudaD3D12OutputBridge(
+                self.presenter.vulkan,
+                self.importer,
+                source_luid=self._cuda_adapter_luid,
+                target_luid=self._vulkan_adapter_luid,
+                width=width,
+                height=height,
+                ring_size=self.ring_size,
+            )
+            context = self.presenter.vulkan
+            left_visible = [
+                VulkanBinarySemaphore(
+                    context, label=f"cuda-d3d12-left-visible-{index}"
+                )
+                for index in range(self.ring_size)
+            ]
+            right_visible = [
+                VulkanBinarySemaphore(
+                    context, label=f"cuda-d3d12-right-visible-{index}"
+                )
+                for index in range(self.ring_size)
+            ]
+        except Exception as exc:
+            self._cross_adapter_gpu_bridge_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            for semaphore in (*left_visible, *right_visible):
+                semaphore.close()
+            importer = self.importer
+            self.importer = None
+            if importer is not None:
+                try:
+                    importer.close()
+                except Exception as close_exc:  # noqa: BLE001
+                    print(
+                        f"[VulkanOutput] CUDA importer cleanup failed: {close_exc}",
+                        flush=True,
+                    )
+            if bridge is not None:
+                try:
+                    bridge.close()
+                except Exception as close_exc:  # noqa: BLE001
+                    print(
+                        f"[VulkanOutput] D3D12 bridge cleanup failed: {close_exc}",
+                        flush=True,
+                    )
+            self._cuda_transfer_path = "cuda_host_eye_staging"
+            self._cuda_transfer_fallback_reason = (
+                f"D3D12 cross-adapter GPU bridge unavailable: "
+                f"{self._cross_adapter_gpu_bridge_error}"
+            )
+            print(
+                "[VulkanOutput] D3D12 cross-adapter bridge unavailable; "
+                f"using host fallback: {self._cross_adapter_gpu_bridge_error}",
+                flush=True,
+            )
+            return None
+
+        self._cross_adapter_gpu_bridge = bridge
+        self.left_slots = bridge.left_images
+        self.right_slots = bridge.right_images
+        self.left_visible_semaphores = left_visible
+        self.right_visible_semaphores = right_visible
+        self.left_release_semaphores = bridge.left_release_semaphores
+        self.right_release_semaphores = bridge.right_release_semaphores
+        self.left_release_values = [0] * self.ring_size
+        self.right_release_values = [0] * self.ring_size
+        self._cuda_release_timelines = [0] * self.ring_size
+        self._extent = (width, height)
+        self._cuda_transfer_path = "cuda_d3d12_cross_adapter_gpu_copy"
+        self._cuda_transfer_fallback_reason = None
+        print(
+            "[VulkanOutput] D3D12 cross-adapter GPU transfer enabled: "
+            f"source=0x{self._cuda_adapter_luid:016x} "
+            f"target=0x{self._vulkan_adapter_luid:016x} "
+            f"extent={width}x{height} cpu_pixel_copy=False "
+            "gpu_fence_wait=True host_fence_wait=False",
+            flush=True,
+        )
+        return bridge
+
+    def _convert_cross_adapter_gpu(
+        self, runtime_result, *, frame_id: int, timestamp: float,
+        left, right, width: int, height: int,
+    ) -> VulkanStereoOutputFrame | None:
+        bridge = self._ensure_cross_adapter_gpu_bridge(width, height)
+        if bridge is None:
+            return self._convert_cross_adapter_host_staging(
+                runtime_result, frame_id=frame_id, timestamp=timestamp
+            )
+        slot_index = int(frame_id) % self.ring_size
+        self._claim_slot(slot_index, frame_id)
+        try:
+            self._wait_for_runtime_cuda_event(runtime_result, left)
+            import torch
+
+            transfer_stream = getattr(self, "_cross_adapter_cuda_stream", None)
+            if transfer_stream is None:
+                transfer_stream = torch.cuda.Stream(device=left.device)
+                self._cross_adapter_cuda_stream = transfer_stream
+            # Cross-adapter copies and release-fence waits must not enter the
+            # default stream used by capture, preprocessing and TRT slot reuse.
+            with torch.cuda.stream(transfer_stream):
+                self._wait_for_runtime_cuda_event(runtime_result, left)
+                # The native copy only retains device pointers. Keep each
+                # allocation alive until its asynchronous transfer retires.
+                left.record_stream(transfer_stream)
+                right.record_stream(transfer_stream)
+                left_image, right_image, copied_slot, completion_value = bridge.copy(
+                    left,
+                    right,
+                    frame_id=frame_id,
+                    stream=int(transfer_stream.cuda_stream),
+                    release_values=(
+                        int(self.left_release_values[slot_index]),
+                        int(self.right_release_values[slot_index]),
+                    ),
+                )
+            if copied_slot != slot_index:
+                raise RuntimeError("D3D12 bridge returned a mismatched output slot")
+            self._release_signaled.discard((0, slot_index))
+            self._release_signaled.discard((1, slot_index))
+            self.left_slot = left_image
+            self.right_slot = right_image
+
+            if self._screen_light_sample_path != "vulkan_compute_reduction":
+                self._update_screen_light_sample(left, right)
+            glow_source = getattr(runtime_result, "source_rgb", None)
+            glow_source = glow_source if glow_source is not None else left
+            glow_metadata = self._update_glow_gpu_source(glow_source, frame_id=frame_id)
+        except Exception as exc:
+            from viewer.cuda_d3d12_bridge import CudaD3D12BridgeBusyError
+
+            if isinstance(exc, CudaD3D12BridgeBusyError):
+                self.release_frame(frame_id)
+                return None
+            self.release_frame(frame_id)
+            self._cross_adapter_gpu_bridge_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            self._cuda_transfer_path = "cuda_host_eye_staging"
+            self._cuda_transfer_fallback_reason = (
+                f"D3D12 cross-adapter transfer failed: "
+                f"{self._cross_adapter_gpu_bridge_error}"
+            )
+            print(
+                "[VulkanOutput] D3D12 cross-adapter transfer failed; "
+                f"using host fallback: {self._cross_adapter_gpu_bridge_error}",
+                flush=True,
+            )
+            return self._convert_cross_adapter_host_staging(
+                runtime_result, frame_id=frame_id, timestamp=timestamp
+            )
+
+        left_contract = self.source_image_contract(left_image.resource)
+        right_contract = self.source_image_contract(right_image.resource)
+        self._source_frames[int(frame_id)] = (left_image, right_image, slot_index)
+        self._released_source_frames.discard(int(frame_id))
+        return VulkanStereoOutputFrame(
+            frame_id=frame_id,
+            timestamp=timestamp,
+            left_eye=left_image.resource,
+            right_eye=right_image.resource,
+            ready_timeline=None,
+            metadata={
+                **dict(getattr(runtime_result, "debug_info", None) or {}),
+                **self._adapter_transfer_metadata(),
+                "vulkan_output_ring_slot": slot_index,
+                "vulkan_output_ring_size": self.ring_size,
+                "vulkan_output_sync": "d3d12_fence_gpu_wait",
+                "vulkan_external_semaphore_available": True,
+                "vulkan_external_semaphore_type": "timeline",
+                "vulkan_readback": "none",
+                "vulkan_output_path": "cuda_d3d12_cross_adapter_gpu_copy",
+                "vulkan_gpu_to_cpu": False,
+                "vulkan_zero_cpu_readback": True,
+                "vulkan_zero_copy": False,
+                "cuda_vulkan_pixel_cpu_copy": False,
+                "cuda_vulkan_cpu_fence_wait": False,
+                "cuda_vulkan_cpu_fence_wait_count": bridge.cpu_wait_count,
+                "cuda_vulkan_gpu_fence_wait": True,
+                "cuda_vulkan_copy_stream": "dedicated",
+                "cuda_vulkan_d3d12_completion_value": completion_value,
+                "cuda_vulkan_cross_adapter_memory": "d3d12_shared_system_memory",
+                "vulkan_source_layout_left": left_contract["layout"],
+                "vulkan_source_layout_right": right_contract["layout"],
+                "vulkan_source_queue_family_left": left_contract["queue_family"],
+                "vulkan_source_queue_family_right": right_contract["queue_family"],
+                "_vulkan_source_prepare_for_sampling": self.prepare_source_for_sampling,
+                "_vulkan_source_consumer_release": self.release_consumer_frame,
+                "_vulkan_output_release": self.release_frame,
+                "screen_light_linear_rgb": self._screen_light_rgb,
+                "screen_light_sample_path": self._screen_light_sample_path,
+                **glow_metadata,
+            },
+            color_space="srgb",
+            image_origin="top_left",
+        )
 
     def _update_screen_light_sample(self, left, right) -> None:
         """Asynchronously reduce display sRGB eyes to one linear screen color."""
@@ -220,9 +585,19 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         # Projection Composer owns the eventual sampling pass.
         glow_image_available = self.presenter.vulkan is not None
         gpu_glow_active = glow_active and glow_image_available
+        host_glow_input = bool(getattr(self, "_force_host_staging", False))
         try:
             if self._glow_gpu_backend is None:
-                if self.backend_name != "cuda":
+                if host_glow_input:
+                    from stereo_runtime.vulkan_glow_source import (
+                        VulkanGlowSourceComputeBackend,
+                    )
+
+                    self._glow_gpu_backend = VulkanGlowSourceComputeBackend(
+                        self.presenter.vulkan, host_input=True
+                    )
+                    self._set_glow_gpu_status("vulkan_compute_host_input")
+                elif self.backend_name != "cuda":
                     prewarmed = getattr(
                         self.presenter, "_prewarmed_glow_backend", None
                     )
@@ -249,14 +624,10 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                         self.presenter.vulkan
                     )
             if gpu_glow_active:
-                if self.backend_name != "cuda":
-                    self._set_glow_gpu_status(
-                        "vulkan_compute_external_image async_queue=True"
-                    )
-                else:
-                    self._set_glow_gpu_status(
-                        "vulkan_compute_external_image async_queue=True"
-                    )
+                input_path = "host_input" if host_glow_input else "external_image"
+                self._set_glow_gpu_status(
+                    f"vulkan_compute_{input_path} async_queue=True"
+                )
             else:
                 reason = (
                     "vulkan_projection_composer_source"
@@ -494,7 +865,27 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         entry = self._source_frames.get(frame_key)
         if entry is None:
             raise RuntimeError(f"unknown Vulkan source frame {frame_id}")
+        cross_adapter_gpu_bridge = getattr(self, "_cross_adapter_gpu_bridge", None)
         left, right, slot_index = entry
+        if cross_adapter_gpu_bridge is not None:
+            if (frame_key, eye) in self._prepared_source_eyes:
+                return None
+            resource = left if eye == 0 else right
+            visible = (
+                self.left_visible_semaphores[slot_index]
+                if eye == 0
+                else self.right_visible_semaphores[slot_index]
+            )
+            self.presenter.vulkan.prepare_external_image_for_sampling(
+                resource.resource,
+                wait_semaphore=cross_adapter_gpu_bridge.ready_semaphore.semaphore,
+                wait_semaphore_value=cross_adapter_gpu_bridge.completion_for_frame(
+                    frame_key
+                ),
+                signal_semaphore=visible.semaphore,
+            )
+            self._prepared_source_eyes.add((frame_key, eye))
+            return visible.semaphore
         if len(self.left_visible_semaphores) <= slot_index:
             # External-semaphore path was never initialized (e.g. on ROCm/HIP
             # where timeline external semaphores are unsupported). convert()
@@ -779,6 +1170,16 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         width, height = self._tensor_extent(left)
         if self._tensor_extent(right) != (width, height):
             raise ValueError("left/right runtime eye dimensions differ")
+        if self.backend_name == "cuda" and not self._configure_adapter_transfer(left).allowed:
+            return self._convert_cross_adapter_gpu(
+                runtime_result,
+                frame_id=frame_id,
+                timestamp=timestamp,
+                left=left,
+                right=right,
+                width=width,
+                height=height,
+            )
         self._wait_for_runtime_cuda_event(runtime_result, left)
         self._ensure_slots(width, height)
         slot_index = int(frame_id) % self.ring_size
@@ -893,6 +1294,11 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
             ready_timeline=None,
             metadata={
                 **dict(getattr(runtime_result, "debug_info", None) or {}),
+                **(
+                    self._adapter_transfer_metadata()
+                    if self.backend_name == "cuda"
+                    else {}
+                ),
                 "vulkan_output_ring_slot": slot_index,
                 "vulkan_output_ring_size": self.ring_size,
                 "vulkan_output_sync": (
@@ -956,12 +1362,36 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         self._glow_gpu_backend = None
         if glow_backend is not None:
             glow_backend.close()
+        cross_adapter_host_output = self._cross_adapter_host_output
+        self._cross_adapter_host_output = None
+        if cross_adapter_host_output is not None:
+            cross_adapter_host_output.close()
+        cross_adapter_gpu_bridge = self._cross_adapter_gpu_bridge
+        if cross_adapter_gpu_bridge is not None:
+            try:
+                cross_adapter_gpu_bridge.wait_all()
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[VulkanOutput] D3D12 bridge drain failed: {exc}",
+                    flush=True,
+                )
+            try:
+                cross_adapter_gpu_bridge.synchronize_cuda()
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[VulkanOutput] CUDA bridge stream drain failed: {exc}",
+                    flush=True,
+                )
         if self.importer is not None:
             self.importer.close()
         self.importer = None
-        for slot in (*self.left_slots, *self.right_slots):
-            if slot is not None:
-                slot.close()
+        self._cross_adapter_gpu_bridge = None
+        if cross_adapter_gpu_bridge is not None:
+            cross_adapter_gpu_bridge.close()
+        else:
+            for slot in (*self.left_slots, *self.right_slots):
+                if slot is not None:
+                    slot.close()
         self.left_slots = []
         self.right_slots = []
         for semaphore in (
@@ -995,6 +1425,9 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         self._source_frames.clear()
         self._released_source_frames.clear()
         self._prepared_source_eyes.clear()
+        self._cross_adapter_gpu_bridge_attempted = False
+        self._cross_adapter_gpu_bridge_error = None
+        self._cross_adapter_cuda_stream = None
 
 
 class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
@@ -1002,8 +1435,9 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
 
     backend_name = "rocm"
 
-    def __init__(self, presenter):
+    def __init__(self, presenter, *, force_host_staging: bool = False):
         super().__init__(presenter)
+        self._force_host_staging = bool(force_host_staging)
         self._rocm_ready_pending: set[tuple[int, int]] = set()
         self._rocm_release_timelines: list[int] = []
         self._rocm_ready_timelines: dict[int, int] = {}
@@ -1011,9 +1445,31 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
         self._buffer_frames: dict[int, tuple[VulkanExportableBuffer, VulkanExportableBuffer]] = {}
         self._host_eye_slots: list[tuple[VulkanHostImage, VulkanHostImage]] = []
         self._host_frame_slots: dict[int, int] = {}
-        self._host_staging_enabled = self._rocm_eye_host_staging_enabled()
+        self._pinned_eye_buffers = None
+        self._pinned_transfer_error_logged = False
+        self._cuda_runtime_api = None
+        self._cuda_vulkan_host_mappings: dict[int, dict[str, object]] = {}
+        self._cuda_direct_host_transfer_enabled: bool | None = None
+        self._cuda_host_transfer_error: str | None = None
+        self._cuda_host_transfer_error_logged = False
+        self._host_staging_enabled = (
+            self._force_host_staging or self._rocm_eye_host_staging_enabled()
+        )
+        self._rocm_adapter_luid = 0
+        self._vulkan_adapter_luid = 0
+        self._adapter_transfer_decision = None
+        self._rocm_transfer_path = None
+        self._rocm_transfer_fallback_reason = None
         if not self._host_staging_enabled:
             self._host_eye_slots = []
+        if self._force_host_staging:
+            if os.environ.pop("D2S_OPENXR_DISABLE_GLOW_DRAW", None) is not None:
+                print(
+                    "[VulkanOutput] Cleared inherited legacy glow-disable diagnostic "
+                    "for cross-adapter output",
+                    flush=True,
+                )
+            return
         # Old diagnostic shells can retain the removed Windows user override.
         # Keep AMD's intentional draw-disable switch explicit and vendor-local.
         disable_glow = os.environ.get("D2S_ROCM_DISABLE_GLOW_DRAW", "0").strip().lower()
@@ -1077,6 +1533,61 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
     def _create_importer(self):
         return RocmVulkanImageImporter()
 
+    def _configure_adapter_transfer(self, tensor):
+        if self._adapter_transfer_decision is not None:
+            return self._adapter_transfer_decision
+        self._rocm_adapter_luid, identity_error = _rocm_tensor_adapter_luid(tensor)
+        context = getattr(self.presenter, "vulkan", None)
+        device_info = getattr(context, "device_info", None)
+        self._vulkan_adapter_luid = int(
+            getattr(device_info, "adapter_luid", 0) or 0
+        )
+        decision = validate_adapter_luid(
+            self._rocm_adapter_luid,
+            self._vulkan_adapter_luid,
+        )
+        self._adapter_transfer_decision = decision
+        if not decision.allowed:
+            self._host_staging_enabled = True
+            self._rocm_transfer_path = "rocm_host_eye_staging"
+            reasons = [decision.reason]
+            if identity_error:
+                reasons.append(identity_error)
+            elif self._rocm_adapter_luid and self._vulkan_adapter_luid:
+                reasons.append("cross-adapter D3D12 bridge is unavailable in this build")
+            self._rocm_transfer_fallback_reason = "; ".join(reasons)
+        elif self._host_staging_enabled:
+            self._rocm_transfer_path = "rocm_host_eye_staging"
+            self._rocm_transfer_fallback_reason = "enabled_by_D2S_ROCM_EYE_HOST_STAGING"
+        else:
+            self._rocm_transfer_path = "hip_vulkan_buffer_same_adapter"
+        rocm_text = (
+            f"0x{self._rocm_adapter_luid:016x}" if self._rocm_adapter_luid else "unknown"
+        )
+        vulkan_text = (
+            f"0x{self._vulkan_adapter_luid:016x}" if self._vulkan_adapter_luid else "unknown"
+        )
+        print(
+            "[VulkanOutput] ROCm/OpenXR adapters: "
+            f"rocm_luid={rocm_text} vulkan_luid={vulkan_text} "
+            f"transfer={self._rocm_transfer_path} "
+            f"fallback={self._rocm_transfer_fallback_reason or 'none'}",
+            flush=True,
+        )
+        return decision
+
+    def _adapter_transfer_metadata(self) -> dict[str, object]:
+        if self._force_host_staging:
+            return {}
+        decision = self._adapter_transfer_decision
+        return {
+            "rocm_adapter_luid": self._rocm_adapter_luid or None,
+            "openxr_vulkan_adapter_luid": self._vulkan_adapter_luid or None,
+            "rocm_vulkan_adapter_match": bool(decision and decision.allowed),
+            "rocm_vulkan_transfer_path": self._rocm_transfer_path,
+            "rocm_vulkan_fallback_reason": self._rocm_transfer_fallback_reason,
+        }
+
     def _ensure_slots(self, width: int, height: int) -> None:
         """Create AMD binary handoffs without invoking CUDA timeline setup."""
         if not bool(getattr(self.presenter, "initialized", False)):
@@ -1135,9 +1646,14 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
                 raise
             self._extent = (width, height)
             self._logged_external_sync_mode = True
+            path_label = (
+                "cross-adapter eye upload"
+                if self._force_host_staging
+                else "ROCm eye upload"
+            )
             print(
-                "[VulkanOutput] ROCm eye upload: vulkan_host_staging "
-                "(no HIP/Vulkan shared memory)",
+                f"[VulkanOutput] {path_label}: vulkan_host_staging "
+                "(no cross-adapter shared memory)",
                 flush=True,
             )
             return
@@ -1254,6 +1770,260 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
                 if self._rocm_release_timelines[slot_index] == release_timeline:
                     self._rocm_release_timelines[slot_index] = 0
 
+    def _queue_pinned_cuda_eye(self, tensor, *, width: int, height: int, eye: int):
+        if not self._force_host_staging:
+            return self._tensor_host_rgba(tensor, width=width, height=height), None
+        try:
+            import torch
+
+            value = tensor.detach()
+            if (
+                getattr(value.device, "type", None) != "cuda"
+                or value.dtype != torch.uint8
+                or value.ndim != 3
+                or int(value.shape[-1]) != 4
+                or tuple(value.shape[:2]) != (height, width)
+            ):
+                return self._tensor_host_rgba(tensor, width=width, height=height), None
+            if self._pinned_eye_buffers is None or tuple(
+                self._pinned_eye_buffers[0].shape
+            ) != (height, width, 4):
+                self._pinned_eye_buffers = tuple(
+                    torch.empty(
+                        (height, width, 4), dtype=torch.uint8, pin_memory=True
+                    )
+                    for _ in range(2)
+                )
+            host = self._pinned_eye_buffers[eye]
+            host.copy_(value, non_blocking=True)
+            return host.numpy(), value.device
+        except Exception as exc:
+            if not self._pinned_transfer_error_logged:
+                print(
+                    "[VulkanOutput] Pinned CUDA host staging unavailable; "
+                    f"using synchronous readback ({type(exc).__name__}: {exc})",
+                    flush=True,
+                )
+                self._pinned_transfer_error_logged = True
+            return self._tensor_host_rgba(tensor, width=width, height=height), None
+
+    def _load_cuda_runtime_api(self):
+        if self._cuda_runtime_api is False:
+            return None
+        if self._cuda_runtime_api is not None:
+            return self._cuda_runtime_api
+        if os.name != "nt":
+            self._cuda_runtime_api = False
+            self._cuda_host_transfer_error = "CUDA/Vulkan host registration is Windows-only"
+            return None
+        try:
+            import ctypes
+            from pathlib import Path
+
+            import torch
+
+            runtime_dir = (
+                Path(torch.__file__).resolve().parent.parent
+                / "nvidia"
+                / "cuda_runtime"
+                / "bin"
+            )
+            runtimes = sorted(runtime_dir.glob("cudart64_*.dll"))
+            if not runtimes:
+                raise FileNotFoundError(f"bundled CUDA runtime not found under {runtime_dir}")
+            library = ctypes.WinDLL(str(runtimes[0]))
+            register = library.cudaHostRegister
+            register.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint)
+            register.restype = ctypes.c_int
+            unregister = library.cudaHostUnregister
+            unregister.argtypes = (ctypes.c_void_p,)
+            unregister.restype = ctypes.c_int
+            copy_2d_async = library.cudaMemcpy2DAsync
+            copy_2d_async.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_int,
+                ctypes.c_void_p,
+            )
+            copy_2d_async.restype = ctypes.c_int
+            self._cuda_runtime_api = {
+                "ctypes": ctypes,
+                "library": library,
+                "register": register,
+                "unregister": unregister,
+                "copy_2d_async": copy_2d_async,
+            }
+            return self._cuda_runtime_api
+        except Exception as exc:
+            self._cuda_runtime_api = False
+            self._cuda_host_transfer_error = (
+                f"could not load bundled CUDA host-copy API: {type(exc).__name__}: {exc}"
+            )
+            return None
+
+    def _release_cuda_vulkan_host_mappings(self) -> None:
+        for entry in tuple(self._cuda_vulkan_host_mappings.values()):
+            api = entry["api"]
+            ctypes = api["ctypes"]
+            try:
+                api["unregister"](ctypes.c_void_p(int(entry["address"])))
+            except Exception:
+                pass
+            try:
+                host = entry["host"]
+                host.vk.vkUnmapMemory(host.context.device, host.memory)
+            except Exception:
+                pass
+        self._cuda_vulkan_host_mappings.clear()
+
+    def _disable_cuda_direct_host_transfer(self, reason: str) -> None:
+        self._cuda_direct_host_transfer_enabled = False
+        self._cuda_host_transfer_error = str(reason)
+        self._release_cuda_vulkan_host_mappings()
+        if not self._cuda_host_transfer_error_logged:
+            self._cuda_host_transfer_error_logged = True
+            print(
+                "[VulkanOutput] Direct CUDA-to-Vulkan host transfer unavailable; "
+                f"using pinned host staging ({self._cuda_host_transfer_error})",
+                flush=True,
+            )
+
+    def _cuda_registered_vulkan_host_mapping(self, host) -> dict[str, object] | None:
+        key = id(host)
+        existing = self._cuda_vulkan_host_mappings.get(key)
+        if existing is not None:
+            return existing
+        api = self._load_cuda_runtime_api()
+        if api is None:
+            self._disable_cuda_direct_host_transfer(
+                self._cuda_host_transfer_error or "CUDA host-copy API is unavailable"
+            )
+            return None
+        mapped = None
+        try:
+            layout = host._layout
+            offset = int(layout.offset)
+            size = offset + int(layout.size)
+            mapped = host.vk.vkMapMemory(
+                host.context.device, host.memory, 0, size, 0
+            )
+            ffi_buffer = host.vk.ffi.from_buffer(mapped)
+            address = int(host.vk.ffi.cast("uintptr_t", ffi_buffer))
+            ctypes = api["ctypes"]
+            status = api["register"](
+                ctypes.c_void_p(address), ctypes.c_size_t(size), ctypes.c_uint(0)
+            )
+            if int(status) != 0:
+                raise RuntimeError(f"cudaHostRegister returned {int(status)}")
+            entry = {
+                "api": api,
+                "host": host,
+                "mapped": mapped,
+                "ffi_buffer": ffi_buffer,
+                "address": address,
+                "size": size,
+            }
+            self._cuda_vulkan_host_mappings[key] = entry
+            return entry
+        except Exception as exc:
+            if mapped is not None:
+                try:
+                    host.vk.vkUnmapMemory(host.context.device, host.memory)
+                except Exception:
+                    pass
+            self._disable_cuda_direct_host_transfer(
+                f"Vulkan host image registration failed: {type(exc).__name__}: {exc}"
+            )
+            return None
+
+    def _queue_cuda_eyes_to_vulkan_host(
+        self, left, right, left_host, right_host, *, width: int, height: int
+    ):
+        if self._cuda_direct_host_transfer_enabled is False:
+            return None
+        try:
+            import numpy as np
+            import torch
+
+            if getattr(getattr(torch, "version", None), "cuda", None) is None:
+                return None
+            tensors = (left.detach(), right.detach())
+            if any(
+                getattr(value.device, "type", None) != "cuda"
+                or value.dtype != torch.uint8
+                or value.ndim != 3
+                or tuple(value.shape) != (height, width, 4)
+                or tuple(value.stride()[1:]) != (4, 1)
+                for value in tensors
+            ):
+                return None
+            if tensors[0].device != tensors[1].device:
+                return None
+            mappings = (
+                self._cuda_registered_vulkan_host_mapping(left_host),
+                self._cuda_registered_vulkan_host_mapping(right_host),
+            )
+            if any(mapping is None for mapping in mappings):
+                return None
+            api = mappings[0]["api"]
+            ctypes = api["ctypes"]
+            device = tensors[0].device
+            with torch.cuda.device(device):
+                stream = torch.cuda.current_stream(device=device)
+                stream_pointer = ctypes.c_void_p(int(stream.cuda_stream))
+                for value, host, mapping in zip(
+                    tensors, (left_host, right_host), mappings
+                ):
+                    layout = host._layout
+                    destination = int(mapping["address"]) + int(layout.offset)
+                    row_pitch = int(layout.rowPitch)
+                    status = api["copy_2d_async"](
+                        ctypes.c_void_p(destination),
+                        ctypes.c_size_t(row_pitch),
+                        ctypes.c_void_p(int(value.data_ptr())),
+                        ctypes.c_size_t(int(value.stride(0))),
+                        ctypes.c_size_t(width * 4),
+                        ctypes.c_size_t(height),
+                        ctypes.c_int(2),
+                        stream_pointer,
+                    )
+                    if int(status) != 0:
+                        raise RuntimeError(f"cudaMemcpy2DAsync returned {int(status)}")
+            views = tuple(
+                np.ndarray(
+                    (height, width, 4),
+                    dtype=np.uint8,
+                    buffer=mapping["mapped"],
+                    offset=int(host._layout.offset),
+                    strides=(int(host._layout.rowPitch), 4, 1),
+                )
+                for host, mapping in zip((left_host, right_host), mappings)
+            )
+            self._cuda_direct_host_transfer_enabled = True
+            if not getattr(self, "_cuda_direct_host_transfer_logged", False):
+                self._cuda_direct_host_transfer_logged = True
+                print(
+                    "[VulkanOutput] CUDA eyes transfer directly into registered "
+                    "Vulkan host images (full resolution)",
+                    flush=True,
+                )
+            return views[0], views[1], device
+        except Exception as exc:
+            stream = locals().get("stream")
+            if stream is not None:
+                try:
+                    stream.synchronize()
+                except Exception:
+                    pass
+            self._disable_cuda_direct_host_transfer(
+                f"direct CUDA image copy failed: {type(exc).__name__}: {exc}"
+            )
+            return None
+
     def _convert_host_staging(
         self, runtime_result, *, frame_id: int, timestamp: float
     ) -> VulkanStereoOutputFrame:
@@ -1268,33 +2038,127 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
         self.left_slot = self.left_slots[slot_index]
         self.right_slot = self.right_slots[slot_index]
         glow_metadata: dict[str, object] = {}
-        try:
-            if self._screen_light_sample_path != "vulkan_compute_reduction":
-                self._update_screen_light_sample(left, right)
-            glow_source = getattr(runtime_result, "source_rgb", None)
-            glow_source = glow_source if glow_source is not None else left
-            glow_metadata = self._update_glow_gpu_source(
-                glow_source, frame_id=frame_id
+        breakdown_enabled = os.environ.get("D2S_FPS_BREAKDOWN", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        transfer_queue_ms = transfer_wait_ms = glow_update_ms = host_upload_ms = 0.0
+        host_compute_source_required = False
+        if self._force_host_staging:
+            glow_mode = str(
+                getattr(self.presenter, "_filament_glow_mode", "off") or "off"
+            ).strip().lower()
+            glow_active = self._glow_environment_enabled() and glow_mode not in {
+                "off",
+                "none",
+                "false",
+                "0",
+            }
+            edge_light_active = bool(
+                getattr(self.presenter, "_environment_screen_light_enabled", False)
+                and getattr(self.presenter.config, "filament_glb_path", None)
             )
-            sampled_light = glow_metadata.get("screen_light_linear_rgb")
-            if isinstance(sampled_light, (list, tuple)) and len(sampled_light) >= 3:
-                self._screen_light_rgb = tuple(
-                    float(value) for value in sampled_light[:3]
+            host_compute_source_required = glow_active or edge_light_active
+        try:
+            if not self._force_host_staging:
+                if self._screen_light_sample_path != "vulkan_compute_reduction":
+                    self._update_screen_light_sample(left, right)
+                glow_source = getattr(runtime_result, "source_rgb", None)
+                glow_source = glow_source if glow_source is not None else left
+                glow_metadata = self._update_glow_gpu_source(
+                    glow_source, frame_id=frame_id
                 )
-                self._screen_light_sample_path = str(
-                    glow_metadata.get(
-                        "screen_light_sample_path", "vulkan_compute_reduction"
+                sampled_light = glow_metadata.get("screen_light_linear_rgb")
+                if isinstance(sampled_light, (list, tuple)) and len(sampled_light) >= 3:
+                    self._screen_light_rgb = tuple(
+                        float(value) for value in sampled_light[:3]
                     )
-                )
+                    self._screen_light_sample_path = str(
+                        glow_metadata.get(
+                            "screen_light_sample_path", "vulkan_compute_reduction"
+                        )
+                    )
             if len(self._host_eye_slots) <= slot_index:
                 raise RuntimeError("ROCm host eye staging slots are unavailable")
             left_host, right_host = self._host_eye_slots[slot_index]
-            left_host.upload(
-                self._tensor_host_rgba(left, width=width, height=height)
-            )
-            right_host.upload(
-                self._tensor_host_rgba(right, width=width, height=height)
-            )
+            if self._force_host_staging and not host_compute_source_required:
+                self._update_screen_light_sample(left, right)
+            transfer_queue_start = time.perf_counter() if breakdown_enabled else 0.0
+            direct_cuda_copy = None
+            if self._force_host_staging:
+                direct_cuda_copy = self._queue_cuda_eyes_to_vulkan_host(
+                    left, right, left_host, right_host, width=width, height=height
+                )
+            if direct_cuda_copy is not None:
+                left_pixels, right_pixels, direct_device = direct_cuda_copy
+                pending_devices = {direct_device}
+            else:
+                left_pixels, left_device = self._queue_pinned_cuda_eye(
+                    left, width=width, height=height, eye=0
+                )
+                right_pixels, right_device = self._queue_pinned_cuda_eye(
+                    right, width=width, height=height, eye=1
+                )
+                pending_devices = {
+                    device for device in (left_device, right_device) if device is not None
+                }
+            if breakdown_enabled:
+                transfer_queue_ms = (time.perf_counter() - transfer_queue_start) * 1000.0
+            if pending_devices:
+                if len(pending_devices) != 1:
+                    raise RuntimeError("left/right CUDA eye tensors use different devices")
+                device = pending_devices.pop()
+                import torch
+
+                transfer_wait_start = time.perf_counter() if breakdown_enabled else 0.0
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(device=device))
+                event.synchronize()
+                if breakdown_enabled:
+                    transfer_wait_ms = (time.perf_counter() - transfer_wait_start) * 1000.0
+            if self._force_host_staging:
+                glow_update_start = time.perf_counter() if breakdown_enabled else 0.0
+                if host_compute_source_required:
+                    glow_metadata = self._update_glow_gpu_source(
+                        left_pixels, frame_id=frame_id
+                    )
+                else:
+                    self._screen_light_sample_path = "cuda_async_sample"
+                    glow_metadata = {
+                        "screen_light_linear_rgb": self._screen_light_rgb,
+                        "screen_light_sample_path": self._screen_light_sample_path,
+                    }
+                    self._set_glow_gpu_status(
+                        "cuda_async_screen_light_only glow=inactive"
+                    )
+                if breakdown_enabled:
+                    glow_update_ms = (time.perf_counter() - glow_update_start) * 1000.0
+                sampled_light = glow_metadata.get("screen_light_linear_rgb")
+                if isinstance(sampled_light, (list, tuple)) and len(sampled_light) >= 3:
+                    self._screen_light_rgb = tuple(
+                        float(value) for value in sampled_light[:3]
+                    )
+                    self._screen_light_sample_path = str(
+                        glow_metadata.get(
+                            "screen_light_sample_path", "vulkan_compute_reduction"
+                        )
+                    )
+            host_upload_start = time.perf_counter() if breakdown_enabled else 0.0
+            if direct_cuda_copy is None:
+                left_host.upload(left_pixels)
+                right_host.upload(right_pixels)
+            if breakdown_enabled:
+                host_upload_ms = (time.perf_counter() - host_upload_start) * 1000.0
+                if self._force_host_staging and int(frame_id) % 30 == 0:
+                    print(
+                        "[VulkanOutput] Cross-adapter transfer timing: "
+                        f"queue={transfer_queue_ms:.2f}ms wait={transfer_wait_ms:.2f}ms "
+                        f"glow={glow_update_ms:.2f}ms host_write={host_upload_ms:.2f}ms "
+                        f"row_pitch={left_host._layout.rowPitch}",
+                        flush=True,
+                    )
         except Exception:
             glow_release = glow_metadata.get("_vulkan_glow_release")
             if callable(glow_release):
@@ -1318,13 +2182,23 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
             ready_timeline=None,
             metadata={
                 **dict(getattr(runtime_result, "debug_info", None) or {}),
+                **self._adapter_transfer_metadata(),
                 "vulkan_output_ring_slot": slot_index,
                 "vulkan_output_ring_size": self.ring_size,
                 "vulkan_output_sync": self.output_sync_mode,
                 "vulkan_external_semaphore_available": False,
                 "vulkan_external_semaphore_requested": False,
                 "vulkan_readback": "none",
-                "vulkan_output_path": "rocm_host_eye_staging",
+                "vulkan_output_path": (
+                    "cuda_registered_vulkan_host_memory"
+                    if self._force_host_staging
+                    and self._cuda_direct_host_transfer_enabled
+                    else (
+                        "cuda_host_eye_staging"
+                        if self._force_host_staging
+                        else "rocm_host_eye_staging"
+                    )
+                ),
                 "vulkan_output_image_direct": False,
                 "vulkan_gpu_to_cpu": True,
                 "vulkan_zero_cpu_readback": False,
@@ -1345,6 +2219,9 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
         )
 
     def convert(self, runtime_result, *, frame_id: int, timestamp: float):
+        left = getattr(runtime_result, "left_eye", None)
+        if not self._force_host_staging:
+            self._configure_adapter_transfer(left)
         if self._host_staging_enabled:
             return self._convert_host_staging(
                 runtime_result, frame_id=frame_id, timestamp=timestamp
@@ -1479,6 +2356,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
             ready_timeline=int(self._rocm_ready_timelines[int(frame_id)]),
             metadata={
                 **dict(getattr(runtime_result, "debug_info", None) or {}),
+                **self._adapter_transfer_metadata(),
                 "vulkan_output_ring_slot": slot_index,
                 "vulkan_output_ring_size": self.ring_size,
                 "vulkan_output_sync": (
@@ -1547,9 +2425,8 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
                 host_slots[eye].resource,
                 resource,
                 wait_semaphore=None,
-            )
-            self._transition_host_eye_to_sampling(
-                resource, signal_semaphore=visible.semaphore
+                destination_sampled=True,
+                signal_semaphore=visible.semaphore,
             )
             self._prepared_source_eyes.add((frame_key, eye))
             return visible.semaphore
@@ -1733,6 +2610,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
         self._host_frame_slots.clear()
         self._rocm_release_timelines = []
         self._rocm_ready_timelines.clear()
+        self._release_cuda_vulkan_host_mappings()
         super().close()
         for host_slots in self._host_eye_slots:
             for host in host_slots:
@@ -1748,6 +2626,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
                 except Exception:
                     pass
         self._eye_buffers = []
+        self._pinned_eye_buffers = None
 
 
 class VulkanHostOutputAdapter(GpuProducerAdapter):
@@ -1762,10 +2641,7 @@ class VulkanHostOutputAdapter(GpuProducerAdapter):
 
     def __init__(self, presenter):
         self.presenter = presenter
-        self.ring_size = max(2, int(os.environ.get("D2S_VULKAN_OUTPUT_RING_SIZE", "3")))
-        self.left_slots: list[VulkanHostImage] = []
-        self.right_slots: list[VulkanHostImage] = []
-        self._extent: tuple[int, int] | None = None
+        self._delegate = None
 
     @staticmethod
     def _tensor_to_rgba(tensor, *, width: int, height: int):
@@ -1805,81 +2681,16 @@ class VulkanHostOutputAdapter(GpuProducerAdapter):
         rgba[..., 3] = 255
         return np.ascontiguousarray(rgba)
 
-    def _ensure_slots(self, width: int, height: int) -> None:
-        extent = (int(width), int(height))
-        if self._extent == extent and self.left_slots and self.right_slots:
-            return
-        context = getattr(self.presenter, "vulkan", None)
-        if context is None:
-            raise RuntimeError("Presenter Vulkan context is unavailable")
-        context.wait_idle()
-        for slot in (*self.left_slots, *self.right_slots):
-            slot.close()
-        format_value = context.vk.VK_FORMAT_R8G8B8A8_UNORM
-        self.left_slots = [
-            VulkanHostImage(
-                context,
-                extent[0],
-                extent[1],
-                format=format_value,
-                label=f"runtime-vulkan-host-left-{index}",
-            )
-            for index in range(self.ring_size)
-        ]
-        self.right_slots = [
-            VulkanHostImage(
-                context,
-                extent[0],
-                extent[1],
-                format=format_value,
-                label=f"runtime-vulkan-host-right-{index}",
-            )
-            for index in range(self.ring_size)
-        ]
-        self._extent = extent
-
     def convert(self, runtime_result, *, frame_id: int, timestamp: float):
-        left = getattr(runtime_result, "left_eye", None)
-        right = getattr(runtime_result, "right_eye", None)
-        width, height = self._tensor_extent(left)
-        if self._tensor_extent(right) != (width, height):
-            raise ValueError("left/right runtime eye dimensions differ")
-        self._ensure_slots(width, height)
-        # The host image ring is reused only after the previous Vulkan copy has
-        # completed. This is slower than external semaphores but race-free.
-        wait_start = time.perf_counter()
-        self.presenter.vulkan.wait_idle()
-        wait_idle_ms = (time.perf_counter() - wait_start) * 1000.0
-        slot_index = int(frame_id) % self.ring_size
-        left_slot = self.left_slots[slot_index]
-        right_slot = self.right_slots[slot_index]
-        upload_start = time.perf_counter()
-        left_slot.upload(self._tensor_to_rgba(left, width=width, height=height))
-        right_slot.upload(self._tensor_to_rgba(right, width=width, height=height))
-        upload_ms = (time.perf_counter() - upload_start) * 1000.0
-        left_contract = self.source_image_contract(left_slot.resource)
-        right_contract = self.source_image_contract(right_slot.resource)
-        return VulkanStereoOutputFrame(
-            frame_id=frame_id,
-            timestamp=timestamp,
-            left_eye=left_slot.resource,
-            right_eye=right_slot.resource,
-            metadata={
-                **dict(getattr(runtime_result, "debug_info", None) or {}),
-                "vulkan_output_ring_slot": slot_index,
-                "vulkan_output_ring_size": self.ring_size,
-                "vulkan_output_sync": self.output_sync_mode,
-                "vulkan_output_wait_idle_ms": wait_idle_ms,
-                "vulkan_output_upload_ms": upload_ms,
-                "vulkan_output_path": "host_visible_vulkan_image",
-                "vulkan_source_layout_left": left_contract["layout"],
-                "vulkan_source_layout_right": right_contract["layout"],
-                "vulkan_source_queue_family_left": left_contract["queue_family"],
-                "vulkan_source_queue_family_right": right_contract["queue_family"],
-                "_vulkan_output_release": self.release_frame,
-            },
-            color_space="srgb",
-            image_origin="top_left",
+        if self._delegate is None:
+            # Host upload images are transfer sources, not sampled images.
+            # Use the ring-buffered transfer into sampled Vulkan images so
+            # OpenXR gets a valid source and avoids a device-wide idle wait.
+            self._delegate = RocmVulkanOutputAdapter(
+                self.presenter, force_host_staging=True
+            )
+        return self._delegate.convert(
+            runtime_result, frame_id=frame_id, timestamp=timestamp
         )
 
     @staticmethod
@@ -1897,17 +2708,15 @@ class VulkanHostOutputAdapter(GpuProducerAdapter):
         raise ValueError(f"Vulkan host output requires BCHW, HWC, or CHW tensor, got {shape}")
 
     def release_frame(self, frame_id: int) -> None:
-        return None
+        delegate = self._delegate
+        if delegate is not None:
+            delegate.release_frame(frame_id)
 
     def close(self) -> None:
-        context = getattr(self.presenter, "vulkan", None)
-        if context is not None:
-            context.wait_idle()
-        for slot in (*self.left_slots, *self.right_slots):
-            slot.close()
-        self.left_slots = []
-        self.right_slots = []
-        self._extent = None
+        delegate = self._delegate
+        self._delegate = None
+        if delegate is not None:
+            delegate.close()
 
 
 class VulkanZeroCopyOutputAdapter(CudaVulkanOutputAdapter):
@@ -2238,6 +3047,9 @@ class VulkanRuntimeOutputConsumer:
                     "runtime_output_import_errors",
                     last_error=f"{type(exc).__name__}: {exc}",
                 )
+                return None
+            if frame is None:
+                self.source_stat_inc("runtime_output_gpu_backpressure")
                 return None
             self._next_frame_id += 1
             self.source_stat_inc("runtime_output_gpu_copies")

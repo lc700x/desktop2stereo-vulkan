@@ -615,6 +615,64 @@ class GUIProcessMixin:
             calibration_button.disabled = running
             changed_controls.append(calibration_button)
         self._safe_update(*changed_controls)
+        self._refresh_openxr_controls_button()
+
+    def _set_openxr_controls_window_state(self, visible: bool) -> None:
+        self._openxr_controls_visible = bool(visible)
+
+    def _refresh_openxr_controls_button(self) -> None:
+        control = getattr(self, "openxr_controls_button", None)
+        if control is None:
+            return
+        is_openxr = getattr(self, "run_mode_key", "") == "OpenXR Link"
+        process = getattr(self, "process", None)
+        active = bool(
+            is_openxr
+            and process is not None
+            and getattr(process, "returncode", None) is None
+        )
+        changed = False
+        if control.visible != is_openxr:
+            control.visible = is_openxr
+            changed = True
+        should_disable = not active
+        if control.disabled != should_disable:
+            control.disabled = should_disable
+            changed = True
+        if not active:
+            self._openxr_controls_visible = False
+        if changed:
+            self._safe_update(control)
+
+    def open_openxr_controls(self, event=None) -> None:
+        process = getattr(self, "process", None)
+        request_path = getattr(self, "_openxr_controls_request_path", None)
+        if (
+            self.run_mode_key != "OpenXR Link"
+            or process is None
+            or process.returncode is not None
+            or not request_path
+        ):
+            self._refresh_openxr_controls_button()
+            return
+        revision = max(
+            time.monotonic_ns(),
+            int(getattr(self, "_openxr_controls_request_revision", 0)) + 1,
+        )
+        temporary_path = f"{request_path}.{process.pid}.{revision}.tmp"
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as request_file:
+                request_file.write(f"{process.pid}\n{revision}\n1\n")
+            os.replace(temporary_path, request_path)
+            self._openxr_controls_request_revision = revision
+            self._set_openxr_controls_window_state(True)
+        except OSError as exc:
+            logger.warning("Could not request OpenXR controls window: %s", exc)
+        finally:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
 
     def _stop_button_text(self):
         locale = getattr(self, "locale", "EN")
@@ -630,100 +688,6 @@ class GUIProcessMixin:
         if content.value != text:
             content.value = text
             self._safe_update(stop_btn)
-
-    def _show_display_refresh_warning(self, payload: dict) -> None:
-        if getattr(self, "_display_refresh_warning_dialog", None) is not None:
-            current = getattr(self, "_display_refresh_warning_payload", None)
-            pending = getattr(self, "_pending_display_refresh_warnings", None)
-            if pending is None:
-                pending = []
-                self._pending_display_refresh_warnings = pending
-            if payload != current and payload not in pending:
-                pending.append(dict(payload))
-            return
-        try:
-            refresh_hz = int(payload.get("refresh_hz", 0) or 0)
-            kind = str(payload.get("kind", "output") or "output")
-            if kind == "input_capture_target":
-                capture_target = int(payload.get("capture_target", 0) or 0)
-                if refresh_hz <= 0 or capture_target <= 0:
-                    return
-            else:
-                sbs_fps = float(payload.get("sbs_fps", 0.0) or 0.0)
-                if refresh_hz <= 0 or sbs_fps <= 0.0:
-                    return
-        except (TypeError, ValueError, AttributeError):
-            return
-        messages = UI_MESSAGES[self.locale]
-        if kind == "input_capture_target":
-            title = messages.get(
-                "Input display refresh warning",
-                "Input display refresh warning",
-            )
-            body = messages.get(
-                "input_refresh_warning_body",
-                "The input display is running at {refresh_hz} Hz, below the "
-                "dynamic capture target of {capture_target} FPS. Increase the "
-                "input display refresh rate or lower the capture target manually.",
-            ).format(
-                refresh_hz=refresh_hz,
-                capture_target=capture_target,
-            )
-        else:
-            title = messages.get(
-                "Display refresh warning",
-                "Display refresh warning",
-            )
-            body = messages.get(
-                "display_refresh_warning_body",
-                "The SBS output display is running at {refresh_hz} Hz, below the "
-                "measured {sbs_fps:.1f} FPS or the recommended 60 Hz minimum. "
-                "Increase the display refresh rate in Windows or the GPU control panel.",
-            ).format(refresh_hz=refresh_hz, sbs_fps=sbs_fps)
-        continuing = messages.get(
-            "display_refresh_warning_continuing",
-            "Desktop2Stereo will continue running; this warning does not stop output.",
-        )
-        self._display_refresh_warning_payload = dict(payload)
-        self._display_refresh_warning_dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Row(
-                [
-                    ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, color=ft.Colors.ORANGE),
-                    ft.Text(title),
-                ],
-                spacing=10,
-            ),
-            content=ft.Column(
-                [
-                    ft.Text(body, size=16, weight=ft.FontWeight.BOLD),
-                    ft.Text(continuing, color=ft.Colors.GREEN),
-                ],
-                width=520,
-                height=170,
-                spacing=16,
-            ),
-            actions=[
-                ft.Button(
-                    content=ft.Text(messages.get("Close", "Close")),
-                    on_click=self._close_display_refresh_warning,
-                )
-            ],
-        )
-        self.page.show_dialog(self._display_refresh_warning_dialog)
-
-    def _close_display_refresh_warning(self, _event=None) -> None:
-        if getattr(self, "_display_refresh_warning_dialog", None) is None:
-            return
-        try:
-            self.page.pop_dialog()
-        except Exception:
-            pass
-        self._display_refresh_warning_dialog = None
-        self._display_refresh_warning_payload = None
-        pending = getattr(self, "_pending_display_refresh_warnings", None) or []
-        if pending:
-            self._show_display_refresh_warning(pending.pop(0))
 
     def _stream_calibration_auto_enabled(self) -> bool:
         value = str(getattr(self.stream_calibration_mode_dd, "value", "") or "")
@@ -1594,14 +1558,39 @@ class GUIProcessMixin:
 
                 apply_macos_vulkan_env(child_env)
             child_env["D2S_STOP_REQUEST_FILE"] = STOP_REQUEST_FILE
+            self._openxr_controls_request_path = None
+            self._openxr_controls_visible = False
+            self._openxr_controls_request_revision = 0
+            self._moonlight_pairing_request_path = None
             calibration_requested = self._calibration_run_requested
             self._calibration_run_requested = False
             if calibration_requested:
                 child_env["D2S_STREAM_CALIBRATE"] = "1"
             if self.run_mode_key == "OpenXR Link":
+                request_token = f"{os.getpid()}-{time.time_ns()}"
+                request_path = os.path.join(
+                    LOG_DIR, f"openxr-controls-{request_token}.request"
+                )
+                self._openxr_controls_request_path = request_path
+                child_env["D2S_OPENXR_CONTROLS_REQUEST_FILE"] = request_path
                 child_env.setdefault("D2S_FPS_BREAKDOWN", "1")
                 child_env.setdefault("D2S_OPENXR_DEBUG", "1")
                 child_env.setdefault("D2S_OPENXR_ASYNC_EFFECTS", "0")
+            elif self.run_mode_key == "Moonlight Streamer" and OS_NAME == "Windows":
+                local_app_data = os.environ.get("LOCALAPPDATA")
+                state_dir = (
+                    local_app_data
+                    if local_app_data
+                    else os.path.join(os.path.expanduser("~"), "AppData", "Local")
+                )
+                state_dir = os.path.join(state_dir, "Desktop2Stereo", "Moonlight")
+                os.makedirs(state_dir, exist_ok=True)
+                request_token = f"{os.getpid()}-{time.time_ns()}"
+                request_path = os.path.join(
+                    state_dir, f"pairing-request-{request_token}.json"
+                )
+                self._moonlight_pairing_request_path = request_path
+                child_env["D2S_MOONLIGHT_PAIRING_REQUEST_FILE"] = request_path
             if OS_NAME == "Windows":
                 self.process = await asyncio.create_subprocess_exec(
                     *child_args,
@@ -1618,8 +1607,14 @@ class GUIProcessMixin:
                     start_new_session=True,
                     env=child_env,
                 )
+            self._refresh_openxr_controls_button()
+            self._sync_moonlight_button_state()
             self._diag(f"process started, pid={self.process.pid}, log={LOG_FILE}")
             asyncio.create_task(self._pump_child_output(self.process))
+            if self.run_mode_key == "Moonlight Streamer" and OS_NAME == "Windows":
+                asyncio.create_task(
+                    self._watch_moonlight_pairing_requests(self.process)
+                )
             self.set_status(UI_MESSAGES[self.locale]["Running"], key="Running")
             self.page.update()
             asyncio.create_task(self._monitor_process_task())
@@ -1672,6 +1667,25 @@ class GUIProcessMixin:
         text = str(line or "").strip()
         if not text:
             return
+        if text.startswith("[D2S_OPENXR_CONTROLS] visible="):
+            fields = dict(
+                item.split("=", 1)
+                for item in text.split()[1:]
+                if "=" in item
+            )
+            try:
+                revision = int(fields["revision"])
+            except (KeyError, ValueError):
+                return
+            if revision < int(getattr(self, "_openxr_controls_request_revision", 0)):
+                return
+            self._openxr_controls_request_revision = revision
+            value = fields.get("visible", "").strip().lower()
+            if value in {"1", "true", "yes", "on"}:
+                self._set_openxr_controls_window_state(True)
+            elif value in {"0", "false", "no", "off"}:
+                self._set_openxr_controls_window_state(False)
+            return
         if _MIGRAPHX_QUICK_TUNING_WARNING in text.casefold():
             return
         # Tk can emit this native panic while the runtime is exiting if a
@@ -1715,11 +1729,7 @@ class GUIProcessMixin:
         if text.startswith(_PROGRESS_PREFIX):
             child_logger.info(text)
         elif text.startswith(_DISPLAY_REFRESH_WARNING_PREFIX):
-            payload_text = text[len(_DISPLAY_REFRESH_WARNING_PREFIX):].strip()
-            try:
-                self._show_display_refresh_warning(json.loads(payload_text))
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                child_logger.warning("Invalid display refresh warning payload: %s", exc)
+            return
         elif text.startswith(_BACKEND_STATUS_PREFIX):
             payload_text = text[len(_BACKEND_STATUS_PREFIX):].strip()
             try:
@@ -1765,6 +1775,8 @@ class GUIProcessMixin:
             self._diag(f"finally: process is proc={self.process is proc}, returncode={proc.returncode}")
             if self.process is proc:
                 self.process = None
+            self._refresh_openxr_controls_button()
+            self._sync_moonlight_button_state()
             self._starting = False
             if self._calibration_active:
                 try:
@@ -2541,6 +2553,13 @@ class GUIProcessMixin:
                 pass
 
     def _on_key(self, e: ft.KeyboardEvent):
+        if (
+            getattr(self, "_moonlight_pair_dialog_open", False)
+            and getattr(e, "key", "") in {"Enter", "Return", "NumpadEnter"}
+            and str(getattr(self.moonlight_pin_tf, "value", "") or "").strip()
+        ):
+            self.submit_moonlight_pairing()
+            return
         if e.key != "Esc" or self._esc_stopped or OS_NAME == "Windows":
             return
         now = time.time()

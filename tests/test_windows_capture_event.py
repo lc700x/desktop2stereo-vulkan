@@ -1,10 +1,11 @@
+import ctypes
 import sys
 import threading
 import time
 import types
+from types import SimpleNamespace
 
 import pytest
-
 from capture import CaptureConfig, CapturedFrame, FrameCopyMode
 from capture.backends import windows_capture_event
 
@@ -34,7 +35,7 @@ def test_bundled_cuda_capture_patch_paces_before_transfer():
     now = [0.0]
     clock = types.SimpleNamespace(perf_counter=lambda: now[0], sleep=lambda delay: now.__setitem__(0, now[0] + delay))
     namespace = {"time": clock}
-    exec(patched, namespace)
+    exec(patched, namespace)  # noqa: S102 - execute the generated patch source under test.
     capture = namespace["Capture"](16)
     capture.start()
     assert capture.transfers == pytest.approx([0.0, 0.016, 0.032])
@@ -47,6 +48,87 @@ def test_bundled_cuda_capture_patch_rejects_unknown_source():
     patch = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/env_install/apply-wc-cuda-patches.py"))
     with pytest.raises(ValueError, match="Unsupported wc-cuda source layout"):
         patch["patched_source"]("class DifferentCapture: pass\n")
+
+
+def test_bundled_rocm_capture_patch_uses_each_hip_device_luid():
+    import runpy
+    from pathlib import Path
+
+    patch = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "src/env_install/apply-wc-rocm-patches.py")
+    )
+    source = '''class Capture:
+    def __init__(self, minimum_update_interval):
+        self._stream        = None
+    def start(self):
+        try:
+            while self._running:
+                res = self._inner.get_frame(self._last_id, timeout=0.1)
+        finally:
+            pass
+'''
+    patched = patch["patched_source"](source)
+    assert patch["patched_source"](patched) == patched
+
+    device_luids = ((0x1234, 5), (0x5678, 9))
+
+    class FakeHipLuid:
+        def __init__(self):
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, luid_ptr, mask_ptr, device_id):
+            low, high = device_luids[device_id]
+            packed = low.to_bytes(4, "little") + high.to_bytes(4, "little", signed=True)
+            ctypes.memmove(luid_ptr, packed, len(packed))
+            ctypes.cast(mask_ptr, ctypes.POINTER(ctypes.c_uint))[0] = 1
+            return 0
+
+    fake_luid = FakeHipLuid()
+    released = []
+    namespace = {
+        "ctypes": ctypes,
+        "_get_hip": lambda: SimpleNamespace(hipDeviceGetLuid=fake_luid),
+    }
+    exec(patched, namespace)  # noqa: S102 - execute the generated patch source under test.
+
+    assert namespace["get_luid"](0) == (0x1234, 5)
+    assert namespace["get_luid"](1) == (0x5678, 9)
+    assert released == []
+
+
+def test_bundled_rocm_capture_patch_returns_unknown_when_hip_identity_fails():
+    import runpy
+    from pathlib import Path
+
+    patch = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "src/env_install/apply-wc-rocm-patches.py")
+    )
+    source = '''class Capture:
+    def __init__(self, minimum_update_interval):
+        self._stream        = None
+    def start(self):
+        try:
+            while self._running:
+                res = self._inner.get_frame(self._last_id, timeout=0.1)
+        finally:
+            pass
+'''
+    patched = patch["patched_source"](source)
+    class FakeHipLuid:
+        argtypes = None
+        restype = None
+
+        def __call__(self, _luid_ptr, _mask_ptr, _device_id):
+            return 35
+
+    namespace = {
+        "ctypes": ctypes,
+        "_get_hip": lambda: SimpleNamespace(hipDeviceGetLuid=FakeHipLuid()),
+    }
+    exec(patched, namespace)  # noqa: S102 - execute the generated patch source under test.
+
+    assert namespace["get_luid"](0) == (0, 0)
 
 
 class FakeControl:
@@ -126,6 +208,8 @@ def _install_capture_module(monkeypatch, module_name):
     module.WindowsCapture = FakeWindowsCapture
     module.Frame = FakeFrame
     module.InternalCaptureControl = FakeControl
+    if module_name in {"wc_cuda", "wc_rocm"}:
+        module.get_luid = lambda _device_id=0: (0x1234, 0)
     monkeypatch.setitem(sys.modules, module_name, module)
     return module
 
@@ -152,6 +236,7 @@ def test_windows_capture_runner_uses_copy_or_clone_buffers(monkeypatch):
         CaptureConfig(
             os_name="Windows",
             capture_tool="WindowsCaptureCUDA",
+            device_id=1,
             capture_mode="Monitor",
             monitor_index=3,
             output_resolution=(3840, 2160),
@@ -173,6 +258,7 @@ def test_windows_capture_runner_uses_copy_or_clone_buffers(monkeypatch):
         "monitor_index": 3,
         "cursor_capture": True,
         "minimum_update_interval": 16,
+        "device_id": 1,
     }
     assert len(capture.handlers) == 2
 
@@ -484,6 +570,7 @@ def test_windows_capture_runner_marks_rocm_direct_device(monkeypatch):
         CaptureConfig(
             os_name="Windows",
             capture_tool="WindowsCaptureROCm",
+            device_id=1,
             capture_mode="Monitor",
             monitor_index=2,
             output_resolution=(1920, 1080),
@@ -509,6 +596,43 @@ def test_windows_capture_runner_marks_rocm_direct_device(monkeypatch):
     assert received[-1].frame_raw_device == "rocm"
     assert received[-1].metadata["zero_copy"] is True
     assert received[-1].metadata["resource_kind"] == "rocm_tensor"
+    assert received[-1].metadata["capture_adapter_luid"] == 0x1234
+    assert received[-1].metadata["capture_device_id"] == 1
+
+
+@pytest.mark.parametrize(
+    ("capture_tool", "module_name"),
+    [
+        ("WindowsCaptureCUDA", "wc_cuda"),
+        ("WindowsCaptureROCm", "wc_rocm"),
+    ],
+)
+def test_gpu_capture_unknown_adapter_falls_back_to_compatibility_capture(
+    monkeypatch, capture_tool, module_name
+):
+    gpu_capture = _install_capture_module(monkeypatch, module_name)
+    gpu_capture.get_luid = lambda _device_id=0: (0, 0)
+    compatibility = _install_capture_module(monkeypatch, "windows_capture")
+    monkeypatch.setattr(windows_capture_event, "_setup_dpi_awareness", lambda: None)
+    monkeypatch.setattr(
+        windows_capture_event.WindowsCaptureEventRunner,
+        "_start_keyboard_worker",
+        lambda self, _event: None,
+    )
+
+    runner = windows_capture_event.WindowsCaptureEventRunner(
+        CaptureConfig(capture_tool=capture_tool, capture_mode="Monitor", monitor_index=1)
+    )
+    shutdown_event = threading.Event()
+    runner.run(
+        shutdown_event=shutdown_event,
+        on_frame=lambda _frame: None,
+        on_error=lambda _exc: shutdown_event.set(),
+    )
+
+    assert runner.capture_tool == "WindowsCapture"
+    assert compatibility.WindowsCapture.last_instance is not None
+    assert gpu_capture.WindowsCapture.last_instance is None
 
 
 def test_windows_capture_cuda_source_fps_log_defaults_off(capsys):

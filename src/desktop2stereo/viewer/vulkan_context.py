@@ -1287,6 +1287,9 @@ class VulkanContext:
         source_rect: tuple[int, int, int, int] | None = None,
         destination_rect: tuple[int, int, int, int] | None = None,
         destination_host_readable: bool = False,
+        destination_sampled: bool = False,
+        signal_semaphore: Any | None = None,
+        signal_semaphore_value: int | None = None,
     ) -> int:
         """Copy one registered Vulkan image layer with optional scaling."""
 
@@ -1371,21 +1374,25 @@ class VulkanContext:
 
         source_stage = source_state.stage_mask or vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
         destination_stage = destination_state.stage_mask or vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-        final_destination_layout = (
-            vk.VK_IMAGE_LAYOUT_GENERAL
-            if destination_host_readable
-            else vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-        )
-        final_destination_access = (
-            vk.VK_ACCESS_HOST_READ_BIT
-            if destination_host_readable
-            else vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
-        )
-        final_destination_stage = (
-            vk.VK_PIPELINE_STAGE_HOST_BIT
-            if destination_host_readable
-            else vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-        )
+        if destination_host_readable and destination_sampled:
+            raise ValueError(
+                "destination_host_readable and destination_sampled are mutually exclusive"
+            )
+        if destination_host_readable:
+            final_destination_layout = vk.VK_IMAGE_LAYOUT_GENERAL
+            final_destination_access = vk.VK_ACCESS_HOST_READ_BIT
+            final_destination_stage = vk.VK_PIPELINE_STAGE_HOST_BIT
+        elif destination_sampled:
+            final_destination_layout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+            final_destination_access = vk.VK_ACCESS_SHADER_READ_BIT
+            final_destination_stage = (
+                vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                | vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+            )
+        else:
+            final_destination_layout = vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+            final_destination_access = vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+            final_destination_stage = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
 
         def record(command_buffer: Any) -> None:
             to_transfer = [
@@ -1539,6 +1546,8 @@ class VulkanContext:
             wait_for_timeline=wait_for_timeline,
             wait_semaphore=wait_semaphore,
             wait_semaphore_value=wait_semaphore_value,
+            signal_semaphore=signal_semaphore,
+            signal_semaphore_value=signal_semaphore_value,
         )
         self._image_states.update(
             destination_key,

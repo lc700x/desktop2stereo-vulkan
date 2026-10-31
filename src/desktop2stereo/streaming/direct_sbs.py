@@ -379,12 +379,20 @@ class RuntimeSbsRgbConverter:
         # Determine source size before any conversion for aspect handling
         # image may be [1,3,H,W] or [H,W,3] or [3,H,W]
         def _hw_of(t):
+            channel_sizes = (1, 3, 4)
+            is_tensor = callable(getattr(t, "detach", None))
             if t.ndim == 4:
-                if int(t.shape[-1]) in (1, 3, 4):
+                if int(t.shape[1]) in channel_sizes and (
+                    is_tensor or int(t.shape[-1]) not in channel_sizes
+                ):
+                    return int(t.shape[-2]), int(t.shape[-1])  # B,C,H,W
+                if int(t.shape[-1]) in channel_sizes:
                     return int(t.shape[-3]), int(t.shape[-2])  # B,H,W,C
                 return int(t.shape[-2]), int(t.shape[-1])  # B,C,H,W
             if t.ndim == 3:
-                if int(t.shape[0]) in (1, 3, 4) and int(t.shape[-1]) not in (1, 3, 4):
+                if int(t.shape[0]) in channel_sizes and (
+                    is_tensor or int(t.shape[-1]) not in channel_sizes
+                ):
                     return int(t.shape[-2]), int(t.shape[-1])  # C,H,W
                 return int(t.shape[0]), int(t.shape[1])  # H,W,C
             return 0, 0
@@ -705,6 +713,27 @@ class DirectSbsOutputConsumer:
             try:
                 runtime_result, _capture_timestamp = item
                 self._fps_sbs_frames += 1
+                submit_runtime_result = getattr(
+                    self.output, "submit_runtime_result", None
+                )
+                if callable(submit_runtime_result):
+                    submit_started = self._clock()
+                    submit_runtime_result(
+                        runtime_result,
+                        capture_timestamp=float(
+                            getattr(
+                                runtime_result,
+                                "capture_timestamp",
+                                _capture_timestamp,
+                            )
+                        ),
+                    )
+                    self._fps_submit_seconds += self._clock() - submit_started
+                    self._fps_submitted_frames += 1
+                    self.source_stat_inc("runtime_output_frames")
+                    self.source_stat_inc("network_stream_frames")
+                    self._report_fps_if_due()
+                    continue
                 native_stream_frame = getattr(runtime_result, "native_stream_frame", None)
                 prepare_calibration = getattr(
                     self.output, "prepare_calibration_source", None

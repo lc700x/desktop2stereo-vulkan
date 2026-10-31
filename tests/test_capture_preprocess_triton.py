@@ -65,6 +65,16 @@ def test_triton_preprocess_preserves_pixels_without_scaling(channels):
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.skipif(torch.version.cuda is None, reason="NVIDIA CUDA required")
+def test_triton_preprocess_same_size_bgra_matches_reference_exactly():
+    frame = torch.randint(0, 256, (37, 53, 4), device="cuda", dtype=torch.uint8)
+
+    actual = bgr_to_rgb_resize_norm(frame, 37, 53)
+    expected = _torch_bilinear_reference(frame, 37, 53)
+
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("channels", [3, 4])
 @pytest.mark.parametrize("out_size", [(4, 5), (6, 7)])
 def test_triton_preprocess_matches_area_filter_when_downscaling(channels, out_size):

@@ -350,7 +350,6 @@ def test_every_stream_parameter_control_has_an_explanatory_tooltip() -> None:
     localization = (APP_ROOT / "gui" / "localization.py").read_text(encoding="utf-8")
     handlers = HANDLERS_SOURCE.read_text(encoding="utf-8")
     tooltip_bindings = {
-        "stream_settings_cb": "tooltip_stream_settings",
         "stream_url_tf": "tooltip_stream_url",
         "preview_btn": "tooltip_stream_preview",
         "stream_port_tf": "tooltip_stream_port",
@@ -412,29 +411,22 @@ def test_advanced_sections_refit_native_window_height() -> None:
     assert expected in source[stereo_start:stereo_end]
 
 
-def test_stream_settings_checkbox_controls_stream_parameter_panel() -> None:
+def test_stream_parameters_show_automatically_for_streaming_modes() -> None:
     builders = BUILDERS_SOURCE.read_text(encoding="utf-8")
     handlers = HANDLERS_SOURCE.read_text(encoding="utf-8")
-    run_row_start = builders.index("self.row7a = ft.Row(")
-    run_row_end = builders.index("self.xr_headset_row = ft.Row(", run_row_start)
-    run_row = builders[run_row_start:run_row_end]
-    mode_change_start = handlers.index("def on_run_mode_change")
-    toggle_start = handlers.index("def on_stream_settings_change", mode_change_start)
-    advanced_start = handlers.index("def on_advanced_device_change", toggle_start)
-    mode_change = handlers[mode_change_start:toggle_start]
-    toggle = handlers[toggle_start:advanced_start]
     visibility_start = handlers.index("def _sync_visibility(self):")
     visibility_end = handlers.index("def ", visibility_start + 4)
     visibility = handlers[visibility_start:visibility_end]
+    row_map_start = builders.index("def _get_streamer_row_map")
+    row_map_end = builders.index("# ── data population ──", row_map_start)
+    row_map = builders[row_map_start:row_map_end]
 
-    assert run_row.index("self.run_mode_dd") < run_row.index("self.stream_settings_cb")
-    assert 'label="Stream Settings"' in builders
-    assert 'value=False' in builders
-    assert "self.stream_settings_cb.value = False" in mode_change
-    assert "self.stream_settings_cb.visible = is_streamer" in visibility
-    assert "self.stream_settings_cb.value" in visibility
-    assert "self._show_streamer_rows(*row_indices)" in toggle
-    assert "resize_window=True" in toggle
+    assert "stream_settings_cb" not in builders
+    assert "stream_settings_cb" not in handlers
+    assert "on_stream_settings_change" not in handlers
+    assert "row_indices = row_map.get(mode, []) if is_streamer else []" in visibility
+    assert "self._show_streamer_rows(*row_indices)" in visibility
+    assert '"Moonlight Streamer": []' in row_map
 
 
 def test_reset_defaults_refits_window_to_left_gui_content() -> None:

@@ -31,7 +31,7 @@ def target_fps_setting_key(raw_run_mode: str) -> str:
     """Return the FPS setting owned by the selected run mode."""
     return (
         "Stream Target FPS"
-        if normalize_run_mode(raw_run_mode) == "RTMP Streamer"
+        if normalize_run_mode(raw_run_mode) in {"RTMP Streamer", "Moonlight Streamer"}
         else "Target FPS"
     )
 
@@ -72,6 +72,9 @@ def resolve_run_mode(
         stream_mode = "RTMP"
         if os_name == "Windows":
             resolved_lossless_scaling = lossless_scaling_support
+    elif raw_run_mode == "Moonlight Streamer" and os_name == "Windows":
+        run_mode = "Viewer"
+        stream_mode = "MOONLIGHT"
     elif raw_run_mode == "OpenXR Link":
         run_mode = "OpenXR"
     else:

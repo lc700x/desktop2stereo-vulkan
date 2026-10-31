@@ -233,12 +233,15 @@ class VulkanStorageBuffer:
         return int.from_bytes(self.read_bytes(4), "little")
 
     def write_bytes(self, payload: bytes | bytearray | memoryview, *, offset: int = 0) -> None:
-        data = bytes(payload)
+        data = memoryview(payload)
+        if not data.c_contiguous:
+            data = memoryview(bytes(data))
+        data = data.cast("B")
         start = int(offset)
-        if start < 0 or start + len(data) > self.size:
+        if start < 0 or start + data.nbytes > self.size:
             raise ValueError("storage buffer write exceeds buffer bounds")
         mapped = self.vk.vkMapMemory(self.context.device, self.memory, 0, self.size, 0)
-        mapped[start : start + len(data)] = data
+        mapped[start : start + data.nbytes] = data
         self.vk.vkUnmapMemory(self.context.device, self.memory)
 
     def read_bytes(self, size: int | None = None, *, offset: int = 0) -> bytes:

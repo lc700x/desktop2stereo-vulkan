@@ -280,6 +280,51 @@ def test_null_backend_placeholders_do_not_request_rebuild_against_auto_config():
     assert snapshot.classify() is not SnapshotChangeClass.PIPELINE_REBUILD
 
 
+def test_hot_reload_ignores_migraphx_flag_on_cuda(monkeypatch):
+    import sys
+
+    fake_torch = SimpleNamespace(
+        version=SimpleNamespace(hip=None),
+        device=lambda value: SimpleNamespace(type=str(value).split(":", 1)[0]),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    config = make_config(depth_backend="auto", device="cuda:0")
+
+    values = hot_reload_value_snapshot({"MIGraphX": True}, config)
+
+    assert "depth_backend" not in values
+
+
+def test_hot_reload_ignores_tensorrt_flag_on_rocm(monkeypatch):
+    import sys
+
+    fake_torch = SimpleNamespace(
+        version=SimpleNamespace(hip="7.0"),
+        device=lambda value: SimpleNamespace(type=str(value).split(":", 1)[0]),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    config = make_config(depth_backend="pytorch_rocm", device="cuda:0")
+
+    values = hot_reload_value_snapshot({"TensorRT": True}, config)
+
+    assert "depth_backend" not in values
+
+
+def test_hot_reload_ignores_migraphx_and_tensorrt_flags_on_mps(monkeypatch):
+    import sys
+
+    fake_torch = SimpleNamespace(
+        version=SimpleNamespace(hip=None),
+        device=lambda value: SimpleNamespace(type=str(value).split(":", 1)[0]),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    config = make_config(depth_backend="auto", device="mps")
+
+    values = hot_reload_value_snapshot({"MIGraphX": True, "TensorRT": True}, config)
+
+    assert "depth_backend" not in values
+
+
 def test_hot_reload_ignores_run_mode_as_runtime_quality_mode():
     config = make_config(mode="movie")
 

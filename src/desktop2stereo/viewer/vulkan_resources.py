@@ -568,13 +568,16 @@ class VulkanHostImage:
             row_pitch = int(self._layout.rowPitch)
             row_bytes = self.width * 4
             start = int(self._layout.offset)
+            source = memoryview(pixels).cast("B")
             if row_pitch == row_bytes:
-                mapped[start:start + row_bytes * self.height] = pixels.tobytes()
+                mapped[start:start + row_bytes * self.height] = source
             else:
                 for row in range(self.height):
-                    mapped[start + row * row_pitch:start + row * row_pitch + row_bytes] = (
-                        pixels[row].tobytes()
-                    )
+                    source_start = row * row_bytes
+                    mapped_start = start + row * row_pitch
+                    mapped[mapped_start:mapped_start + row_bytes] = source[
+                        source_start:source_start + row_bytes
+                    ]
         finally:
             vk.vkUnmapMemory(self.context.device, self.memory)
 
@@ -1225,6 +1228,191 @@ class VulkanExportableImage:
         self.allocation_size = 0
 
     def __enter__(self) -> "VulkanExportableImage":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
+class VulkanD3D12ImportedImage:
+    """Import an AMD-local D3D12 texture into the selected Vulkan device."""
+
+    def __init__(
+        self,
+        context: Any,
+        width: int,
+        height: int,
+        shared_handle: int,
+        *,
+        adapter_luid: int,
+        label: str = "d3d12-imported-rgba8-srgb",
+    ) -> None:
+        if os.name != "nt":
+            raise RuntimeError("D3D12 Vulkan import is only available on Windows")
+        if int(shared_handle) == 0:
+            raise ValueError("D3D12 shared resource handle is required")
+        if int(adapter_luid) == 0:
+            raise RuntimeError("D3D12 adapter LUID is required for Vulkan import")
+        context_luid = int(getattr(getattr(context, "device_info", None), "adapter_luid", 0))
+        if context_luid == 0:
+            raise RuntimeError("Vulkan adapter LUID is unavailable; refusing cross-device import")
+        if context_luid != int(adapter_luid):
+            raise RuntimeError("D3D12 and Vulkan adapter LUIDs do not match")
+        self.context = context
+        self.vk = context.vk
+        self.width = int(width)
+        self.height = int(height)
+        self.label = str(label)
+        self.shared_handle = int(shared_handle)
+        self._owns_shared_handle = True
+        self.image = None
+        self.memory = None
+        self.view = None
+        self.resource: VulkanImageResource | None = None
+        self._create()
+
+    def _create(self) -> None:
+        vk = self.vk
+        required = (
+            "VkExternalMemoryImageCreateInfo",
+            "VkImportMemoryWin32HandleInfoKHR",
+            "VkMemoryDedicatedAllocateInfo",
+            "VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT",
+        )
+        missing = [name for name in required if not hasattr(vk, name)]
+        if missing:
+            raise RuntimeError(
+                "Vulkan binding lacks D3D12 resource import support: "
+                + ", ".join(missing)
+            )
+        handle_type = int(vk.VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT)
+        pixel_format = int(vk.VK_FORMAT_R8G8B8A8_SRGB)
+        external_image = vk.VkExternalMemoryImageCreateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            handleTypes=handle_type,
+        )
+        self.image = vk.vkCreateImage(
+            self.context.device,
+            vk.VkImageCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                pNext=external_image,
+                imageType=vk.VK_IMAGE_TYPE_2D,
+                format=pixel_format,
+                extent=vk.VkExtent3D(width=self.width, height=self.height, depth=1),
+                mipLevels=1,
+                arrayLayers=1,
+                samples=vk.VK_SAMPLE_COUNT_1_BIT,
+                tiling=vk.VK_IMAGE_TILING_OPTIMAL,
+                usage=(
+                    vk.VK_IMAGE_USAGE_SAMPLED_BIT
+                    | vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                    | vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                ),
+                sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+                initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+            ),
+            None,
+        )
+        try:
+            requirements = vk.vkGetImageMemoryRequirements(self.context.device, self.image)
+            properties = vk.vkGetPhysicalDeviceMemoryProperties(self.context.physical_device)
+            memory_type = next(
+                (
+                    index
+                    for index, item in enumerate(properties.memoryTypes)
+                    if requirements.memoryTypeBits & (1 << index)
+                    and item.propertyFlags & vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+                ),
+                None,
+            )
+            if memory_type is None:
+                raise RuntimeError("no compatible memory type for D3D12 texture import")
+            dedicated = vk.VkMemoryDedicatedAllocateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+                image=self.image,
+            )
+            import_info = vk.VkImportMemoryWin32HandleInfoKHR(
+                sType=vk.VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+                pNext=dedicated,
+                handle=self.shared_handle,
+                handleType=handle_type,
+            )
+            self.memory = vk.vkAllocateMemory(
+                self.context.device,
+                vk.VkMemoryAllocateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                    pNext=import_info,
+                    allocationSize=requirements.size,
+                    memoryTypeIndex=memory_type,
+                ),
+                None,
+            )
+            self._owns_shared_handle = False
+            vk.vkBindImageMemory(self.context.device, self.image, self.memory, 0)
+            self.view = vk.vkCreateImageView(
+                self.context.device,
+                vk.VkImageViewCreateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                    image=self.image,
+                    viewType=vk.VK_IMAGE_VIEW_TYPE_2D,
+                    format=pixel_format,
+                    subresourceRange=vk.VkImageSubresourceRange(
+                        aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                        baseMipLevel=0,
+                        levelCount=1,
+                        baseArrayLayer=0,
+                        layerCount=1,
+                    ),
+                ),
+                None,
+            )
+            self.resource = VulkanImageResource(
+                context=self.context,
+                image=self.image,
+                view=self.view,
+                width=self.width,
+                height=self.height,
+                format=pixel_format,
+                layout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+                access_mask=0,
+                stage_mask=0,
+                queue_family_index=self.context.queue_family_index,
+                external=True,
+                label=self.label,
+                external_memory_handle=self.shared_handle,
+                external_memory_handle_type=handle_type,
+                allocation_size=int(requirements.size),
+                adapter_luid=int(getattr(self.context.device_info, "adapter_luid", 0)),
+                adapter_vendor_id=int(getattr(self.context.device_info, "vendor_id", 0)),
+                adapter_device_id=int(getattr(self.context.device_info, "device_id", 0)),
+            )
+            self.context.register_external_image(self.resource)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self.resource is not None:
+            try:
+                self.context.unregister_external_image(self.resource)
+            except Exception:
+                pass
+        if getattr(self.context, "device", None) is not None:
+            if self.view is not None:
+                self.vk.vkDestroyImageView(self.context.device, self.view, None)
+            if self.image is not None:
+                self.vk.vkDestroyImage(self.context.device, self.image, None)
+            if self.memory is not None:
+                self.vk.vkFreeMemory(self.context.device, self.memory, None)
+        if self._owns_shared_handle and self.shared_handle:
+            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(self.shared_handle))
+        self._owns_shared_handle = False
+        self.resource = None
+        self.view = None
+        self.image = None
+        self.memory = None
+
+    def __enter__(self) -> "VulkanD3D12ImportedImage":
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:

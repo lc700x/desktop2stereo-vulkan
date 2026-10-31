@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="auto">
+
+<head>
+  <!-- TEMPLATE_HEADER - Used by Every UI Page -->
+<meta charset="UTF-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sunshine</title>
+<link rel="icon" type="image/x-icon" href="./images/sunshine.ico">
+
+  <script type="module" crossorigin src="./assets/pin-BeRaTpxk.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/logo-sunshine-45-jSIapha2.js">
+  <link rel="modulepreload" crossorigin href="./assets/Notification-CkJkKBnN.js">
+  <link rel="modulepreload" crossorigin href="./assets/Navbar-Dibp9hT2.js">
+  <link rel="modulepreload" crossorigin href="./assets/monitor-BeD3xYpa.js">
+  <link rel="modulepreload" crossorigin href="./assets/x-jwKGGgAH.js">
+  <link rel="modulepreload" crossorigin href="./assets/fetch_utils-COCp1DR8.js">
+  <link rel="stylesheet" crossorigin href="./assets/logo-sunshine-45-2HJRdqau.css">
+  <link rel="stylesheet" crossorigin href="./assets/Notification-DmToSpaP.css">
+  <link rel="stylesheet" crossorigin href="./assets/Navbar-SNHnNuEx.css">
+</head>
+
+<body id="app" v-cloak>
+  <Navbar></Navbar>
+  <div id="content" class="container">
+    <h1 class="my-4 text-center">{{ $t('pin.pin_pairing') }}</h1>
+    <form class="form d-flex flex-column align-items-center" id="form" @submit.prevent="registerDevice">
+      <div class="card flex-column d-flex p-4 mb-4">
+        <div class="input-group mt-2">
+          <span class="input-group-text">
+            <user-round-search :size="18" class="icon"></user-round-search>
+          </span>
+          <select v-model="selectedPairingId" class="form-select" id="pairing-input" required>
+            <option disabled value="">
+              {{ pendingPairings.length ? $t('pin.select_pairing') : $t('pin.no_pending_pairings') }}
+            </option>
+            <option v-for="pairing in pendingPairings" :key="pairing.id" :value="pairing.id">
+              {{ pairing.name || $t('pin.unknown_device') }} — {{ pairing.address || $t('pin.unknown_address') }}
+            </option>
+          </select>
+          <button
+            type="button"
+            class="btn btn-outline-danger"
+            :disabled="!selectedPairingId"
+            :title="$t('pin.cancel_pairing')"
+            @click="cancelSelectedPairing"
+          >
+            <x :size="18" class="icon"></x>
+          </button>
+        </div>
+        <div class="input-group mt-2">
+          <span class="input-group-text">
+            <hash :size="18" class="icon"></hash>
+          </span>
+          <input v-model="pin" type="text" pattern="\d{4}" maxlength="4" inputmode="numeric" :placeholder="`${$t('navbar.pin')}`" autofocus id="pin-input" class="form-control" required />
+        </div>
+        <div class="input-group my-4">
+          <span class="input-group-text">
+            <monitor :size="18" class="icon"></monitor>
+          </span>
+          <input v-model="name" type="text" :placeholder="`${$t('pin.device_name')}`" id="name-input" class="form-control" required />
+        </div>
+        <button class="btn btn-primary">
+          <forward :size="18" class="icon"></forward>
+          {{ $t('pin.send') }}
+        </button>
+      </div>
+      <div class="alert alert-warning">
+        <b>{{ $t('_common.warning') }}</b> {{ $t('pin.warning_msg') }}
+      </div>
+      <div v-if="status" :class="`alert alert-${status.type}`" role="alert">{{ status.message }}</div>
+    </form>
+  </div>
+</body>
+

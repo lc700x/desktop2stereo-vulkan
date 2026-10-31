@@ -154,11 +154,11 @@ def test_display_fit_feature_is_enabled_by_default() -> None:
 
 
 def test_local_viewer_selects_inference_adapter_even_if_enumerated_later() -> None:
-    nvidia = (object(), "NVIDIA GeForce RTX 2070", 0)
-    amd = (object(), "AMD Radeon RX 9060 XT", 1)
+    nvidia = (object(), "NVIDIA GeForce RTX 2070", 0, 0x100)
+    amd = (object(), "AMD Radeon RX 9060 XT", 1, 0x200)
 
     selected, interop_allowed = _choose_present_device_candidate(
-        [nvidia, amd], "AMD Radeon RX 9060 XT"
+        [nvidia, amd], "AMD Radeon RX 9060 XT", 0x200
     )
 
     assert selected is amd
@@ -166,13 +166,36 @@ def test_local_viewer_selects_inference_adapter_even_if_enumerated_later() -> No
 
 
 def test_local_viewer_disables_interop_if_preferred_adapter_cannot_present() -> None:
-    nvidia = (object(), "NVIDIA GeForce RTX 2070", 0)
+    nvidia = (object(), "NVIDIA GeForce RTX 2070", 0, 0x100)
 
     selected, interop_allowed = _choose_present_device_candidate(
-        [nvidia], "AMD Radeon RX 9060 XT"
+        [nvidia], "AMD Radeon RX 9060 XT", 0x200
     )
 
     assert selected is nvidia
+    assert not interop_allowed
+
+
+def test_local_viewer_uses_luid_when_gpu_names_are_identical() -> None:
+    first = (object(), "AMD Radeon RX 9060 XT", 0, 0x100)
+    second = (object(), "AMD Radeon RX 9060 XT", 1, 0x200)
+
+    selected, interop_allowed = _choose_present_device_candidate(
+        [first, second], "AMD Radeon RX 9060 XT", 0x200
+    )
+
+    assert selected is second
+    assert interop_allowed
+
+
+def test_local_viewer_disables_interop_when_inference_luid_is_unknown() -> None:
+    amd = (object(), "AMD Radeon RX 9060 XT", 0, 0x200)
+
+    selected, interop_allowed = _choose_present_device_candidate(
+        [amd], "AMD Radeon RX 9060 XT"
+    )
+
+    assert selected is amd
     assert not interop_allowed
 
 
@@ -694,9 +717,8 @@ def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync, 
     run_vulkan_local_viewer(runtime_q=FrameQueue(), shutdown_event=shutdown,
                             config=VulkanLocalViewerConfig(vsync=vsync))
 
-    assert timeouts == pytest.approx(
-        [.05, .002 if packer and not vsync else 0.0]
-    )
+    handoff_timeout = 1.0 / 60 if vsync else .002 if packer else 0.0
+    assert timeouts == pytest.approx([.05, handoff_timeout])
     if vsync:
         assert waits == []
     else:
@@ -925,7 +947,12 @@ def test_gpu_fence_timeout_does_not_reuse_pending_commands(monkeypatch, throws) 
         VK_SUCCESS=0, VK_TIMEOUT=2, VkTimeout=VkTimeout, vkWaitForFences=wait,
     )
     source = local_viewer_module._TransferSource.__new__(local_viewer_module._TransferSource)
-    source.owner = SimpleNamespace(vk=vk, device=object(), fence=object())
+    source.owner = SimpleNamespace(
+        vk=vk,
+        device=object(),
+        fence=object(),
+        config=SimpleNamespace(vsync=False),
+    )
     monkeypatch.setattr(local_viewer_module.sys, "platform", "darwin")
 
     assert source.present(None, reuse=True) is False
@@ -949,6 +976,7 @@ def test_image_acquire_timeout_does_not_reset_submission_fence(monkeypatch, resu
     source.owner = SimpleNamespace(
         vk=vk, device=object(), fence=object(), _source=None, _direct_sources=[],
         _device_function=lambda *a: acquire, swapchain=object(), image_available=object(),
+        config=SimpleNamespace(vsync=False),
     )
     monkeypatch.setattr(local_viewer_module.sys, "platform", "darwin")
 

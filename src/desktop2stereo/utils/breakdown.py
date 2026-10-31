@@ -66,6 +66,8 @@ LATEST_KEYS = {
     "parallel_inference_dropped",
     "openxr_vulkan_projection_quality_chain_requested",
     "openxr_vulkan_projection_quality_chain_active",
+    "sys_gpu",
+    "sys_gpu_max",
 }
 
 
@@ -99,15 +101,10 @@ _TIMING_SAMPLE_NAMES = {
 
 
 def fps_breakdown_default(settings: dict, run_mode: str) -> str:
-    """Default detailed FPS logs on for an FPS-enabled Local Viewer run."""
+    """Keep verbose stage logs opt-in across run modes."""
     if "D2S_OPENXR_DEBUG" in os.environ:
         return os.environ["D2S_OPENXR_DEBUG"]
-    selected_mode = str(settings.get("Run Mode", "")).strip().casefold()
-    show_fps = settings.get("Show FPS", False)
-    if not isinstance(show_fps, bool):
-        show_fps = str(show_fps).strip().casefold() in {"1", "true", "yes", "on"}
-    enabled = run_mode == "Viewer" and selected_mode == "local viewer" and show_fps
-    return "1" if enabled else "0"
+    return "0"
 
 
 def _percentile(values: tuple[float, ...], quantile: float) -> float:
@@ -358,6 +355,9 @@ class FPSBreakdown:
         elapsed = now - self.last_log
         if elapsed < self.log_delay:
             return
+        from utils.gc_tuning import take_pause_snapshot
+
+        gc_snapshot = take_pause_snapshot()
         with self.lock:
             self.log_count += 1
             stats = dict(self.stats)
@@ -404,6 +404,11 @@ class FPSBreakdown:
                 stats.get("openxr_vulkan_projection_quality_chain_requested", False),
             )
         )
+        gpu_fields = ""
+        if isinstance(stats.get("sys_gpu"), (int, float)):
+            gpu_fields += f"sys_gpu={float(stats['sys_gpu']):.0f} "
+        if isinstance(stats.get("sys_gpu_max"), (int, float)):
+            gpu_fields += f"sys_gpu_max={float(stats['sys_gpu_max']):.0f} "
 
         print(
             "[FPSBreakdown] "
@@ -724,6 +729,12 @@ class FPSBreakdown:
             f"rt_fused_temporal_bypass={stats.get('rt_fast_plus_fused_temporal_bypass', 'n/a')} "
             f"openxr_async_ok={int(async_validation.passed)} "
             f"openxr_async_missing={async_missing} "
-            f"openxr_async_failed={async_failed}",
+            f"openxr_async_failed={async_failed} "
+            f"{gpu_fields}"
+            f"gc_last={float(gc_snapshot['last_ms']):.2f}ms/"
+            f"gen{int(gc_snapshot['last_generation'])} "
+            f"gc_window={int(gc_snapshot['count'])}/"
+            f"{float(gc_snapshot['total_ms']):.2f}ms "
+            f"gc_max={float(gc_snapshot['max_ms']):.2f}ms",
             flush=True,
         )

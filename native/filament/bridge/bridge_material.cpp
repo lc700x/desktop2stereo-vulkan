@@ -566,8 +566,11 @@ int bridge_material_set_passthrough_backdrop(
     for (auto& eye : bridge->eyes) {
         if (!eye.renderer) continue;
         filament::Renderer::ClearOptions clear_options;
+        // Store the requested sRGB chroma key RGB (0, 153, 51) as linear
+        // clear values for the OpenXR sRGB swapchain.
         clear_options.clearColor = active
-                ? filament::math::float4{0.0f, 0.6f, 0.2f, 1.0f}
+                ? filament::math::float4{
+                        0.0f, 0.31854678f, 0.03310477f, 1.0f}
                 : filament::math::float4{0.0f, 0.0f, 0.0f, 1.0f};
         clear_options.clear = true;
         clear_options.discard = true;

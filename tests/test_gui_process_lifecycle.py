@@ -67,6 +67,49 @@ def test_graceful_stop_timeout_allows_runtime_cleanup():
     assert gui_process._GRACEFUL_PROCESS_STOP_TIMEOUT_S >= 8.0
 
 
+def test_openxr_controls_button_opens_window_request(tmp_path):
+    class Harness(gui_process.GUIProcessMixin):
+        def _safe_update(self, *_controls):
+            pass
+
+    request_path = tmp_path / "openxr-controls.request"
+    gui = Harness()
+    gui.run_mode_key = "OpenXR Link"
+    gui.process = SimpleNamespace(pid=4321, returncode=None)
+    gui._openxr_controls_request_path = str(request_path)
+    gui._openxr_controls_visible = False
+    gui.openxr_controls_button = SimpleNamespace(disabled=False, visible=True)
+
+    for _ in range(3):
+        gui.open_openxr_controls()
+
+    request_pid, request_revision, request_visible = request_path.read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert request_pid == "4321"
+    assert int(request_revision) > 0
+    assert request_visible == "1"
+    assert gui._openxr_controls_request_revision == int(request_revision)
+    assert gui._openxr_controls_visible is True
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_openxr_controls_ignores_stale_window_acknowledgements():
+    class Harness(gui_process.GUIProcessMixin):
+        def _safe_update(self, *_controls):
+            pass
+
+    gui = Harness()
+    gui._openxr_controls_request_revision = 42
+    gui._openxr_controls_visible = False
+
+    gui._log_child_line("[D2S_OPENXR_CONTROLS] visible=1 revision=41")
+    assert gui._openxr_controls_visible is False
+
+    gui._log_child_line("[D2S_OPENXR_CONTROLS] visible=1 revision=42")
+    assert gui._openxr_controls_visible is True
+
+
 def test_run_completion_flags_preserve_runtime_glow_selection(tmp_path):
     settings_path = tmp_path / "settings.yaml"
     settings_path.write_text(
@@ -307,87 +350,17 @@ def test_page_close_applies_completed_calibration_before_stopping(monkeypatch, t
     assert events == ["apply", "stop"]
 
 
-def test_display_refresh_warning_uses_non_stopping_modal_dialog():
-    shown = []
-    popped = []
-
+def test_display_refresh_warning_payloads_are_suppressed():
     class Harness(gui_process.GUIProcessMixin):
-        pass
+        def _show_display_refresh_warning(self, _payload):
+            pytest.fail("display refresh warnings must not open modal dialogs")
 
     gui = Harness()
-    gui.locale = "CN"
-    gui.page = SimpleNamespace(
-        show_dialog=lambda dialog: shown.append(dialog),
-        pop_dialog=lambda: popped.append(True),
-    )
-    gui._display_refresh_warning_dialog = None
-
-    gui._show_display_refresh_warning({"refresh_hz": 30, "sbs_fps": 58.2})
-    gui._show_display_refresh_warning({"refresh_hz": 30, "sbs_fps": 58.2})
-
-    assert len(shown) == 1
-    assert shown[0].modal is True
-    assert "30 Hz" in shown[0].content.controls[0].value
-    assert "继续运行" in shown[0].content.controls[1].value
-
-    gui._close_display_refresh_warning()
-    assert popped == [True]
-    assert gui._display_refresh_warning_dialog is None
-
-
-def test_input_refresh_warning_is_queued_behind_output_warning():
-    shown = []
-    popped = []
-
-    class Harness(gui_process.GUIProcessMixin):
-        pass
-
-    gui = Harness()
-    gui.locale = "CN"
-    gui.page = SimpleNamespace(
-        show_dialog=lambda dialog: shown.append(dialog),
-        pop_dialog=lambda: popped.append(True),
-    )
-    gui._display_refresh_warning_dialog = None
-    gui._display_refresh_warning_payload = None
-    gui._pending_display_refresh_warnings = []
-
-    gui._show_display_refresh_warning(
-        {"kind": "output", "refresh_hz": 30, "sbs_fps": 58.2}
-    )
-    gui._show_display_refresh_warning(
-        {
-            "kind": "input_capture_target",
-            "refresh_hz": 60,
-            "capture_target": 64,
-        }
-    )
-
-    assert len(shown) == 1
-    gui._close_display_refresh_warning()
-    assert len(shown) == 2
-    assert "输入显示器" in shown[1].content.controls[0].value
-    assert "60 Hz" in shown[1].content.controls[0].value
-    assert "64 FPS" in shown[1].content.controls[0].value
-
-    gui._close_display_refresh_warning()
-    assert popped == [True, True]
-    assert gui._display_refresh_warning_dialog is None
-
-
-def test_child_refresh_warning_payload_opens_dialog():
-    payloads = []
-
-    class Harness(gui_process.GUIProcessMixin):
-        def _show_display_refresh_warning(self, payload):
-            payloads.append(payload)
-
-    gui = Harness()
-    gui._log_child_line(
-        '[D2S_DISPLAY_REFRESH_WARNING] {"refresh_hz": 30, "sbs_fps": 58.2}'
-    )
-
-    assert payloads == [{"refresh_hz": 30, "sbs_fps": 58.2}]
+    for payload in (
+        '{"kind":"output","refresh_hz":30,"sbs_fps":58.2}',
+        '{"kind":"input_capture_target","refresh_hz":60,"capture_target":64}',
+    ):
+        gui._log_child_line(f"[D2S_DISPLAY_REFRESH_WARNING] {payload}")
 
 
 def test_running_ui_does_not_redraw_enabled_stop_button():

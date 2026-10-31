@@ -1,3 +1,4 @@
+import io
 import queue
 import subprocess
 import sys
@@ -23,6 +24,16 @@ from streaming.direct_sbs import (
     runtime_sbs_to_rgb,
 )
 from streaming.nvidia_encoder import H264MpegTsTimestampMuxer, PyNvSrtVideoOutput
+
+
+def _stub_streaming_executables(monkeypatch, tmp_path):
+    for name, variable in (
+        ("ffmpeg", "D2S_FFMPEG_PATH"),
+        ("mediamtx", "D2S_MEDIAMTX_PATH"),
+    ):
+        executable = tmp_path / name
+        executable.touch()
+        monkeypatch.setenv(variable, str(executable))
 
 
 def test_runtime_sbs_to_rgb_converts_chw_float_to_hwc_uint8():
@@ -497,7 +508,7 @@ def test_cuda_converter_reuses_pinned_host_buffer():
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    converter = RuntimeSbsRgbConverter()
+    converter = RuntimeSbsRgbConverter(fit_mode="stretch")
     first_tensor = torch.zeros((3, 2, 4), device="cuda", dtype=torch.uint8)
     second_tensor = torch.full(
         (3, 2, 4), 255, device="cuda", dtype=torch.uint8
@@ -556,6 +567,7 @@ def test_vulkan_native_mux_uses_wallclock_sync_and_async1(monkeypatch):
 
     class RunningProcess:
         stdin = object()
+        stderr = io.StringIO()
         returncode = None
 
         @staticmethod
@@ -910,10 +922,11 @@ def test_macos_audio_uses_avfoundation_device_index():
     ]
 
 
-def test_macos_rtmp_stream_audio_uses_opus_like_v250(monkeypatch) -> None:
+def test_macos_rtmp_stream_audio_uses_opus_like_v250(monkeypatch, tmp_path) -> None:
     # v2.5.0 macOS parity: every non-WebRTC client protocol (RTMP/RTSP/HLS)
     # publishes Opus 96k/48k to MediaMTX's RTSP ingest; AAC is only used on
     # the Windows/Linux SRT/RTMP paths (NVIDIA/ROCm soundcard chain).
+    _stub_streaming_executables(monkeypatch, tmp_path)
     output = FfmpegDirectSbsOutput(
         base_dir=str(APP_ROOT),
         protocol="RTMP",
@@ -960,7 +973,8 @@ def test_macos_rtmp_stream_audio_uses_opus_like_v250(monkeypatch) -> None:
     assert "-flush_packets" in command
 
 
-def test_macos_webrtc_stream_audio_uses_opus_async1(monkeypatch) -> None:
+def test_macos_webrtc_stream_audio_uses_opus_async1(monkeypatch, tmp_path) -> None:
+    _stub_streaming_executables(monkeypatch, tmp_path)
     output = FfmpegDirectSbsOutput(
         base_dir=str(APP_ROOT),
         protocol="WebRTC",
@@ -1174,6 +1188,7 @@ def test_full_sbs_hevc_falls_back_to_libx265(monkeypatch, capsys):
         display_mode="Full-SBS",
     )
     monkeypatch.setattr(output, "_probe_nvenc", lambda width, height: False)
+    monkeypatch.setattr(output, "_probe_encoder", lambda *_args: False)
 
     assert output._select_video_encoder(7680, 2160) == "libx265"
     assert "falling back to libx265" in capsys.readouterr().out
@@ -1329,8 +1344,9 @@ def test_windows_webrtc_stream_audio_uses_opus():
 
 
 def test_macos_webrtc_uses_higher_quality_opus_without_fec(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ):
+    _stub_streaming_executables(monkeypatch, tmp_path)
     output = FfmpegDirectSbsOutput(
         base_dir=str(APP_ROOT),
         protocol="WebRTC",
@@ -1399,6 +1415,7 @@ def test_nvenc_selection_falls_back_when_probe_fails(monkeypatch, capsys):
         prefer_nvenc=True,
     )
     monkeypatch.setattr(output, "_probe_nvenc", lambda width, height: False)
+    monkeypatch.setattr(output, "_probe_encoder", lambda *_args: False)
 
     assert output._select_video_encoder(3840, 2160) == "libx264"
     assert "falling back to libx264" in capsys.readouterr().out

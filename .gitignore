@@ -22,6 +22,9 @@ src/desktop2stereo/logs/
 src/desktop2stereo/gui/flet_clients/
 src/desktop2stereo/gui/flet_packages/*.partial
 src/desktop2stereo/streaming/rtmp/ffmpeg/
+# Sunshine's runtime configuration contains per-machine credentials, pairing
+# state, and certificates; D2S creates it under the user's local app data.
+src/desktop2stereo/streaming/moonlight_server/config/
 # Runtime-extracted darwin MediaMTX binary + generated macOS config (derived
 # from mediamtx.yml at startup by _darwin_safe_mediamtx_config).
 src/desktop2stereo/streaming/rtmp/mediamtx/mediamtx

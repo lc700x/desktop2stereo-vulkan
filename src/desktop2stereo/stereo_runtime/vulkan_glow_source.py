@@ -73,10 +73,13 @@ class VulkanGlowSourceComputeBackend:
     MAX_INPUT_SIDE = 512
     INPUT_BUFFER_CAPACITY = MAX_INPUT_SIDE * MAX_INPUT_SIDE * 3 * 4
 
-    def __init__(self, context: Any, *, slot_count: int = 3) -> None:
+    def __init__(
+        self, context: Any, *, slot_count: int = 3, host_input: bool = False
+    ) -> None:
         self.context = context
         self.vk = context.vk
         self.slot_count = max(3, int(slot_count))
+        self._host_input = bool(host_input)
         if int(context.compute_queue_family_index) != int(context.queue_family_index):
             raise VulkanGlowSourceUnavailable(
                 "Glow compute and Filament graphics queues must share one queue family"
@@ -87,20 +90,26 @@ class VulkanGlowSourceComputeBackend:
             )
         self.compute_queue = context.compute_queue
         self.graphics_queue = context.graphics_queue
-        self.importer = _create_interop_importer()
+        self.importer = None if self._host_input else _create_interop_importer()
         # ROCm's stable path synchronizes HIP before Vulkan submission and
         # intentionally does not consume the HIP external semaphore here.
         # CUDA still needs the producer-ready semaphore: the CUDA copy is
         # asynchronous and the compute queue must not read the imported buffer
         # before that copy completes.
-        self._rocm_interop = "rocm_vulkan_interop" in type(self.importer).__module__
-        self._input_memory_handle_type = self._rocm_input_memory_handle_type()
-        capabilities = self.importer.capabilities
-        if not capabilities.external_memory or not capabilities.external_semaphore:
-            self.importer.close()
-            raise VulkanGlowSourceUnavailable(
-                "CUDA external buffer/semaphore interop is unavailable"
-            )
+        self._rocm_interop = bool(
+            self.importer is not None
+            and "rocm_vulkan_interop" in type(self.importer).__module__
+        )
+        self._input_memory_handle_type = (
+            None if self._host_input else self._rocm_input_memory_handle_type()
+        )
+        if self.importer is not None:
+            capabilities = self.importer.capabilities
+            if not capabilities.external_memory or not capabilities.external_semaphore:
+                self.importer.close()
+                raise VulkanGlowSourceUnavailable(
+                    "CUDA external buffer/semaphore interop is unavailable"
+                )
         self.effect_pass = VulkanGlowSourcePass(
             context,
             target_width=self.TARGET_WIDTH,
@@ -264,7 +273,8 @@ class VulkanGlowSourceComputeBackend:
     def _ensure_inputs(self, required_size: int) -> None:
         required = int(required_size)
         if required <= self._input_capacity and all(
-            slot.input_buffer is not None and slot.input_ready is not None
+            slot.input_buffer is not None
+            and (self._host_input or slot.input_ready is not None)
             for slot in self.slots
         ):
             return
@@ -272,7 +282,8 @@ class VulkanGlowSourceComputeBackend:
             raise VulkanGlowSourceUnavailable(
                 "Glow input resolution changed while GPU slots are active"
             )
-        self.importer.close()
+        if self.importer is not None:
+            self.importer.close()
         for slot in self.slots:
             if slot.input_ready is not None:
                 slot.input_ready.close()
@@ -280,8 +291,14 @@ class VulkanGlowSourceComputeBackend:
                 slot.input_buffer.close()
             slot.input_ready = None
             slot.input_buffer = None
-        self.importer = _create_interop_importer()
-        self._rocm_interop = "rocm_vulkan_interop" in type(self.importer).__module__
+        if self._host_input:
+            self.importer = None
+        else:
+            self.importer = _create_interop_importer()
+        self._rocm_interop = bool(
+            self.importer is not None
+            and "rocm_vulkan_interop" in type(self.importer).__module__
+        )
         # Monitor switching can change the source aspect ratio while previous
         # glow slots are still leased by the compositor. Reserve the complete
         # capped source envelope once, so that a 16:9 -> 16:10 change does not
@@ -289,17 +306,21 @@ class VulkanGlowSourceComputeBackend:
         allocation_size = max(required, self.INPUT_BUFFER_CAPACITY)
         self._input_capacity = allocation_size
         for slot in self.slots:
-            slot.input_buffer = VulkanExportableBuffer(
-                self.context,
-                allocation_size,
-                label=f"glow-source-input-{slot.index}",
-                memory_handle_type=self._input_memory_handle_type,
-            )
-            slot.input_ready = VulkanExportableSemaphore(
-                self.context, label=f"glow-source-ready-{slot.index}"
-            )
-            self.importer.register_buffer(slot.input_buffer)
-            self.importer.register_semaphore(slot.input_ready)
+            if self._host_input:
+                slot.input_buffer = VulkanStorageBuffer(self.context, allocation_size)
+                slot.input_ready = None
+            else:
+                slot.input_buffer = VulkanExportableBuffer(
+                    self.context,
+                    allocation_size,
+                    label=f"glow-source-input-{slot.index}",
+                    memory_handle_type=self._input_memory_handle_type,
+                )
+                slot.input_ready = VulkanExportableSemaphore(
+                    self.context, label=f"glow-source-ready-{slot.index}"
+                )
+                self.importer.register_buffer(slot.input_buffer)
+                self.importer.register_semaphore(slot.input_ready)
 
     @staticmethod
     def prefilter_scale(mode: str) -> float:
@@ -310,6 +331,8 @@ class VulkanGlowSourceComputeBackend:
         return 1.0
 
     def _prepare_source(self, source: Any):
+        if self._host_input:
+            return self._prepare_host_source(source)
         import torch
 
         if not isinstance(source, torch.Tensor) or not source.is_cuda:
@@ -348,6 +371,51 @@ class VulkanGlowSourceComputeBackend:
             )
         return value.contiguous()
 
+    def _prepare_host_source(self, source: Any):
+        """Downsample a CPU RGBA image for the safe cross-adapter glow path."""
+        import numpy as np
+
+        value = np.asarray(source)
+        if value.ndim == 4:
+            if value.shape[0] != 1:
+                raise VulkanGlowSourceUnavailable(
+                    f"Glow host source requires one image, got {value.shape[0]}"
+                )
+            value = value[0]
+        if value.ndim != 3 or value.shape[-1] not in (3, 4):
+            raise VulkanGlowSourceUnavailable(
+                f"Glow host source requires [H,W,3|4], got {value.shape}"
+            )
+        value = value[..., :3]
+        source_height, source_width = map(int, value.shape[:2])
+        if source_height < 1 or source_width < 1:
+            raise VulkanGlowSourceUnavailable("Glow host source is empty")
+        longest = max(source_height, source_width)
+        if longest > self.MAX_INPUT_SIDE:
+            scale = self.MAX_INPUT_SIDE / float(longest)
+            height = max(1, int(round(source_height * scale)))
+            width = max(1, int(round(source_width * scale)))
+            try:
+                import cv2
+
+                value = cv2.resize(value, (width, height), interpolation=cv2.INTER_AREA)
+            except ImportError:
+                y = np.minimum(
+                    ((np.arange(height, dtype=np.float32) + 0.5)
+                     * source_height / height).astype(np.int32),
+                    source_height - 1,
+                )
+                x = np.minimum(
+                    ((np.arange(width, dtype=np.float32) + 0.5)
+                     * source_width / width).astype(np.int32),
+                    source_width - 1,
+                )
+                value = value[y[:, None], x[None, :]]
+        value = np.asarray(value, dtype=np.float32)
+        if np.asarray(source).dtype == np.uint8:
+            value *= 1.0 / 255.0
+        return np.ascontiguousarray(value.transpose(2, 0, 1)[None])
+
     @staticmethod
     def _normalize_source_crop_uv(value: Any) -> tuple[float, float, float, float]:
         """Return a finite, in-bounds source crop rectangle in top-left UVs."""
@@ -385,7 +453,9 @@ class VulkanGlowSourceComputeBackend:
         self._ensure_inputs(
             self.effect_pass.input_buffer_size(source_width, source_height)
         )
-        if slot.input_buffer is None or slot.input_ready is None:
+        if slot.input_buffer is None or (
+            not self._host_input and slot.input_ready is None
+        ):
             raise VulkanGlowSourceUnavailable("Glow input slot is unavailable")
         start = time.perf_counter()
         prefilter_scale = self.prefilter_scale(mode)
@@ -403,9 +473,39 @@ class VulkanGlowSourceComputeBackend:
             if smoothing > 0.0:
                 temporal_alpha = 1.0 - math.exp(-elapsed / smoothing)
         self._reset_command(slot.compute_command, slot.compute_fence)
-        self.importer.copy_tensor_to_buffer(value, slot.input_buffer)
-        self.importer.signal_semaphore(slot.input_ready)
+        if self._host_input:
+            slot.input_buffer.write_bytes(memoryview(value).cast("B"))
+            wait_semaphores, wait_stages = (), ()
+        else:
+            self.importer.copy_tensor_to_buffer(value, slot.input_buffer)
+            self.importer.signal_semaphore(slot.input_ready)
+            wait_semaphores, wait_stages = self._input_ready_wait(
+                slot.input_ready.semaphore
+            )
         self._begin_command(slot.compute_command)
+        if self._host_input:
+            input_barrier = self.vk.VkBufferMemoryBarrier(
+                sType=self.vk.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                srcAccessMask=self.vk.VK_ACCESS_HOST_WRITE_BIT,
+                dstAccessMask=self.vk.VK_ACCESS_SHADER_READ_BIT,
+                srcQueueFamilyIndex=self.vk.VK_QUEUE_FAMILY_IGNORED,
+                dstQueueFamilyIndex=self.vk.VK_QUEUE_FAMILY_IGNORED,
+                buffer=slot.input_buffer.buffer,
+                offset=0,
+                size=int(value.nbytes),
+            )
+            self.vk.vkCmdPipelineBarrier(
+                slot.compute_command,
+                self.vk.VK_PIPELINE_STAGE_HOST_BIT,
+                self.vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0,
+                None,
+                1,
+                [input_barrier],
+                0,
+                None,
+            )
         self._record_history_barrier(slot.compute_command)
         self.effect_pass.record(
             slot.compute_command,
@@ -437,7 +537,6 @@ class VulkanGlowSourceComputeBackend:
                 slot.compute_command, slot.crop_detection_buffer,
             )
         self.vk.vkEndCommandBuffer(slot.compute_command)
-        wait_semaphores, wait_stages = self._input_ready_wait(slot.input_ready.semaphore)
         self._submit_queue(
             self.compute_queue,
             1,
@@ -694,7 +793,11 @@ class VulkanGlowSourceComputeBackend:
         return {
             "glow_vulkan_image": slot.image.resource,
             "glow_vulkan_serial": self._serial,
-            "glow_source_path": "vulkan_compute_external_image",
+            "glow_source_path": (
+                "vulkan_compute_host_input"
+                if self._host_input
+                else "vulkan_compute_external_image"
+            ),
             "glow_gpu_submit_ms": self._last_submit_ms,
             "glow_reuse": self._reuse_count,
             "glow_budget_skip": self._budget_skip_count,

@@ -53,3 +53,9 @@ build host is an RX 9060 XT (`gfx1200`), outside this package's device set, so
 the host-specific `torch.compile` smoke check is recorded as skipped. Package
 dependency checks, imports, application probe, and relocated extraction passed;
 actual RDNA1–3 GPU compilation still needs matching hardware.
+
+## GUI verification
+
+After every GUI modification, launch Desktop2Stereo and verify the affected
+screen and interaction in the running app. Pair this with focused automated
+checks; unit tests alone do not count as GUI verification.

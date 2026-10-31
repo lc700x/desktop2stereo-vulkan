@@ -22,7 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 import struct
 import time
-from typing import Any, Callable
+from typing import Any
 
 from viewer.vulkan_compute_pipeline import read_spirv_words
 
@@ -35,7 +35,7 @@ _PANEL_PADDING = 14
 _PANEL_RADIUS = 10
 _FONT_SIZE = 26
 _MAX_PANEL_WIDTH = 560
-_PANEL_TEXTURE_HEIGHT = 256
+_PANEL_TEXTURE_HEIGHT = 320
 
 
 def _load_panel_font(size: int):
@@ -61,6 +61,9 @@ def build_fps_panel_rgba(
     avg_latency_ms: float | None = None,
     content_fps: float | None = None,
     reuse_ratio: float | None = None,
+    source_fps: float | None = None,
+    gpu_util: float | None = None,
+    gpu_util_max: float | None = None,
 ):
     """Rasterize the FPS panel as one RGBA image.
 
@@ -82,6 +85,13 @@ def build_fps_panel_rgba(
         ratio = max(0.0, min(1.0, float(reuse_ratio)))
         color = (255, 135, 90, 255) if ratio >= 0.30 else (190, 190, 190, 255)
         rows.append((f"Reused  {ratio:.0%}", color))
+    if source_fps is not None and float(source_fps) > 0:
+        rows.append((f"Src  {float(source_fps):.1f} FPS", (100, 210, 255, 255)))
+    if gpu_util is not None:
+        util = max(0.0, min(100.0, float(gpu_util)))
+        peak = util if gpu_util_max is None else max(0.0, min(100.0, float(gpu_util_max)))
+        color = (255, 150, 60, 255) if peak >= 95.0 else (190, 190, 190, 255)
+        rows.append((f"GPU  {util:.0f}%  max {peak:.0f}%", color))
     # Latency is the frame age at present time; avg keeps a rolling mean so a
     # single slow frame does not dominate the reading.
     if latency_ms is not None and float(latency_ms) > 0:

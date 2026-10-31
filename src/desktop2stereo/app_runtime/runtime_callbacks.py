@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import replace
 import os
 import time
+from collections import deque
+from dataclasses import replace
 
+from utils.gc_tuning import install_pause_watch, tune_gc_for_realtime
 from utils.queue_utils import clear_nonblocking, drain_latest, put_latest
+from utils.sys_load import install_system_load_sampler
 from xr_viewer.settings_menu import OPENXR_RENDER_SCALE_MAX, OPENXR_RENDER_SCALE_MIN
 
 
@@ -26,6 +28,10 @@ class RuntimeCallbacks:
         )
         self._runtime_fps_started = time.perf_counter()
         self._runtime_fps_frames = 0.0
+        self._runtime_frame_total = 0.0
+        self._gc_tuning_checked = False
+        install_pause_watch()
+        self._system_load_sampler = install_system_load_sampler(cpu=False)
         self._runtime_fps = 0.0
         self._capture_frame_ts = deque(maxlen=120)
         self._show_fps = bool(show_fps)
@@ -57,6 +63,12 @@ class RuntimeCallbacks:
         if name == "runtime":
             now = time.perf_counter()
             self._runtime_fps_frames += float(amount)
+            self._runtime_frame_total += float(amount)
+            if not self._gc_tuning_checked and self._runtime_frame_total >= 120:
+                self._gc_tuning_checked = True
+                tune_gc_for_realtime(
+                    str(getattr(self.context, "run_mode", "runtime"))
+                )
             elapsed = now - self._runtime_fps_started
             if elapsed >= 1.0:
                 self._runtime_fps = self._runtime_fps_frames / elapsed
@@ -98,6 +110,12 @@ class RuntimeCallbacks:
 
     def log_fps_breakdown(self, now=None):
         if self._render_active_for_breakdown():
+            if self._system_load_sampler is not None:
+                for key, value in self._system_load_sampler.snapshot().items():
+                    if key == "gpu":
+                        self.context.fps_breakdown.set_latest("sys_gpu", value)
+                    elif key == "gpu_max":
+                        self.context.fps_breakdown.set_latest("sys_gpu_max", value)
             self.context.fps_breakdown.log(now)
 
     def source_stat_inc(self, name, amount=1, **values):
@@ -109,6 +127,12 @@ class RuntimeCallbacks:
     def log_source_health(self, now=None, force=False):
         self.context.source_health.log(now, force)
         if self._render_active_for_breakdown():
+            if self._system_load_sampler is not None:
+                for key, value in self._system_load_sampler.snapshot().items():
+                    if key == "gpu":
+                        self.context.fps_breakdown.set_latest("sys_gpu", value)
+                    elif key == "gpu_max":
+                        self.context.fps_breakdown.set_latest("sys_gpu_max", value)
             self.context.fps_breakdown.log(now)
 
     def openxr_source_paused(self):

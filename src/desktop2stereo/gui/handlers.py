@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import subprocess
+import webbrowser
 import flet as ft
 from utils import (
     OS_NAME, DEFAULT_PORT, STEREO_MIX_NAMES,
@@ -30,7 +31,7 @@ from .config import (
     environment_display_label, environment_key_from_label, save_yaml,
     get_environment_model_options, load_environment_display_names,
 )
-from .controls import FONT_SIZE
+from .controls import FONT_SIZE, S
 from .localization import UI_MESSAGES, is_supported_locale
 from .paths import BASE_DIR
 from .devices import DEVICES
@@ -220,6 +221,7 @@ class GUIHandlerMixin:
                 self.capture_tool_dd.value = new_opts[0]
             self.capture_tool_dd.update()
         self._update_accelerator_visibility(device_label)
+        self._sync_moonlight_encoder_options()
         self._sync_nvfruc_visibility(device_label)
         self._sync_lsfg_visibility()
         self.auto_enable_optimizers_based_on_device()
@@ -560,6 +562,7 @@ class GUIHandlerMixin:
             texts.get("Local Viewer", "Local Viewer"): "Local Viewer",
             texts.get("OpenXR Link", "OpenXR Link"): "OpenXR Link",
             texts.get("RTMP Streamer", "RTMP Streamer"): "RTMP Streamer",
+            texts.get("Moonlight Streamer", "Moonlight Streamer"): "Moonlight Streamer",
             texts.get("MJPEG Streamer", "MJPEG Streamer"): "MJPEG Streamer",
             texts.get("3D Monitor", "3D Monitor"): "3D Monitor",
         }
@@ -569,8 +572,6 @@ class GUIHandlerMixin:
         fps_default = DEFAULTS.get(fps_key, DEFAULTS["Target FPS"])
         fps = self._config.get(fps_key, self._config.get("Target FPS", fps_default))
         self.target_fps_dd.value = self._target_fps_to_display(fps)
-        if self.run_mode_key in {"MJPEG Streamer", "RTMP Streamer"}:
-            self.stream_settings_cb.value = False
         if self.run_mode_key == "RTMP Streamer":
             # Collect every GUI control after changing mode.  The calibration
             # fingerprint must be built from the same values that will be
@@ -585,13 +586,695 @@ class GUIHandlerMixin:
         self._sync_visibility()
         self._fit_window_to_content(update=True, resize_window=True)
 
-    def on_stream_settings_change(self, e):
-        mode = self.run_mode_key
-        streamer_modes = {"MJPEG Streamer", "RTMP Streamer"}
-        row_map = self._get_streamer_row_map()
-        row_indices = row_map.get(mode, []) if mode in streamer_modes and self.stream_settings_cb.value else []
-        self._show_streamer_rows(*row_indices)
-        self._fit_window_to_content(update=True, resize_window=True)
+    def _sync_moonlight_button_state(self):
+        process = getattr(self, "process", None)
+        enabled = bool(
+            self.run_mode_key == "Moonlight Streamer"
+            and process is not None
+            and getattr(process, "returncode", None) is None
+        )
+        for name in ("moonlight_pairing_btn", "moonlight_pair_btn"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.disabled = not enabled
+
+    def _sync_moonlight_encoder_options(self):
+        dropdown = getattr(self, "video_backend_dd", None)
+        if dropdown is None:
+            return
+
+        if self.run_mode_key == "Moonlight Streamer":
+            if devices_module.IS_ROCM:
+                options = ["Auto", "AMD AMF"]
+            elif "CUDA" in str(getattr(self.device_dd, "value", "")):
+                options = ["Auto", "PyNvVideoCodec"]
+            else:
+                options = ["Auto"]
+            if dropdown.value not in options:
+                dropdown.value = "Auto"
+                self.set_status(
+                    UI_MESSAGES[self.locale].get(
+                        "moonlight_encoder_fallback",
+                        "Moonlight uses the native NVIDIA or AMD encoder; unsupported selection reset to Auto.",
+                    )
+                )
+        else:
+            options = [
+                "Auto",
+                "Intel QSV (D3D11)",
+                "FFmpeg",
+                "Vulkan Video",
+                "PyNvVideoCodec",
+                "AMD AMF",
+            ]
+
+        if list(dropdown.options) != options:
+            dropdown.options = options
+            self._safe_update(dropdown)
+
+    async def open_moonlight_pairing(self, e=None):
+        del e
+        import json
+        from pathlib import Path
+
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        state_dir = (
+            Path(local_app_data)
+            if local_app_data
+            else Path.home() / "AppData" / "Local"
+        ) / "Desktop2Stereo" / "Moonlight"
+        messages = UI_MESSAGES.get(self.locale, UI_MESSAGES["EN"])
+        self.set_status(messages.get("sunshine_settings_loading", "Loading Sunshine settings..."))
+        try:
+            from streaming.moonlight_output import (
+                read_sunshine_base_port,
+                request_sunshine_api,
+            )
+
+            config = await asyncio.to_thread(
+                request_sunshine_api, state_dir, "GET", "/api/config"
+            )
+            if config.get("status") is not True:
+                raise RuntimeError("Sunshine did not return its configuration.")
+            paired_devices = await asyncio.to_thread(
+                request_sunshine_api,
+                state_dir,
+                "GET",
+                "/api/clients/list",
+            )
+            if paired_devices.get("status") is not True:
+                raise RuntimeError("Sunshine did not return its paired-device list.")
+            paired_clients = paired_devices.get("named_certs", [])
+            if not isinstance(paired_clients, list):
+                raise RuntimeError("Sunshine returned an invalid paired-device list.")
+            account = json.loads(
+                (state_dir / "web_account.json").read_text(encoding="utf-8")
+            )
+            self._show_sunshine_settings_dialog(
+                state_dir,
+                read_sunshine_base_port(state_dir / "sunshine.conf") + 1,
+                config,
+                account,
+                paired_clients,
+            )
+            self.set_status("")
+        except (AttributeError, OSError, RuntimeError, TimeoutError, TypeError, ValueError) as exc:
+            self.set_status(
+                messages.get(
+                    "sunshine_settings_load_failed",
+                    "Could not load Sunshine settings: {}",
+                ).format(exc)
+            )
+
+    def _show_sunshine_settings_dialog(
+        self, state_dir, web_port, config, account, paired_clients=None
+    ):
+        import json
+        import math
+        from pathlib import Path
+
+        messages = UI_MESSAGES.get(self.locale, UI_MESSAGES["EN"])
+        state_dir = Path(state_dir)
+        username = str(account.get("username") or "")
+        password = str(account.get("password") or "")
+        managed_keys = {
+            "port",
+            "sunshine_name",
+            "pkey",
+            "cert",
+            "file_state",
+            "credentials_file",
+            "file_apps",
+            "log_path",
+        }
+        settings = {
+            key: value
+            for key, value in config.items()
+            if key not in {"status", "platform", "version"}
+        }
+        fields = {}
+        rows = []
+        for key in sorted(settings):
+            value = settings[key]
+            read_only = key in managed_keys
+            label = key.replace("_", " ")
+            if isinstance(value, bool):
+                control = ft.Switch(
+                    label=label,
+                    value=value,
+                    disabled=read_only,
+                    tooltip=key,
+                )
+            elif value is None:
+                control = ft.Text(
+                    f"{label}: null",
+                    tooltip=key,
+                )
+            else:
+                field_value = (
+                    json.dumps(value, ensure_ascii=False)
+                    if isinstance(value, (dict, list))
+                    else str(value)
+                )
+                control = ft.TextField(
+                    label=label,
+                    value=field_value,
+                    read_only=read_only,
+                    tooltip=key,
+                    multiline=isinstance(value, (dict, list)),
+                    min_lines=1,
+                    max_lines=3 if isinstance(value, (dict, list)) else 1,
+                )
+            fields[key] = (value, control)
+            rows.append(control)
+
+        status = ft.Text()
+        editor = ft.ListView(
+            controls=rows,
+            expand=True,
+            spacing=8,
+            padding=4,
+        )
+        paired_devices = ft.ListView(
+            controls=[],
+            height=128,
+            spacing=4,
+            padding=4,
+        )
+        browser_url = f"https://localhost:{web_port}"
+
+        def set_paired_device_rows(clients):
+            rows = []
+            seen_uuids = set()
+            for client in clients if isinstance(clients, list) else []:
+                if not isinstance(client, dict):
+                    continue
+                uuid = str(client.get("uuid") or "").strip()
+                if not uuid or uuid in seen_uuids:
+                    continue
+                seen_uuids.add(uuid)
+                name = str(client.get("name") or "Moonlight device").strip()
+                enabled = bool(client.get("enabled", True))
+
+                def make_enabled_handler(client_uuid, previous_enabled):
+                    async def set_enabled(event):
+                        control = event.control
+                        control.disabled = True
+                        dialog.update()
+                        try:
+                            from streaming.moonlight_output import request_sunshine_api
+
+                            result = await asyncio.to_thread(
+                                request_sunshine_api,
+                                state_dir,
+                                "POST",
+                                "/api/clients/update",
+                                {
+                                    "uuid": client_uuid,
+                                    "enabled": bool(control.value),
+                                },
+                            )
+                            if result.get("status") is not True:
+                                raise RuntimeError("Sunshine could not update this device.")
+                            refreshed = await fetch_paired_clients()
+                            set_paired_device_rows(refreshed)
+                            status.value = messages.get(
+                                "sunshine_device_saved",
+                                "Paired-device change saved.",
+                            )
+                        except (OSError, RuntimeError, TimeoutError, TypeError, ValueError) as exc:
+                            control.value = previous_enabled
+                            status.value = messages.get(
+                                "sunshine_device_save_failed",
+                                "Could not update the paired device: {}",
+                            ).format(exc)
+                        finally:
+                            control.disabled = False
+                            dialog.update()
+
+                    return set_enabled
+
+                def make_unpair_handler(client_uuid):
+                    async def unpair(_event):
+                        try:
+                            from streaming.moonlight_output import request_sunshine_api
+
+                            result = await asyncio.to_thread(
+                                request_sunshine_api,
+                                state_dir,
+                                "POST",
+                                "/api/clients/unpair",
+                                {"uuid": client_uuid},
+                            )
+                            if result.get("status") is not True:
+                                raise RuntimeError("Sunshine could not unpair this device.")
+                            refreshed = await fetch_paired_clients()
+                            set_paired_device_rows(refreshed)
+                            status.value = messages.get(
+                                "sunshine_device_removed",
+                                "Device unpaired.",
+                            )
+                        except (OSError, RuntimeError, TimeoutError, TypeError, ValueError) as exc:
+                            status.value = messages.get(
+                                "sunshine_device_remove_failed",
+                                "Could not unpair the device: {}",
+                            ).format(exc)
+                        finally:
+                            dialog.update()
+
+                    return unpair
+
+                rows.append(
+                    ft.Row(
+                        controls=[
+                            ft.Container(content=ft.Text(name), expand=True),
+                            ft.Switch(
+                                label=messages.get(
+                                    "sunshine_client_enabled",
+                                    "Allow connection",
+                                ),
+                                value=enabled,
+                                on_change=make_enabled_handler(uuid, enabled),
+                            ),
+                            ft.TextButton(
+                                content=messages.get(
+                                    "sunshine_unpair_device",
+                                    "Unpair",
+                                ),
+                                on_click=make_unpair_handler(uuid),
+                            ),
+                        ],
+                        spacing=8,
+                    )
+                )
+            if not rows:
+                rows.append(
+                    ft.Text(
+                        messages.get(
+                            "sunshine_no_paired_devices",
+                            "No paired devices yet.",
+                        )
+                    )
+                )
+            paired_devices.controls = rows
+
+        async def fetch_paired_clients():
+            from streaming.moonlight_output import request_sunshine_api
+
+            result = await asyncio.to_thread(
+                request_sunshine_api,
+                state_dir,
+                "GET",
+                "/api/clients/list",
+            )
+            if result.get("status") is not True:
+                raise RuntimeError("Sunshine could not load its paired-device list.")
+            clients = result.get("named_certs", [])
+            if not isinstance(clients, list):
+                raise RuntimeError("Sunshine returned an invalid paired-device list.")
+            return clients
+
+        async def refresh_paired_clients(_event=None):
+            refresh_button.disabled = True
+            try:
+                set_paired_device_rows(await fetch_paired_clients())
+                status.value = ""
+            except (OSError, RuntimeError, TimeoutError, TypeError, ValueError) as exc:
+                status.value = messages.get(
+                    "sunshine_devices_load_failed",
+                    "Could not load paired devices: {}",
+                ).format(exc)
+            finally:
+                refresh_button.disabled = False
+                dialog.update()
+
+        async def save_settings(_event):
+            payload = {}
+            invalid_key = None
+            try:
+                for key, (original, control) in fields.items():
+                    invalid_key = key
+                    if original is None:
+                        payload[key] = None
+                    elif isinstance(original, bool):
+                        payload[key] = bool(control.value)
+                    elif isinstance(original, int):
+                        payload[key] = int(str(control.value).strip())
+                    elif isinstance(original, float):
+                        value = float(str(control.value).strip())
+                        if not math.isfinite(value):
+                            raise ValueError(key)
+                        payload[key] = value
+                    elif isinstance(original, (list, dict)):
+                        payload[key] = json.loads(str(control.value or ""))
+                    else:
+                        value = str(control.value or "")
+                        if any(character in value for character in "\r\n\0"):
+                            raise ValueError(key)
+                        payload[key] = value
+            except (TypeError, ValueError, OverflowError):
+                status.value = messages.get(
+                    "sunshine_settings_invalid_value",
+                    "Invalid value for {}.",
+                ).format(invalid_key)
+                status.update()
+                return
+
+            save_button.disabled = True
+            status.value = messages.get(
+                "sunshine_settings_saving",
+                "Saving Sunshine settings...",
+            )
+            dialog.update()
+            try:
+                from streaming.moonlight_output import request_sunshine_api
+
+                result = await asyncio.to_thread(
+                    request_sunshine_api,
+                    state_dir,
+                    "POST",
+                    "/api/config",
+                    payload,
+                )
+                if result.get("status") is not True:
+                    raise RuntimeError("Sunshine rejected the configuration.")
+                status.value = messages.get(
+                    "sunshine_settings_saved",
+                    "Saved. Restart Moonlight Streaming to apply changes.",
+                )
+            except (OSError, RuntimeError, TimeoutError, TypeError, ValueError) as exc:
+                status.value = messages.get(
+                    "sunshine_settings_save_failed",
+                    "Could not save Sunshine settings: {}",
+                ).format(exc)
+            finally:
+                save_button.disabled = False
+                dialog.update()
+
+        async def open_browser(_event):
+            error = None
+            launcher = ft.UrlLauncher()
+            try:
+                if await launcher.can_launch_url(browser_url):
+                    await launcher.launch_url(
+                        browser_url,
+                        mode=ft.LaunchMode.EXTERNAL_APPLICATION,
+                    )
+                    return
+            except Exception as exc:  # noqa: BLE001 - Flet URL errors vary by platform.
+                error = exc
+            try:
+                if webbrowser.open(browser_url):
+                    return
+            except Exception as exc:  # noqa: BLE001 - fallback browser launch is platform-specific.
+                error = exc
+            status.value = messages.get(
+                "sunshine_settings_browser_open_failed",
+                "Could not open Sunshine in the browser: {}",
+            ).format(error or "No browser handler was available.")
+            dialog.update()
+
+        def close_dialog(_event):
+            self.page.pop_dialog()
+
+        account_panel = ft.Column(
+            controls=[
+                ft.Text(
+                    messages.get(
+                        "sunshine_settings_signed_in",
+                        "Signed in as: {}",
+                    ).format(username)
+                ),
+                ft.Text(
+                    messages.get("sunshine_settings_password", "Password: {}").format(
+                        password
+                    ),
+                    selectable=True,
+                ),
+                ft.Text(
+                    messages.get(
+                        "sunshine_settings_browser_note",
+                        "Use the account shown here in the browser. "
+                        "The browser may still show its certificate warning.",
+                    ),
+                    size=12,
+                ),
+            ],
+            spacing=4,
+        )
+        save_button = ft.Button(
+            content=messages.get("sunshine_settings_save", "Save settings"),
+            on_click=save_settings,
+        )
+        refresh_button = ft.TextButton(
+            content=messages.get("sunshine_refresh_devices", "Refresh"),
+            on_click=refresh_paired_clients,
+        )
+        set_paired_device_rows(paired_clients or [])
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(messages.get("Open Moonlight pairing", "Sunshine Settings")),
+            content=ft.Container(
+                width=900,
+                height=620,
+                content=ft.Column(
+                    controls=[
+                        account_panel,
+                        ft.Divider(),
+                        ft.Text(
+                            messages.get(
+                                "sunshine_settings_managed_note",
+                                "D2S-managed host identity, ports, certificates, and paths are read-only.",
+                            ),
+                            size=12,
+                        ),
+                        ft.Row(
+                            controls=[
+                                ft.Text(
+                                    messages.get(
+                                        "sunshine_paired_devices",
+                                        "Paired devices",
+                                    ),
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                                ft.Container(expand=True),
+                                refresh_button,
+                            ],
+                        ),
+                        ft.Text(
+                            messages.get(
+                                "sunshine_pairing_persist_note",
+                                "Pairings and device changes are saved automatically.",
+                            ),
+                            size=12,
+                        ),
+                        paired_devices,
+                        ft.Divider(),
+                        editor,
+                        status,
+                    ],
+                    expand=True,
+                    spacing=8,
+                ),
+            ),
+            actions=[
+                ft.TextButton(
+                    content=messages.get(
+                        "sunshine_settings_browser",
+                        "Open in browser",
+                    ),
+                    on_click=open_browser,
+                ),
+                ft.TextButton(
+                    content=messages.get("Close", "Close"),
+                    on_click=close_dialog,
+                ),
+                save_button,
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.show_dialog(dialog)
+
+    async def _watch_moonlight_pairing_requests(self, process):
+        import http.client
+        from pathlib import Path
+
+        from streaming.moonlight_output import request_sunshine_api
+
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        state_dir = (
+            Path(local_app_data)
+            if local_app_data
+            else Path.home() / "AppData" / "Local"
+        ) / "Desktop2Stereo" / "Moonlight"
+        announced_ids = set()
+        while process.returncode is None and not getattr(self, "_closed", False):
+            try:
+                result = await asyncio.to_thread(
+                    request_sunshine_api,
+                    state_dir,
+                    "GET",
+                    "/api/pin",
+                    timeout=2.0,
+                )
+                pairings = result.get("pairings", [])
+                current = {
+                    str(item.get("id")): item
+                    for item in pairings
+                    if isinstance(item, dict) and item.get("id")
+                } if isinstance(pairings, list) else {}
+                announced_ids.intersection_update(current)
+                if getattr(self, "_moonlight_pair_dialog_open", False):
+                    if current and not getattr(
+                        self, "_moonlight_selected_pairing_id", None
+                    ):
+                        pairing_id, pairing = next(iter(current.items()))
+                        self._moonlight_selected_pairing_id = pairing_id
+                        announced_ids.add(pairing_id)
+                        self._set_moonlight_pairing_device_text(pairing)
+                else:
+                    next_pairing = next(
+                        (
+                            (pairing_id, pairing)
+                            for pairing_id, pairing in current.items()
+                            if pairing_id not in announced_ids
+                        ),
+                        None,
+                    )
+                    if next_pairing is not None:
+                        pairing_id, pairing = next_pairing
+                        announced_ids.add(pairing_id)
+                        self.open_moonlight_pairing_pin_dialog(pairing=pairing)
+            except (
+                OSError,
+                RuntimeError,
+                TimeoutError,
+                TypeError,
+                ValueError,
+                http.client.HTTPException,
+            ):
+                pass
+            await asyncio.sleep(2.0)
+
+    def _set_moonlight_pairing_device_text(self, pairing):
+        text = getattr(self, "_moonlight_pairing_device_text", None)
+        if text is None:
+            return
+        messages = UI_MESSAGES.get(self.locale, UI_MESSAGES["EN"])
+        name = str(pairing.get("name") or "Moonlight client").strip()
+        address = str(pairing.get("address") or "").strip()
+        details = f" ({address})" if address else ""
+        text.value = messages.get(
+            "moonlight_pair_pending",
+            "Waiting device: {}{}",
+        ).format(name, details)
+        self._safe_update(text)
+
+    def open_moonlight_pairing_pin_dialog(self, e=None, pairing=None):
+        del e
+        messages = UI_MESSAGES.get(self.locale, UI_MESSAGES["EN"])
+        if getattr(self, "_moonlight_pair_dialog_open", False):
+            return
+        self.moonlight_pin_tf.value = ""
+        self.moonlight_pin_tf.on_submit = self.submit_moonlight_pairing
+        self._moonlight_pair_submission_pending = False
+        self._moonlight_selected_pairing_id = (
+            str(pairing.get("id")) if isinstance(pairing, dict) and pairing.get("id") else None
+        )
+        device_text = ft.Text()
+        self._moonlight_pairing_device_text = device_text
+        if isinstance(pairing, dict):
+            self._set_moonlight_pairing_device_text(pairing)
+
+        def on_dismiss(_event=None):
+            self._moonlight_pair_dialog_open = False
+            self._moonlight_selected_pairing_id = None
+            self._moonlight_pairing_device_text = None
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(
+                messages.get(
+                    "moonlight_pair_dialog_title",
+                    "Pair Moonlight device",
+                )
+            ),
+            content=ft.Column(
+                controls=[
+                    ft.Text(
+                        messages.get(
+                            "moonlight_pair_dialog_help",
+                            "Enter the 4-digit PIN shown by the Moonlight client.",
+                        )
+                    ),
+                    device_text,
+                    self.moonlight_pin_tf,
+                ],
+                tight=True,
+                spacing=12,
+                width=360,
+            ),
+            actions=[
+                ft.TextButton(
+                    content=messages.get("Close", "Close"),
+                    on_click=lambda _event: self.page.pop_dialog(),
+                ),
+                ft.Button(
+                    content=messages.get("Pair Moonlight Client", "Pair device"),
+                    on_click=self.submit_moonlight_pairing,
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+            on_dismiss=on_dismiss,
+        )
+        self._moonlight_pair_dialog_open = True
+        self.page.show_dialog(dialog)
+
+    def submit_moonlight_pairing(self, e=None):
+        del e
+        import json
+        from pathlib import Path
+
+        if getattr(self, "_moonlight_pair_submission_pending", False):
+            return
+        t = UI_MESSAGES.get(self.locale, UI_MESSAGES["EN"])
+        pin = str(getattr(self.moonlight_pin_tf, "value", "") or "").strip()
+        if len(pin) != 4 or not pin.isascii() or not pin.isdigit():
+            self.set_status(t.get("moonlight_pair_pin_invalid", "Enter the 4-digit PIN."))
+            return
+        process = getattr(self, "process", None)
+        request_path = getattr(self, "_moonlight_pairing_request_path", None)
+        if process is None or process.returncode is not None or not request_path:
+            self.set_status(
+                t.get("moonlight_pair_not_running", "Start Moonlight Streaming before pairing.")
+            )
+            return
+        try:
+            target = Path(request_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            request = {"request_id": os.urandom(16).hex(), "pin": pin}
+            pairing_id = getattr(self, "_moonlight_selected_pairing_id", None)
+            if pairing_id:
+                request["pairing_id"] = pairing_id
+            target.write_text(
+                json.dumps(request) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            self.set_status(
+                t.get("moonlight_pair_submit_error", "Could not submit pairing PIN: {}").format(exc)
+            )
+            return
+        self._moonlight_pair_submission_pending = True
+        self.moonlight_pin_tf.value = ""
+        self._safe_update(self.moonlight_pin_tf)
+        self.page.pop_dialog()
+        self.set_status(
+            t.get(
+                "moonlight_pair_request_sent",
+                "PIN sent to Sunshine; complete pairing on the Moonlight client.",
+            )
+        )
 
     def on_advanced_device_change(self, e):
         self._sync_visibility()
@@ -633,16 +1316,16 @@ class GUIHandlerMixin:
         mode_reverse = {
             "Local Viewer": texts["Local Viewer"], "OpenXR Link": texts["OpenXR Link"],
             "RTMP Streamer": texts["RTMP Streamer"], "MJPEG Streamer": texts["MJPEG Streamer"],
+            "Moonlight Streamer": texts.get("Moonlight Streamer", "Moonlight Streamer"),
             "3D Monitor": texts["3D Monitor"],
         }
         self.run_mode_dd.value = mode_reverse.get(mode, texts["Local Viewer"])
-        streamer_modes = {"MJPEG Streamer", "RTMP Streamer"}
+        streamer_modes = {"MJPEG Streamer", "RTMP Streamer", "Moonlight Streamer"}
         is_streamer = mode in streamer_modes
         if hasattr(self, "stream_url_row"):
-            self.stream_url_row.visible = is_streamer
+            self.stream_url_row.visible = is_streamer and mode != "Moonlight Streamer"
         if hasattr(self, "stream_url_container"):
-            self.stream_url_container.visible = is_streamer
-        self.stream_settings_cb.visible = is_streamer
+            self.stream_url_container.visible = is_streamer and mode != "Moonlight Streamer"
         is_openxr = mode == "OpenXR Link"
         self.display_mode_label.visible = not is_openxr
         self.display_mode_dd.visible = not is_openxr
@@ -651,6 +1334,14 @@ class GUIHandlerMixin:
         self.xr_headset_label.visible = True
         self.xr_headset_dd.visible = True
         self._sync_device_advanced_visibility(mode)
+        openxr_controls_button = getattr(self, "openxr_controls_button", None)
+        if openxr_controls_button is not None:
+            openxr_controls_button.visible = is_openxr
+            refresh_controls_button = getattr(
+                self, "_refresh_openxr_controls_button", None
+            )
+            if callable(refresh_controls_button):
+                refresh_controls_button()
         self.row7b.visible = is_openxr
         display_fit_visible = mode in ["Local Viewer", "3D Monitor"]
         if is_openxr:
@@ -675,8 +1366,11 @@ class GUIHandlerMixin:
         self.row9.visible = (not is_openxr) and (
             stereo_full or display_fit_visible
         )
+        self.moonlight_controls_row.visible = mode == "Moonlight Streamer"
+        self._sync_moonlight_button_state()
+        self._sync_moonlight_encoder_options()
         row_map = self._get_streamer_row_map()
-        row_indices = row_map.get(mode, []) if is_streamer and self.stream_settings_cb.value else []
+        row_indices = row_map.get(mode, []) if is_streamer else []
         self._show_streamer_rows(*row_indices)
         self._sync_manual_bitrate_visibility()
         self.update_stereo_monitor_menu()
@@ -705,13 +1399,19 @@ class GUIHandlerMixin:
             return
         manual = (
             self.run_mode_key == "RTMP Streamer"
-            and bool(getattr(self, "stream_settings_cb", None).value)
             and not self._stream_calibration_auto_enabled()
         )
         row.visible = manual
         if button is not None:
             button.visible = not manual
-        self._safe_update(row, button)
+        container = getattr(self, "stream_container", None)
+        if container is not None:
+            content = getattr(container, "content", None)
+            rows = getattr(content, "controls", []) or []
+            container.visible = any(
+                getattr(control, "visible", True) for control in rows
+            )
+        self._safe_update(row, button, container)
 
     def _set_stream_bitrate_controls(self, target_mbps, peak_mbps=None):
         try:
@@ -802,6 +1502,8 @@ class GUIHandlerMixin:
 
     def update_ui_texts(self):
         t = UI_MESSAGES[self.locale]
+        self.video_backend_label.value = t["Video Encoder:"]
+        self.video_backend_label.width = S(110 if self.locale == "CN" else 130)
         self.depth_model_label.value = t["Depth Model:"]
         self.fp16_cb.label = t["FP16"]
         self.depth_resolution_label.value = t["Depth Resolution:"]
@@ -885,7 +1587,6 @@ class GUIHandlerMixin:
         self.showfps_cb.label = t["Show FPS"]
         self.capture_tool_label.value = t["Capture Tool:"]
         self.run_mode_label.value = t["Run Mode:"]
-        self.stream_settings_cb.label = t.get("Stream Settings", "Stream Settings")
         self.display_mode_label.value = t["Display Mode:"]
         self.xr_headset_label.value = t.get("Headset Model:", "Headset Model:")
         headset_key = display_to_xr_headset(self.xr_headset_dd.value)
@@ -958,13 +1659,20 @@ class GUIHandlerMixin:
                 "Local Viewer": t["Local Viewer"], "RTMP Streamer": t["RTMP Streamer"],
                 "MJPEG Streamer": t["MJPEG Streamer"],
             }
+        elif OS_NAME == "Windows":
+            run_mode_texts = {
+                "Local Viewer": t["Local Viewer"],
+                "OpenXR Link": t["OpenXR Link"],
+                "Moonlight Streamer": t.get("Moonlight Streamer", "Moonlight Streamer"),
+                "RTMP Streamer": t["RTMP Streamer"],
+                "MJPEG Streamer": t["MJPEG Streamer"],
+                "3D Monitor": t["3D Monitor"],
+            }
         else:
             run_mode_texts = {
                 "Local Viewer": t["Local Viewer"], "OpenXR Link": t["OpenXR Link"],
                 "RTMP Streamer": t["RTMP Streamer"], "MJPEG Streamer": t["MJPEG Streamer"],
             }
-            if OS_NAME == "Windows":
-                run_mode_texts["3D Monitor"] = t["3D Monitor"]
         self.run_mode_dd.options = [v for v in run_mode_texts.values()]
         self.capture_mode_dd.options = [t["Monitor"], t["Window"]]
         self.capture_mode_dd.value = t["Monitor"] if self.capture_mode_key == "Monitor" else t["Window"]
@@ -974,6 +1682,21 @@ class GUIHandlerMixin:
         self.stream_quality_label.value = t["Stream Quality:"]
         self.stream_proto_label.value = t["Stream Protocol:"]
         self.stream_key_label.value = t["Stream Key"]
+        self.moonlight_pairing_btn.content = ft.Text(
+            t.get("Open Moonlight pairing", "Sunshine Settings"),
+            size=FONT_SIZE,
+            max_lines=1,
+            no_wrap=True,
+        )
+        self.moonlight_pairing_btn.width = S(145 if self.locale == "CN" else 170)
+        self.moonlight_pin_tf.label = t.get("Moonlight Pairing PIN", "Pairing PIN:")
+        self.moonlight_pair_btn.content = ft.Text(
+            t.get("Pair Moonlight Client", "Pair device"),
+            size=FONT_SIZE,
+            max_lines=1,
+            no_wrap=True,
+        )
+        self.moonlight_pair_btn.width = S(95 if self.locale == "CN" else 120)
         calibration_auto = self._stream_calibration_auto_enabled()
         self.stream_calibration_label.value = t.get(
             "Transmission Profile:", "Transmission Profile:"
@@ -1002,6 +1725,11 @@ class GUIHandlerMixin:
         self.reset_btn.content.value = t["Reset"]
         self.stop_btn.content.value = self._stop_button_text()
         self.run_btn.content.value = t["Run"]
+        openxr_controls_button = getattr(self, "openxr_controls_button", None)
+        if openxr_controls_button is not None:
+            openxr_controls_button.content.value = t.get(
+                "OpenXR Controls", "OpenXR Controls"
+            )
         self.report_issue_btn.content.value = t.get("Report issue", "Report bug")
         self.open_log_file_btn.content.value = t.get("Open log file", "Open log")
         self._sync_log_visibility_link()
@@ -1016,6 +1744,11 @@ class GUIHandlerMixin:
                     pass
 
         _set_tooltip(self.window_dd, t["tooltip_window"])
+        if openxr_controls_button is not None:
+            _set_tooltip(
+                openxr_controls_button,
+                t.get("tooltip_openxr_controls", "Open the OpenXR controls window."),
+            )
         for ctrl, key in [
             (self.depth_model_dd, "tooltip_depth_model"),
             (self.model_size_dd, "tooltip_model_size"),
@@ -1067,7 +1800,6 @@ class GUIHandlerMixin:
             (self.stereo_monitor_dd, "tooltip_stereo_monitor"),
             (self.lang_dd, "tooltip_lang"),
             (self.theme_dd, "tooltip_theme"),
-            (self.stream_settings_cb, "tooltip_stream_settings"),
             (self.stream_url_tf, "tooltip_stream_url"),
             (self.preview_btn, "tooltip_stream_preview"),
             (self.stream_quality_dd, "tooltip_stream_quality"),

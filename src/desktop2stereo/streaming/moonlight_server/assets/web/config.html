@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="auto">
+
+<head>
+  <!-- TEMPLATE_HEADER - Used by Every UI Page -->
+<meta charset="UTF-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sunshine</title>
+<link rel="icon" type="image/x-icon" href="./images/sunshine.ico">
+
+  <script type="module" crossorigin src="./assets/config-Be6hEjiR.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/logo-sunshine-45-jSIapha2.js">
+  <link rel="modulepreload" crossorigin href="./assets/trash-hacRL4Qy.js">
+  <link rel="modulepreload" crossorigin href="./assets/Notification-CkJkKBnN.js">
+  <link rel="modulepreload" crossorigin href="./assets/Navbar-Dibp9hT2.js">
+  <link rel="modulepreload" crossorigin href="./assets/gamepad-2-CH-kKcrZ.js">
+  <link rel="modulepreload" crossorigin href="./assets/Checkbox-DUVuaVAk.js">
+  <link rel="modulepreload" crossorigin href="./assets/save-Xs6Ko-C-.js">
+  <link rel="modulepreload" crossorigin href="./assets/fetch_utils-COCp1DR8.js">
+  <link rel="stylesheet" crossorigin href="./assets/logo-sunshine-45-2HJRdqau.css">
+  <link rel="stylesheet" crossorigin href="./assets/Notification-DmToSpaP.css">
+  <link rel="stylesheet" crossorigin href="./assets/Navbar-SNHnNuEx.css">
+  <link rel="stylesheet" crossorigin href="./assets/config-ByMCr56h.css">
+</head>
+
+<body id="app" v-cloak>
+  <Navbar></Navbar>
+  <div id="content" class="container">
+    <div class="my-4">
+      <h1>{{ $t('config.configuration') }}</h1>
+      <p>{{ $t('config.configuration_desc') }}</p>
+    </div>
+
+    <!-- Search Bar with Autocomplete -->
+    <div class="toolbar mb-3 d-flex flex-wrap align-items-center gap-3">
+      <div class="input-group config-search">
+        <span class="input-group-text">
+          <search :size="18" class="icon"></search>
+        </span>
+        <input
+          type="text"
+          class="form-control"
+          v-model="searchQuery"
+          :placeholder="$t('config.search_options')"
+          @input="handleSearch"
+          list="config-options"
+        />
+      </div>
+      <datalist id="config-options">
+        <option v-for="option in allConfigOptions" :key="option.key" :value="option.label">
+          {{ option.tab }} - {{ option.label }}
+        </option>
+      </datalist>
+      <span v-if="searchQuery && searchResults.length === 0" class="text-muted small flex-shrink-0">
+        No results found for "{{ searchQuery }}"
+      </span>
+      <span v-else-if="searchQuery" class="text-muted small flex-shrink-0">
+        Found {{ searchResults.length }} result(s)
+      </span>
+    </div>
+
+    <div class="form" v-if="config">
+      <div class="config-layout">
+        <!-- Sidebar navigation -->
+        <nav class="config-nav">
+          <ul class="nav config-nav-list">
+            <li class="nav-item" v-for="tab in generalTabs" :key="tab.id">
+              <a class="nav-link" :class="{'active': tab.id === currentTab}" href="#"
+                @click="currentTab = tab.id">
+                <component :is="getTabIcon(tab.id)" :size="18" class="icon"></component>
+                {{ $t(tab.nameKey) }}
+              </a>
+            </li>
+          </ul>
+          <template v-if="encoderTabs.length">
+            <div class="config-nav-heading">{{ $t('config.encoders') }}</div>
+            <ul class="nav config-nav-list">
+              <li class="nav-item" v-for="tab in encoderTabs" :key="tab.id">
+                <a class="nav-link" :class="{'active': tab.id === currentTab}" href="#"
+                  @click="currentTab = tab.id">
+                  <component :is="getTabIcon(tab.id)" :size="18" class="icon"></component>
+                  {{ $t(tab.nameKey) }}
+                </a>
+              </li>
+            </ul>
+          </template>
+
+          <div class="config-actions">
+            <button class="btn btn-primary" @click="save">
+              <save :size="18" class="icon"></save>
+              {{ $t('_common.save') }}
+            </button>
+            <button class="btn btn-success" @click="apply" v-if="saved && !restarted">
+              <check :size="18" class="icon"></check>
+              {{ $t('_common.apply') }}
+            </button>
+          </div>
+        </nav>
+
+        <!-- Tab content -->
+        <div class="config-content">
+          <div class="alert alert-success mb-4" v-if="saved && !restarted">
+            <b>{{ $t('_common.success') }}</b> {{ $t('config.apply_note') }}
+          </div>
+          <div class="alert alert-success mb-4" v-if="restarted">
+            <b>{{ $t('_common.success') }}</b> {{ $t('config.restart_note') }}
+          </div>
+
+      <!-- General Tab -->
+      <general
+        v-if="currentTab === 'general'"
+        :config="config"
+        :platform="platform">
+      </general>
+
+      <!-- Input Tab -->
+      <inputs
+        v-if="currentTab === 'input'"
+        :config="config"
+        :platform="platform">
+      </inputs>
+
+      <!-- Audio/Video Tab -->
+      <audio-video
+        v-if="currentTab === 'av'"
+        :config="config"
+        :platform="platform"
+      >
+      </audio-video>
+
+      <!-- Network Tab -->
+      <network
+        v-if="currentTab === 'network'"
+        :config="config"
+        :platform="platform">
+      </network>
+
+      <!-- Files Tab -->
+      <files
+        v-if="currentTab === 'files'"
+        :config="config"
+        :platform="platform">
+      </files>
+
+      <!-- Advanced Tab -->
+      <advanced
+        v-if="currentTab === 'advanced'"
+        :config="config"
+        :platform="platform">
+      </advanced>
+
+      <container-encoders
+        :current-tab="currentTab"
+        :config="config"
+        :platform="platform">
+      </container-encoders>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</body>
+
+

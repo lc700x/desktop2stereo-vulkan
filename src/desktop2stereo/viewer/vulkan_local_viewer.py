@@ -22,6 +22,7 @@ from utils.queue_utils import _release_item
 from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
 from viewer.direct_sink import DIRECT_SINK, direct_staging_enabled
 from viewer.vulkan_fps_overlay import VulkanFpsOverlay, build_fps_panel_rgba
+from viewer.vulkan_context import _query_adapter_luid
 from viewer.vulkan_resources import (
     VulkanExportableBuffer,
     VulkanExportableImage,
@@ -665,19 +666,25 @@ def depth_preview_frame(result: Any) -> Any | None:
 
 
 def _choose_present_device_candidate(
-    candidates: list[tuple[Any, str, int]],
+    candidates: list[tuple[Any, str, int, int]],
     inference_gpu_name: str | None,
-) -> tuple[tuple[Any, str, int] | None, bool]:
-    """Prefer the Vulkan adapter that owns inference tensors for GPU interop."""
+    inference_gpu_luid: int | None = None,
+) -> tuple[tuple[Any, str, int, int] | None, bool]:
+    """Prefer the inference adapter and allow interop only for an exact LUID match."""
     if not candidates:
         return None, False
+    expected_luid = int(inference_gpu_luid or 0)
+    if expected_luid:
+        for candidate in candidates:
+            if int(candidate[3] or 0) == expected_luid:
+                return candidate, True
     preferred = str(inference_gpu_name or "").strip().casefold()
     if preferred:
         for candidate in candidates:
             if candidate[1].strip().casefold() == preferred:
-                return candidate, True
+                return candidate, False
         return candidates[0], False
-    return candidates[0], True
+    return candidates[0], not expected_luid
 
 
 @dataclass(frozen=True, slots=True)
@@ -712,6 +719,7 @@ class VulkanLocalViewerConfig:
     on_breakdown_add_time: Callable[[str, float], None] | None = None
     direct_staging: bool = True
     inference_gpu_name: str | None = None
+    inference_gpu_luid: int | None = None
     window_width: int = 1280
     window_height: int = 720
 
@@ -789,6 +797,7 @@ class VulkanLocalViewer:
         self.physical_device = self.device = self.queue = None
         self.queue_family = None
         self._gpu_interop_allowed = True
+        self._adapter_luid = 0
         self.command_pool = self.command_buffer = None
         self.swapchain = None
         self.swap_images: list[Any] = []
@@ -842,6 +851,11 @@ class VulkanLocalViewer:
         self._reuse_cumulative_total = 0
         self._present_window_start = time.perf_counter()
         self._content_fps = 0.0
+        self.upstream_fps_provider = None
+        self._upstream_fps = 0.0
+        self.sys_load_provider = None
+        self._gpu_util = None
+        self._gpu_util_max = None
         self._reuse_ratio = 0.0
 
     def initialize(self) -> None:
@@ -1192,6 +1206,21 @@ class VulkanLocalViewer:
             self._fps_overlay.set_enabled(
                 show_fps and self._fps_overlay_swapchain_supported
             )
+        upstream_provider = getattr(self, "upstream_fps_provider", None)
+        if callable(upstream_provider):
+            try:
+                self._upstream_fps = max(0.0, float(upstream_provider()))
+            except (TypeError, ValueError, RuntimeError):
+                self._upstream_fps = 0.0
+        load_provider = getattr(self, "sys_load_provider", None)
+        if callable(load_provider):
+            try:
+                load = load_provider()
+                self._gpu_util = load.get("gpu")
+                self._gpu_util_max = load.get("gpu_max")
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                self._gpu_util = None
+                self._gpu_util_max = None
         benchmark_fps = os.environ.get("D2S_BENCHMARK", "0").strip().lower() in {
             "1",
             "true",
@@ -1232,6 +1261,12 @@ class VulkanLocalViewer:
             f"latency_samples={len(self._latency_history)}",
             f"display_hz={int(self._output_refresh_hz)}",
         ]
+        if self._upstream_fps > 0.0:
+            parts.append(f"upstream_fps={self._upstream_fps:.2f}")
+        if isinstance(self._gpu_util, (int, float)):
+            parts.append(f"sys_gpu={float(self._gpu_util):.0f}")
+            if isinstance(self._gpu_util_max, (int, float)):
+                parts.append(f"sys_gpu_max={float(self._gpu_util_max):.0f}")
         if latency:
             parts.extend(
                 (
@@ -1476,6 +1511,9 @@ class VulkanLocalViewer:
             avg_latency_ms=self.avg_latency_ms(),
             content_fps=self.content_fps(),
             reuse_ratio=self.reuse_ratio(),
+            source_fps=self._upstream_fps if self._upstream_fps > 0.0 else None,
+            gpu_util=self._gpu_util,
+            gpu_util_max=self._gpu_util_max,
         )
         if panel is None:
             return
@@ -1490,6 +1528,12 @@ class VulkanLocalViewer:
         available_instance_extensions = {
             prop.extensionName for prop in vk.vkEnumerateInstanceExtensionProperties(None)
         }
+        properties2_extension = "VK_KHR_get_physical_device_properties2"
+        if (
+            properties2_extension in available_instance_extensions
+            and properties2_extension not in extensions
+        ):
+            extensions.append(properties2_extension)
         request_full_screen_exclusive = should_request_full_screen_exclusive(
             self.config.fullscreen,
             self.config.capture_compatible_fullscreen,
@@ -1531,7 +1575,7 @@ class VulkanLocalViewer:
         if result != vk.VK_SUCCESS:
             raise RuntimeError(f"glfwCreateWindowSurface failed ({result})")
         self.surface = surface_ptr[0]
-        present_candidates: list[tuple[Any, str, int]] = []
+        present_candidates: list[tuple[Any, str, int, int]] = []
         for candidate in vk.vkEnumeratePhysicalDevices(self.instance):
             available = {prop.extensionName for prop in vk.vkEnumerateDeviceExtensionProperties(candidate, None)}
             if "VK_KHR_swapchain" not in available:
@@ -1539,26 +1583,52 @@ class VulkanLocalViewer:
             for index, props in enumerate(vk.vkGetPhysicalDeviceQueueFamilyProperties(candidate)):
                 if props.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT and self._surface_support(candidate, index):
                     name = str(vk.vkGetPhysicalDeviceProperties(candidate).deviceName)
-                    present_candidates.append((candidate, name, index))
+                    adapter_luid = _query_adapter_luid(vk, candidate)
+                    present_candidates.append(
+                        (candidate, name, index, int(adapter_luid or 0))
+                    )
                     break
         selected, self._gpu_interop_allowed = _choose_present_device_candidate(
             present_candidates,
             self.config.inference_gpu_name,
+            self.config.inference_gpu_luid,
         )
         if selected is not None:
-            self.physical_device, selected_name, self.queue_family = selected
+            (
+                self.physical_device,
+                selected_name,
+                self.queue_family,
+                self._adapter_luid,
+            ) = selected
             inference_name = str(self.config.inference_gpu_name or "").strip()
-            if inference_name and not self._gpu_interop_allowed:
+            inference_luid = int(self.config.inference_gpu_luid or 0)
+            if (inference_name or inference_luid) and not self._gpu_interop_allowed:
+                expected_text = (
+                    f"0x{inference_luid:016x}" if inference_luid else "unknown"
+                )
+                selected_text = (
+                    f"0x{self._adapter_luid:016x}"
+                    if self._adapter_luid
+                    else "unknown"
+                )
                 print(
-                    "[VulkanLocalViewer] No present-capable Vulkan adapter matches "
-                    f"inference GPU '{inference_name}'; selected '{selected_name}' "
-                    "and disabled cross-adapter GPU interop",
+                    "[VulkanLocalViewer] Inference/presentation adapter identity "
+                    f"not matched (inference_luid={expected_text}, "
+                    f"presentation_luid={selected_text}, "
+                    f"inference_gpu='{inference_name or 'unknown'}', "
+                    f"presentation_gpu='{selected_name}'); using host upload",
                     flush=True,
                 )
             else:
+                selected_text = (
+                    f"0x{self._adapter_luid:016x}"
+                    if self._adapter_luid
+                    else "unknown"
+                )
                 print(
-                    f"[VulkanLocalViewer] Selected Vulkan adapter: {selected_name}"
-                    + (" (matches inference GPU)" if inference_name else ""),
+                    f"[VulkanLocalViewer] Selected Vulkan adapter: {selected_name} "
+                    f"luid={selected_text}"
+                    + (" (matches inference GPU)" if inference_luid else ""),
                     flush=True,
                 )
         if self.physical_device is None:
@@ -2452,7 +2522,8 @@ class _TransferSource:
         if not self.owner._gpu_interop_allowed:
             print(
                 "[VulkanLocalViewer] GPU external-memory interop disabled because "
-                "the inference and presentation adapters differ; using host upload",
+                "the inference and presentation adapter LUIDs differ or are "
+                "unavailable; using host upload",
                 flush=True,
             )
         elif required.issubset(set(self.owner._interop_extensions)):
@@ -2551,7 +2622,14 @@ class _TransferSource:
         stage_started = frame_started
         # Keep the macOS event loop responsive if a drawable/GPU completion
         # is late. Never reset a command buffer whose submission is pending.
-        wait_ns = 2_000_000 if sys.platform == "darwin" else 1_000_000_000
+        # Under FIFO, MoltenVK's CAMetalLayer drawable acquisition waits for
+        # the display refresh. A 2 ms cap turns that normal wait into repeated
+        # VK_TIMEOUT results and drops otherwise valid frames.
+        wait_ns = (
+            1_000_000_000
+            if (sys.platform != "darwin" or o.config.vsync)
+            else 2_000_000
+        )
         try:
             fence_value = vk.vkWaitForFences(o.device, 1, [o.fence], True, wait_ns)
         except vk.VkTimeout:
@@ -2923,6 +3001,23 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
     cached_frame = None
     cached_path = "host"
     next_present_at = 0.0
+    last_presented_at = 0.0
+    vsync_handoff_stalled = False
+    vsync_handoff_wait_logged = False
+
+    def _vsync_refresh_hz() -> float:
+        try:
+            refresh_hz = float(getattr(viewer, "_output_refresh_hz", 0) or 0.0)
+        except (TypeError, ValueError):
+            refresh_hz = 0.0
+        if refresh_hz < 20.0:
+            refresh_hz = 60.0
+        return refresh_hz
+
+    def _vsync_handoff_timeout() -> float:
+        """Bound the VSync queue hand-off wait to roughly one refresh."""
+        return min(0.05, max(0.004, 1.25 / _vsync_refresh_hz()))
+
     try:
         while not shutdown_event.is_set():
             paced = cached_frame is not None and not config.vsync
@@ -2948,16 +3043,39 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                         0.0, scheduled_deadline - time.perf_counter()
                     )
                 elif cached_frame is not None:
-                    queue_timeout = 0.0
+                    # Present already paces the VSync loop. Briefly wait for a
+                    # freshly prepared frame so a publication just after the
+                    # prior poll is not replaced before the next refresh.
+                    queue_timeout = (
+                        0.0 if vsync_handoff_stalled else _vsync_handoff_timeout()
+                    )
+                    if last_presented_at > 0.0:
+                        # Keep a late producer from pushing cached-frame reuse
+                        # beyond the next display boundary.
+                        boundary_wait = (
+                            last_presented_at
+                            + 1.0 / _vsync_refresh_hz()
+                            - time.perf_counter()
+                        )
+                        queue_timeout = min(
+                            queue_timeout, max(0.0, boundary_wait)
+                        )
+                    if not vsync_handoff_wait_logged:
+                        vsync_handoff_wait_logged = True
+                        print(
+                            "[VulkanLocalViewer] VSync hand-off wait: "
+                            f"{queue_timeout * 1000.0:.1f}ms "
+                            f"(refresh {1000.0 / _vsync_refresh_hz():.1f}ms)",
+                            flush=True,
+                        )
                 else:
                     queue_timeout = 0.05
                 result, _started = runtime_q.get(
-                    # FIFO VSync already waits for presentation. Adding a full
-                    # capture-queue wait here drops a 24 FPS video's presents
-                    # below 60 Hz and makes its reuse cadence uneven. The
-                    # bounded grace is already positioned before the deadline.
+                    # This grace only catches a newly published result; an
+                    # empty queue reuses the cached frame at the next refresh.
                     timeout=queue_timeout
                 )
+                vsync_handoff_stalled = False
             except queue.Empty:
                 if viewer is not None and cached_frame is not None:
                     # Keep submitting the last valid GPU frame while depth
@@ -2966,6 +3084,7 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     result = cached_result
                     frame = cached_frame
                     reused = True
+                    vsync_handoff_stalled = True
                 else:
                     if viewer is not None:
                         viewer.poll_events()
@@ -3028,6 +3147,16 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                 # Vulkan/MoltenVK is unavailable (e.g., missing SDK).
                 try:
                     viewer = VulkanLocalViewer(config)
+                    packer = getattr(runtime_q, "_d2s_packer", None)
+                    if packer is not None:
+                        viewer.upstream_fps_provider = getattr(
+                            packer, "take_published_fps", None
+                        )
+                    from utils.sys_load import install_system_load_sampler
+
+                    system_load = install_system_load_sampler(cpu=False)
+                    if system_load is not None:
+                        viewer.sys_load_provider = system_load.snapshot
                     viewer.initialize()
                     print("[VulkanLocalViewer] Vulkan local window initialized", flush=True)
                 except Exception as vulkan_exc:
@@ -3226,6 +3355,16 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                         f"{type(exc).__name__}: {exc}",
                         flush=True,
                     )
+            if presented is not False:
+                last_presented_at = presented_at
+                if config.vsync:
+                    # Some Windows FIFO_LATEST_READY drivers return immediately.
+                    # Pace those submissions to the existing 60 Hz slot grid.
+                    interval = 1.0 / _vsync_refresh_hz()
+                    if presented_at - present_started < interval * 0.5:
+                        remaining = next_present_at - time.perf_counter()
+                        if remaining > 0.0:
+                            time.sleep(min(remaining, interval))
     except StopIteration:
         shutdown_event.set()
     finally:

@@ -1,17 +1,20 @@
 from utils.breakdown import FPSBreakdown, fps_breakdown_default
 
 
-def test_fps_breakdown_defaults_on_for_fps_enabled_local_viewer(monkeypatch):
+def test_fps_breakdown_defaults_off_for_every_run_mode(monkeypatch):
     monkeypatch.delenv("D2S_OPENXR_DEBUG", raising=False)
 
     assert fps_breakdown_default(
         {"Run Mode": "Local Viewer", "Show FPS": True}, "Viewer"
-    ) == "1"
+    ) == "0"
     assert fps_breakdown_default(
         {"Run Mode": "Local Viewer", "Show FPS": False}, "Viewer"
     ) == "0"
     assert fps_breakdown_default(
         {"Run Mode": "RTMP Streamer", "Show FPS": True}, "Viewer"
+    ) == "0"
+    assert fps_breakdown_default(
+        {"Run Mode": "Moonlight Streamer", "Show FPS": True}, "Viewer"
     ) == "0"
 
 
@@ -142,3 +145,18 @@ def test_fps_breakdown_reports_bounded_openxr_timing_percentiles(capsys):
     assert "vk_submit_p95=29.00ms" in output
     assert "rt_total_p50=20.00ms" in output
     assert "rt_slot_wait_p95=14.50ms" in output
+
+
+def test_fps_breakdown_reports_gc_and_optional_gpu_metrics(capsys):
+    breakdown = FPSBreakdown(enabled=True, target_fps=60)
+    start = breakdown.last_log
+    breakdown.set_latest("sys_gpu", 81)
+    breakdown.set_latest("sys_gpu_max", 97)
+
+    breakdown.log(now=start + 15.0)
+
+    output = capsys.readouterr().out
+    assert "sys_gpu=81" in output
+    assert "sys_gpu_max=97" in output
+    assert "gc_window=" in output
+    assert "gc_max=" in output

@@ -3207,6 +3207,98 @@ def test_fps_and_operation_guides_select_gpu_msdf_quad_requests() -> None:
     ))
 
 
+def test_curved_screen_fps_overlay_uses_matching_cylinder_layer() -> None:
+    presenter = OpenXrVulkanPresenter()
+
+    class FakeXr:
+        CompositionLayerFlags = SimpleNamespace(
+            BLEND_TEXTURE_SOURCE_ALPHA_BIT=1,
+            UNPREMULTIPLIED_ALPHA_BIT=2,
+        )
+        EyeVisibility = SimpleNamespace(BOTH="both")
+        CompositionLayerCylinderKHR = staticmethod(
+            lambda **kwargs: {"layer_type": "cylinder", **kwargs}
+        )
+        CompositionLayerQuad = staticmethod(
+            lambda **kwargs: {"layer_type": "quad", **kwargs}
+        )
+        SwapchainSubImage = staticmethod(lambda **kwargs: kwargs)
+        Rect2Di = staticmethod(lambda **kwargs: kwargs)
+        Offset2Di = staticmethod(lambda **kwargs: kwargs)
+        Extent2Di = staticmethod(lambda **kwargs: kwargs)
+        Posef = staticmethod(lambda **kwargs: kwargs)
+        Quaternionf = staticmethod(lambda **kwargs: kwargs)
+        Vector3f = staticmethod(lambda **kwargs: kwargs)
+        Extent2Df = staticmethod(lambda **kwargs: kwargs)
+
+    presenter.xr = FakeXr()
+    presenter.reference_space = "reference"
+    presenter._openxr_cylinder_supported = True
+    presenter._screen_curved = True
+    presenter._screen_curve_half_angle = 0.72
+    presenter._screen_crop_width_percent = 0.0
+    presenter._screen_crop_height_percent = 0.0
+    presenter._filament_screen = (
+        (0.0, 0.0, -2.0), 2.4, 1.35, (0.0, 0.0, 0.0)
+    )
+    local = np.eye(4, dtype=np.float64)
+    local[:3, 3] = (-0.7, -0.8, 0.0)
+    position, _rotation = presenter._screen_overlay_pose(local)
+
+    entry = {"swapchain": "fps-swapchain"}
+    layer = presenter._make_tool_quad_layer(
+        entry,
+        640,
+        96,
+        position,
+        (0.8, 0.16),
+        (0.0, 0.0, 0.0, 1.0),
+        key="screen_fps",
+    )
+
+    assert layer["layer_type"] == "cylinder"
+    assert layer["space"] == "reference"
+    assert layer["eye_visibility"] == "both"
+    assert layer["radius"] == pytest.approx(2.4 / (2.0 * 0.72))
+    assert layer["central_angle"] == pytest.approx(0.8 / layer["radius"])
+    assert layer["aspect_ratio"] == pytest.approx(0.8 / 0.16)
+    assert layer["sub_image"]["swapchain"] == "fps-swapchain"
+    radius = layer["radius"]
+    theta = -0.7 / radius
+    expected_normal = (-math.sin(theta), 0.0, math.cos(theta))
+    expected_position = (
+        radius * math.sin(theta) + expected_normal[0] * 0.003,
+        -0.8,
+        -2.0 + radius * (1.0 - math.cos(theta)) + expected_normal[2] * 0.003,
+    )
+    actual_position = layer["pose"]["position"]
+    assert (actual_position["x"], actual_position["y"], actual_position["z"]) == pytest.approx(
+        expected_position
+    )
+
+    presenter._openxr_cylinder_supported = False
+    fallback_layer = presenter._make_tool_quad_layer(
+        entry,
+        640,
+        96,
+        position,
+        (0.8, 0.16),
+        (0.0, 0.0, 0.0, 1.0),
+        key="screen_fps",
+    )
+    assert 4 <= len(fallback_layer) <= 8
+    assert all(layer["layer_type"] == "quad" for layer in fallback_layer)
+    rectangles = [layer["sub_image"]["image_rect"] for layer in fallback_layer]
+    assert rectangles[0]["offset"]["x"] == 0
+    assert rectangles[-1]["offset"]["x"] + rectangles[-1]["extent"]["width"] == 640
+    assert all(
+        left["offset"]["x"] + left["extent"]["width"] == right["offset"]["x"]
+        for left, right in zip(rectangles, rectangles[1:])
+    )
+    rotations = [layer["pose"]["orientation"] for layer in fallback_layer]
+    assert rotations[0] != rotations[-1]
+
+
 def test_msdf_osd_canvas_width_follows_text_advance() -> None:
     atlas = MsdfFontAtlas()
     short_width, short_height, _ = _layout_msdf_osd_runs(

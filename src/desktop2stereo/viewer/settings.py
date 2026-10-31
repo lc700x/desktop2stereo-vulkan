@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from stereo_runtime.render_size import RenderSizeConfig, render_size_config_from_settings
+from utils import display_info
 from utils.display import compute_output_resolution, get_fps
-from utils.display_info import resolve_display_capture_index
 from utils.run_mode import target_fps_for_run_mode
 from utils.xr_headset_presets import DEFAULT_XR_HEADSET_MODEL, resolve_xr_headset_preset
+
 from viewer.controller_help import get_controller_help_rows
 from viewer.upscaler import normalize_upscaler, normalize_upscaler_sharpness
 
@@ -41,29 +43,71 @@ class ViewerSettings:
     xr_preview_window: bool
 
 
+def _resolve_available_display_index(
+    saved_index,
+    identity,
+    displays,
+    *,
+    fallback_index: int | None = None,
+) -> int | None:
+    available_indices = {int(display.capture_index) for display in displays}
+    if not available_indices:
+        return None
+
+    if isinstance(identity, Mapping) and identity:
+        resolved_index = display_info.resolve_display_capture_index(
+            saved_index,
+            identity,
+            displays,
+        )
+    else:
+        try:
+            resolved_index = int(saved_index)
+        except (TypeError, ValueError):
+            resolved_index = None
+
+    if resolved_index in available_indices:
+        return resolved_index
+
+    if fallback_index in available_indices:
+        return fallback_index
+
+    from gui.capture_sources import get_primary_monitor_index
+
+    primary_index = get_primary_monitor_index()
+    if primary_index in available_indices:
+        return primary_index
+    return int(displays[0].capture_index)
+
+
 def resolve_viewer_settings(settings: dict) -> ViewerSettings:
-    monitor_index = resolve_display_capture_index(
+    displays = display_info.enumerate_displays()
+    if not displays:
+        raise RuntimeError(
+            "no system displays are available; connect or enable a display and restart"
+        )
+
+    monitor_index = _resolve_available_display_index(
         settings["Monitor Index"],
         settings.get("Monitor Identity"),
+        displays,
     )
     if monitor_index is None:
         raise RuntimeError(
-            "configured input display is unavailable; refresh and select it again"
+            "no system displays are available; connect or enable a display and restart"
         )
     display_mode = settings["Display Mode"]
     saved_stereo_display_index = settings.get("Stereo Output")
     stereo_display_index = (
-        resolve_display_capture_index(
+        _resolve_available_display_index(
             saved_stereo_display_index,
             settings.get("Stereo Output Identity"),
+            displays,
+            fallback_index=monitor_index,
         )
         if saved_stereo_display_index is not None
         else None
     )
-    if saved_stereo_display_index is not None and stereo_display_index is None:
-        raise RuntimeError(
-            "configured stereo output display is unavailable; refresh and select it again"
-        )
     stereo_display_selection = stereo_display_index is not None
     # Only the 3D Monitor run mode actually renders onto the stereo-output
     # display, so only it should size the processing resolution to that screen.

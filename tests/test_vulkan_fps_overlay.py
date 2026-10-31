@@ -15,6 +15,9 @@ def test_fps_panel_uses_a_stable_texture_extent():
         avg_latency_ms=28,
         content_fps=5.2,
         reuse_ratio=0.91,
+        source_fps=58.7,
+        gpu_util=85,
+        gpu_util_max=97,
     )
     large_values = build_fps_panel_rgba(
         present_fps=60.0,
@@ -23,11 +26,14 @@ def test_fps_panel_uses_a_stable_texture_extent():
         avg_latency_ms=450,
         content_fps=60.0,
         reuse_ratio=0.1,
+        source_fps=59.9,
+        gpu_util=78,
+        gpu_util_max=92,
     )
 
     assert small_values is not None
     assert large_values is not None
-    assert small_values.size == large_values.size == (560, 256)
+    assert small_values.size == large_values.size == (560, 320)
     assert small_values.mode == large_values.mode == "RGBA"
     assert small_values.getpixel((559, 255)) == (0, 0, 0, 0)
 

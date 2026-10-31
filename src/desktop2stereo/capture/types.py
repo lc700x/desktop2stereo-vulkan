@@ -16,6 +16,7 @@ class CaptureConfig:
     capture_mode: str = "Monitor"
     monitor_index: int = 1
     capture_tool: str | None = None
+    device_id: int | None = None
     os_name: str | None = None
     fps_provider: Callable[[], int] | None = None
 

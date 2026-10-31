@@ -1,6 +1,13 @@
+import os
+import queue
+import threading
+from types import SimpleNamespace
+
 import pytest
 
 from gui.localization import gettext_for
+from xr_viewer import desktop_settings_menu
+from xr_viewer.desktop_settings_menu import DesktopOpenXrSettingsWindow
 from xr_viewer.settings_menu import (
     OpenXrSettingsMenu,
     _CONTENT_LEFT,
@@ -16,6 +23,68 @@ from xr_viewer.settings_menu import (
     SETTINGS_MENU_TEXTURE_SIZE,
     clamp_picture_values,
 )
+
+
+def test_desktop_launcher_returns_when_settings_panel_closes():
+    window = DesktopOpenXrSettingsWindow.__new__(DesktopOpenXrSettingsWindow)
+    window._started = threading.Event()
+    window._started.set()
+    window._closed = threading.Event()
+    window._flet_commands = queue.Queue()
+    window._icon_visible = True
+
+    assert window.set_panel_visible(True) is True
+    assert window._icon_visible is False
+    command, revision = window._flet_commands.get_nowait()
+    assert command == "__show_flet__"
+    assert revision > 0
+
+    assert window.set_panel_visible(False) is True
+    assert window._icon_visible is True
+    command, revision = window._flet_commands.get_nowait()
+    assert command == "__show_icon__"
+    assert revision > 0
+
+    window.toggle_icon_visibility()
+    assert window._icon_visible is True
+    command, revision = window._flet_commands.get_nowait()
+    assert command == "__show_icon__"
+    assert revision > 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native window visibility")
+def test_hidden_desktop_launcher_is_shown_without_activation(monkeypatch):
+    class FakeFunction:
+        def __init__(self, function):
+            self.function = function
+
+        def __call__(self, *args):
+            return self.function(*args)
+
+    state = {"visible": False}
+    calls = []
+
+    def show_window(hwnd, mode):
+        calls.append((hwnd, mode))
+        state["visible"] = True
+        return False  # ShowWindow returns the previous visibility.
+
+    user32 = SimpleNamespace(
+        IsWindow=FakeFunction(lambda hwnd: hwnd == 123),
+        IsWindowVisible=FakeFunction(lambda _hwnd: state["visible"]),
+        ShowWindow=FakeFunction(show_window),
+    )
+    monkeypatch.setattr(
+        desktop_settings_menu.ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: user32,
+    )
+
+    assert desktop_settings_menu._ensure_windows_drawer_visible(123) is True
+    assert calls == [(123, 4)]
+    assert desktop_settings_menu._ensure_windows_drawer_visible(123) is True
+    assert calls == [(123, 4)]
+    assert desktop_settings_menu._ensure_windows_drawer_visible(999) is False
 
 
 def test_picture_layout_exposes_all_planned_controls():
@@ -426,17 +495,19 @@ def test_screen_reset_stays_in_placement_card_below_secondary_navigation():
     toolbar = [
         controls[key] for key in (
             "screen:section:layout", "screen:section:crop",
+            "screen:section:passthrough",
         )
     ]
     boxes = [tuple(round(value * size) for value, size in zip(
         control.rect, (1024, 832, 1024, 832)
     )) for control in toolbar]
     assert boxes == [
-        (288, 56, 632, 104),
-        (632, 56, 976, 104),
+        (288, 56, 516, 104),
+        (516, 56, 744, 104),
+        (744, 56, 976, 104),
     ]
     assert controls["reset:screen_placement"].group == "screen_placement"
-    assert controls["reset:screen_placement"].rect[1] > toolbar[1].rect[3]
+    assert controls["reset:screen_placement"].rect[1] > toolbar[-1].rect[3]
 
 
 @pytest.mark.parametrize("tab", OpenXrSettingsMenu.tabs)

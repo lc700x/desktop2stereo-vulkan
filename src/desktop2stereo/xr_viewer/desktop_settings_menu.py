@@ -23,6 +23,7 @@ from typing import Any
 
 from gui.localization import gettext_for, normalize_locale
 from .settings_menu import (
+    MenuControl,
     OPENXR_MENU_COLORS,
     OPENXR_MENU_GROUP_LABELS,
     OPENXR_MENU_RADII,
@@ -37,6 +38,8 @@ DESKTOP_SETTINGS_ICON_SIZE = (51, 57)
 DESKTOP_SETTINGS_ICON_IMAGE_SIZE = (42, 42)
 _FLET_PANEL_SIZE = (760, 650)
 _FLET_PANEL_POLL_SECONDS = 0.08
+_FLET_VISIBILITY_DEBOUNCE_SECONDS = 0.16
+_FLET_DRAWER_VISIBILITY_CHECK_SECONDS = 0.25
 _FLET_DRAWER_WIDTH = 192
 _FLET_DRAWER_TAB_WIDTH = 12
 _FLET_DRAWER_HIDE_DELAY_SECONDS = 0.3
@@ -399,6 +402,24 @@ def _clip_windows_drawer(
     # Windows owns a successfully assigned region and releases it on replacement.
 
 
+def _ensure_windows_drawer_visible(hwnd: int | None) -> bool:
+    """Restore a hidden drawer without taking focus from the desktop."""
+    if os.name != "nt" or hwnd is None:
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    if not user32.IsWindow(hwnd):
+        return False
+    if not user32.IsWindowVisible(hwnd):
+        user32.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE.
+    return bool(user32.IsWindowVisible(hwnd))
+
+
 def _primary_screen_size() -> tuple[int, int]:
     """Return the primary screen size for launcher placement without Tk."""
     if os.name == "nt":
@@ -730,6 +751,8 @@ def _run_flet_desktop_settings_app(
         drawer_expanded = False
         drawer_hide_task: asyncio.Task | None = None
         native_window_handle = None
+        last_visibility_revision = 0
+        next_drawer_visibility_check = 0.0
 
         def cancel_drawer_hide() -> None:
             nonlocal drawer_hide_task
@@ -788,7 +811,7 @@ def _run_flet_desktop_settings_app(
 
         def request_panel_toggle(_event: Any) -> None:
             try:
-                commands.put_nowait("__toggle_flet__")
+                commands.put_nowait(("__toggle_flet__", time.monotonic_ns()))
             except Exception:
                 pass
 
@@ -853,70 +876,75 @@ def _run_flet_desktop_settings_app(
         step_widgets: dict[str, tuple[Any, Any]] = {}
         toggle_widgets: dict[str, Any] = {}
         layout_signature: tuple[Any, ...] | None = None
+        window_mode_lock = asyncio.Lock()
 
         async def set_window_mode(show_panel: bool) -> None:
             nonlocal visible, drawer_expanded
-            cancel_drawer_hide()
-            visible = show_panel
-            drawer_expanded = False
-            drawer_body.visible = False
-            drawer_handle.visible = True
-            if show_panel:
-                apply_drawer_region()
-            # Apply minimum constraints before shrinking the native window.
-            # Flet's Window service otherwise resizes against the old minimum.
-            page.window.min_width = 580 if show_panel else 1
-            page.window.min_height = 420 if show_panel else 1
-            page.window.update()
-            await page.window.wait_until_ready_to_show()
-            page.controls.clear()
-            if show_panel:
-                page.add(panel_view)
-                page.bgcolor = _menu_color("surface")
-                page.window.width = _FLET_PANEL_SIZE[0]
-                page.window.height = _FLET_PANEL_SIZE[1]
-                page.window.resizable = True
-                page.window.movable = None if os.name == "nt" else True
-                page.window.skip_task_bar = False
-                page.window.frameless = False
-                page.window.title_bar_hidden = False
-                page.window.title_bar_buttons_hidden = False
-                page.window.opacity = 1.0
-                page.window.bgcolor = _menu_color("surface")
-                monitor_rect = active_monitor_rect or (
-                    0,
-                    0,
-                    *_primary_screen_size(),
-                )
-                panel_position = _flet_panel_position_for_monitor(
-                    monitor_rect, pixel_ratio=window_pixel_ratio()
-                )
-                if panel_position is not None:
-                    page.window.left, page.window.top = panel_position
-                page.window.visible = True
-                page.window.focused = True
-            else:
-                page.add(launcher_view)
-                page.bgcolor = ft.Colors.TRANSPARENT
-                page.window.width = _FLET_DRAWER_WIDTH
-                launcher_view.width = _FLET_DRAWER_WIDTH
-                page.window.height = DESKTOP_SETTINGS_ICON_SIZE[1]
-                page.window.resizable = False
-                page.window.movable = None if os.name == "nt" else False
-                page.window.skip_task_bar = True
-                page.window.frameless = True
-                page.window.title_bar_hidden = True
-                page.window.title_bar_buttons_hidden = True
-                page.window.opacity = DESKTOP_SETTINGS_ICON_OPACITY
-                page.window.bgcolor = ft.Colors.TRANSPARENT
-                geometry = _icon_geometry_for_monitor(
-                    active_monitor_rect,
-                    fallback_size=_primary_screen_size(),
-                    pixel_ratio=window_pixel_ratio(),
-                )
-                page.window.left, page.window.top = geometry[:2]
-                page.window.visible = True
-                apply_drawer_region()
+            async with window_mode_lock:
+                cancel_drawer_hide()
+                visible = show_panel
+                drawer_expanded = False
+                drawer_body.visible = False
+                drawer_handle.visible = True
+                if show_panel:
+                    apply_drawer_region()
+                # Apply minimum constraints before shrinking the native window.
+                # Flet's Window service otherwise resizes against the old minimum.
+                page.window.min_width = 580 if show_panel else 1
+                page.window.min_height = 420 if show_panel else 1
+                if not page.window.visible:
+                    page.window.opacity = 0.0
+                    page.window.visible = True
+                page.window.update()
+                await page.window.wait_until_ready_to_show()
+                page.controls.clear()
+                if show_panel:
+                    page.add(panel_view)
+                    page.bgcolor = _menu_color("surface")
+                    page.window.width = _FLET_PANEL_SIZE[0]
+                    page.window.height = _FLET_PANEL_SIZE[1]
+                    page.window.resizable = True
+                    page.window.movable = None if os.name == "nt" else True
+                    page.window.skip_task_bar = False
+                    page.window.frameless = False
+                    page.window.title_bar_hidden = False
+                    page.window.title_bar_buttons_hidden = False
+                    page.window.opacity = 1.0
+                    page.window.bgcolor = _menu_color("surface")
+                    monitor_rect = active_monitor_rect or (
+                        0,
+                        0,
+                        *_primary_screen_size(),
+                    )
+                    panel_position = _flet_panel_position_for_monitor(
+                        monitor_rect, pixel_ratio=window_pixel_ratio()
+                    )
+                    if panel_position is not None:
+                        page.window.left, page.window.top = panel_position
+                    page.window.visible = True
+                    page.window.focused = True
+                else:
+                    page.add(launcher_view)
+                    page.bgcolor = ft.Colors.TRANSPARENT
+                    page.window.width = _FLET_DRAWER_WIDTH
+                    launcher_view.width = _FLET_DRAWER_WIDTH
+                    page.window.height = DESKTOP_SETTINGS_ICON_SIZE[1]
+                    page.window.resizable = False
+                    page.window.movable = None if os.name == "nt" else False
+                    page.window.skip_task_bar = True
+                    page.window.frameless = True
+                    page.window.title_bar_hidden = True
+                    page.window.title_bar_buttons_hidden = True
+                    page.window.opacity = DESKTOP_SETTINGS_ICON_OPACITY
+                    page.window.bgcolor = ft.Colors.TRANSPARENT
+                    geometry = _icon_geometry_for_monitor(
+                        active_monitor_rect,
+                        fallback_size=_primary_screen_size(),
+                        pixel_ratio=window_pixel_ratio(),
+                    )
+                    page.window.left, page.window.top = geometry[:2]
+                    page.window.visible = True
+                    apply_drawer_region()
 
         def queue_action(key: str, value: float | None = None) -> None:
             try:
@@ -966,6 +994,13 @@ def _run_flet_desktop_settings_app(
             section_controls = [
                 item for item in controls if str(item.key).startswith("screen:section:")
             ]
+            reset_orientation_control = MenuControl(
+                "screen:reset_to_front",
+                "Reset orientation",
+                (0.0, 0.0, 1.0, 1.0),
+                group="navigation_actions",
+                fixed=True,
+            )
 
             def make_button(control: Any, *, width: int | None = None) -> Any:
                 key = str(control.key)
@@ -1427,6 +1462,10 @@ def _run_flet_desktop_settings_app(
             sidebar.controls = [
                 *(nav_button(control) for control in nav_controls),
                 ft.Container(expand=True),
+                make_button(
+                    reset_orientation_control,
+                    width=_FLET_SIDEBAR_WIDTH - 24,
+                ),
                 make_button(stop_control) if stop_control is not None else ft.Container(height=_FLET_BUTTON_HEIGHT),
             ]
             body_content.controls = content
@@ -1473,9 +1512,19 @@ def _run_flet_desktop_settings_app(
 
         async def on_window_event(event: Any) -> None:
             if event.type == ft.WindowEventType.CLOSE:
-                await set_window_mode(False)
+                page.window.prevent_close = True
+                page.window.visible = True
                 page.window.update()
-                page.update()
+                try:
+                    commands.put_nowait(
+                        (
+                            "__show_icon__",
+                            max(time.monotonic_ns(), last_visibility_revision + 1),
+                            True,
+                        )
+                    )
+                except Exception:
+                    pass
             elif event.type == ft.WindowEventType.SHOW and not visible:
                 apply_drawer_region()
 
@@ -1488,26 +1537,77 @@ def _run_flet_desktop_settings_app(
         page.window.visible = True
         page.window.update()
         page.update()
-
         while True:
             changed = False
-            command = _drain_latest(commands)
-            if command == "__quit__":
+            controls_visibility_changed = False
+            controls_ack_revision = None
+            requested_visibility = visible
+            quit_requested = False
+            try:
+                first_command = commands.get_nowait()
+            except queue.Empty:
+                first_command = None
+            command_items = [] if first_command is None else [first_command]
+            first_command_is_urgent = bool(
+                isinstance(first_command, tuple)
+                and len(first_command) == 3
+                and first_command[2]
+            )
+            if (
+                first_command is not None
+                and first_command != "__quit__"
+                and not first_command_is_urgent
+            ):
+                await asyncio.sleep(_FLET_VISIBILITY_DEBOUNCE_SECONDS)
+                while True:
+                    try:
+                        command_items.append(commands.get_nowait())
+                    except queue.Empty:
+                        break
+
+            for command_item in command_items:
+                command_revision = None
+                if isinstance(command_item, tuple) and len(command_item) in (2, 3):
+                    command, command_revision = command_item[:2]
+                    try:
+                        command_revision = int(command_revision)
+                    except (TypeError, ValueError):
+                        continue
+                    if command_revision <= last_visibility_revision:
+                        continue
+                    last_visibility_revision = command_revision
+                else:
+                    command = command_item
+                if command == "__quit__":
+                    quit_requested = True
+                    break
+                if command in {
+                    "__toggle_flet__",
+                    "__show_flet__",
+                    "__hide_flet__",
+                    "__show_icon__",
+                } and command_revision is None:
+                    command_revision = max(
+                        time.monotonic_ns(), last_visibility_revision + 1
+                    )
+                    last_visibility_revision = command_revision
+                if command == "__toggle_flet__":
+                    requested_visibility = not requested_visibility
+                elif command == "__show_flet__":
+                    requested_visibility = True
+                elif command in {"__hide_flet__", "__show_icon__"}:
+                    requested_visibility = False
+                else:
+                    continue
+                changed = True
+                controls_visibility_changed = True
+                controls_ack_revision = command_revision
+            if quit_requested:
                 break
-            if command == "__toggle_flet__":
-                await set_window_mode(not visible)
-                changed = True
-            elif command == "__show_flet__":
-                await set_window_mode(True)
-                changed = True
-            elif command == "__hide_flet__":
-                cancel_drawer_hide()
-                visible = False
-                page.window.visible = False
-                changed = True
-            elif command == "__show_icon__":
-                await set_window_mode(False)
-                changed = True
+            if controls_visibility_changed and requested_visibility != visible:
+                # Coalesce a burst of switch/close requests before touching the
+                # native window; intermediate resizes can leave its drawer clipped.
+                await set_window_mode(requested_visibility)
 
             snapshot = _drain_latest(snapshots)
             if snapshot is not None:
@@ -1542,6 +1642,28 @@ def _run_flet_desktop_settings_app(
             if changed:
                 page.window.update()
                 page.update()
+                if controls_visibility_changed:
+                    revision_suffix = (
+                        f" revision={controls_ack_revision}"
+                        if controls_ack_revision is not None
+                        else ""
+                    )
+                    print(
+                        f"[D2S_OPENXR_CONTROLS] visible={int(visible)}"
+                        f"{revision_suffix}",
+                        flush=True,
+                    )
+            if os.name == "nt" and not visible:
+                now = time.monotonic()
+                if controls_visibility_changed:
+                    next_drawer_visibility_check = now + _FLET_PANEL_POLL_SECONDS
+                elif now >= next_drawer_visibility_check:
+                    if not _ensure_windows_drawer_visible(native_window_handle):
+                        native_window_handle = _windows_flet_window_handle()
+                        if native_window_handle is not None:
+                            apply_drawer_region()
+                            _ensure_windows_drawer_visible(native_window_handle)
+                    next_drawer_visibility_check = now + _FLET_DRAWER_VISIBILITY_CHECK_SECONDS
             await asyncio.sleep(_FLET_PANEL_POLL_SECONDS)
 
         cancel_drawer_hide()
@@ -1669,10 +1791,10 @@ class DesktopOpenXrSettingsWindow:
     def toggle_icon_visibility(self) -> None:
         if self._closed.is_set():
             return
-        self._icon_visible = not self._icon_visible
+        self._icon_visible = True
         try:
             self._flet_commands.put_nowait(
-                "__show_icon__" if self._icon_visible else "__hide_flet__"
+                ("__show_icon__", time.monotonic_ns())
             )
         except Exception:
             pass
@@ -1705,6 +1827,27 @@ class DesktopOpenXrSettingsWindow:
         if self._closed.is_set():
             return
         try:
-            self._flet_commands.put_nowait("__toggle_flet__")
+            self._flet_commands.put_nowait(
+                ("__toggle_flet__", time.monotonic_ns())
+            )
         except Exception:
             pass
+
+    def set_panel_visible(
+        self,
+        visible: bool,
+        *,
+        revision: int | None = None,
+    ) -> bool:
+        if not self._started.is_set() or self._closed.is_set():
+            return False
+        try:
+            command = "__show_flet__" if visible else "__show_icon__"
+            command_revision = (
+                int(revision) if revision is not None else time.monotonic_ns()
+            )
+            self._flet_commands.put_nowait((command, command_revision))
+        except Exception:
+            return False
+        self._icon_visible = not visible
+        return True

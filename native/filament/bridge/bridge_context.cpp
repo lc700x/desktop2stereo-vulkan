@@ -48,7 +48,9 @@ FilamentBridge* bridge_context_create(
     bridge->shared_context.graphicsQueueIndex = info->graphics_queue_index;
     bridge->platform = new OpenXrVulkanPlatform();
     filament::Engine::Config engine_config{};
-    engine_config.stereoscopicType = filament::Engine::StereoscopicType::MULTIVIEW;
+    // OpenXR submits each eye independently, so Filament does not need its
+    // multiview default-material package here.
+    engine_config.stereoscopicType = filament::Engine::StereoscopicType::NONE;
     engine_config.stereoscopicEyeCount = 2;
     bridge->engine = filament::Engine::Builder()
             .backend(filament::Engine::Backend::VULKAN)
@@ -62,8 +64,11 @@ FilamentBridge* bridge_context_create(
         bridge->platform = nullptr;
         return bridge.release();
     }
-    bridge->multiview_supported = bridge->engine->isStereoSupported(
-            filament::Engine::StereoscopicType::MULTIVIEW);
+    bridge->multiview_supported =
+            engine_config.stereoscopicType ==
+                    filament::Engine::StereoscopicType::MULTIVIEW &&
+            bridge->engine->isStereoSupported(
+                    filament::Engine::StereoscopicType::MULTIVIEW);
     bridge->scene = bridge->engine->createScene();
     bridge->foreground_scene = bridge->engine->createScene();
     bridge->materials = bridge_create_material_provider(bridge->engine);

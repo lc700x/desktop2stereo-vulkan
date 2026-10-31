@@ -73,6 +73,34 @@ from stereo_runtime.nvfruc_calibration import (
 from stereo_runtime.nvfruc_stage import NvFrucStage
 
 
+def _inference_gpu_adapter_luid(device: Any) -> tuple[int | None, str | None]:
+    """Return the selected CUDA/ROCm adapter LUID for local Vulkan interop."""
+    if str(getattr(device, "type", device)).strip().casefold() != "cuda":
+        return None, None
+    try:
+        import torch
+
+        device_index = getattr(device, "index", None)
+        if device_index is None:
+            device_index = int(torch.cuda.current_device())
+        if getattr(torch.version, "hip", None):
+            from wc_rocm import get_luid
+        else:
+            from wc_cuda import get_luid
+
+        luid = get_luid(int(device_index))
+        if isinstance(luid, (tuple, list)) and len(luid) == 2:
+            low, high = (int(value) & 0xFFFFFFFF for value in luid)
+            packed_luid = (high << 32) | low
+        else:
+            packed_luid = int(luid or 0)
+        if packed_luid:
+            return packed_luid, None
+        return None, "selected GPU returned an empty LUID"
+    except Exception as exc:  # noqa: BLE001 - identity failures must disable external interop.
+        return None, f"{type(exc).__name__}: {exc}"
+
+
 def _resolve_filament_environment_paths(
     settings: dict,
     src_root: Path,
@@ -1017,6 +1045,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             output_thread.start()
         elif configured_run_mode in {
             "RTMP Streamer",
+            "Moonlight Streamer",
             "MJPEG Streamer",
         }:
             from streaming.direct_sbs import (
@@ -1036,27 +1065,55 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             # Shared input_size (tex_w,tex_h) for dynamic eye ratio like VulkanLocalViewer
             cap_mode_stream = str(settings.get("Capture Mode", "")).strip()
             stream_input_size: tuple[int, int] | None = None
+            stream_input_bounds: tuple[int, int, int, int, int, int] | None = None
             try:
-                if cap_mode_stream.casefold() == "window":
-                    title_stream = str(settings.get("Window Title", "")).strip()
-                    if title_stream and OS_NAME == "Windows":
-                        try:
-                            import win32gui
-                            hwnd_stream = win32gui.FindWindow(None, title_stream)
-                            if hwnd_stream:
-                                _, _, w_stream, h_stream = win32gui.GetClientRect(hwnd_stream)
-                                if w_stream > 0 and h_stream > 0:
-                                    stream_input_size = (int(w_stream), int(h_stream))
-                        except Exception:
-                            pass
-                    if stream_input_size is None:
-                        from utils.display import get_monitor_size
-                        stream_input_size = get_monitor_size(int(MONITOR_INDEX))
-                else:
-                    from utils.display import get_monitor_size
-                    stream_input_size = get_monitor_size(int(MONITOR_INDEX))
+                import mss
+
+                with mss.MSS() as stream_sct:
+                    virtual_desktop = stream_sct.monitors[0]
+                    source_rect = None
+                    if cap_mode_stream.casefold() == "window":
+                        title_stream = str(settings.get("Window Title", "")).strip()
+                        if title_stream and OS_NAME == "Windows":
+                            try:
+                                import win32gui
+
+                                hwnd_stream = win32gui.FindWindow(None, title_stream)
+                                if hwnd_stream:
+                                    client = win32gui.GetClientRect(hwnd_stream)
+                                    left, top = win32gui.ClientToScreen(hwnd_stream, (client[0], client[1]))
+                                    width, height = client[2] - client[0], client[3] - client[1]
+                                    if width > 0 and height > 0:
+                                        source_rect = (left, top, width, height)
+                            except Exception:
+                                pass
+                    if source_rect is None:
+                        monitor_index = int(MONITOR_INDEX)
+                        if monitor_index <= 0 or monitor_index >= len(stream_sct.monitors):
+                            monitor_index = 1
+                        monitor = stream_sct.monitors[monitor_index]
+                        source_rect = (
+                            monitor["left"], monitor["top"],
+                            monitor["width"], monitor["height"],
+                        )
+                    left, top, width, height = map(int, source_rect)
+                    stream_input_size = (width, height)
+                    stream_input_bounds = (
+                        left - int(virtual_desktop["left"]),
+                        top - int(virtual_desktop["top"]),
+                        width,
+                        height,
+                        int(virtual_desktop["width"]),
+                        int(virtual_desktop["height"]),
+                    )
             except Exception:
-                stream_input_size = None
+                from utils.display import get_monitor_size
+
+                stream_input_size = get_monitor_size(int(MONITOR_INDEX))
+                stream_input_bounds = (
+                    0, 0, stream_input_size[0], stream_input_size[1],
+                    stream_input_size[0], stream_input_size[1],
+                )
 
             if configured_run_mode in CALIBRATABLE_STREAM_MODES:
                 selected_audio = resolve_stream_audio_device(
@@ -1198,6 +1255,20 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     # Intel sink, which owns the Vulkan image ring and the
                     # D3D11/oneVPL lifetime.
                     os.environ.setdefault("D2S_INTEL_VULKAN_SBS", "1")
+            elif configured_run_mode == "Moonlight Streamer":
+                from streaming.moonlight_output import MoonlightSbsOutput
+
+                network_output = MoonlightSbsOutput(
+                    base_dir=context.base_dir,
+                    fps=int(FPS),
+                    display_mode=str(settings.get("Display Mode", "Half-SBS")),
+                    fit_mode=stream_fit_mode,
+                    input_size=stream_input_size,
+                    device=str(DEVICE),
+                    encoder_backend=str(settings.get("Video Encoder Backend", "auto")),
+                    bitrate_mbps=int(settings.get("Stream Target Bitrate Mbps", 0) or 0),
+                    input_bounds=stream_input_bounds,
+                )
             else:
                 network_output = MjpegDirectSbsOutput(
                     port=int(settings.get("Streamer Port", 1122)),
@@ -1360,8 +1431,16 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             except Exception:
                 input_size = None
             inference_gpu_name = None
+            inference_gpu_luid = None
             if str(getattr(DEVICE, "type", DEVICE)).strip().casefold() == "cuda":
                 inference_gpu_name = str(DEVICE_INFO or "").partition(":")[2].strip() or None
+                inference_gpu_luid, identity_error = _inference_gpu_adapter_luid(DEVICE)
+                if identity_error:
+                    print(
+                        "[VulkanLocalViewer] Could not identify inference GPU by LUID; "
+                        f"external GPU interop will use the safe host path ({identity_error})",
+                        flush=True,
+                    )
             local_viewer_config = VulkanLocalViewerConfig(
                 title=f"{WINDOW_TITLE or 'Desktop2Stereo'} Vulkan Viewer",
                 monitor_index=max(0, selected_monitor),
@@ -1393,6 +1472,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 on_breakdown_inc=callbacks.breakdown_inc,
                 on_breakdown_add_time=callbacks.breakdown_add_time,
                 inference_gpu_name=inference_gpu_name,
+                inference_gpu_luid=inference_gpu_luid,
             )
             local_viewer_kwargs = {
                 "runtime_q": presentation_q,
@@ -1521,6 +1601,9 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         pass
     finally:
         shutdown_event.set()
+        from utils.gc_tuning import restore_gc_settings
+
+        restore_gc_settings()
         if stop_request_thread is not None:
             stop_request_thread.join(timeout=0.2)
         callbacks.stop_active_capture_session()

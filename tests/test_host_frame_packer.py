@@ -209,3 +209,15 @@ def test_packer_replaces_queued_frame_without_waiting_for_viewer() -> None:
 
     assert out_q.get_nowait() is newest
     assert released == [1]
+
+
+def test_packer_reports_ready_frame_rate_without_warmup_dilution(monkeypatch) -> None:
+    import viewer.host_frame_packer as host_frame_packer
+
+    times = iter((10.0, 11.0, 12.0))
+    monkeypatch.setattr(host_frame_packer.time, "perf_counter", lambda: next(times))
+    packer = HostFramePacker(queue.Queue(), queue.Queue(maxsize=1))
+
+    assert packer.take_published_fps() == 0.0
+    packer._published = 60
+    assert packer.take_published_fps() == 60.0

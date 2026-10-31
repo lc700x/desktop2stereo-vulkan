@@ -86,6 +86,9 @@ def _windows_capture_kwargs(config, capture_tool):
         optional = {
             "minimum_update_interval": _fps_to_minimum_update_interval_ms(getattr(config, "fps", None)),
         }
+        device_id = getattr(config, "device_id", None)
+        if device_id is not None:
+            optional["device_id"] = int(device_id)
         if capture_tool == "WindowsCaptureCUDA":
             optional.update(
                 reuse_output_buffer=_env_bool("D2S_WGC_REUSE_OUTPUT_BUFFER"),
@@ -166,6 +169,32 @@ def _event_capture_device(capture_tool):
     if capture_tool == "WindowsCaptureROCm":
         return "rocm"
     return "cpu"
+
+
+def _capture_adapter_luid(capture_tool, device_id=0):
+    try:
+        if capture_tool == "WindowsCaptureROCm":
+            from wc_rocm import get_luid
+            backend = "ROCm"
+        elif capture_tool == "WindowsCaptureCUDA":
+            from wc_cuda import get_luid
+            backend = "CUDA"
+        else:
+            return 0, "capture backend has no GPU adapter identity provider"
+
+        luid = get_luid(int(device_id))
+        if isinstance(luid, (tuple, list)) and len(luid) == 2:
+            low, high = (int(value) & 0xFFFFFFFF for value in luid)
+            packed = (high << 32) | low
+            return (packed, None) if packed else (0, f"{backend} adapter LUID is unavailable")
+        packed = int(luid or 0)
+        return (packed, None) if packed else (0, f"{backend} adapter LUID is unavailable")
+    except Exception as exc:  # noqa: BLE001 - unresolved identity requires compatibility capture.
+        return 0, f"{capture_tool} adapter identity lookup failed: {type(exc).__name__}: {exc}"
+
+
+def _rocm_capture_adapter_luid(device_id=0):
+    return _capture_adapter_luid("WindowsCaptureROCm", device_id)
 
 
 def _copy_frame_buffer(frame_buffer, capture_tool):
@@ -250,6 +279,7 @@ class WindowsCaptureEventRunner:
         self._last_frame_emit_ts = 0.0
         self._replay_thread = None
         self._capture_monitor_rect = None
+        self._capture_adapter_luid = 0
 
     @property
     def session(self):
@@ -489,6 +519,26 @@ class WindowsCaptureEventRunner:
         on_session_update=None,
         on_tick=None,
     ):
+        if self.capture_tool in {"WindowsCaptureCUDA", "WindowsCaptureROCm"}:
+            device_id = int(getattr(self.config, "device_id", 0) or 0)
+            self._capture_adapter_luid, identity_error = _capture_adapter_luid(
+                self.capture_tool, device_id
+            )
+            if not self._capture_adapter_luid:
+                requested_tool = self.capture_tool
+                self.capture_tool = "WindowsCapture"
+                self.config = replace(self.config, capture_tool=self.capture_tool)
+                print(
+                    f"[{requested_tool}] adapter identity is unknown; "
+                    f"using compatibility capture ({identity_error})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[{self.capture_tool}] device={device_id} "
+                    f"capture_adapter_luid=0x{self._capture_adapter_luid:016x}",
+                    flush=True,
+                )
         _setup_dpi_awareness()
         if self.config.capture_mode == "Monitor":
             self._capture_monitor_rect = _capture_monitor_rect(
@@ -603,6 +653,11 @@ class WindowsCaptureEventRunner:
                         "cursor_capture": bool(capture_kwargs.get("cursor_capture", True)),
                         "cursor_position_uv": _cursor_position_uv(
                             self._capture_monitor_rect
+                        ),
+                        "capture_adapter_luid": self._capture_adapter_luid or None,
+                        "capture_device_id": (
+                            int(getattr(self.config, "device_id", 0) or 0)
+                            if self._capture_adapter_luid else None
                         ),
                         "native_resource_output": native_output,
                         "capture_gpu": bool(
