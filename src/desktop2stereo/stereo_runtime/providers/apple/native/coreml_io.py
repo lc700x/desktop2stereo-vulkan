@@ -104,6 +104,8 @@ class _NativeWarpConfig(ctypes.Structure):
         ("antialias_strength", ctypes.c_float),
         ("anaglyph_method", ctypes.c_int32),
         ("edge_aa_enabled", ctypes.c_int32),
+        ("half_sbs_single_sample", ctypes.c_int32),
+        ("stream_bgra", ctypes.c_int32),
     ]
 
 
@@ -561,6 +563,8 @@ class NativeCoreMLIOBridge:
                     output_edge_aa_enabled(),
                 )
             ),
+            int(values.get("half_sbs_single_sample", 0)),
+            int(values.get("stream_bgra", 0)),
         )
         handle = self._begin_call(allow_closing=True)
         try:

@@ -89,6 +89,7 @@ class MoonlightBridgeServer:
         self._send_lock = threading.Lock()
         self._client_socket: socket.socket | None = None
         self._client_config: MoonlightClientConfig | None = None
+        self._client_generation = 0
         self._client_reserved = False
         self._server: socketserver.ThreadingTCPServer | None = None
         self._server_thread: threading.Thread | None = None
@@ -104,6 +105,11 @@ class MoonlightBridgeServer:
     def connected(self) -> bool:
         with self._socket_lock:
             return self._client_socket is not None
+
+    @property
+    def connection_generation(self) -> int:
+        with self._socket_lock:
+            return self._client_generation
 
     def start(self) -> tuple[str, int]:
         if self._server is not None:
@@ -142,6 +148,7 @@ class MoonlightBridgeServer:
                             return
                         owner._client_socket = self.connection
                         owner._client_config = config
+                        owner._client_generation += 1
                     self.wfile.write((json.dumps({"ok": True, **response}) + "\n").encode("utf-8"))
                     self.wfile.flush()
                     while True:
@@ -164,12 +171,19 @@ class MoonlightBridgeServer:
                         if owner._client_socket is self.connection:
                             owner._client_socket = None
                             owner._client_config = None
+                            # Keep new handshakes out until D2S has released
+                            # the old encoder session and its queued frames.
+                            owner._client_reserved = True
                             disconnected = True
                         else:
+                            owner._client_reserved = False
                             disconnected = False
-                        owner._client_reserved = False
                     if disconnected:
-                        owner.on_client_stop()
+                        try:
+                            owner.on_client_stop()
+                        finally:
+                            with owner._socket_lock:
+                                owner._client_reserved = False
 
         self._server = _Server(("127.0.0.1", 0), _Handler)
         self._server_thread = threading.Thread(
@@ -187,6 +201,7 @@ class MoonlightBridgeServer:
         payload: bytes,
         *,
         idr: bool,
+        client_generation: int | None = None,
     ) -> bool:
         data = bytes(payload)
         if not data or len(data) > _MAX_ACCESS_UNIT:
@@ -200,15 +215,43 @@ class MoonlightBridgeServer:
         )
         with self._socket_lock:
             client = self._client_socket
-        if client is None:
+            generation = self._client_generation
+        if client is None or (
+            client_generation is not None and client_generation != generation
+        ):
             return False
         # Do not hold _socket_lock while sendall applies network backpressure.
         # close() must be able to shut down the socket and unblock this writer.
         with self._send_lock:
             with self._socket_lock:
-                if self._client_socket is not client:
+                if (
+                    self._client_socket is not client
+                    or self._client_generation != generation
+                    or (
+                        client_generation is not None
+                        and client_generation != self._client_generation
+                    )
+                ):
                     return False
             client.sendall(header + data)
+        return True
+
+    def disconnect_client(self, client_generation: int | None = None) -> bool:
+        with self._socket_lock:
+            client = self._client_socket
+            generation = self._client_generation
+            if client is None or (
+                client_generation is not None and client_generation != generation
+            ):
+                return False
+        try:
+            client.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            client.close()
+        except OSError:
+            pass
         return True
 
     def close(self) -> None:

@@ -8,6 +8,7 @@ import hmac
 import http.client
 import json
 import os
+import queue
 import secrets
 import socket
 import ssl
@@ -16,6 +17,7 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,17 @@ _SUNSHINE_PORT_OFFSETS = (
     (socket.SOCK_STREAM, (-5, 0, 1, 21)),
     (socket.SOCK_DGRAM, (9, 10, 11, 13)),
 )
+
+
+@dataclass
+class _NativeFrameSubmission:
+    native_frame: Any
+    output_format: str
+    frame_index: int
+    capture_timestamp_ns: int
+    session_generation: int
+    client_generation: int
+    force_keyframe: bool
 
 
 def read_sunshine_base_port(config_path: str | Path) -> int:
@@ -197,6 +210,27 @@ class MoonlightSbsOutput:
         self._amd_rate_tokens = 1.0
         self._amd_backpressure_logged = False
         self._force_idr = threading.Event()
+        self._native_session_lock = threading.Lock()
+        self._native_session_generation = 0
+        self._native_session_ready = False
+        self._native_frame_index = 0
+        self._native_force_keyframe_pending = True
+        self._native_keyframe_request_generation = 0
+        self._native_frame_queue: queue.Queue[_NativeFrameSubmission] = queue.Queue(maxsize=1)
+        self._native_queue_lock = threading.Lock()
+        self._native_worker_stop = threading.Event()
+        self._native_worker: threading.Thread | None = None
+        self._native_worker_lock = threading.Lock()
+        self._encoder_lifecycle_lock = threading.Lock()
+        self._native_metrics_lock = threading.Lock()
+        self._native_metrics_started = time.monotonic()
+        self._native_metrics_encoded = 0
+        self._native_metrics_sent = 0
+        self._native_metrics_dropped = 0
+        self._native_metrics_warp_gpu_ms = 0.0
+        self._native_metrics_encode_ms = 0.0
+        self._native_metrics_send_ms = 0.0
+        self._negotiated_bitrate_mbps = float(self.bitrate_mbps)
         self._encoder_lock = threading.RLock()
         self._encoder = None
         self._encoder_config: MoonlightClientConfig | None = None
@@ -232,7 +266,13 @@ class MoonlightSbsOutput:
 
     @property
     def current_network_bitrate_mbps(self) -> float:
-        return float(self.bitrate_mbps)
+        return self._negotiated_bitrate_mbps
+
+    def _request_keyframe(self) -> None:
+        with self._native_session_lock:
+            self._native_force_keyframe_pending = True
+            self._native_keyframe_request_generation += 1
+            self._force_idr.set()
 
     def _ensure_service_files(self, port: int) -> None:
         self._state_dir.mkdir(parents=True, exist_ok=True)
@@ -514,7 +554,7 @@ class MoonlightSbsOutput:
             token,
             on_client_start=self._configure_encoder,
             on_client_stop=self._client_disconnected,
-            on_idr_request=self._force_idr.set,
+            on_idr_request=self._request_keyframe,
         )
         host, port = self._bridge.start()
         environment = os.environ.copy()
@@ -594,26 +634,56 @@ class MoonlightSbsOutput:
                     )
                 from streaming.videotoolbox_encoder import VideoToolboxEncoder
 
-                with self._encoder_lock:
-                    self._close_encoder_locked()
-                    self._encoder = VideoToolboxEncoder(
-                        config.width,
-                        config.height,
-                        round(config.fps),
-                        config.bitrate_kbps * 1000,
-                        hevc=config.codec == "hevc",
-                        fit_mode=self.fit_mode,
-                        display_mode=self.display_mode,
-                        input_size=self.input_size,
-                    )
-                    self._encoder_config = config
-                    self._frame_index = 0
-                    self._frame_timestamps.clear()
-                    self._amd_pending_frames.clear()
-                    self._amd_rate_update_at = None
-                    self._amd_rate_tokens = 1.0
-                    self._amd_backpressure_logged = False
+                with self._native_session_lock:
+                    self._native_session_generation += 1
+                    session_generation = self._native_session_generation
+                    self._native_session_ready = False
+                    self._native_frame_index = 0
+                    self._native_force_keyframe_pending = True
+                    self._native_keyframe_request_generation += 1
                     self._force_idr.set()
+                    self._negotiated_bitrate_mbps = config.bitrate_kbps / 1000.0
+                self._drop_pending_native_frames()
+                with self._encoder_lifecycle_lock:
+                    with self._native_session_lock:
+                        if session_generation != self._native_session_generation:
+                            return None
+                    with self._encoder_lock:
+                        self._close_encoder_locked()
+                        self._encoder = VideoToolboxEncoder(
+                            config.width,
+                            config.height,
+                            round(config.fps),
+                            config.bitrate_kbps * 1000,
+                            hevc=config.codec == "hevc",
+                            fit_mode=self.fit_mode,
+                            display_mode=self.display_mode,
+                            input_size=self.input_size,
+                        )
+                        self._encoder_config = config
+                        self._frame_index = 0
+                        self._frame_timestamps.clear()
+                        self._amd_pending_frames.clear()
+                        self._amd_rate_update_at = None
+                        self._amd_rate_tokens = 1.0
+                        self._amd_backpressure_logged = False
+                    with self._native_session_lock:
+                        if session_generation == self._native_session_generation:
+                            self._native_session_ready = True
+                        else:
+                            self._native_session_ready = False
+                        session_ready = self._native_session_ready
+                    if not session_ready:
+                        with self._encoder_lock:
+                            self._close_encoder_locked()
+                            self._encoder_config = None
+                        return None
+                print(
+                    "[Moonlight] Client negotiated "
+                    f"{config.width}x{config.height}@{config.fps:g}, "
+                    f"{config.codec.upper()}, {config.bitrate_kbps / 1000.0:g} Mbps",
+                    flush=True,
+                )
                 return {"accepted_width": config.width, "accepted_height": config.height}
 
             import torch
@@ -685,7 +755,16 @@ class MoonlightSbsOutput:
             return None
 
     def _client_disconnected(self) -> None:
-        with self._encoder_lock:
+        with self._native_session_lock:
+            self._native_session_generation += 1
+            self._native_session_ready = False
+            self._native_frame_index = 0
+            self._native_force_keyframe_pending = False
+            self._native_keyframe_request_generation += 1
+            self._force_idr.clear()
+            self._negotiated_bitrate_mbps = float(self.bitrate_mbps)
+        self._drop_pending_native_frames()
+        with self._encoder_lifecycle_lock, self._encoder_lock:
             self._close_encoder_locked()
             self._encoder_config = None
             self._frame_timestamps.clear()
@@ -693,6 +772,240 @@ class MoonlightSbsOutput:
             self._amd_rate_update_at = None
             self._amd_rate_tokens = 1.0
             self._amd_backpressure_logged = False
+
+    def _ensure_native_encoder_worker(self) -> None:
+        with self._native_worker_lock:
+            if self._native_worker_stop.is_set():
+                return
+            if self._native_worker is not None and self._native_worker.is_alive():
+                return
+            self._native_worker = threading.Thread(
+                target=self._run_native_encoder_worker,
+                name="D2SMoonlightVideoToolbox",
+                daemon=True,
+            )
+            self._native_worker.start()
+
+    @staticmethod
+    def _release_native_submission(submission: _NativeFrameSubmission) -> None:
+        native_frame = submission.native_frame
+        submission.native_frame = None
+        release = getattr(native_frame, "release", None)
+        if callable(release):
+            try:
+                release()
+            except Exception as exc:  # noqa: BLE001 - cleanup must not strand the worker
+                print(
+                    f"[Moonlight] Failed to release a native stream frame: {exc}",
+                    flush=True,
+                )
+
+    def _record_native_drop(self) -> None:
+        with self._native_metrics_lock:
+            self._native_metrics_dropped += 1
+
+    def _drop_pending_native_frames(self) -> None:
+        while True:
+            with self._native_queue_lock:
+                try:
+                    submission = self._native_frame_queue.get_nowait()
+                except queue.Empty:
+                    return
+            try:
+                self._release_native_submission(submission)
+                self._record_native_drop()
+            finally:
+                self._native_frame_queue.task_done()
+
+    def _enqueue_native_frame(self, submission: _NativeFrameSubmission) -> bool:
+        while not self._native_worker_stop.is_set():
+            stale = None
+            with self._native_queue_lock:
+                if self._native_worker_stop.is_set():
+                    return False
+                try:
+                    self._native_frame_queue.put_nowait(submission)
+                    return True
+                except queue.Full:
+                    try:
+                        stale = self._native_frame_queue.get_nowait()
+                    except queue.Empty:
+                        continue
+            if stale is not None:
+                try:
+                    if stale.force_keyframe:
+                        submission.force_keyframe = True
+                    self._release_native_submission(stale)
+                    self._record_native_drop()
+                finally:
+                    self._native_frame_queue.task_done()
+        return False
+
+    def _native_session_is_current(self, generation: int) -> bool:
+        with self._native_session_lock:
+            return (
+                self._native_session_ready
+                and self._native_session_generation == generation
+            )
+
+    def _run_native_encoder_worker(self) -> None:
+        while not self._native_worker_stop.is_set():
+            try:
+                submission = self._native_frame_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            encode_ms = 0.0
+            warp_gpu_ms = 0.0
+            send_ms = 0.0
+            encoded = False
+            sent = False
+            try:
+                if not self._native_session_is_current(submission.session_generation):
+                    self._record_native_drop()
+                    continue
+                encode_started = time.perf_counter()
+                try:
+                    with self._encoder_lock:
+                        with self._native_session_lock:
+                            if (
+                                not self._native_session_ready
+                                or self._native_session_generation
+                                != submission.session_generation
+                            ):
+                                self._record_native_drop()
+                                continue
+                        encoder = self._encoder
+                        config = self._encoder_config
+                        if encoder is None or config is None:
+                            self._record_native_drop()
+                            continue
+                        access_unit = encoder.encode_native_frame(
+                            submission.native_frame,
+                            output_format=submission.output_format,
+                            frame_index=submission.frame_index,
+                            force_keyframe=submission.force_keyframe,
+                        )
+                        pack_metrics = getattr(
+                            submission.native_frame, "last_pack_metrics", {}
+                        )
+                        if isinstance(pack_metrics, dict):
+                            try:
+                                warp_gpu_ms = max(
+                                    0.0, float(pack_metrics.get("metal_gpu_ms", 0.0))
+                                )
+                            except (TypeError, ValueError):
+                                warp_gpu_ms = 0.0
+                finally:
+                    encode_ms = (time.perf_counter() - encode_started) * 1000.0
+                    # The native Metal surface is no longer needed once the
+                    # VideoToolbox call has copied and submitted it. Release it
+                    # before any potentially backpressured network write.
+                    self._release_native_submission(submission)
+                encoded = True
+                if not self._native_session_is_current(submission.session_generation):
+                    self._record_native_drop()
+                    continue
+                bridge = self._bridge
+                if bridge is None or not bridge.connected:
+                    self._record_native_drop()
+                    continue
+                payload = bytes(access_unit["data"])
+                send_started = time.perf_counter()
+                sent = bridge.send_access_unit(
+                    submission.frame_index,
+                    submission.capture_timestamp_ns,
+                    payload,
+                    idr=bool(access_unit.get("idr"))
+                    or self._is_idr(payload, config.codec),
+                    client_generation=submission.client_generation,
+                )
+                send_ms = (time.perf_counter() - send_started) * 1000.0
+                if not sent:
+                    self._record_native_drop()
+            except Exception as exc:  # noqa: BLE001 - retire a failed client, keep the worker alive
+                self._record_native_drop()
+                print(
+                    f"[Moonlight] VideoToolbox stream worker failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                bridge = self._bridge
+                disconnect = getattr(bridge, "disconnect_client", None)
+                if callable(disconnect):
+                    try:
+                        disconnect(submission.client_generation)
+                    except Exception as disconnect_error:  # noqa: BLE001 - teardown is best-effort
+                        print(
+                            f"[Moonlight] Could not disconnect failed client: {disconnect_error}",
+                            flush=True,
+                        )
+            finally:
+                self._release_native_submission(submission)
+                self._native_frame_queue.task_done()
+                self._record_native_worker_result(
+                    encode_ms=encode_ms,
+                    warp_gpu_ms=warp_gpu_ms,
+                    send_ms=send_ms,
+                    encoded=encoded,
+                    sent=sent,
+                )
+
+    def _record_native_worker_result(
+        self,
+        *,
+        encode_ms: float,
+        warp_gpu_ms: float,
+        send_ms: float,
+        encoded: bool,
+        sent: bool,
+    ) -> None:
+        now = time.monotonic()
+        with self._native_metrics_lock:
+            self._native_metrics_encoded += int(encoded)
+            self._native_metrics_sent += int(sent)
+            self._native_metrics_warp_gpu_ms += warp_gpu_ms
+            self._native_metrics_encode_ms += encode_ms
+            self._native_metrics_send_ms += send_ms
+            elapsed = now - self._native_metrics_started
+            if elapsed < 5.0:
+                return
+            encoded_count = self._native_metrics_encoded
+            sent_count = self._native_metrics_sent
+            dropped_count = self._native_metrics_dropped
+            warp_gpu_total = self._native_metrics_warp_gpu_ms
+            encode_total = self._native_metrics_encode_ms
+            send_total = self._native_metrics_send_ms
+            self._native_metrics_started = now
+            self._native_metrics_encoded = 0
+            self._native_metrics_sent = 0
+            self._native_metrics_dropped = 0
+            self._native_metrics_warp_gpu_ms = 0.0
+            self._native_metrics_encode_ms = 0.0
+            self._native_metrics_send_ms = 0.0
+        print(
+            "[Moonlight] VideoToolbox: "
+            f"encoded={encoded_count / elapsed:.1f} fps, "
+            f"sent={sent_count / elapsed:.1f} fps, "
+            f"dropped={dropped_count}, "
+            f"stereo_gpu={warp_gpu_total / max(1, encoded_count):.1f} ms, "
+            f"encode={encode_total / max(1, encoded_count):.1f} ms, "
+            f"send={send_total / max(1, sent_count):.1f} ms",
+            flush=True,
+        )
+
+    def _stop_native_encoder_worker(self) -> None:
+        self._native_worker_stop.set()
+        self._drop_pending_native_frames()
+        with self._native_worker_lock:
+            worker = self._native_worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=3.0)
+            if worker.is_alive():
+                print(
+                    "[Moonlight] VideoToolbox worker did not stop within 3 seconds; "
+                    "waiting for the active encoder operation before releasing it",
+                    flush=True,
+                )
 
     def _close_encoder_locked(self) -> None:
         encoder = self._encoder
@@ -815,6 +1128,7 @@ class MoonlightSbsOutput:
     def submit_runtime_result(self, runtime_result: Any, capture_timestamp: float) -> None:
         if sys.platform == "darwin":
             native_frame = getattr(runtime_result, "native_stream_frame", None)
+            ownership_transferred = False
             try:
                 bridge = self._bridge
                 if bridge is None or not bridge.connected:
@@ -824,33 +1138,52 @@ class MoonlightSbsOutput:
                         "GPU-resident Moonlight streaming on macOS needs the native "
                         "CoreML/Metal stream path. Enable CoreML and grant Screen Recording permission."
                     )
-                with self._encoder_lock:
-                    encoder = self._encoder
-                    config = self._encoder_config
-                    if encoder is None or config is None:
+                with self._native_session_lock:
+                    if not self._native_session_ready:
                         return
-                    frame_index = self._frame_index
-                    self._frame_index += 1
-                    force_idr = self._force_idr.is_set()
-                    self._force_idr.clear()
-                    capture_ns = max(0, int(float(capture_timestamp) * 1_000_000_000))
-                    access_unit = encoder.encode_native_frame(
-                        native_frame,
-                        output_format=str(
-                            getattr(runtime_result, "output_format", "half_sbs")
-                            or "half_sbs"
-                        ),
-                        frame_index=frame_index,
-                        force_keyframe=force_idr,
+                    session_generation = self._native_session_generation
+                    frame_index = self._native_frame_index
+                    self._native_frame_index += 1
+                    keyframe_request_generation = (
+                        self._native_keyframe_request_generation
                     )
-                    bridge.send_access_unit(
-                        frame_index,
-                        capture_ns,
-                        bytes(access_unit["data"]),
-                        idr=bool(access_unit.get("idr")),
+                    force_keyframe = (
+                        self._native_force_keyframe_pending or self._force_idr.is_set()
                     )
+                submission = _NativeFrameSubmission(
+                    native_frame=native_frame,
+                    output_format=str(
+                        getattr(runtime_result, "output_format", "half_sbs")
+                        or "half_sbs"
+                    ),
+                    frame_index=frame_index,
+                    capture_timestamp_ns=max(
+                        0, int(float(capture_timestamp) * 1_000_000_000)
+                    ),
+                    session_generation=session_generation,
+                    client_generation=int(
+                        getattr(bridge, "connection_generation", 0)
+                    ),
+                    force_keyframe=force_keyframe,
+                )
+                self._ensure_native_encoder_worker()
+                if not self._enqueue_native_frame(submission):
+                    return
+                ownership_transferred = True
+                with self._native_session_lock:
+                    if (
+                        self._native_session_generation == session_generation
+                        and self._native_keyframe_request_generation
+                        == keyframe_request_generation
+                    ):
+                        self._native_force_keyframe_pending = False
+                        self._force_idr.clear()
+                try:
+                    object.__setattr__(runtime_result, "native_stream_frame", None)
+                except (AttributeError, TypeError):
+                    pass
             finally:
-                if native_frame is not None:
+                if native_frame is not None and not ownership_transferred:
                     native_frame.release()
                     try:
                         object.__setattr__(runtime_result, "native_stream_frame", None)
@@ -963,6 +1296,7 @@ class MoonlightSbsOutput:
         if self._bridge is not None:
             self._bridge.close()
             self._bridge = None
+        self._stop_native_encoder_worker()
         self._client_disconnected()
         process = self._sunshine
         self._sunshine = None

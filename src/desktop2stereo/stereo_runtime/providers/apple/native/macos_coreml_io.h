@@ -72,6 +72,8 @@ typedef struct {
     float antialias_strength;
     int32_t anaglyph_method;
     int32_t edge_aa_enabled;
+    int32_t half_sbs_single_sample;
+    int32_t stream_bgra;
 } D2SCoreMLIOWarpConfig;
 
 void *d2s_coreml_io_create(const char *model_path, int32_t input_width,

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 import ssl
+import threading
 from unittest.mock import patch
 
 from streaming import moonlight_output
-from streaming.moonlight_output import MoonlightSbsOutput, read_sunshine_base_port
 from streaming.moonlight_bridge import MoonlightClientConfig
+from streaming.moonlight_output import MoonlightSbsOutput, read_sunshine_base_port
 from streaming.moonlight_paths import (
     moonlight_state_directory,
     sunshine_executable,
@@ -173,17 +173,23 @@ def test_macos_moonlight_encodes_native_coreml_metal_frame():
             assert frame is native_frame
             assert kwargs["frame_index"] == 0
             assert kwargs["force_keyframe"] is True
+            encoded.set()
             return {"data": b"annex-b", "frame_index": 0, "idr": True}
 
     class _Bridge:
         connected = True
+        connection_generation = 7
 
         def __init__(self):
             self.sent = []
 
         def send_access_unit(self, *args, **kwargs):
             self.sent.append((args, kwargs))
+            sent.set()
             return True
+
+        def close(self):
+            self.connected = False
 
     output = MoonlightSbsOutput(
         base_dir=".",
@@ -195,6 +201,8 @@ def test_macos_moonlight_encodes_native_coreml_metal_frame():
         device="mps",
     )
     native_frame = _NativeFrame()
+    encoded = threading.Event()
+    sent = threading.Event()
     bridge = _Bridge()
     output._bridge = bridge
     output._encoder = _Encoder()
@@ -209,15 +217,190 @@ def test_macos_moonlight_encodes_native_coreml_metal_frame():
         "sbs": object(),
     })()
     timestamp = 12.5
+    output._native_session_ready = True
 
-    with patch("streaming.moonlight_output.sys.platform", "darwin"):
-        output.submit_runtime_result(result, timestamp)
+    try:
+        with patch("streaming.moonlight_output.sys.platform", "darwin"):
+            output.submit_runtime_result(result, timestamp)
 
-    assert native_frame.released
-    assert result.native_stream_frame is None
-    args, kwargs = bridge.sent[0]
-    assert args == (0, 12_500_000_000, b"annex-b")
-    assert kwargs == {"idr": True}
+        assert result.native_stream_frame is None
+        assert encoded.wait(1.0)
+        assert sent.wait(1.0)
+        assert native_frame.released
+        args, kwargs = bridge.sent[0]
+        assert args == (0, 12_500_000_000, b"annex-b")
+        assert kwargs == {"idr": True, "client_generation": 7}
+    finally:
+        output.close()
+
+
+def test_macos_moonlight_drops_stale_native_frames_under_backpressure():
+    class _NativeFrame:
+        def __init__(self, marker):
+            self.marker = marker
+            self.released = threading.Event()
+
+        def release(self):
+            self.released.set()
+
+    class _Encoder:
+        def __init__(self):
+            self.started = threading.Event()
+            self.allow_first = threading.Event()
+            self.frames = []
+
+        def encode_native_frame(self, frame, **kwargs):
+            self.frames.append(frame.marker)
+            if frame.marker == 1:
+                self.started.set()
+                assert self.allow_first.wait(2.0)
+            return {
+                "data": bytes((frame.marker,)),
+                "frame_index": kwargs["frame_index"],
+                "idr": kwargs["force_keyframe"],
+            }
+
+        def close(self):
+            pass
+
+    class _Bridge:
+        connected = True
+        connection_generation = 11
+
+        def __init__(self):
+            self.sent = []
+            self.sent_latest = threading.Event()
+
+        def send_access_unit(self, _index, _timestamp, payload, **_kwargs):
+            self.sent.append(payload[0])
+            if payload[0] == 3:
+                self.sent_latest.set()
+            return True
+
+        def close(self):
+            self.connected = False
+
+    output = MoonlightSbsOutput(
+        base_dir=".",
+        fps=60,
+        display_mode="Half-SBS",
+        fit_mode="contain",
+        input_size=(1920, 1080),
+        input_bounds=None,
+        device="mps",
+    )
+    encoder = _Encoder()
+    bridge = _Bridge()
+    output._bridge = bridge
+    output._encoder = encoder
+    output._encoder_config = MoonlightClientConfig(
+        1920, 1080, 60.0, 20_000, "h264", 1920, 1080,
+        0, 0, 1920, 1080, 0,
+    )
+    output._native_session_ready = True
+    frames = [_NativeFrame(marker) for marker in (1, 2, 3)]
+
+    def submit(frame, capture_timestamp):
+        result = type("RuntimeResult", (), {
+            "native_stream_frame": frame,
+            "output_format": "half_sbs",
+        })()
+        output.submit_runtime_result(result, capture_timestamp)
+        assert result.native_stream_frame is None
+
+    try:
+        with patch("streaming.moonlight_output.sys.platform", "darwin"):
+            submit(frames[0], 1.0)
+            assert encoder.started.wait(1.0)
+            submit(frames[1], 2.0)
+            submit(frames[2], 3.0)
+            assert frames[1].released.wait(1.0)
+            # The encoder is deliberately blocked on frame 1; submissions still
+            # return immediately and the one waiting slot retains only frame 3.
+            encoder.allow_first.set()
+            assert bridge.sent_latest.wait(1.0)
+
+        assert encoder.frames == [1, 3]
+        assert bridge.sent == [1, 3]
+        assert all(frame.released.wait(1.0) for frame in frames)
+    finally:
+        encoder.allow_first.set()
+        output.close()
+
+
+def test_macos_moonlight_close_releases_waiting_native_frame():
+    class _NativeFrame:
+        def __init__(self):
+            self.released = threading.Event()
+
+        def release(self):
+            self.released.set()
+
+    class _Encoder:
+        def __init__(self):
+            self.started = threading.Event()
+            self.allow_encode = threading.Event()
+
+        def encode_native_frame(self, _frame, **kwargs):
+            self.started.set()
+            assert self.allow_encode.wait(2.0)
+            return {
+                "data": b"encoded",
+                "frame_index": kwargs["frame_index"],
+                "idr": kwargs["force_keyframe"],
+            }
+
+        def close(self):
+            pass
+
+    class _Bridge:
+        connected = True
+        connection_generation = 3
+
+        def close(self):
+            self.connected = False
+
+    output = MoonlightSbsOutput(
+        base_dir=".",
+        fps=60,
+        display_mode="Half-SBS",
+        fit_mode="contain",
+        input_size=(1920, 1080),
+        input_bounds=None,
+        device="mps",
+    )
+    encoder = _Encoder()
+    output._bridge = _Bridge()
+    output._encoder = encoder
+    output._encoder_config = MoonlightClientConfig(
+        1920, 1080, 60.0, 20_000, "h264", 1920, 1080,
+        0, 0, 1920, 1080, 0,
+    )
+    output._native_session_ready = True
+    active, waiting = _NativeFrame(), _NativeFrame()
+
+    def submit(frame):
+        result = type("RuntimeResult", (), {"native_stream_frame": frame})()
+        output.submit_runtime_result(result, 1.0)
+
+    closer = threading.Thread(target=output.close, daemon=True)
+    try:
+        with patch("streaming.moonlight_output.sys.platform", "darwin"):
+            submit(active)
+            assert encoder.started.wait(1.0)
+            submit(waiting)
+        closer.start()
+        assert waiting.released.wait(1.0)
+        encoder.allow_encode.set()
+        closer.join(timeout=2.0)
+        assert not closer.is_alive()
+        assert active.released.wait(1.0)
+    finally:
+        encoder.allow_encode.set()
+        if closer.ident is not None:
+            closer.join(timeout=3.0)
+        else:
+            output.close()
 
 
 def test_macos_moonlight_without_a_client_does_not_require_native_frame():
@@ -364,6 +547,10 @@ def test_videotoolbox_native_pack_composes_and_fits_each_eye_on_metal():
 
         def __init__(self):
             self.packed = None
+            self.warp_config = {"depth_strength": 0.4}
+
+        def configure_warp(self, **values):
+            self.warp_config = dict(values)
 
         def pack_metal(self, destination, destination_size, output_size, output_format):
             self.packed = (destination, destination_size, output_size, output_format)
@@ -374,9 +561,10 @@ def test_videotoolbox_native_pack_composes_and_fits_each_eye_on_metal():
             return 1234
 
         def d2s_videotoolbox_encode(
-            self, _handle, _frame_index, _force, region_count, regions,
+            self, _handle, _frame_index, _force, region_count, source_bgra, regions,
             output, output_size, keyframe, _error, _error_size,
         ):
+            self.source_bgra = source_bgra
             self.regions = tuple(regions[: region_count * 8])
             self.encoded = (ctypes.c_uint8 * 7)(0, 0, 0, 1, 0x65, 0x88, 0x84)
             ctypes.cast(output, ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)))[0] = (
@@ -405,6 +593,12 @@ def test_videotoolbox_native_pack_composes_and_fits_each_eye_on_metal():
 
     assert encoder._library.source_size == (1920, 1080)
     assert native_frame.packed == (1234, 1920 * 1080 * 4, (1920, 1080), "half_sbs")
+    assert native_frame.warp_config == {
+        "depth_strength": 0.4,
+        "half_sbs_single_sample": 1,
+        "stream_bgra": 1,
+    }
+    assert encoder._library.source_bgra == 1
     assert encoder._library.regions == (
         0, 0, 960, 1080, 0, 0, 640, 720,
         960, 0, 1920, 1080, 640, 0, 1280, 720,
@@ -691,6 +885,7 @@ def test_amd_moonlight_drains_amf_backpressure_and_caps_burst_rate(
     )
     clock = iter((100.0, 100.005, 100.017))
     monkeypatch.setattr(moonlight_output.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(moonlight_output.sys, "platform", "linux")
     runtime_result = SimpleNamespace(sbs=_Frame())
 
     output.submit_runtime_result(runtime_result, 12.5)

@@ -108,6 +108,7 @@ def _native_library() -> ctypes.CDLL:
         ctypes.c_int64,
         ctypes.c_int,
         ctypes.c_int,
+        ctypes.c_int,
         ctypes.POINTER(ctypes.c_int32),
         ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),
         ctypes.POINTER(ctypes.c_size_t),
@@ -180,6 +181,19 @@ class VideoToolboxEncoder:
 
         source_size = tuple(map(int, native_frame.source_size))
         packed_size = self._packed_size(source_size, output_format)
+        normalized_output = str(output_format).strip().casefold().replace("-", "_")
+        if normalized_output == "half_sbs":
+            warp_config = dict(getattr(native_frame, "warp_config", None) or {})
+            warp_config["half_sbs_single_sample"] = 1
+            warp_config["stream_bgra"] = 1
+            configure_warp = getattr(native_frame, "configure_warp", None)
+            if callable(configure_warp):
+                configure_warp(**warp_config)
+            else:
+                try:
+                    native_frame.warp_config = warp_config
+                except (AttributeError, TypeError):
+                    pass
         regions = presentation_blit_regions(
             packed_size,
             (self.width, self.height),
@@ -219,6 +233,7 @@ class VideoToolboxEncoder:
             int(frame_index),
             int(bool(force_keyframe)),
             len(regions),
+            int(normalized_output == "half_sbs"),
             region_array,
             ctypes.byref(output),
             ctypes.byref(output_size),

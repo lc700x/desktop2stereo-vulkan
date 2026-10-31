@@ -74,8 +74,24 @@ def test_moonlight_bridge_authenticates_and_preserves_encoded_frame_metadata():
                     dynamic_range=0,
                 )
             ]
+            client_generation = bridge.connection_generation
+            assert client_generation == 1
+            assert not bridge.send_access_unit(
+                6,
+                123456788,
+                b"stale",
+                idr=False,
+                client_generation=client_generation - 1,
+            )
+            assert not bridge.disconnect_client(client_generation + 1)
 
-            assert bridge.send_access_unit(7, 123456789, b"\x00\x00\x00\x01\x65frame", idr=True)
+            assert bridge.send_access_unit(
+                7,
+                123456789,
+                b"\x00\x00\x00\x01\x65frame",
+                idr=True,
+                client_generation=client_generation,
+            )
             header = _read_exact(client, struct.calcsize("!4sQQII"))
             marker, frame_index, timestamp, flags, payload_size = struct.unpack(
                 "!4sQQII", header

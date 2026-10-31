@@ -52,8 +52,10 @@ def test_native_result_abi_has_stable_layout() -> None:
     assert _NativeResult.source_width.offset > _NativeResult.slot.offset
     assert _NativeResult.raw_normalize_lo.offset == 80
     assert _NativeResult.normalization_history_reset.offset == 88
-    assert ctypes.sizeof(_NativeWarpConfig) == 84
+    assert ctypes.sizeof(_NativeWarpConfig) == 92
     assert _NativeWarpConfig.edge_aa_enabled.offset == 80
+    assert _NativeWarpConfig.half_sbs_single_sample.offset == 84
+    assert _NativeWarpConfig.stream_bgra.offset == 88
 
 
 def test_native_output_modes_match_runtime_frame_shapes() -> None:
@@ -172,9 +174,9 @@ def test_native_metal_bridge_preserves_metal_logical_rgb_channel_order() -> None
     assert "output[offset] = (pixel.r - p.mean0) / p.std0;" in preprocess
     assert "output[plane + offset] = (pixel.g - p.mean1) / p.std1;" in preprocess
     assert "output[2u * plane + offset] = (pixel.b - p.mean2) / p.std2;" in preprocess
-    assert "output[offset + 0u] = uchar(clamp(pixel.r * 255.0f" in pack
+    assert "(p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f" in pack
     assert "pixel.g * 255.0f" in pack
-    assert "output[offset + 2u] = uchar(clamp(pixel.b * 255.0f" in pack
+    assert "(p.stream_bgra != 0 ? pixel.r : pixel.b) * 255.0f" in pack
 
 
 def test_native_warp_uses_depth_dimensions_for_depth_sampling() -> None:

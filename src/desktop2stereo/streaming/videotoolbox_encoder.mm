@@ -44,13 +44,14 @@ struct D2SResizeParams {
   uint32_t target_width;
   uint32_t target_height;
   uint32_t region_count;
+  uint32_t source_bgra;
   uint32_t regions[16];
 };
 
 static NSString *const D2SResizeMetalSource = @"\
 #include <metal_stdlib>\n\
 using namespace metal;\n\
-struct ResizeParams { uint sw; uint sh; uint dw; uint dh; uint count; uint regions[16]; };\n\
+struct ResizeParams { uint sw; uint sh; uint dw; uint dh; uint count; uint source_bgra; uint regions[16]; };\n\
 kernel void d2s_resize_rgba(device const uchar *source [[buffer(0)]],\n\
                             texture2d<float, access::write> target [[texture(0)]],\n\
                             constant ResizeParams& p [[buffer(1)]],\n\
@@ -77,8 +78,9 @@ kernel void d2s_resize_rgba(device const uchar *source [[buffer(0)]],\n\
     uint i01 = (p1.y * p.sw + p0.x) * 4;\n\
     uint i11 = (p1.y * p.sw + p1.x) * 4;\n\
     for (uint channel = 0; channel < 3; ++channel) {\n\
-      float a = mix(float(source[i00 + channel]), float(source[i10 + channel]), f.x);\n\
-      float b = mix(float(source[i01 + channel]), float(source[i11 + channel]), f.x);\n\
+      uint source_channel = p.source_bgra != 0 && channel != 1 ? 2 - channel : channel;\n\
+      float a = mix(float(source[i00 + source_channel]), float(source[i10 + source_channel]), f.x);\n\
+      float b = mix(float(source[i01 + source_channel]), float(source[i11 + source_channel]), f.x);\n\
       color[channel] = mix(a, b, f.y) / 255.0f;\n\
     }\n\
     color.a = 1.0f;\n\
@@ -394,7 +396,7 @@ void *d2s_videotoolbox_source_buffer(void *handle, int width, int height,
 }
 
 int d2s_videotoolbox_encode(void *handle, int64_t frame_index, int force_keyframe,
-                            int region_count, const int32_t *regions,
+                            int region_count, int source_bgra, const int32_t *regions,
                             const uint8_t **output, size_t *output_size,
                             int *is_keyframe, char *error, size_t error_capacity) {
   auto *encoder = static_cast<D2SVideoToolboxEncoder *>(handle);
@@ -457,8 +459,7 @@ int d2s_videotoolbox_encode(void *handle, int64_t frame_index, int force_keyfram
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)encoder->command_queue;
     id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)encoder->resize_pipeline;
     id<MTLCommandBuffer> command = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> compute = [command computeCommandEncoder];
-    if (status != kCVReturnSuccess || !target || !command || !compute) {
+    if (status != kCVReturnSuccess || !target || !command) {
       if (wrapped_texture) CFRelease(wrapped_texture);
       CVPixelBufferRelease(pixel_buffer);
       std::lock_guard<std::mutex> guard(encoder->mutex);
@@ -474,18 +475,72 @@ int d2s_videotoolbox_encode(void *handle, int64_t frame_index, int force_keyfram
     params.target_width = encoder->width;
     params.target_height = encoder->height;
     params.region_count = static_cast<uint32_t>(region_count);
+    params.source_bgra = source_bgra ? 1u : 0u;
     for (int i = 0; i < region_count * 8; ++i) {
       params.regions[i] = static_cast<uint32_t>(regions[i]);
     }
-    [compute setComputePipelineState:pipeline];
-    [compute setBuffer:source offset:0 atIndex:0];
-    [compute setTexture:target atIndex:0];
-    [compute setBytes:&params length:sizeof(params) atIndex:1];
-    NSUInteger tw = std::min<NSUInteger>(16, pipeline.maxTotalThreadsPerThreadgroup);
-    NSUInteger th = std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tw);
-    [compute dispatchThreads:MTLSizeMake(encoder->width, encoder->height, 1)
-        threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
-    [compute endEncoding];
+    const int32_t *region = regions;
+    const bool matching_dimensions =
+        encoder->source_width == encoder->width &&
+        encoder->source_height == encoder->height;
+    const bool full_identity_region = region_count == 1 &&
+        region[0] == 0 && region[1] == 0 &&
+        region[2] == encoder->source_width && region[3] == encoder->source_height &&
+        region[4] == 0 && region[5] == 0 &&
+        region[6] == encoder->width && region[7] == encoder->height;
+    const bool half_sbs_identity_regions = region_count == 2 &&
+        encoder->source_width % 2 == 0 &&
+        region[0] == 0 && region[1] == 0 &&
+        region[2] == encoder->source_width / 2 &&
+        region[3] == encoder->source_height &&
+        region[4] == 0 && region[5] == 0 &&
+        region[6] == encoder->width / 2 && region[7] == encoder->height &&
+        region[8] == encoder->source_width / 2 && region[9] == 0 &&
+        region[10] == encoder->source_width && region[11] == encoder->source_height &&
+        region[12] == encoder->width / 2 && region[13] == 0 &&
+        region[14] == encoder->width && region[15] == encoder->height;
+    const bool identity_fit = source_bgra && matching_dimensions &&
+        (full_identity_region || half_sbs_identity_regions);
+    if (identity_fit) {
+      id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+      if (!blit) {
+        if (wrapped_texture) CFRelease(wrapped_texture);
+        CVPixelBufferRelease(pixel_buffer);
+        std::lock_guard<std::mutex> guard(encoder->mutex);
+        encoder->waiting = false;
+        d2s_set_error(error, error_capacity,
+            "Could not create a Metal copy for the encoder pixel buffer");
+        return -1;
+      }
+      [blit copyFromBuffer:source sourceOffset:0
+          sourceBytesPerRow:static_cast<NSUInteger>(encoder->source_width) * 4u
+          sourceBytesPerImage:static_cast<NSUInteger>(encoder->source_width) *
+                              static_cast<NSUInteger>(encoder->source_height) * 4u
+          sourceSize:MTLSizeMake(encoder->source_width, encoder->source_height, 1)
+          toTexture:target destinationSlice:0 destinationLevel:0
+          destinationOrigin:MTLOriginMake(0, 0, 0)];
+      [blit endEncoding];
+    } else {
+      id<MTLComputeCommandEncoder> compute = [command computeCommandEncoder];
+      if (!compute) {
+        if (wrapped_texture) CFRelease(wrapped_texture);
+        CVPixelBufferRelease(pixel_buffer);
+        std::lock_guard<std::mutex> guard(encoder->mutex);
+        encoder->waiting = false;
+        d2s_set_error(error, error_capacity,
+            "Could not create a Metal stereo-fit pass");
+        return -1;
+      }
+      [compute setComputePipelineState:pipeline];
+      [compute setBuffer:source offset:0 atIndex:0];
+      [compute setTexture:target atIndex:0];
+      [compute setBytes:&params length:sizeof(params) atIndex:1];
+      NSUInteger tw = std::min<NSUInteger>(16, pipeline.maxTotalThreadsPerThreadgroup);
+      NSUInteger th = std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tw);
+      [compute dispatchThreads:MTLSizeMake(encoder->width, encoder->height, 1)
+          threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+      [compute endEncoding];
+    }
     [command commit];
     [command waitUntilCompleted];
     if (wrapped_texture) CFRelease(wrapped_texture);

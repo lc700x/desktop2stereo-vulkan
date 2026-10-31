@@ -130,6 +130,8 @@ struct WarpParams {
     float antialias_strength;
     int anaglyph_method;
     int edge_aa_enabled;
+    int half_sbs_single_sample;
+    int stream_bgra;
 };
 
 kernel void d2s_preprocess(
@@ -792,6 +794,12 @@ static inline float3 output_eye_pixel(
     if (p.output_format != 0u || p.source_width != p.output_width) {
         return eye_pixel(color, depth, x, y, eye_sign, screen_edge, p);
     }
+    // Moonlight renders each eye at half the source width. A center sample
+    // avoids evaluating the full depth reprojection twice for every streamed
+    // pixel; local rendering keeps the higher-quality two-sample filter.
+    if (p.half_sbs_single_sample != 0) {
+        return eye_pixel(color, depth, x + 0.5f, y, eye_sign, screen_edge, p);
+    }
     float base = floor(x);
     float3 left = eye_pixel(color, depth, base, y, eye_sign, screen_edge, p);
     float3 right = eye_pixel(color, depth, base + 1.0f, y, eye_sign, screen_edge, p);
@@ -914,9 +922,11 @@ kernel void d2s_warp_pack(
     }
     pixel = finite_color(pixel);
     uint offset = gid * p.output_channels;
-    output[offset + 0u] = uchar(clamp(pixel.r * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 0u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f + 0.5f, 0.0f, 255.0f));
     output[offset + 1u] = uchar(clamp(pixel.g * 255.0f + 0.5f, 0.0f, 255.0f));
-    output[offset + 2u] = uchar(clamp(pixel.b * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 2u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.r : pixel.b) * 255.0f + 0.5f, 0.0f, 255.0f));
     if (p.output_channels == 4u) output[offset + 3u] = 255u;
 }
 
@@ -1994,6 +2004,7 @@ static int32_t d2s_coreml_io_pack_internal(
             1.0f, 48.0f, 0.0f, 0.04f, 0.0f,
             0, 0, 1, 2, 0.08f,
             1.0f, 1.0f, 1.0f, 2, 0, 2, 1, 0.0f, 0.0f, 0, 1,
+            0, 0,
         };
         D2SWarpParams params = {
             source_width,
