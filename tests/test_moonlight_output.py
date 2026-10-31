@@ -599,3 +599,132 @@ def test_sunshine_pairing_targets_selected_request_when_multiple_are_waiting(tmp
 
     assert request.call_args_list[1].args[1]["pairing_id"] == "client-two"
     assert request.call_args_list[1].args[1]["name"] == "Bedroom"
+
+
+def test_amd_moonlight_drains_amf_backpressure_and_caps_burst_rate(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+
+    class _Frame:
+        is_cuda = True
+        shape = (1080, 1920, 3)
+
+    class _Rgba:
+        device = "cuda:0"
+
+        @staticmethod
+        def data_ptr():
+            return 1234
+
+        @staticmethod
+        def stride(_index):
+            return 1920 * 4
+
+        @staticmethod
+        def element_size():
+            return 1
+
+    class _Encoder:
+        def __init__(self):
+            self.submits = []
+            self.submit_results = iter((False, True, True))
+            self.packets = iter(
+                (
+                    b"\x00\x00\x00\x01\x65",
+                    None,
+                    b"\x00\x00\x00\x01\x41",
+                    None,
+                    None,
+                    None,
+                )
+            )
+
+        def submit_hip_rgba(self, *args, **kwargs):
+            self.submits.append((args, kwargs))
+            return next(self.submit_results)
+
+        def read_packet(self):
+            return next(self.packets)
+
+    class _Bridge:
+        connected = True
+
+        def __init__(self):
+            self.sent = []
+
+        def send_access_unit(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+
+    output = MoonlightSbsOutput(
+        base_dir=tmp_path,
+        fps=60,
+        display_mode="Half-SBS",
+        fit_mode="contain",
+        input_size=(1920, 1080),
+        input_bounds=None,
+        device="cuda:0",
+    )
+    encoder = _Encoder()
+    bridge = _Bridge()
+    rgba = _Rgba()
+    output._bridge = bridge
+    output._encoder = encoder
+    output._encoder_config = MoonlightClientConfig(
+        1920, 1080, 60.0, 20_000, "h264", 1920, 1080,
+        0, 0, 1920, 1080, 0,
+    )
+    output._frame_index = 4
+    output._amd_pending_frames.append(3)
+    output._frame_timestamps[3] = 2_000_000
+    output._force_idr.set()
+    output._fit_frame = lambda frame, _config: frame
+    output._to_rgba8 = lambda _frame: rgba
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "torch",
+        SimpleNamespace(
+            cuda=SimpleNamespace(
+                current_stream=lambda **_kwargs: SimpleNamespace(cuda_stream=99)
+            )
+        ),
+    )
+    clock = iter((100.0, 100.005, 100.017))
+    monkeypatch.setattr(moonlight_output.time, "perf_counter", lambda: next(clock))
+    runtime_result = SimpleNamespace(sbs=_Frame())
+
+    output.submit_runtime_result(runtime_result, 12.5)
+    output.submit_runtime_result(runtime_result, 12.505)
+    output.submit_runtime_result(runtime_result, 12.517)
+
+    assert len(encoder.submits) == 3  # full queue retry, then one later paced frame
+    assert [call[1]["force_idr"] for call in encoder.submits] == [True, True, False]
+    assert [item[0][0] for item in bridge.sent] == [3, 4]
+    assert [item[0][1] for item in bridge.sent] == [2_000_000, 12_500_000_000]
+    assert [item[1]["idr"] for item in bridge.sent] == [True, False]
+    assert not output._force_idr.is_set()
+    assert output._frame_index == 6
+    assert list(output._amd_pending_frames) == [5]
+
+
+def test_amd_encoder_wrapper_reports_amf_input_full_without_raising():
+    from streaming.amd_encoder import AmdAmfSurfaceEncoder
+
+    class _Library:
+        result = 0
+
+        def d2s_amd_encoder_submit_hip_rgba(self, *_args):
+            return self.result
+
+        @staticmethod
+        def d2s_amd_encoder_destroy(_handle):
+            pass
+
+    encoder = AmdAmfSurfaceEncoder.__new__(AmdAmfSurfaceEncoder)
+    encoder._dll = _Library()
+    encoder._abi_version = 3
+    encoder._handle = 1
+
+    assert encoder.submit_hip_rgba(1234, 7680, 99) is False
+    encoder._dll.result = 1
+    assert encoder.submit_hip_rgba(1234, 7680, 99) is True

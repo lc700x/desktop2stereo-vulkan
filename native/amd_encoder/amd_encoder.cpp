@@ -4,6 +4,8 @@
 #include <dxgi1_2.h>
 #include <windows.h>
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -61,6 +63,20 @@ using HipMemcpy2DToArrayAsync = int (*)(void*, std::size_t, std::size_t, const v
 using HipDestroyExternalMemory = int (*)(void*);
 using HipStreamSynchronize = int (*)(void*);
 
+constexpr std::size_t kAmfInputSurfaceCount = 4;
+
+struct AmdInputSurface final : amf::AMFSurfaceObserver {
+    std::atomic<bool> available{true};
+    ID3D11Texture2D* texture = nullptr;
+    HANDLE shared_handle = nullptr;
+    void* hip_external_memory = nullptr;
+    void* hip_array = nullptr;
+
+    void AMF_STD_CALL OnSurfaceDataRelease(amf::AMFSurface*) override {
+        available.store(true, std::memory_order_release);
+    }
+};
+
 HMODULE load_hip_runtime() {
     for (const auto* name : {L"amdhip64_7.dll", L"amdhip64_6.dll", L"amdhip64_5.dll", L"amdhip64.dll"}) {
         if (auto module = LoadLibraryW(name)) return module;
@@ -75,85 +91,85 @@ struct AmdEncoder {
     int height = 0;
     int fps = 0;
     bool hevc = false;
+    bool force_idr_pending = false;
     int hip_device_index = -1;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* device_context = nullptr;
-    ID3D11Texture2D* shared_texture = nullptr;
-    HANDLE shared_handle = nullptr;
     HMODULE hip_runtime = nullptr;
     HipDeviceGetLuid hip_device_get_luid = nullptr;
-    void* hip_external_memory = nullptr;
-    void* hip_array = nullptr;
     HipImportExternalMemory hip_import_external_memory = nullptr;
     HipGetMappedMipmappedArray hip_get_mapped_mipmapped_array = nullptr;
     HipGetMipmappedArrayLevel hip_get_mipmapped_array_level = nullptr;
     HipMemcpy2DToArrayAsync hip_memcpy_2d_to_array_async = nullptr;
     HipDestroyExternalMemory hip_destroy_external_memory = nullptr;
     HipStreamSynchronize hip_stream_synchronize = nullptr;
+    std::array<AmdInputSurface, kAmfInputSurfaceCount> input_surfaces;
 };
 
-bool create_shared_rgba_texture(AmdEncoder* state) {
-    D3D_FEATURE_LEVEL feature_level{};
-    IDXGIAdapter1* selected_adapter = nullptr;
-    if (state->hip_device_index >= 0) {
-        if (!state->hip_runtime) state->hip_runtime = load_hip_runtime();
-        if (!state->hip_runtime) {
-            set_error("amdhip64.dll was not found; ROCm is required for adapter matching");
-            return false;
-        }
-        state->hip_device_get_luid = reinterpret_cast<HipDeviceGetLuid>(
-            GetProcAddress(state->hip_runtime, "hipDeviceGetLuid"));
-        if (!state->hip_device_get_luid) {
-            set_error("ROCm cannot report a device LUID; refusing an ambiguous adapter");
-            return false;
-        }
-        char hip_luid[8]{};
-        unsigned int node_mask = 0;
-        if (state->hip_device_get_luid(hip_luid, &node_mask, state->hip_device_index) != 0) {
-            set_error("ROCm failed to query the selected HIP device LUID");
-            return false;
-        }
-        IDXGIFactory1* factory = nullptr;
-        const HRESULT factory_result = CreateDXGIFactory1(
-            __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
-        if (FAILED(factory_result) || !factory) {
-            set_error("DXGI factory creation failed during HIP adapter matching");
-            return false;
-        }
-        for (UINT index = 0; ; ++index) {
-            IDXGIAdapter1* adapter = nullptr;
-            const HRESULT enum_result = factory->EnumAdapters1(index, &adapter);
-            if (enum_result == DXGI_ERROR_NOT_FOUND) break;
-            if (FAILED(enum_result) || !adapter) continue;
-            DXGI_ADAPTER_DESC1 desc{};
-            if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
-                std::memcmp(&desc.AdapterLuid, hip_luid, sizeof(desc.AdapterLuid)) == 0) {
-                selected_adapter = adapter;
-                break;
+bool create_shared_rgba_texture(AmdEncoder* state, AmdInputSurface& surface) {
+    if (!state->device) {
+        D3D_FEATURE_LEVEL feature_level{};
+        IDXGIAdapter1* selected_adapter = nullptr;
+        if (state->hip_device_index >= 0) {
+            if (!state->hip_runtime) state->hip_runtime = load_hip_runtime();
+            if (!state->hip_runtime) {
+                set_error("amdhip64.dll was not found; ROCm is required for adapter matching");
+                return false;
             }
-            adapter->Release();
+            state->hip_device_get_luid = reinterpret_cast<HipDeviceGetLuid>(
+                GetProcAddress(state->hip_runtime, "hipDeviceGetLuid"));
+            if (!state->hip_device_get_luid) {
+                set_error("ROCm cannot report a device LUID; refusing an ambiguous adapter");
+                return false;
+            }
+            char hip_luid[8]{};
+            unsigned int node_mask = 0;
+            if (state->hip_device_get_luid(hip_luid, &node_mask, state->hip_device_index) != 0) {
+                set_error("ROCm failed to query the selected HIP device LUID");
+                return false;
+            }
+            IDXGIFactory1* factory = nullptr;
+            const HRESULT factory_result = CreateDXGIFactory1(
+                __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
+            if (FAILED(factory_result) || !factory) {
+                set_error("DXGI factory creation failed during HIP adapter matching");
+                return false;
+            }
+            for (UINT index = 0; ; ++index) {
+                IDXGIAdapter1* adapter = nullptr;
+                const HRESULT enum_result = factory->EnumAdapters1(index, &adapter);
+                if (enum_result == DXGI_ERROR_NOT_FOUND) break;
+                if (FAILED(enum_result) || !adapter) continue;
+                DXGI_ADAPTER_DESC1 desc{};
+                if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
+                    std::memcmp(&desc.AdapterLuid, hip_luid, sizeof(desc.AdapterLuid)) == 0) {
+                    selected_adapter = adapter;
+                    break;
+                }
+                adapter->Release();
+            }
+            factory->Release();
+            if (!selected_adapter) {
+                set_error("No DXGI adapter matches the selected HIP device LUID");
+                return false;
+            }
         }
-        factory->Release();
-        if (!selected_adapter) {
-            set_error("No DXGI adapter matches the selected HIP device LUID");
+        const auto hr = D3D11CreateDevice(
+            selected_adapter,
+            selected_adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            nullptr,
+            0,
+            D3D11_SDK_VERSION,
+            &state->device,
+            &feature_level,
+            &state->device_context);
+        if (selected_adapter) selected_adapter->Release();
+        if (FAILED(hr) || !state->device || !state->device_context) {
+            set_error("D3D11 device creation failed");
             return false;
         }
-    }
-    const auto hr = D3D11CreateDevice(
-        selected_adapter,
-        selected_adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        nullptr,
-        0,
-        D3D11_SDK_VERSION,
-        &state->device,
-        &feature_level,
-        &state->device_context);
-    if (selected_adapter) selected_adapter->Release();
-    if (FAILED(hr) || !state->device || !state->device_context) {
-        set_error("D3D11 device creation failed");
-        return false;
     }
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = static_cast<UINT>(state->width);
@@ -166,30 +182,30 @@ bool create_shared_rgba_texture(AmdEncoder* state) {
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
                      D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
-    const HRESULT texture_result = state->device->CreateTexture2D(&desc, nullptr, &state->shared_texture);
+    const HRESULT texture_result = state->device->CreateTexture2D(&desc, nullptr, &surface.texture);
     if (FAILED(texture_result)) {
         set_error((std::string("shared D3D11 RGBA texture creation failed, HRESULT=") +
                    std::to_string(static_cast<unsigned long>(texture_result))).c_str());
         return false;
     }
     IDXGIResource1* resource = nullptr;
-    if (FAILED(state->shared_texture->QueryInterface(
+    if (FAILED(surface.texture->QueryInterface(
             __uuidof(IDXGIResource1), reinterpret_cast<void**>(&resource))) || !resource) {
         set_error("D3D11 texture does not expose IDXGIResource1");
         return false;
     }
     const HRESULT handle_result = resource->CreateSharedHandle(
         nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-        nullptr, &state->shared_handle);
+        nullptr, &surface.shared_handle);
     resource->Release();
-    if (FAILED(handle_result) || !state->shared_handle) {
+    if (FAILED(handle_result) || !surface.shared_handle) {
         set_error("D3D11 shared handle creation failed");
         return false;
     }
     return true;
 }
 
-bool import_shared_texture_into_hip(AmdEncoder* state) {
+bool import_shared_texture_into_hip(AmdEncoder* state, AmdInputSurface& surface) {
     if (!state->hip_runtime) state->hip_runtime = load_hip_runtime();
     if (!state->hip_runtime) {
         set_error("amdhip64.dll was not found; ROCm is required for AMD GPU surface import");
@@ -215,11 +231,11 @@ bool import_shared_texture_into_hip(AmdEncoder* state) {
     }
     HipExternalMemoryHandleDesc handle_desc{};
     handle_desc.type = 2; // hipExternalMemoryHandleTypeOpaqueWin32
-    handle_desc.handle.win32.handle = state->shared_handle;
+    handle_desc.handle.win32.handle = surface.shared_handle;
     handle_desc.size = static_cast<std::uint64_t>(state->width) *
                        static_cast<std::uint64_t>(state->height) * 4u;
-    void* external_memory = nullptr;
-    if (state->hip_import_external_memory(&external_memory, &handle_desc) != 0 || !external_memory) {
+    if (state->hip_import_external_memory(&surface.hip_external_memory, &handle_desc) != 0 ||
+        !surface.hip_external_memory) {
         set_error("HIP could not import the shared D3D11 texture");
         return false;
     }
@@ -228,36 +244,51 @@ bool import_shared_texture_into_hip(AmdEncoder* state) {
     mapped_desc.extent = {static_cast<std::size_t>(state->width), static_cast<std::size_t>(state->height), 0};
     mapped_desc.num_levels = 1;
     void* mipmapped = nullptr;
-    if (state->hip_get_mapped_mipmapped_array(&mipmapped, external_memory, &mapped_desc) != 0 || !mipmapped) {
-        state->hip_destroy_external_memory(external_memory);
+    if (state->hip_get_mapped_mipmapped_array(
+            &mipmapped, surface.hip_external_memory, &mapped_desc) != 0 || !mipmapped) {
+        state->hip_destroy_external_memory(surface.hip_external_memory);
+        surface.hip_external_memory = nullptr;
         set_error("HIP could not map the shared D3D11 texture");
         return false;
     }
     void* array = nullptr;
     if (state->hip_get_mipmapped_array_level(&array, mipmapped, 0) != 0 || !array) {
-        state->hip_destroy_external_memory(external_memory);
+        state->hip_destroy_external_memory(surface.hip_external_memory);
+        surface.hip_external_memory = nullptr;
         set_error("HIP could not access the mapped D3D11 texture array");
         return false;
     }
-    state->hip_external_memory = external_memory;
-    state->hip_array = array;
+    surface.hip_array = array;
+    return true;
+}
+
+bool create_shared_rgba_surfaces(AmdEncoder* state) {
+    for (auto& surface : state->input_surfaces) {
+        if (!create_shared_rgba_texture(state, surface) ||
+            !import_shared_texture_into_hip(state, surface)) {
+            return false;
+        }
+    }
     return true;
 }
 
 void release_native_resources(AmdEncoder* state) {
     if (!state) return;
-    if (state->hip_external_memory && state->hip_destroy_external_memory) {
-        state->hip_destroy_external_memory(state->hip_external_memory);
+    for (auto& surface : state->input_surfaces) {
+        if (surface.hip_external_memory && state->hip_destroy_external_memory) {
+            state->hip_destroy_external_memory(surface.hip_external_memory);
+        }
+        if (surface.shared_handle) CloseHandle(surface.shared_handle);
+        if (surface.texture) surface.texture->Release();
+        surface.hip_external_memory = nullptr;
+        surface.hip_array = nullptr;
+        surface.shared_handle = nullptr;
+        surface.texture = nullptr;
     }
     if (state->hip_runtime) FreeLibrary(state->hip_runtime);
-    if (state->shared_handle) CloseHandle(state->shared_handle);
-    if (state->shared_texture) state->shared_texture->Release();
     if (state->device_context) state->device_context->Release();
     if (state->device) state->device->Release();
-    state->hip_external_memory = nullptr;
     state->hip_runtime = nullptr;
-    state->shared_handle = nullptr;
-    state->shared_texture = nullptr;
     state->device_context = nullptr;
     state->device = nullptr;
 }
@@ -302,7 +333,7 @@ extern "C" D2S_AMD_API int d2s_amd_encoder_probe() {
 }
 
 extern "C" D2S_AMD_API int d2s_amd_encoder_abi_version() {
-    return 2;
+    return 3;
 }
 
 extern "C" D2S_AMD_API int d2s_amd_encoder_last_error(char* output, int capacity) {
@@ -342,7 +373,7 @@ static void* d2s_amd_encoder_create_impl(
         delete state;
         return nullptr;
     }
-    if (!create_shared_rgba_texture(state) || !import_shared_texture_into_hip(state)) {
+    if (!create_shared_rgba_surfaces(state)) {
         release_native_resources(state);
         delete state;
         return nullptr;
@@ -371,9 +402,15 @@ static void* d2s_amd_encoder_create_impl(
     state->encoder->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, AMFConstructRate(fps, 1));
     state->encoder->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, rate);
     if (hevc) {
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_INPUT_QUEUE_SIZE,
+            static_cast<amf_int64>(kAmfInputSurfaceCount));
         state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, static_cast<amf_int64>(fps));
         state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, static_cast<amf_int64>(1));
     } else {
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_INPUT_QUEUE_SIZE,
+            static_cast<amf_int64>(kAmfInputSurfaceCount));
         state->encoder->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, static_cast<amf_int64>(fps));
     }
     result = state->encoder->Init(amf::AMF_SURFACE_RGBA, width, height);
@@ -409,9 +446,16 @@ extern "C" D2S_AMD_API int d2s_amd_encoder_submit_texture(void* handle, void* d3
     if (!state || !state->context || !state->encoder || !d3d11_texture) return -1;
     amf::AMFSurfacePtr surface;
     AMF_RESULT result = state->context->CreateSurfaceFromDX11Native(d3d11_texture, &surface, nullptr);
-    if (result != AMF_OK || !surface) { set_error("AMF could not wrap the D3D11 texture"); return -1; }
+    if (result != AMF_OK || !surface) {
+        set_error("AMF could not wrap the D3D11 texture");
+        return -1;
+    }
     result = state->encoder->SubmitInput(surface);
-    return result == AMF_OK || result == AMF_NEED_MORE_INPUT ? 1 : 0;
+    if (result == AMF_INPUT_FULL) return 0;
+    if (result == AMF_OK || result == AMF_NEED_MORE_INPUT) return 1;
+    set_error((std::string("AMF SubmitInput failed, result=") +
+               std::to_string(static_cast<int>(result))).c_str());
+    return -1;
 #endif
 }
 
@@ -421,42 +465,74 @@ extern "C" D2S_AMD_API int d2s_amd_encoder_submit_hip_rgba(
     (void)handle; (void)device_pointer; (void)pitch_bytes; (void)stream; (void)force_idr; return -1;
 #else
     auto* state = static_cast<AmdEncoder*>(handle);
-    if (!state || !device_pointer || pitch_bytes < state->width * 4 || !state->hip_array) {
+    if (!state || !device_pointer || pitch_bytes < state->width * 4) {
         set_error("invalid HIP RGBA surface arguments");
         return -1;
     }
+    AmdInputSurface* surface_slot = nullptr;
+    for (auto& candidate : state->input_surfaces) {
+        bool expected = true;
+        if (candidate.available.compare_exchange_strong(
+                expected, false, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            surface_slot = &candidate;
+            break;
+        }
+    }
+    if (!surface_slot) return 0;
+
     if (state->hip_memcpy_2d_to_array_async(
-            state->hip_array, 0, 0, device_pointer,
+            surface_slot->hip_array, 0, 0, device_pointer,
             static_cast<std::size_t>(pitch_bytes),
             static_cast<std::size_t>(state->width) * 4u,
             static_cast<std::size_t>(state->height), 3, stream) != 0) {
+        surface_slot->available.store(true, std::memory_order_release);
         set_error("HIP RGBA to D3D11 surface copy failed");
         return -1;
     }
     if (state->hip_stream_synchronize(stream) != 0) {
+        surface_slot->available.store(true, std::memory_order_release);
         set_error("HIP stream synchronization failed before AMF submit");
         return -1;
     }
+    const wchar_t* idr_property = state->hevc
+        ? AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE
+        : AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE;
     if (force_idr) {
-        const wchar_t* property = state->hevc
-            ? AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE
-            : AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE;
         const amf_int64 picture_type = state->hevc
             ? AMF_VIDEO_ENCODER_HEVC_PICTURE_TYPE_IDR
             : AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR;
-        if (state->encoder->SetProperty(property, picture_type) != AMF_OK) {
+        if (state->encoder->SetProperty(idr_property, picture_type) != AMF_OK) {
+            surface_slot->available.store(true, std::memory_order_release);
             set_error("AMF rejected the forced IDR request");
             return -1;
         }
+        state->force_idr_pending = true;
     }
-    const int submitted = d2s_amd_encoder_submit_texture(state, state->shared_texture);
-    if (force_idr) {
-        const wchar_t* property = state->hevc
-            ? AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE
-            : AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE;
-        state->encoder->SetProperty(property, static_cast<amf_int64>(0));
+    amf::AMFSurfacePtr surface;
+    AMF_RESULT result = state->context->CreateSurfaceFromDX11Native(
+        surface_slot->texture, &surface, surface_slot);
+    if (result != AMF_OK || !surface) {
+        surface_slot->available.store(true, std::memory_order_release);
+        set_error("AMF could not wrap the HIP RGBA D3D11 surface");
+        return -1;
     }
-    return submitted;
+    result = state->encoder->SubmitInput(surface);
+    if (result == AMF_INPUT_FULL) {
+        surface_slot->available.store(true, std::memory_order_release);
+        return 0;
+    }
+    if (result != AMF_OK && result != AMF_NEED_MORE_INPUT) {
+        surface_slot->available.store(true, std::memory_order_release);
+        set_error((std::string("AMF SubmitInput failed, result=") +
+                   std::to_string(static_cast<int>(result))).c_str());
+        return -1;
+    }
+    if (state->force_idr_pending) {
+        if (state->encoder->SetProperty(idr_property, static_cast<amf_int64>(0)) == AMF_OK) {
+            state->force_idr_pending = false;
+        }
+    }
+    return 1;
 #endif
 }
 

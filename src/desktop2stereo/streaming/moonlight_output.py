@@ -193,6 +193,9 @@ class MoonlightSbsOutput:
         self._frame_index = 0
         self._frame_timestamps: dict[int, int] = {}
         self._amd_pending_frames: deque[int] = deque()
+        self._amd_rate_update_at: float | None = None
+        self._amd_rate_tokens = 1.0
+        self._amd_backpressure_logged = False
         self._force_idr = threading.Event()
         self._encoder_lock = threading.RLock()
         self._encoder = None
@@ -607,6 +610,9 @@ class MoonlightSbsOutput:
                     self._frame_index = 0
                     self._frame_timestamps.clear()
                     self._amd_pending_frames.clear()
+                    self._amd_rate_update_at = None
+                    self._amd_rate_tokens = 1.0
+                    self._amd_backpressure_logged = False
                     self._force_idr.set()
                 return {"accepted_width": config.width, "accepted_height": config.height}
 
@@ -640,10 +646,11 @@ class MoonlightSbsOutput:
                         library_path=os.environ.get("D2S_AMD_ENCODER_DLL")
                         or self._server_dir / "d2s_amd_encoder.dll",
                     )
-                    if int(getattr(self._encoder, "_abi_version", 0)) < 2:
+                    if int(getattr(self._encoder, "_abi_version", 0)) < 3:
                         self._close_encoder_locked()
                         raise RuntimeError(
-                            "The bundled AMD AMF bridge lacks Moonlight IDR support; rebuild d2s_amd_encoder.dll"
+                            "The bundled AMD AMF bridge lacks pooled-surface backpressure support; "
+                            "rebuild d2s_amd_encoder.dll"
                         )
                 else:
                     from streaming.direct_sbs import _load_pynvvideo_codec
@@ -667,6 +674,9 @@ class MoonlightSbsOutput:
                 self._frame_index = 0
                 self._frame_timestamps.clear()
                 self._amd_pending_frames.clear()
+                self._amd_rate_update_at = None
+                self._amd_rate_tokens = 1.0
+                self._amd_backpressure_logged = False
                 self._force_idr.set()
             return {"accepted_width": config.width, "accepted_height": config.height}
         except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -680,6 +690,9 @@ class MoonlightSbsOutput:
             self._encoder_config = None
             self._frame_timestamps.clear()
             self._amd_pending_frames.clear()
+            self._amd_rate_update_at = None
+            self._amd_rate_tokens = 1.0
+            self._amd_backpressure_logged = False
 
     def _close_encoder_locked(self) -> None:
         encoder = self._encoder
@@ -747,6 +760,58 @@ class MoonlightSbsOutput:
             return any((nal & 0x1F) == 5 for nal in nals)
         return any(((nal >> 1) & 0x3F) in {19, 20, 21} for nal in nals)
 
+    def _submit_amd_rgba(
+        self,
+        encoder: Any,
+        rgba: Any,
+        capture_ns: int,
+        *,
+        force_idr: bool,
+    ) -> bool:
+        import torch
+
+        frame_index = self._frame_index
+        accepted = encoder.submit_hip_rgba(
+            int(rgba.data_ptr()),
+            int(rgba.stride(0) * rgba.element_size()),
+            int(torch.cuda.current_stream(device=rgba.device).cuda_stream),
+            force_idr=force_idr,
+        )
+        if accepted is False:
+            return False
+        self._frame_index += 1
+        self._frame_timestamps[frame_index] = capture_ns
+        self._amd_pending_frames.append(frame_index)
+        if len(self._frame_timestamps) > 64:
+            self._frame_timestamps.pop(min(self._frame_timestamps))
+        if force_idr:
+            self._force_idr.clear()
+        return True
+
+    def _drain_amd_packets(
+        self,
+        encoder: Any,
+        config: MoonlightClientConfig,
+        capture_ns: int,
+    ) -> list[dict[str, Any]]:
+        access_units: list[dict[str, Any]] = []
+        for _ in range(32):
+            payload = encoder.read_packet()
+            if not payload:
+                break
+            if not self._amd_pending_frames:
+                continue
+            source_index = self._amd_pending_frames.popleft()
+            access_units.append(
+                {
+                    "data": payload,
+                    "frame_index": source_index,
+                    "idr": self._is_idr(payload, config.codec),
+                }
+            )
+            self._frame_timestamps.setdefault(source_index, capture_ns)
+        return access_units
+
     def submit_runtime_result(self, runtime_result: Any, capture_timestamp: float) -> None:
         if sys.platform == "darwin":
             native_frame = getattr(runtime_result, "native_stream_frame", None)
@@ -805,15 +870,16 @@ class MoonlightSbsOutput:
             if encoder is None or config is None:
                 return
             frame_index = self._frame_index
-            self._frame_index += 1
-            force_idr = self._force_idr.is_set()
-            self._force_idr.clear()
             capture_ns = max(0, int(float(capture_timestamp) * 1_000_000_000))
-            self._frame_timestamps[frame_index] = capture_ns
-            if len(self._frame_timestamps) > 64:
-                self._frame_timestamps.pop(min(self._frame_timestamps))
 
             if hasattr(encoder, "encode_access_units"):
+                frame_index = self._frame_index
+                self._frame_index += 1
+                force_idr = self._force_idr.is_set()
+                self._force_idr.clear()
+                self._frame_timestamps[frame_index] = capture_ns
+                if len(self._frame_timestamps) > 64:
+                    self._frame_timestamps.pop(min(self._frame_timestamps))
                 fitted_frame = self._fit_frame(frame, config)
                 access_units = encoder.encode_access_units(
                     fitted_frame,
@@ -821,27 +887,45 @@ class MoonlightSbsOutput:
                     force_idr=force_idr,
                 )
             else:
-                rgba = self._to_rgba8(self._fit_frame(frame, config))
-                import torch
-
-                self._amd_pending_frames.append(frame_index)
-                encoder.submit_hip_rgba(
-                    int(rgba.data_ptr()),
-                    int(rgba.stride(0) * rgba.element_size()),
-                    int(torch.cuda.current_stream(device=rgba.device).cuda_stream),
-                    force_idr=force_idr,
-                )
-                payload = encoder.read_packet()
-                access_units = []
-                if payload:
-                    source_index = self._amd_pending_frames.popleft()
-                    access_units.append(
-                        {
-                            "data": payload,
-                            "frame_index": source_index,
-                            "idr": self._is_idr(payload, config.codec),
-                        }
+                now = time.perf_counter()
+                target_fps = max(1.0, float(config.fps))
+                if self._amd_rate_update_at is None:
+                    self._amd_rate_update_at = now
+                else:
+                    elapsed = max(0.0, now - self._amd_rate_update_at)
+                    self._amd_rate_update_at = now
+                    self._amd_rate_tokens = min(
+                        2.0,
+                        self._amd_rate_tokens + elapsed * target_fps,
                     )
+                submit_due = self._amd_rate_tokens >= 0.98
+                access_units = []
+                if submit_due:
+                    self._amd_rate_tokens -= 1.0
+                    rgba = self._to_rgba8(self._fit_frame(frame, config))
+                    force_idr = self._force_idr.is_set()
+                    accepted = self._submit_amd_rgba(
+                        encoder, rgba, capture_ns, force_idr=force_idr
+                    )
+                    if not accepted:
+                        if not self._amd_backpressure_logged:
+                            print(
+                                "[Moonlight] AMD AMF input queue is full; "
+                                "draining output and dropping only the current frame",
+                                flush=True,
+                            )
+                            self._amd_backpressure_logged = True
+                        access_units.extend(
+                            self._drain_amd_packets(encoder, config, capture_ns)
+                        )
+                        accepted = self._submit_amd_rgba(
+                            encoder, rgba, capture_ns, force_idr=force_idr
+                        )
+                    if accepted:
+                        self._amd_backpressure_logged = False
+                access_units.extend(
+                    self._drain_amd_packets(encoder, config, capture_ns)
+                )
 
             for access_unit in access_units:
                 source_index = int(access_unit.get("frame_index", frame_index))

@@ -76,6 +76,8 @@ class AmdAmfSurfaceEncoder:
             raise RuntimeError(detail)
         dll = next(path for path in _library_candidates(library_path) if path and path.exists())
         self._dll = ctypes.WinDLL(str(dll))
+        self._packet_capacity = 2 * 1024 * 1024
+        self._packet_buffer = ctypes.create_string_buffer(self._packet_capacity)
         self._abi_version = 1
         abi_probe = getattr(self._dll, "d2s_amd_encoder_abi_version", None)
         if abi_probe is not None:
@@ -113,9 +115,13 @@ class AmdAmfSurfaceEncoder:
         if not self._handle:
             raise RuntimeError("AMF surface encoder initialization failed")
 
-    def submit_d3d11_texture(self, texture_pointer: int) -> None:
-        if self._dll.d2s_amd_encoder_submit_texture(self._handle, ctypes.c_void_p(texture_pointer)) <= 0:
+    def submit_d3d11_texture(self, texture_pointer: int) -> bool:
+        result = self._dll.d2s_amd_encoder_submit_texture(
+            self._handle, ctypes.c_void_p(texture_pointer)
+        )
+        if result < 0:
             raise RuntimeError("AMF rejected the D3D11 texture")
+        return result > 0
 
     def submit_hip_rgba(
         self,
@@ -124,7 +130,7 @@ class AmdAmfSurfaceEncoder:
         stream: int,
         *,
         force_idr: bool = False,
-    ) -> None:
+    ) -> bool:
         if force_idr and self._abi_version < 2:
             raise RuntimeError(
                 "AMD AMF bridge is too old for Moonlight IDR requests; rebuild d2s_amd_encoder.dll"
@@ -138,15 +144,23 @@ class AmdAmfSurfaceEncoder:
         if self._abi_version >= 2:
             args = (*args, int(force_idr))
         result = self._dll.d2s_amd_encoder_submit_hip_rgba(*args)
-        if result <= 0:
+        if result == 0:
+            return False
+        if result < 0:
             raise RuntimeError("AMF rejected the HIP RGBA surface")
+        return True
 
     def read_packet(self, capacity: int = 2 * 1024 * 1024) -> bytes | None:
-        buffer = ctypes.create_string_buffer(capacity)
-        size = self._dll.d2s_amd_encoder_read_packet(self._handle, buffer, capacity)
+        capacity = max(1, int(capacity))
+        if capacity != self._packet_capacity:
+            self._packet_capacity = capacity
+            self._packet_buffer = ctypes.create_string_buffer(capacity)
+        size = self._dll.d2s_amd_encoder_read_packet(
+            self._handle, self._packet_buffer, capacity
+        )
         if size <= 0:
             return None
-        return buffer.raw[:size]
+        return ctypes.string_at(self._packet_buffer, size)
 
     def close(self) -> None:
         if self._handle:
