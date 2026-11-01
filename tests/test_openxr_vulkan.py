@@ -5,6 +5,7 @@ from dataclasses import replace
 import inspect
 import json
 import math
+import queue
 import sys
 import threading
 from pathlib import Path
@@ -46,6 +47,7 @@ from xr_viewer.core_openxr_vulkan import (
     _xr_view_pose_to_model_mat4,
     _layout_msdf_osd_runs,
     _build_msdf_help_panel,
+    _coalesce_desktop_settings_actions,
     _scaled_dimension,
     _select_swapchain_format,
     _select_vulkan_api_version,
@@ -68,6 +70,47 @@ def test_vulkan_version_round_trip() -> None:
     packed = make_vulkan_version(1, 3, 275)
     assert unpack_vulkan_version(packed) == (1, 3, 275)
     assert format_vulkan_version(packed) == "1.3.275"
+
+
+def test_desktop_settings_actions_coalesce_transient_slider_updates() -> None:
+    actions = [
+        ("depth_strength", 0.30, False),
+        ("depth_strength", 0.45, False),
+        ("depth_strength", 0.60, True),
+        ("screen:distance", 1.10, False),
+        ("screen:distance", 1.20, False),
+        ("tab:glow", None, True),
+    ]
+    assert _coalesce_desktop_settings_actions(actions) == [
+        ("depth_strength", 0.60, True),
+        ("screen:distance", 1.20, False),
+        ("tab:glow", None, True),
+    ]
+
+
+def test_desktop_settings_pump_coalesces_actions_and_publishes_once() -> None:
+    presenter = OpenXrVulkanPresenter.__new__(OpenXrVulkanPresenter)
+    actions: queue.Queue = queue.Queue()
+    actions.put(("depth_strength", 0.30, False))
+    actions.put(("depth_strength", 0.45, False))
+    actions.put(("depth_strength", 0.60, True))
+    presenter._desktop_settings_window = SimpleNamespace(
+        actions=actions,
+        stop=lambda: None,
+    )
+    applied = []
+    published = []
+    presenter._apply_desktop_settings_action = (
+        lambda key, value, *, persist=True: applied.append((key, value, persist))
+    )
+    presenter._publish_desktop_settings_snapshot = (
+        lambda *, force=False: published.append(force)
+    )
+
+    presenter._pump_desktop_settings_actions()
+
+    assert applied == [("depth_strength", 0.60, True)]
+    assert published == [True]
 
 
 def test_panorama_push_constants_are_translation_free_and_rotation_aware() -> None:

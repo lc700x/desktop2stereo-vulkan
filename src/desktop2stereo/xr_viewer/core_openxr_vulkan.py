@@ -133,6 +133,31 @@ from utils.screen_resolution_policy import (
 )
 
 
+_OPENXR_SLIDER_UPDATE_INTERVAL_SECONDS = 1.0 / 60.0
+
+
+def _coalesce_desktop_settings_actions(
+    actions: list[tuple[str, float | None, bool]],
+) -> list[tuple[str, float | None, bool]]:
+    """Keep the latest transient slider value and every final action."""
+    coalesced: list[tuple[str, float | None, bool] | None] = []
+    transient_indices: dict[str, int] = {}
+    for key, value, persist in actions:
+        if persist:
+            transient_index = transient_indices.pop(key, None)
+            if transient_index is not None:
+                coalesced[transient_index] = None
+            coalesced.append((key, value, True))
+            continue
+        transient_index = transient_indices.get(key)
+        if transient_index is None:
+            transient_indices[key] = len(coalesced)
+            coalesced.append((key, value, False))
+        else:
+            coalesced[transient_index] = (key, value, False)
+    return [action for action in coalesced if action is not None]
+
+
 _DEFAULT_XR_HEADSET_PRESET = resolve_xr_headset_preset(None)
 
 _MSDF_OSD_SCALE = 0.58
@@ -5557,27 +5582,42 @@ class OpenXrVulkanPresenter(
         window = self._desktop_settings_window
         if window is None:
             return
+        pending_actions: list[tuple[str, float | None, bool]] = []
         while True:
             try:
-                key, value = window.actions.get_nowait()
+                action = window.actions.get_nowait()
             except Exception:
-                return
+                break
+            try:
+                key, value = action[:2]
+            except (TypeError, ValueError):
+                continue
             if key == "__close__":
                 window.stop()
                 self._desktop_settings_window = None
                 return
+            persist = bool(action[2]) if len(action) >= 3 else True
+            pending_actions.append((str(key), value, persist))
+        force_publish = False
+        for key, value, persist in _coalesce_desktop_settings_actions(pending_actions):
             try:
-                self._apply_desktop_settings_action(key, value)
+                self._apply_desktop_settings_action(key, value, persist=persist)
             except Exception as exc:
                 print(
                     "[OpenXRViewer] Desktop settings action failed: "
                     f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
-            self._publish_desktop_settings_snapshot(force=True)
+            force_publish = force_publish or persist
+        if pending_actions:
+            self._publish_desktop_settings_snapshot(force=force_publish)
 
     def _apply_desktop_settings_action(
-        self, key: str, value: float | None
+        self,
+        key: str,
+        value: float | None,
+        *,
+        persist: bool = True,
     ) -> None:
         if key == "screen:reset_to_front":
             self._recenter_filament_screen_to_head()
@@ -5608,9 +5648,9 @@ class OpenXrVulkanPresenter(
                 + fraction * (float(control.rect[2]) - float(control.rect[0])),
                 (float(control.rect[1]) + float(control.rect[3])) * 0.5,
             )
-            self._apply_settings_menu_control(control, uv, persist=True)
+            self._apply_settings_menu_control(control, uv, persist=persist)
             return
-        self._apply_settings_menu_control(control, None, persist=True)
+        self._apply_settings_menu_control(control, None, persist=persist)
 
     def _settings_menu_ray_hit(self, hand: int) -> tuple[float, float] | None:
         if not self._settings_menu.visible or self._settings_menu_pose is None:
@@ -5921,7 +5961,8 @@ class OpenXrVulkanPresenter(
                     self._screen_crop_detector_inflight = False
                     self._reset_screen_crop_hysteresis()
                     self._settings_menu_values["screen:dynamic_crop"] = False
-                    self._persist_screen_state(force=True)
+                    if persist:
+                        self._persist_screen_state(force=True)
                     self._settings_menu_values[key] = value
                     self._settings_menu.mark_dirty()
                     return
@@ -5948,7 +5989,8 @@ class OpenXrVulkanPresenter(
                         )
                     )
                 self._filament_screen = (position, width, height, rotation)
-                self._persist_screen_state(force=True)
+                if persist:
+                    self._persist_screen_state(force=True)
             elif key == "room:seat_height":
                 self._apply_settings_menu_seat_height(value)
             elif key == "room:exposure":
@@ -6181,7 +6223,10 @@ class OpenXrVulkanPresenter(
                 control = control_for_hand
                 if control is not None and control.kind == "slider" and control.key == self._settings_menu.active_key:
                     now = time.perf_counter()
-                    if now - self._settings_menu_last_adjust >= 0.05:
+                    if (
+                        now - self._settings_menu_last_adjust
+                        >= _OPENXR_SLIDER_UPDATE_INTERVAL_SECONDS
+                    ):
                         self._apply_settings_menu_control(control, hits[hand])
                         self._settings_menu_last_adjust = now
         return True

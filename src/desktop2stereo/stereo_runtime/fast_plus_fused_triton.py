@@ -19,7 +19,7 @@ def _shift_from_depth(
     depth_value,
     convergence: tl.constexpr,
     max_disparity_px: tl.constexpr,
-    depth_strength: tl.constexpr,
+    depth_strength,
 ):
     depth_value = tl.minimum(tl.maximum(depth_value, 0.0), 1.0)
     return -(depth_value - convergence) * max_disparity_px * depth_strength * 0.5
@@ -45,7 +45,7 @@ def _sample_eye(
     pixels: tl.constexpr,
     convergence: tl.constexpr,
     max_disparity_px: tl.constexpr,
-    depth_strength: tl.constexpr,
+    depth_strength,
 ):
     tx_i = _clamp_i32(target_x, 0, width - 1)
     depth_value = _load_depth_at(depth, y, tx_i, width, height)
@@ -87,7 +87,7 @@ def _mask_at(
     height: tl.constexpr,
     convergence: tl.constexpr,
     max_disparity_px: tl.constexpr,
-    depth_strength: tl.constexpr,
+    depth_strength,
     edge_threshold: tl.constexpr,
     shift_edge_threshold_px: tl.constexpr,
 ):
@@ -123,7 +123,7 @@ def _filled_eye(
     pixels: tl.constexpr,
     convergence: tl.constexpr,
     max_disparity_px: tl.constexpr,
-    depth_strength: tl.constexpr,
+    depth_strength,
     edge_threshold: tl.constexpr,
     shift_edge_threshold_px: tl.constexpr,
 ):
@@ -168,7 +168,7 @@ def _filled_eye(
     return tl.where(mask, value + (filled - value) * 0.60, value)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["depth_strength"])
 def _fast_plus_half_sbs_uint8_kernel(
     rgb,
     depth,
@@ -180,7 +180,7 @@ def _fast_plus_half_sbs_uint8_kernel(
     pixels: tl.constexpr,
     convergence: tl.constexpr,
     max_disparity_px: tl.constexpr,
-    depth_strength: tl.constexpr,
+    depth_strength,
     edge_threshold: tl.constexpr,
     shift_edge_threshold_px: tl.constexpr,
     block: tl.constexpr,
@@ -234,7 +234,7 @@ def _fast_plus_half_sbs_uint8_kernel(
     tl.store(out + offsets, value.to(tl.uint8), mask=active)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["depth_strength"])
 def _fast_plus_warp_only_half_sbs_uint8_kernel(
     rgb,
     depth,
@@ -246,7 +246,7 @@ def _fast_plus_warp_only_half_sbs_uint8_kernel(
     pixels: tl.constexpr,
     convergence: tl.constexpr,
     max_disparity_px: tl.constexpr,
-    depth_strength: tl.constexpr,
+    depth_strength,
     block: tl.constexpr,
 ):
     """Render the complete SBS image without the expensive hole-fill branch."""
@@ -294,7 +294,7 @@ def _fast_plus_warp_only_half_sbs_uint8_kernel(
     tl.store(out + offsets, value.to(tl.uint8), mask=active)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["depth_strength"])
 def _fast_plus_hole_ratio_probe_kernel(
     depth,
     out,
@@ -306,7 +306,7 @@ def _fast_plus_hole_ratio_probe_kernel(
     probe_height: tl.constexpr,
     convergence: tl.constexpr,
     max_disparity_px: tl.constexpr,
-    depth_strength: tl.constexpr,
+    depth_strength,
     edge_threshold: tl.constexpr,
     shift_edge_threshold_px: tl.constexpr,
     block: tl.constexpr,
@@ -348,7 +348,7 @@ def _fast_plus_hole_ratio_probe_kernel(
     tl.store(out + offsets, found.to(tl.uint8), mask=active)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["depth_strength"])
 def _fast_plus_active_mask_kernel(
     depth,
     out,
@@ -358,7 +358,7 @@ def _fast_plus_active_mask_kernel(
     half_width: tl.constexpr,
     convergence: tl.constexpr,
     max_disparity_px: tl.constexpr,
-    depth_strength: tl.constexpr,
+    depth_strength,
     edge_threshold: tl.constexpr,
     shift_edge_threshold_px: tl.constexpr,
     block: tl.constexpr,
@@ -398,7 +398,7 @@ def _fast_plus_active_mask_kernel(
     tl.store(out + offsets, found.to(tl.uint8), mask=active)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["depth_strength"])
 def _fast_plus_sparse_fill_kernel(
     rgb,
     depth,
@@ -413,7 +413,7 @@ def _fast_plus_sparse_fill_kernel(
     pixels: tl.constexpr,
     convergence: tl.constexpr,
     max_disparity_px: tl.constexpr,
-    depth_strength: tl.constexpr,
+    depth_strength,
     edge_threshold: tl.constexpr,
     shift_edge_threshold_px: tl.constexpr,
     block: tl.constexpr,

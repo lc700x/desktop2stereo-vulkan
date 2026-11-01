@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 import stereo_runtime.synthesis as synthesis_module
+from stereo_runtime import fast_plus_fused_triton
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
@@ -31,6 +32,20 @@ from stereo_runtime.temporal import TemporalState, _scene_sample
 def test_triton_occlusion_hot_path_has_no_cpu_scalar_sync():
     source = (APP_ROOT / "stereo_runtime" / "occlusion_triton.py").read_text(encoding="utf-8")
     assert ".item()" not in source
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    (
+        fast_plus_fused_triton._fast_plus_half_sbs_uint8_kernel,
+        fast_plus_fused_triton._fast_plus_warp_only_half_sbs_uint8_kernel,
+        fast_plus_fused_triton._fast_plus_hole_ratio_probe_kernel,
+        fast_plus_fused_triton._fast_plus_active_mask_kernel,
+        fast_plus_fused_triton._fast_plus_sparse_fill_kernel,
+    ),
+)
+def test_fast_plus_depth_strength_reuses_triton_program(kernel) -> None:
+    assert "depth_strength" in kernel.do_not_specialize
 
 
 def test_scene_sample_uses_bounded_spatial_sample():

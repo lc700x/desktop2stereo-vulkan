@@ -946,16 +946,27 @@ def _run_flet_desktop_settings_app(
                     page.window.visible = True
                     apply_drawer_region()
 
-        def queue_action(key: str, value: float | None = None) -> None:
+        def queue_action(
+            key: str,
+            value: float | None = None,
+            *,
+            persist: bool = True,
+        ) -> None:
             try:
-                actions.put_nowait((key, value))
+                actions.put_nowait((key, value, bool(persist)))
             except Exception:
                 pass
 
         def queue_button(key: str) -> Any:
             return lambda _event: queue_action(key)
 
-        def queue_slider(key: str, value_label: Any, step: float) -> Any:
+        def queue_slider(
+            key: str,
+            value_label: Any,
+            step: float,
+            *,
+            persist: bool,
+        ) -> Any:
             def on_change(event: Any) -> None:
                 try:
                     value = float(event.control.value)
@@ -963,7 +974,7 @@ def _run_flet_desktop_settings_app(
                     return
                 value_label.value = _format_value(value, step, key)
                 value_label.update()
-                queue_action(key, value)
+                queue_action(key, value, persist=persist)
 
             return on_change
 
@@ -1205,7 +1216,16 @@ def _run_flet_desktop_settings_app(
                     thumb_color=_menu_color("text_primary"),
                     overlay_color=_menu_color("primary_hover_container"),
                     on_change=queue_slider(
-                        key, value_label, float(control.step)
+                        key,
+                        value_label,
+                        float(control.step),
+                        persist=False,
+                    ),
+                    on_change_end=queue_slider(
+                        key,
+                        value_label,
+                        float(control.step),
+                        persist=True,
                     ),
                     disabled=not bool(control.enabled),
                     expand=True,
