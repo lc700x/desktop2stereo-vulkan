@@ -234,6 +234,99 @@ def test_macos_moonlight_encodes_native_coreml_metal_frame():
         output.close()
 
 
+def test_macos_moonlight_paces_native_frames_to_negotiated_fps():
+    class _NativeFrame:
+        def __init__(self):
+            self.released = False
+
+        def release(self):
+            self.released = True
+
+    class _Encoder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class _Bridge:
+        connected = True
+        connection_generation = 4
+
+        def close(self):
+            self.connected = False
+
+    output = MoonlightSbsOutput(
+        base_dir=".",
+        fps=60,
+        display_mode="Half-SBS",
+        fit_mode="contain",
+        input_size=(1920, 1080),
+        input_bounds=None,
+        device="mps",
+    )
+    output._bridge = _Bridge()
+    frames = [_NativeFrame() for _ in range(5)]
+    submissions = []
+    clock = [100.0]
+
+    def submit(frame, timestamp):
+        result = type("RuntimeResult", (), {
+            "native_stream_frame": frame,
+            "output_format": "half_sbs",
+        })()
+        output.submit_runtime_result(result, timestamp)
+
+    try:
+        with (
+            patch("streaming.moonlight_output.sys.platform", "darwin"),
+            patch(
+                "streaming.moonlight_output.time.perf_counter",
+                side_effect=lambda: clock[0],
+            ),
+            patch("streaming.videotoolbox_encoder.VideoToolboxEncoder", _Encoder),
+        ):
+            output._configure_encoder(
+                MoonlightClientConfig(
+                    1920, 1080, 30.0, 15_000, "hevc", 1920, 1080,
+                    0, 0, 1920, 1080, 0,
+                )
+            )
+            output._ensure_native_encoder_worker = lambda: None
+            output._enqueue_native_frame = (
+                lambda submission: submissions.append(submission) or True
+            )
+            submit(frames[0], 1.0)
+            submit(frames[1], 1.1)
+            output._request_keyframe()
+            submit(frames[2], 1.2)
+            first_batch = list(submissions)
+            output._configure_encoder(
+                MoonlightClientConfig(
+                    1920, 1080, 60.0, 15_000, "hevc", 1920, 1080,
+                    0, 0, 1920, 1080, 0,
+                )
+            )
+            submissions.clear()
+            clock[0] += 1.0 / 60.0
+            submit(frames[3], 1.3)
+            clock[0] += 1.0 / 60.0
+            submit(frames[4], 1.4)
+
+        assert [submission.frame_index for submission in first_batch] == [0, 1]
+        assert first_batch[-1].force_keyframe
+        assert [submission.frame_index for submission in submissions] == [0, 1]
+        assert submissions[0].force_keyframe
+        assert not submissions[1].force_keyframe
+        assert not frames[0].released
+        assert frames[1].released
+        assert not frames[2].released
+        assert not frames[3].released
+        assert not frames[4].released
+    finally:
+        output.close()
+
+
 def test_macos_moonlight_drops_stale_native_frames_under_backpressure():
     class _NativeFrame:
         def __init__(self, marker):
@@ -298,6 +391,9 @@ def test_macos_moonlight_drops_stale_native_frames_under_backpressure():
         0, 0, 1920, 1080, 0,
     )
     output._native_session_ready = True
+    # This test exercises the one-slot backpressure queue independently of
+    # negotiated-rate pacing.
+    output._native_target_fps = 1_000_000.0
     frames = [_NativeFrame(marker) for marker in (1, 2, 3)]
 
     def submit(frame, capture_timestamp):

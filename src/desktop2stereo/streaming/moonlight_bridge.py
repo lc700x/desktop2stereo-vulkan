@@ -90,7 +90,7 @@ class MoonlightBridgeServer:
         self._client_socket: socket.socket | None = None
         self._client_config: MoonlightClientConfig | None = None
         self._client_generation = 0
-        self._client_reserved = False
+        self._client_reserved: object | None = None
         self._server: socketserver.ThreadingTCPServer | None = None
         self._server_thread: threading.Thread | None = None
 
@@ -122,6 +122,7 @@ class MoonlightBridgeServer:
 
         class _Handler(socketserver.StreamRequestHandler):
             def handle(self) -> None:
+                reservation: object | None = None
                 self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 line = self.rfile.readline(_MAX_CONTROL_LINE + 1)
                 if len(line) > _MAX_CONTROL_LINE or not line.endswith(b"\n"):
@@ -136,19 +137,27 @@ class MoonlightBridgeServer:
                         return
                     config = MoonlightClientConfig.from_handshake(message)
                     with owner._socket_lock:
-                        if owner._client_socket is not None or owner._client_reserved:
+                        if (
+                            owner._client_socket is not None
+                            or owner._client_reserved is not None
+                        ):
                             self.wfile.write(b'{"ok":false,"error":"stream already active"}\n')
                             return
-                        owner._client_reserved = True
+                        reservation = object()
+                        owner._client_reserved = reservation
                     response = owner.on_client_start(config)
                     with owner._socket_lock:
-                        owner._client_reserved = False
-                        if response is None:
-                            self.wfile.write(b'{"ok":false,"error":"encoder configuration rejected"}\n')
+                        if owner._client_reserved is not reservation:
                             return
-                        owner._client_socket = self.connection
-                        owner._client_config = config
-                        owner._client_generation += 1
+                        owner._client_reserved = None
+                        reservation = None
+                        if response is not None:
+                            owner._client_socket = self.connection
+                            owner._client_config = config
+                            owner._client_generation += 1
+                    if response is None:
+                        self.wfile.write(b'{"ok":false,"error":"encoder configuration rejected"}\n')
+                        return
                     self.wfile.write((json.dumps({"ok": True, **response}) + "\n").encode("utf-8"))
                     self.wfile.flush()
                     while True:
@@ -168,22 +177,29 @@ class MoonlightBridgeServer:
                     return
                 finally:
                     with owner._socket_lock:
+                        if (
+                            reservation is not None
+                            and owner._client_reserved is reservation
+                        ):
+                            owner._client_reserved = None
                         if owner._client_socket is self.connection:
                             owner._client_socket = None
                             owner._client_config = None
                             # Keep new handshakes out until D2S has released
                             # the old encoder session and its queued frames.
-                            owner._client_reserved = True
+                            disconnect_reservation = object()
+                            owner._client_reserved = disconnect_reservation
                             disconnected = True
                         else:
-                            owner._client_reserved = False
+                            disconnect_reservation = None
                             disconnected = False
                     if disconnected:
                         try:
                             owner.on_client_stop()
                         finally:
                             with owner._socket_lock:
-                                owner._client_reserved = False
+                                if owner._client_reserved is disconnect_reservation:
+                                    owner._client_reserved = None
 
         self._server = _Server(("127.0.0.1", 0), _Handler)
         self._server_thread = threading.Thread(
@@ -263,7 +279,7 @@ class MoonlightBridgeServer:
             client = self._client_socket
             self._client_socket = None
             self._client_config = None
-            self._client_reserved = False
+            self._client_reserved = None
         if client is not None:
             try:
                 client.shutdown(socket.SHUT_RDWR)

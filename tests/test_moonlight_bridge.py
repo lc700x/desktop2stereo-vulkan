@@ -4,6 +4,7 @@ import json
 import socket
 import struct
 import threading
+import time
 
 from streaming.moonlight_bridge import MoonlightBridgeServer, MoonlightClientConfig
 
@@ -133,6 +134,49 @@ def test_moonlight_bridge_rejects_bad_token_and_unsupported_configuration():
             assert response["ok"] is False
             assert "unsupported" in response["error"]
     finally:
+        bridge.close()
+
+
+def test_rejected_handshake_does_not_clear_active_encoder_reservation():
+    first_started = threading.Event()
+    allow_first_start = threading.Event()
+    bridge = MoonlightBridgeServer(
+        "d" * 64,
+        on_client_start=lambda _config: (
+            first_started.set(),
+            allow_first_start.wait(2.0),
+            {"ok": True},
+        )[-1],
+        on_client_stop=lambda: None,
+        on_idr_request=lambda: None,
+    )
+    host, port = bridge.start()
+    first = socket.create_connection((host, port), timeout=3.0)
+    invalid = None
+    try:
+        first.sendall(_hello("d" * 64))
+        assert first_started.wait(1.0)
+
+        invalid = socket.create_connection((host, port), timeout=3.0)
+        invalid.sendall(_hello("wrong"))
+        assert json.loads(invalid.makefile("rb").readline())["error"] == "unauthorized"
+
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            with bridge._socket_lock:
+                if not bridge._client_reserved:
+                    break
+            time.sleep(0.005)
+        with bridge._socket_lock:
+            assert bridge._client_reserved
+
+        allow_first_start.set()
+        assert json.loads(first.makefile("rb").readline())["ok"] is True
+    finally:
+        allow_first_start.set()
+        first.close()
+        if invalid is not None:
+            invalid.close()
         bridge.close()
 
 
