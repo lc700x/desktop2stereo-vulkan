@@ -260,6 +260,58 @@ Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True -ErrorAction 
     return True, ""
 
 
+def _set_alvr_openxr_runtime_override(child_env, run_mode_key):
+    """Use ALVR's OpenXR runtime for this child while its server is running."""
+    if OS_NAME != "Windows" or run_mode_key != "OpenXR Link":
+        return None
+
+    command = (
+        "$server = Get-Process -Name 'alvr_openxr_host' "
+        "-ErrorAction SilentlyContinue | Select-Object -First 1; "
+        "if ($server -and $server.Path) { "
+        "$manifest = Join-Path (Split-Path -Parent $server.Path) "
+        "'alvr_openxr_runtime.json'; "
+        "if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { "
+        "Write-Output ('ALVR_RUNTIME_ERROR:Missing runtime manifest: ' + $manifest) "
+        "} else { try { "
+        "$runtime = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).runtime; "
+        "$dll = $runtime.library_path; "
+        "if (-not $dll) { throw 'Manifest has no runtime.library_path' }; "
+        "if (-not [IO.Path]::IsPathRooted($dll)) { "
+        "$dll = Join-Path (Split-Path -Parent $manifest) $dll }; "
+        "if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) { "
+        "throw ('Runtime library is missing: ' + $dll) }; "
+        "Write-Output $manifest "
+        "} catch { Write-Output ('ALVR_RUNTIME_ERROR:' + $_.Exception.Message) } } }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    manifest_path = next(
+        (line.strip() for line in result.stdout.splitlines() if line.strip()),
+        None,
+    )
+    if manifest_path and manifest_path.startswith("ALVR_RUNTIME_ERROR:"):
+        raise RuntimeError(manifest_path.removeprefix("ALVR_RUNTIME_ERROR:"))
+    if manifest_path:
+        child_env["XR_RUNTIME_JSON"] = manifest_path
+        child_env["DISABLE_XR_APILAYER_VIRTUALDESKTOP_OCULUS_COMPATIBILITY"] = "1"
+    return manifest_path
+
+
 def _is_asyncio_shutdown_unraisable(unraisable):
     exc = getattr(unraisable, "exc_value", None)
     if str(exc) not in _ASYNCIO_SHUTDOWN_UNRAISABLE_MESSAGES:
@@ -1553,6 +1605,13 @@ class GUIProcessMixin:
             child_env = os.environ.copy()
             child_env["DESKTOP2STEREO_LOCALE"] = self.locale
             child_env["PYTHONIOENCODING"] = "utf-8"
+            runtime_override = _set_alvr_openxr_runtime_override(
+                child_env, self.run_mode_key
+            )
+            if runtime_override:
+                self._diag(
+                    f"Using ALVR OpenXR runtime for D2S child: {runtime_override}"
+                )
             if OS_NAME == "Darwin":
                 from utils.vulkan_env import apply_macos_vulkan_env
 

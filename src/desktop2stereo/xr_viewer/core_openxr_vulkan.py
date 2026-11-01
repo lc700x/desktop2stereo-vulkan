@@ -1739,6 +1739,15 @@ class OpenXrVulkanPresenter(
                     enabled_extension_names=enabled_extensions,
                 )
             )
+            runtime_properties = xr.get_instance_properties(self.instance)
+            runtime_name = runtime_properties.runtime_name
+            if isinstance(runtime_name, bytes):
+                runtime_name = runtime_name.decode("utf-8", errors="replace")
+            print(
+                f"[OpenXRViewer] OpenXR runtime selected: {runtime_name} "
+                f"(XR_RUNTIME_JSON={os.environ.get('XR_RUNTIME_JSON', 'system default')})",
+                flush=True,
+            )
             self.system_id = xr.get_system(
                 self.instance,
                 xr.SystemGetInfo(form_factor=xr.FormFactor.HEAD_MOUNTED_DISPLAY),
@@ -6264,6 +6273,12 @@ class OpenXrVulkanPresenter(
                                 "[OpenXRViewer] Runtime rejected a frame "
                                 f"(client interstitial?): {error}; "
                                 "session will be re-created",
+                                flush=True,
+                            )
+                            print(
+                                "[OpenXRViewer] Runtime failure traceback:",
+                                traceback.format_exc().rstrip(),
+                                sep="\n",
                                 flush=True,
                             )
                         self.close()

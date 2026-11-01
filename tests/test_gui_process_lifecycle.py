@@ -94,6 +94,47 @@ def test_openxr_controls_button_opens_window_request(tmp_path):
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_openxr_child_uses_alvr_runtime_when_server_is_running(monkeypatch):
+    manifest = "F:/alvr/bin/win64/alvr_openxr_runtime.json"
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout=manifest + "\n", stderr="")
+
+    monkeypatch.setattr(gui_process, "OS_NAME", "Windows")
+    monkeypatch.setattr(gui_process.subprocess, "run", fake_run)
+    child_env = {"XR_RUNTIME_JSON": "C:/VirtualDesktop/OpenXR/vdxr.json"}
+
+    selected = gui_process._set_alvr_openxr_runtime_override(child_env, "OpenXR Link")
+
+    assert selected == manifest
+    assert child_env["XR_RUNTIME_JSON"] == manifest
+    assert child_env["DISABLE_XR_APILAYER_VIRTUALDESKTOP_OCULUS_COMPATIBILITY"] == "1"
+    assert calls[0][0][:3] == ["powershell.exe", "-NoProfile", "-NonInteractive"]
+    assert "alvr_openxr_host" in calls[0][0][-1]
+    assert calls[0][1]["timeout"] == 5
+
+
+def test_openxr_child_keeps_inherited_runtime_without_alvr_server(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gui_process, "OS_NAME", "Windows")
+    monkeypatch.setattr(gui_process.subprocess, "run", fake_run)
+    child_env = {"XR_RUNTIME_JSON": "C:/VirtualDesktop/OpenXR/vdxr.json"}
+
+    assert gui_process._set_alvr_openxr_runtime_override(child_env, "Desktop") is None
+    assert calls == []
+    assert gui_process._set_alvr_openxr_runtime_override(child_env, "OpenXR Link") is None
+    assert child_env["XR_RUNTIME_JSON"] == "C:/VirtualDesktop/OpenXR/vdxr.json"
+    assert "DISABLE_XR_APILAYER_VIRTUALDESKTOP_OCULUS_COMPATIBILITY" not in child_env
+    assert len(calls) == 1
+
+
 def test_openxr_controls_ignores_stale_window_acknowledgements():
     class Harness(gui_process.GUIProcessMixin):
         def _safe_update(self, *_controls):
@@ -745,3 +786,18 @@ def test_intentional_gui_stop_suppresses_openxr_fatal_auto_relaunch(monkeypatch)
     assert gui.process is None
     assert (gui_process.UI_MESSAGES["EN"]["Stopped"], "Stopped") in statuses
     assert not any("Auto Restart" in str(message) for message, *_rest in statuses)
+
+
+def test_openxr_child_reports_broken_alvr_install(monkeypatch):
+    monkeypatch.setattr(gui_process, "OS_NAME", "Windows")
+    monkeypatch.setattr(
+        gui_process.subprocess, "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="ALVR_RUNTIME_ERROR:Missing runtime manifest: F:/alvr/runtime.json",
+            stderr="",
+        ),
+    )
+    child_env = {"XR_RUNTIME_JSON": "C:/VirtualDesktop/OpenXR/vdxr.json"}
+    with pytest.raises(RuntimeError, match="Missing runtime manifest"):
+        gui_process._set_alvr_openxr_runtime_override(child_env, "OpenXR Link")
+    assert child_env["XR_RUNTIME_JSON"] == "C:/VirtualDesktop/OpenXR/vdxr.json"
