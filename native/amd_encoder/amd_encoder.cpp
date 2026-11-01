@@ -4,11 +4,13 @@
 #include <dxgi1_2.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #ifdef D2S_AMF_SDK
 #include "public/common/AMFFactory.h"
@@ -104,6 +106,7 @@ struct AmdEncoder {
     HipDestroyExternalMemory hip_destroy_external_memory = nullptr;
     HipStreamSynchronize hip_stream_synchronize = nullptr;
     std::array<AmdInputSurface, kAmfInputSurfaceCount> input_surfaces;
+    std::vector<std::uint8_t> pending_packet;
 };
 
 bool create_shared_rgba_texture(AmdEncoder* state, AmdInputSurface& surface) {
@@ -333,7 +336,7 @@ extern "C" D2S_AMD_API int d2s_amd_encoder_probe() {
 }
 
 extern "C" D2S_AMD_API int d2s_amd_encoder_abi_version() {
-    return 3;
+    return 4;
 }
 
 extern "C" D2S_AMD_API int d2s_amd_encoder_last_error(char* output, int capacity) {
@@ -398,20 +401,142 @@ static void* d2s_amd_encoder_create_impl(
         return nullptr;
     }
     const amf_int64 rate = static_cast<amf_int64>(bitrate);
+    // AMF's Windows D3D11 interop currently emits approximately twice the
+    // configured target for both H.264 and HEVC in this RGBA surface path.
+    // Compensate so Moonlight receives the negotiated network budget.
+    const amf_int64 encoder_rate = std::max<amf_int64>(rate / 2, 1);
+    const amf_int64 frame_bits = std::max<amf_int64>(
+        encoder_rate / std::max(1, fps),
+        1);
+    // A one-frame VBV is too tight for 4K content and causes visible
+    // macroblocking during motion. Keep a one-second average-rate buffer while
+    // retaining the per-frame AU cap below.
+    const amf_int64 vbv_size = std::max<amf_int64>(
+        encoder_rate,
+        frame_bits * 2);
+    const amf_int64 max_au_size = std::max<amf_int64>(
+        frame_bits * 4,
+        1);
     state->encoder->SetProperty(AMF_VIDEO_ENCODER_FRAMESIZE, AMFConstructSize(width, height));
     state->encoder->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, AMFConstructRate(fps, 1));
-    state->encoder->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, rate);
     if (hevc) {
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_USAGE,
+            static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET,
+            static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_MAX_NUM_REFRAMES,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE,
+            static_cast<amf_int64>(
+                AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE_FRAME));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_SLICES_PER_FRAME,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_DE_BLOCKING_FILTER_DISABLE,
+            static_cast<amf_int64>(0));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_HIGH_MOTION_QUALITY_BOOST_ENABLE,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE,
+            static_cast<amf_int64>(
+                AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED));
         state->encoder->SetProperty(
             AMF_VIDEO_ENCODER_HEVC_INPUT_QUEUE_SIZE,
             static_cast<amf_int64>(kAmfInputSurfaceCount));
-        state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, static_cast<amf_int64>(fps));
-        state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_GOP_SIZE,
+            static_cast<amf_int64>(fps));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD,
+            static_cast<amf_int64>(
+                AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE,
+            vbv_size);
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_INITIAL_VBV_BUFFER_FULLNESS,
+            static_cast<amf_int64>(64));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_ENFORCE_HRD,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, encoder_rate);
+        state->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, encoder_rate);
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_MAX_AU_SIZE,
+            max_au_size);
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_LOWLATENCY_MODE,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_SKIP_FRAME_ENABLE,
+            static_cast<amf_int64>(0));
     } else {
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_USAGE,
+            static_cast<amf_int64>(AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_QUALITY_PRESET,
+            static_cast<amf_int64>(AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_OUTPUT_MODE,
+            static_cast<amf_int64>(AMF_VIDEO_ENCODER_OUTPUT_MODE_FRAME));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_SLICES_PER_FRAME,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_DE_BLOCKING_FILTER,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_ENABLE_VBAQ,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_HIGH_MOTION_QUALITY_BOOST_ENABLE,
+            static_cast<amf_int64>(1));
         state->encoder->SetProperty(
             AMF_VIDEO_ENCODER_INPUT_QUEUE_SIZE,
             static_cast<amf_int64>(kAmfInputSurfaceCount));
-        state->encoder->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, static_cast<amf_int64>(fps));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_IDR_PERIOD,
+            static_cast<amf_int64>(fps));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
+            static_cast<amf_int64>(
+                AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE,
+            vbv_size);
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_INITIAL_VBV_BUFFER_FULLNESS,
+            static_cast<amf_int64>(64));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_ENFORCE_HRD,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, encoder_rate);
+        state->encoder->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, encoder_rate);
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_MAX_AU_SIZE,
+            max_au_size);
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_LOWLATENCY_MODE,
+            static_cast<amf_int64>(1));
+        state->encoder->SetProperty(
+            AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE,
+            static_cast<amf_int64>(0));
     }
     result = state->encoder->Init(amf::AMF_SURFACE_RGBA, width, height);
     if (result != AMF_OK) {
@@ -542,12 +667,23 @@ extern "C" D2S_AMD_API int d2s_amd_encoder_read_packet(void* handle, void* outpu
 #else
     auto* state = static_cast<AmdEncoder*>(handle);
     if (!state || !output || capacity <= 0) return -1;
+    if (!state->pending_packet.empty()) {
+        const auto size = static_cast<int>(state->pending_packet.size());
+        if (size > capacity) return -size;
+        std::memcpy(output, state->pending_packet.data(), state->pending_packet.size());
+        state->pending_packet.clear();
+        return size;
+    }
     amf::AMFDataPtr data;
     AMF_RESULT result = state->encoder->QueryOutput(&data);
     if (result != AMF_OK || !data) return 0;
     amf::AMFBufferPtr buffer(data);
     const auto size = static_cast<int>(buffer->GetSize());
-    if (size > capacity) return -size;
+    if (size > capacity) {
+        const auto* source = static_cast<const std::uint8_t*>(buffer->GetNative());
+        state->pending_packet.assign(source, source + buffer->GetSize());
+        return -size;
+    }
     std::memcpy(output, buffer->GetNative(), static_cast<size_t>(size));
     return size;
 #endif

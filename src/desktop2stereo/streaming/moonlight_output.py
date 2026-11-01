@@ -716,10 +716,10 @@ class MoonlightSbsOutput:
                         library_path=os.environ.get("D2S_AMD_ENCODER_DLL")
                         or self._server_dir / "d2s_amd_encoder.dll",
                     )
-                    if int(getattr(self._encoder, "_abi_version", 0)) < 3:
+                    if int(getattr(self._encoder, "_abi_version", 0)) < 4:
                         self._close_encoder_locked()
                         raise RuntimeError(
-                            "The bundled AMD AMF bridge lacks pooled-surface backpressure support; "
+                            "The bundled AMD AMF bridge lacks low-latency rate control; "
                             "rebuild d2s_amd_encoder.dll"
                         )
                 else:
@@ -748,6 +748,13 @@ class MoonlightSbsOutput:
                 self._amd_rate_tokens = 1.0
                 self._amd_backpressure_logged = False
                 self._force_idr.set()
+            print(
+                "[Moonlight] Client negotiated "
+                f"{config.width}x{config.height}@{config.fps:g}, "
+                f"{config.codec.upper()}, {config.bitrate_kbps / 1000.0:g} Mbps, "
+                f"{'AMF' if use_rocm else 'NVENC'}",
+                flush=True,
+            )
             return {"accepted_width": config.width, "accepted_height": config.height}
         except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
             print(f"[Moonlight] Could not configure GPU encoder: {type(exc).__name__}: {exc}", flush=True)

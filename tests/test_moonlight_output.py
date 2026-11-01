@@ -917,9 +917,42 @@ def test_amd_encoder_wrapper_reports_amf_input_full_without_raising():
 
     encoder = AmdAmfSurfaceEncoder.__new__(AmdAmfSurfaceEncoder)
     encoder._dll = _Library()
-    encoder._abi_version = 3
+    encoder._abi_version = 4
     encoder._handle = 1
 
     assert encoder.submit_hip_rgba(1234, 7680, 99) is False
     encoder._dll.result = 1
     assert encoder.submit_hip_rgba(1234, 7680, 99) is True
+
+
+def test_amd_encoder_wrapper_resizes_oversized_access_unit():
+    import ctypes
+
+    from streaming.amd_encoder import AmdAmfSurfaceEncoder
+
+    payload = b"x" * (2 * 1024 * 1024 + 1)
+
+    class _Library:
+        calls = 0
+
+        def d2s_amd_encoder_read_packet(self, _handle, output, capacity):
+            self.calls += 1
+            if self.calls == 1:
+                assert capacity == 2 * 1024 * 1024
+                return -len(payload)
+            assert capacity == len(payload)
+            ctypes.memmove(output, payload, len(payload))
+            return len(payload)
+
+        @staticmethod
+        def d2s_amd_encoder_destroy(_handle):
+            pass
+
+    encoder = AmdAmfSurfaceEncoder.__new__(AmdAmfSurfaceEncoder)
+    encoder._dll = _Library()
+    encoder._handle = 1
+    encoder._packet_capacity = 2 * 1024 * 1024
+    encoder._packet_buffer = ctypes.create_string_buffer(encoder._packet_capacity)
+
+    assert encoder.read_packet() == payload
+    assert encoder._dll.calls == 2

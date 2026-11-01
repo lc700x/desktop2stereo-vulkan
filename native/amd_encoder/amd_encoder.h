@@ -11,7 +11,8 @@ extern "C" {
 // Returns 1 when the AMD AMF runtime and a D3D11 device can be created.
 D2S_AMD_API int d2s_amd_encoder_probe();
 
-// Reports the native ABI level used for Moonlight keyframe requests.
+// Reports the native ABI level used for Moonlight keyframe requests and
+// resizable access-unit reads.
 D2S_AMD_API int d2s_amd_encoder_abi_version();
 
 // Writes a UTF-8 diagnostic into caller-provided storage.

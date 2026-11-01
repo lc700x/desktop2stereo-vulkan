@@ -152,15 +152,24 @@ class AmdAmfSurfaceEncoder:
 
     def read_packet(self, capacity: int = 2 * 1024 * 1024) -> bytes | None:
         capacity = max(1, int(capacity))
-        if capacity != self._packet_capacity:
-            self._packet_capacity = capacity
-            self._packet_buffer = ctypes.create_string_buffer(capacity)
-        size = self._dll.d2s_amd_encoder_read_packet(
-            self._handle, self._packet_buffer, capacity
-        )
-        if size <= 0:
-            return None
-        return ctypes.string_at(self._packet_buffer, size)
+        for _ in range(2):
+            if capacity != self._packet_capacity:
+                self._packet_capacity = capacity
+                self._packet_buffer = ctypes.create_string_buffer(capacity)
+            size = self._dll.d2s_amd_encoder_read_packet(
+                self._handle, self._packet_buffer, capacity
+            )
+            if size > 0:
+                return ctypes.string_at(self._packet_buffer, size)
+            if size == 0:
+                return None
+            required = -size
+            if required <= capacity or required > 32 * 1024 * 1024:
+                raise RuntimeError(
+                    f"AMF returned an invalid access-unit size: {required}"
+                )
+            capacity = required
+        return None
 
     def close(self) -> None:
         if self._handle:
