@@ -467,10 +467,14 @@ def make_official_requirements(
     target: Path,
     *,
     rocm_arches: tuple[str, ...] = (),
+    package_pins: dict[str, str] | None = None,
 ) -> None:
     """Copy a requirements file while removing inherited indexes and mirror includes."""
     rows: list[str] = []
     architecture_extras = ",".join(f"device-{architecture}" for architecture in rocm_arches)
+    normalized_pins = {
+        name.casefold(): version for name, version in (package_pins or {}).items()
+    }
     for original in source.read_text(encoding="utf-8").splitlines():
         line = original.strip()
         if not line or line.startswith("#"):
@@ -483,6 +487,17 @@ def make_official_requirements(
         line = line.replace("https://ghfast.top/github.com/", "https://github.com/")
         if re.search(r"(?:ghfast\.top|huaweicloud\.com|mirrors\.aliyun\.com)", line, re.I):
             raise ValueError(f"Non-official package source in requirements: {line}")
+        requirement = re.match(
+            r"^(?P<name>[A-Za-z0-9_.-]+)(?P<extras>\[[^\]]+\])?",
+            line,
+        )
+        if requirement:
+            pinned_version = normalized_pins.get(requirement.group("name").casefold())
+            if pinned_version:
+                extras = requirement.group("extras") or ""
+                marker_offset = line.find(";")
+                marker = line[marker_offset:] if marker_offset >= 0 else ""
+                line = f"{requirement.group('name')}{extras}{pinned_version}{marker}"
         rows.append(line)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("\n".join(rows) + "\n", encoding="utf-8")
@@ -1034,6 +1049,11 @@ def build_variant(
         ROOT / "src" / "env_install" / variant["requirements"],
         backend_requirements,
         rocm_arches=variant["expected_arches"] if variant["profile"] == "rocm" else (),
+        package_pins={
+            name: value
+            for name, value in variant["constraints"].items()
+            if name == "triton-windows"
+        },
     )
     make_official_requirements(ROOT / "src" / "env_install" / "requirements.txt", common_requirements)
     index_args = official_index_args(variant["profile"])
