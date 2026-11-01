@@ -32,6 +32,7 @@ from streaming.moonlight_paths import (
 _SUNSHINE_DEFAULT_PORT = 47989
 _SUNSHINE_MIN_PORT = 1019
 _SUNSHINE_MAX_PORT = 65514
+_NATIVE_MAX_FRAME_CREDIT = 1.25
 _SUNSHINE_PORT_OFFSETS = (
     (socket.SOCK_STREAM, (-5, 0, 1, 21)),
     (socket.SOCK_DGRAM, (9, 10, 11, 13)),
@@ -214,6 +215,9 @@ class MoonlightSbsOutput:
         self._native_session_generation = 0
         self._native_session_ready = False
         self._native_frame_index = 0
+        self._native_target_fps = float(self.fps)
+        self._native_rate_updated_at: float | None = None
+        self._native_rate_tokens = _NATIVE_MAX_FRAME_CREDIT
         self._native_force_keyframe_pending = True
         self._native_keyframe_request_generation = 0
         self._native_frame_queue: queue.Queue[_NativeFrameSubmission] = queue.Queue(maxsize=1)
@@ -639,6 +643,9 @@ class MoonlightSbsOutput:
                     session_generation = self._native_session_generation
                     self._native_session_ready = False
                     self._native_frame_index = 0
+                    self._native_target_fps = config.fps
+                    self._native_rate_updated_at = None
+                    self._native_rate_tokens = _NATIVE_MAX_FRAME_CREDIT
                     self._native_force_keyframe_pending = True
                     self._native_keyframe_request_generation += 1
                     self._force_idr.set()
@@ -766,6 +773,8 @@ class MoonlightSbsOutput:
             self._native_session_generation += 1
             self._native_session_ready = False
             self._native_frame_index = 0
+            self._native_rate_updated_at = None
+            self._native_rate_tokens = _NATIVE_MAX_FRAME_CREDIT
             self._native_force_keyframe_pending = False
             self._native_keyframe_request_generation += 1
             self._force_idr.clear()
@@ -1149,14 +1158,28 @@ class MoonlightSbsOutput:
                     if not self._native_session_ready:
                         return
                     session_generation = self._native_session_generation
-                    frame_index = self._native_frame_index
-                    self._native_frame_index += 1
                     keyframe_request_generation = (
                         self._native_keyframe_request_generation
                     )
                     force_keyframe = (
                         self._native_force_keyframe_pending or self._force_idr.is_set()
                     )
+                    now = time.perf_counter()
+                    target_fps = max(1.0, self._native_target_fps)
+                    if self._native_rate_updated_at is not None:
+                        elapsed = max(0.0, now - self._native_rate_updated_at)
+                        self._native_rate_tokens = min(
+                            _NATIVE_MAX_FRAME_CREDIT,
+                            self._native_rate_tokens + elapsed * target_fps,
+                        )
+                    self._native_rate_updated_at = now
+                    if not force_keyframe and self._native_rate_tokens < 0.98:
+                        return
+                    self._native_rate_tokens = max(
+                        0.0, self._native_rate_tokens - 1.0
+                    )
+                    frame_index = self._native_frame_index
+                    self._native_frame_index += 1
                 submission = _NativeFrameSubmission(
                     native_frame=native_frame,
                     output_format=str(
