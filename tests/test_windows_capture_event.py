@@ -786,3 +786,66 @@ def test_windows_capture_cuda_accepts_env_capture_options(monkeypatch):
         "reuse_output_buffer": True,
         "output_buffer_count": 6,
     }
+
+
+@pytest.mark.parametrize("ending", ["shutdown", "hard_idle", "closed", "error"])
+def test_standard_capture_uses_free_threaded_lifecycle(monkeypatch, ending):
+    module = _install_capture_module(monkeypatch, "windows_capture")
+    shutdown = threading.Event()
+    calls = []
+    state = {"finished": False, "hard_idle": False}
+
+    def stop():
+        calls.append("stop")
+        state["finished"] = True
+        shutdown.set()
+
+    def wait():
+        calls.append("wait")
+        if ending == "error":
+            raise RuntimeError("capture worker failed")
+
+    control = SimpleNamespace(is_finished=lambda: state["finished"], stop=stop, wait=wait)
+
+    def start_free_threaded(_capture):
+        calls.append("start_free_threaded")
+        if ending == "shutdown":
+            shutdown.set()
+        elif ending == "hard_idle":
+            state["hard_idle"] = True
+        else:
+            state["finished"] = True
+            if ending == "closed":
+                shutdown.set()
+        return control
+
+    monkeypatch.setattr(module.WindowsCapture, "start_free_threaded", start_free_threaded, raising=False)
+    monkeypatch.setattr(windows_capture_event, "_setup_dpi_awareness", lambda: None)
+    monkeypatch.setattr(windows_capture_event, "_capture_monitor_rect", lambda _: None)
+    monkeypatch.setattr(windows_capture_event.WindowsCaptureEventRunner, "_start_keyboard_worker", lambda *args: None)
+    monkeypatch.setattr(
+        windows_capture_event.WindowsCaptureEventRunner,
+        "_start_static_replay_worker",
+        lambda *args, **kw: None,
+    )
+    monkeypatch.setattr(windows_capture_event.time, "sleep", lambda _: None)
+    errors = []
+    sessions = []
+
+    def on_error(exc):
+        errors.append(str(exc))
+        shutdown.set()
+
+    runner = windows_capture_event.WindowsCaptureEventRunner(CaptureConfig(capture_tool="WindowsCapture"))
+    runner.run(
+        shutdown_event=shutdown,
+        on_frame=lambda _: None,
+        on_error=on_error,
+        is_hard_idle=lambda: state["hard_idle"],
+        on_session_update=lambda session, handle: sessions.append((session, handle)),
+    )
+
+    assert calls == ["start_free_threaded", "stop" if ending in {"shutdown", "hard_idle"} else "wait"]
+    assert errors == (["capture worker failed"] if ending == "error" else [])
+    assert sessions[-1] == (None, None)
+    assert runner.session is None and runner.control is None

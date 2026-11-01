@@ -703,7 +703,26 @@ class WindowsCaptureEventRunner:
                     on_closed_callback()
 
             try:
-                cap.start()
+                start_free_threaded = getattr(cap, "start_free_threaded", None)
+                if self.capture_tool == "WindowsCapture" and callable(start_free_threaded):
+                    # The bundled blocking WGC loop retains the GIL between
+                    # callbacks, starving inference and OpenXR presentation.
+                    control = start_free_threaded()
+                    try:
+                        while not control.is_finished():
+                            if shutdown_event.wait(0.01):
+                                break
+                            if is_hard_idle is not None and is_hard_idle():
+                                break
+                            if on_tick is not None:
+                                on_tick()
+                    finally:
+                        if control.is_finished():
+                            control.wait()
+                        else:
+                            control.stop()
+                else:
+                    cap.start()
             except Exception as exc:
                 if on_error is not None:
                     on_error(exc)
