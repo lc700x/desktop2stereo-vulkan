@@ -13840,18 +13840,14 @@ class OpenXrVulkanPresenter(
         position, size, rotation, *, key: str | None = None,
         sub_image_rect: tuple[int, int, int, int] | None = None,
     ):
-        if key == "screen_fps":
-            cylinder_layer = self._screen_fps_cylinder_layer(
+        if key == "screen_fps" and self._screen_curved:
+            # Rebuild the panel from the current screen dimensions each frame;
+            # tangent quads preserve the curve while following live resizing.
+            segmented_layers = self._screen_fps_segmented_quad_layers(
                 entry, width, height, position, size
             )
-            if cylinder_layer is not None:
-                return cylinder_layer
-            if self._screen_curved:
-                segmented_layers = self._screen_fps_segmented_quad_layers(
-                    entry, width, height, position, size
-                )
-                if segmented_layers:
-                    return segmented_layers
+            if segmented_layers:
+                return segmented_layers
         if len(rotation) == 4:
             qx, qy, qz, qw = (float(value) for value in rotation)
         else:
@@ -13973,7 +13969,7 @@ class OpenXrVulkanPresenter(
         if layers and not self._fps_curve_mode_logged:
             print(
                 "[OpenXRViewer] Curved FPS overlay uses "
-                f"{len(layers)} tangent quad segments (cylinder extension unavailable)",
+                f"{len(layers)} resize-aware tangent quad segments",
                 flush=True,
             )
             self._fps_curve_mode_logged = True
