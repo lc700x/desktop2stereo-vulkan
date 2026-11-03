@@ -666,6 +666,7 @@ def test_local_viewer_counts_successful_depth_presentations_and_intervals(monkey
 @pytest.mark.parametrize("vsync", [True, False])
 @pytest.mark.parametrize("packer", [True, False])
 def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync, packer) -> None:
+    monkeypatch.setenv("D2S_PRESENT_ASAP", "0")
     shutdown = threading.Event()
     frame = object()
     timeouts = []
@@ -724,6 +725,63 @@ def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync, 
     else:
         grace = .002 if packer else 0.0
         assert waits == pytest.approx([1 / 60 - .003 - grace])
+
+
+def test_vsync_present_asap_skips_fresh_frame_sleep_but_paces_reuse(monkeypatch):
+    shutdown = threading.Event()
+    timeouts = []
+    sleeps = []
+    clock = [1.0]
+
+    class FrameQueue:
+        _d2s_packer = None
+
+        def get(self, *, timeout):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                return SimpleNamespace(sbs=object()), 1.0
+            clock[0] += timeout
+            raise queue.Empty
+
+        def get_nowait(self):
+            raise queue.Empty
+
+    class FakeViewer:
+        def __init__(self, _config):
+            self._output_refresh_hz = 60.0
+            self.calls = 0
+
+        def initialize(self):
+            pass
+
+        def present(self, _frame):
+            self.calls += 1
+            clock[0] += 0.003
+            if self.calls == 2:
+                shutdown.set()
+            return True
+
+        def close(self):
+            pass
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.delenv("D2S_PRESENT_ASAP", raising=False)
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(local_viewer_module.time, "sleep", fake_sleep)
+
+    run_vulkan_local_viewer(
+        runtime_q=FrameQueue(),
+        shutdown_event=shutdown,
+        config=VulkanLocalViewerConfig(vsync=True),
+    )
+
+    assert timeouts == pytest.approx([0.05, 1.25 / 60.0])
+    assert len(sleeps) == 1
+    assert 0.0 < sleeps[0] < 1.0 / 60.0
 
 
 def test_local_viewer_latency_ends_after_successful_present(monkeypatch) -> None:

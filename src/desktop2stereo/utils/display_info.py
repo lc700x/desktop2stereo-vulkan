@@ -287,13 +287,13 @@ def resolve_windows_fullscreen_policy(
     capture_index: int,
     displays: Iterable[DisplayInfo] | None = None,
 ) -> tuple[str, DisplayInfo | None]:
-    """Choose capture-compatible DWM for physical or unclassified targets."""
+    """Prefer DWM fullscreen for physical, virtual, or unclassified targets."""
     known = list(displays) if displays is not None else enumerate_displays("Windows")
     target = next(
         (item for item in known if item.capture_index == int(capture_index)),
         None,
     )
-    if target is None or target.display_kind in {"physical", "unknown"}:
+    if target is None or target.display_kind in {"physical", "virtual", "unknown"}:
         return "capture_compatible", target
     return "exclusive", target
 

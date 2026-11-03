@@ -150,12 +150,12 @@ def test_windows_fullscreen_policy_uses_dwm_for_physical_output() -> None:
     assert target is display
 
 
-def test_windows_fullscreen_policy_keeps_exclusive_for_virtual_output() -> None:
+def test_windows_fullscreen_policy_uses_dwm_for_virtual_output() -> None:
     display = DisplayInfo(
         2, 2, 3840, 0, 3840, 2400, display_kind="virtual"
     )
     policy, target = resolve_windows_fullscreen_policy(2, [display])
-    assert policy == "exclusive"
+    assert policy == "capture_compatible"
     assert target is display
 
 

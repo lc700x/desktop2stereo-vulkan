@@ -3018,6 +3018,17 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
         """Bound the VSync queue hand-off wait to roughly one refresh."""
         return min(0.05, max(0.004, 1.25 / _vsync_refresh_hz()))
 
+    present_asap = bool(config.vsync) and (
+        os.environ.get("D2S_PRESENT_ASAP", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    if present_asap:
+        print(
+            "[VulkanLocalViewer] Present ASAP active: fresh frames submit "
+            "on arrival; reuse frames stay paced (D2S_PRESENT_ASAP=0 disables)",
+            flush=True,
+        )
+
     try:
         while not shutdown_event.is_set():
             paced = cached_frame is not None and not config.vsync
@@ -3049,9 +3060,9 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     queue_timeout = (
                         0.0 if vsync_handoff_stalled else _vsync_handoff_timeout()
                     )
-                    if last_presented_at > 0.0:
-                        # Keep a late producer from pushing cached-frame reuse
-                        # beyond the next display boundary.
+                    if last_presented_at > 0.0 and not present_asap:
+                        # Keep the legacy refresh-boundary hand-off when ASAP
+                        # is disabled.
                         boundary_wait = (
                             last_presented_at
                             + 1.0 / _vsync_refresh_hz()
@@ -3357,9 +3368,9 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     )
             if presented is not False:
                 last_presented_at = presented_at
-                if config.vsync:
-                    # Some Windows FIFO_LATEST_READY drivers return immediately.
-                    # Pace those submissions to the existing 60 Hz slot grid.
+                if config.vsync and not (present_asap and not reused):
+                    # Pace reused frames to the refresh grid. Fresh ASAP frames
+                    # are already paced by the producer and submit immediately.
                     interval = 1.0 / _vsync_refresh_hz()
                     if presented_at - present_started < interval * 0.5:
                         remaining = next_present_at - time.perf_counter()
