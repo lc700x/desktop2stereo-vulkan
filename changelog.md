@@ -1,5 +1,13 @@
 # Desktop2Stereo Vulkan 项目日志
 
+## 2026-11-01（对比 2026-10-17 打包版本）
+
+- 新增 Moonlight Streamer：Windows/macOS 随包启动 Sunshine 主机，通过 4 位 PIN 配对并以 SBS 输出串流，不创建虚拟显示器；Windows 使用 NVENC/AMF，macOS 使用 VideoToolbox。
+- 修复 Moonlight AMD AMF 编码卡顿和串流停滞；提升 macOS 串流吞吐，并改进重连时的节奏控制。
+- OpenXR 新增 CUDA→D3D12 跨适配器 GPU 输出桥；运行时选择改为优先使用当前活动的 ALVR，并平滑实时深度调节。
+- Vulkan Glow 改用独立异步计算队列；Windows Graphics Capture 回调移出 GIL，减少捕获线程争用。
+- ROCm 包由宽泛的 `rocm-device-all` 改为明确的 RDNA1–3 17 架构版本，gfx1200/gfx1201 与 CUDA 包继续独立提供。
+
 ## 2026-08-28
 
 - 完成 Presenter-owned Vulkan 输出图像直通：Vulkan layered image pass 现在明确将合成结果写入持久化 `VulkanExportableImage`，通过 timeline/外部 semaphore 交接给输出消费者，不再把输出图像读回 CPU；新增 `vulkan_output_image_direct`、`vulkan_zero_cpu_readback` 和 `vulkan_gpu_to_cpu` 遥测。CUDA→Vulkan 输入仍可能包含一次设备侧导入复制，因此严格 `zero_copy` 仍保持 false，避免把“零 CPU 回读”误报成端到端零复制。

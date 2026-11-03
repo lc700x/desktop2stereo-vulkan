@@ -33,6 +33,17 @@ PATCH_SCRIPTS = (
     "apply-wc-cuda-patches.py",
     "apply-triton-portable-patches.py",
 )
+MOONLIGHT_SUNSHINE_VERSION = "2026.914.233613"
+MOONLIGHT_REQUIRED_FILES = (
+    "sunshine.exe",
+    "zlib1.dll",
+    "d2s_amd_encoder.dll",
+    "LICENSE-Sunshine.txt",
+    "NOTICE-Sunshine.txt",
+    "sunshine-d2s-2026.914.233613.patch",
+    "assets/apps.json",
+    "assets/web/index.html",
+)
 
 
 VARIANTS: dict[str, dict[str, Any]] = {
@@ -362,6 +373,11 @@ def app_ignore(source: str, names: list[str]) -> set[str]:
             ignored.add(name)
         if source_path == (APP_SOURCE / "gui").resolve() and name == "flet_clients":
             ignored.add(name)
+        if (
+            source_path == (APP_SOURCE / "streaming" / "moonlight_server").resolve()
+            and name in {"config", "macos"}
+        ):
+            ignored.add(name)
         if source_path == models_path and path.resolve() != base_cache_path:
             ignored.add(name)
         if source_path == base_cache_path and name == "blobs":
@@ -369,6 +385,48 @@ def app_ignore(source: str, names: list[str]) -> set[str]:
         if source_path == base_cache_path and name.lower().endswith((".mgx", ".onnx", ".trt")):
             ignored.add(name)
     return ignored
+
+
+def moonlight_asset_manifest(server_root: Path) -> dict[str, Any]:
+    if not server_root.is_dir():
+        raise FileNotFoundError(f"Bundled Sunshine directory is missing: {server_root}")
+    files = {
+        path.relative_to(server_root).as_posix(): sha256_file(path)
+        for path in sorted(server_root.rglob("*"))
+        if path.is_file() and path.relative_to(server_root).parts[0] not in {"config", "macos"}
+    }
+    missing = [name for name in MOONLIGHT_REQUIRED_FILES if name not in files]
+    if missing:
+        raise FileNotFoundError("Moonlight bundle is missing required assets: " + ", ".join(missing))
+    digest_input = "".join(f"{name}  {digest}\n" for name, digest in sorted(files.items()))
+    return {
+        "file_count": len(files),
+        "sha256": hashlib.sha256(digest_input.encode("utf-8")).hexdigest(),
+        "files": files,
+    }
+
+
+def validate_moonlight_assets(app_root: Path) -> dict[str, Any]:
+    source_root = APP_SOURCE / "streaming" / "moonlight_server"
+    package_root = app_root / "streaming" / "moonlight_server"
+    if (package_root / "config").exists():
+        raise RuntimeError("Sunshine pairing state and certificates must not be bundled")
+    source = moonlight_asset_manifest(source_root)
+    packaged = moonlight_asset_manifest(package_root)
+    if packaged["files"] != source["files"]:
+        source_files = source["files"]
+        packaged_files = packaged["files"]
+        missing = sorted(source_files.keys() - packaged_files.keys())
+        extra = sorted(packaged_files.keys() - source_files.keys())
+        changed = sorted(
+            name for name in source_files.keys() & packaged_files.keys()
+            if source_files[name] != packaged_files[name]
+        )
+        raise RuntimeError(
+            "Moonlight bundle differs from source "
+            f"(missing={missing}, extra={extra}, changed={changed})"
+        )
+    return {key: packaged[key] for key in ("file_count", "sha256", "files")}
 
 
 def copy_application(stage: Path) -> None:
@@ -828,6 +886,8 @@ import xr
 import vulkan
 from OpenGL import GL
 import yaml
+from streaming.moonlight_bridge import MoonlightBridgeServer
+from streaming.moonlight_output import MoonlightSbsOutput
 
 settings_path = Path(sys.prefix).parent / "desktop2stereo" / "settings.yaml"
 settings = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
@@ -840,6 +900,7 @@ assert settings.get("Stereo Output Identity") is None, "A machine-specific outpu
 required = {
     "torch": "2.11.0",
     "torchvision": "0.26.0",
+    "PyNvVideoCodec": "2.2.0",
 }
 versions = {name: metadata.version(name) for name in required}
 for name, prefix in required.items():
@@ -860,6 +921,7 @@ result = {
     "torch_hip": torch.version.hip,
     "cuda_available": bool(torch.cuda.is_available()),
     "torch_path_bundled": True,
+    "pynvvideo_codec": metadata.version("PyNvVideoCodec"),
     "flet": metadata.version("flet"),
     "onnx": onnx.__version__,
     "openxr_module": xr.__file__,
@@ -885,6 +947,8 @@ else:
     result["wc_cuda"] = metadata.version("wc-cuda")
     assert Path(tensorrt.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 
+result["moonlight_bridge"] = MoonlightBridgeServer.__module__
+result["moonlight_output"] = MoonlightSbsOutput.__module__
 print(json.dumps(result, sort_keys=True))
 """
     try:
@@ -902,6 +966,89 @@ print(json.dumps(result, sort_keys=True))
         return json.loads(result.stdout.strip().splitlines()[-1])
     except (IndexError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Runtime import probe did not return JSON: {result.stdout}") from exc
+
+
+def validate_moonlight_runtime(
+    runtime: Path,
+    profile: str,
+    slug: str,
+    app_root: Path,
+    validation_dir: Path,
+) -> dict[str, Any]:
+    env = clean_environment(runtime, profile=profile, slug=slug)
+    env["PYTHONPATH"] = str(runtime.parent)
+    env["D2S_RUNTIME_PATHS_FILE"] = str(app_root / "runtime_paths.env")
+    env["D2S_PORTABLE_MOONLIGHT_VERSION"] = MOONLIGHT_SUNSHINE_VERSION
+    isolated_profile = validation_dir / "moonlight-smoke-user"
+    local_app_data = isolated_profile / "LocalAppData"
+    roaming_app_data = isolated_profile / "RoamingAppData"
+    local_app_data.mkdir(parents=True, exist_ok=True)
+    roaming_app_data.mkdir(parents=True, exist_ok=True)
+    env["LOCALAPPDATA"] = str(local_app_data)
+    env["APPDATA"] = str(roaming_app_data)
+    code = r"""
+import ctypes
+import json
+import os
+import subprocess
+from pathlib import Path
+
+from streaming.moonlight_bridge import MoonlightBridgeServer
+from streaming.moonlight_output import MoonlightSbsOutput
+
+server = Path.cwd() / "streaming" / "moonlight_server"
+zlib = ctypes.WinDLL(str(server / "zlib1.dll"))
+encoder = ctypes.WinDLL(str(server / "d2s_amd_encoder.dll"))
+abi = getattr(encoder, "d2s_amd_encoder_abi_version", None)
+if abi is None:
+    raise RuntimeError("Bundled Moonlight AMD encoder does not expose its ABI version")
+abi.restype = ctypes.c_int
+abi_version = abi()
+if abi_version < 2:
+    raise RuntimeError(f"Bundled Moonlight AMD encoder ABI is too old: {abi_version}")
+
+sunshine = subprocess.run(
+    [str(server / "sunshine.exe"), "--version"],
+    cwd=server,
+    capture_output=True,
+    text=True,
+    timeout=30,
+)
+version_output = (sunshine.stdout + sunshine.stderr).strip()
+expected_version = os.environ["D2S_PORTABLE_MOONLIGHT_VERSION"]
+if sunshine.returncode or expected_version not in version_output:
+    raise RuntimeError(
+        f"Bundled Sunshine version check failed (exit={sunshine.returncode}): {version_output}"
+    )
+
+print(json.dumps({
+    "sunshine_version": expected_version,
+    "sunshine_exit_code": sunshine.returncode,
+    "amd_encoder_abi": abi_version,
+    "zlib_loaded": bool(zlib._handle),
+    "moonlight_bridge_imported": MoonlightBridgeServer.__module__,
+    "moonlight_output_imported": MoonlightSbsOutput.__module__,
+}))
+"""
+    result = subprocess.run(
+        [str(runtime / "python.exe"), "-c", code],
+        env=env,
+        cwd=app_root,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    if result.returncode:
+        raise RuntimeError(f"Moonlight runtime validation failed for {slug}: {result.stderr or result.stdout}")
+    try:
+        return json.loads(result.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Moonlight runtime validation returned no result for {slug}: {result.stdout}"
+        ) from exc
 
 
 def run_app_probe(runtime: Path, app_root: Path, profile: str, slug: str) -> dict[str, Any]:
@@ -961,6 +1108,7 @@ def verify_package(
     if missing_assets:
         raise FileNotFoundError("Portable package is missing runtime assets: " + ", ".join(missing_assets))
     model = base_model_manifest(app_root)
+    moonlight_assets = validate_moonlight_assets(app_root)
     pip_env = clean_environment(runtime, profile=variant["profile"], slug=slug)
     pip_check = subprocess.run(
         [str(runtime / "python.exe"), "-m", "pip", "check"],
@@ -970,6 +1118,9 @@ def verify_package(
         check=True,
     ).stdout.strip()
     imports = validate_imports(runtime, variant["profile"], slug, app_root)
+    moonlight_runtime = validate_moonlight_runtime(
+        runtime, variant["profile"], slug, app_root, validation_dir
+    )
     probe = run_app_probe(runtime, app_root, variant["profile"], slug)
     if not probe["completed"]:
         raise RuntimeError(f"Application capability probe failed for {slug}")
@@ -985,6 +1136,7 @@ def verify_package(
         "imports": imports,
         "app_probe": probe,
         "torch_compile_smoke": compile_smoke,
+        "moonlight": {"assets": moonlight_assets, "runtime": moonlight_runtime},
         "model": model,
     }
 
@@ -1146,6 +1298,7 @@ def build_variant(
     model = base_model_manifest(app_root)
     wheel_hash_file = stage / "dependencies" / "wheel-sources-sha256.tsv"
     source_count = app_file_hashes(app_root, stage / "SOURCE_SHA256SUMS.txt")
+    moonlight_assets = validate_moonlight_assets(app_root)
     vc_files = sorted(path.name for path in source_python.glob("*.dll") if path.name.lower().startswith(("vcruntime", "msvcp", "concrt", "vccorlib")))
     manifest = {
         "product": "Desktop2Stereo Windows Portable",
@@ -1160,6 +1313,7 @@ def build_variant(
             "anti_aliasing": 2,
         },
         "model": model,
+        "moonlight": {"assets": moonlight_assets},
         "python_package_count": len(versions),
         "device_packages": inventory,
         "vc_runtime_dlls": vc_files,

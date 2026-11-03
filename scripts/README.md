@@ -43,7 +43,21 @@ Package installation uses the official PyPI, AMD ROCm, PyTorch CUDA, and NVIDIA
 indexes as applicable. It ignores machine pip configuration and does not read
 `requirements-pip-options.txt`; the repository requirements files are left
 untouched. The MIGraphX wheel is fetched from its direct GitHub Releases URL.
-The package workflow and current build scope are recorded in the repository
-root `CONTEXT.md`.
+After all archives and relocation checks pass, `scripts/tools/cleanup_windows_portable.py`
+can remove only the matching build staging and verification caches. It verifies
+the release manifests and archive SHA256 values before cleanup and defaults to
+a dry run. Add `--archives-moved` when archives have been moved out of the release
+directory; it then relies on the recorded SHA256 and validation reports. Add
+`--apply` to remove the two cache roots:
+
+```powershell
+src\python3\python.exe scripts\tools\cleanup_windows_portable.py `
+    --release-root "dist\windows-portable\<release-folder>" `
+    --staging-root ".portable-build\<build-id>-moonlight" `
+    --verification-root "C:\Temp\Desktop2Stereo Portable 验证\<build-id>-moonlight" --archives-moved --apply
+```
+
+The package workflow, current build scope, and verified release record are in
+the repository root `CONTEXT.md`.
 
 Keep root-level `scripts/` empty except for this README and category folders.
