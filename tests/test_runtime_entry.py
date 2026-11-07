@@ -174,16 +174,68 @@ def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode(monkey
     assert "VideoToolbox" in mac_auto.reason
 
 
-def test_only_windows_3d_display_is_excluded_from_capture() -> None:
+def test_runtime_contract_uses_fullscreen_for_same_monitor_local_output(monkeypatch) -> None:
+    import app_runtime.runtime_context as runtime_context
+
+    monkeypatch.setattr(
+        runtime_context,
+        "enumerate_displays",
+        lambda: [object(), object()],
+    )
+    settings = {
+        "Run Mode": "Local Viewer",
+        "Capture Mode": "Monitor",
+        "Monitor Index": 2,
+        "Stereo Output": 2,
+    }
+
+    assert runtime_context._runtime_contract_from_settings(
+        settings,
+        os_name="Windows",
+    ) == ("local_display", "local_fullscreen")
+    assert runtime_context._runtime_contract_from_settings(
+        {**settings, "Stereo Output": 1},
+        os_name="Windows",
+    ) == ("local_display", "local_window")
+
+
+def test_single_display_local_viewer_is_excluded_from_its_monitor_capture() -> None:
     from app_runtime.runtime_entry import _exclude_local_output_from_capture
 
-    assert not _exclude_local_output_from_capture(
-        {"Run Mode": "Local Viewer"},
+    local_monitor_capture = {"Run Mode": "Local Viewer", "Capture Mode": "Monitor"}
+    assert _exclude_local_output_from_capture(
+        local_monitor_capture,
         os_name="Windows",
+        monitor_count=1,
     )
     assert _exclude_local_output_from_capture(
-        {"Run Mode": "3D Monitor"},
+        {**local_monitor_capture, "Run Mode": "3D Monitor"},
         os_name="Windows",
+        monitor_count=1,
+    )
+    assert not _exclude_local_output_from_capture(
+        local_monitor_capture,
+        os_name="Windows",
+        monitor_count=2,
+    )
+    assert _exclude_local_output_from_capture(
+        local_monitor_capture,
+        os_name="Windows",
+        monitor_count=2,
+        input_monitor_index=2,
+        output_monitor_index=2,
+    )
+    assert not _exclude_local_output_from_capture(
+        local_monitor_capture,
+        os_name="Windows",
+        monitor_count=2,
+        input_monitor_index=1,
+        output_monitor_index=2,
+    )
+    assert not _exclude_local_output_from_capture(
+        {**local_monitor_capture, "Capture Mode": "Window"},
+        os_name="Windows",
+        monitor_count=1,
     )
 
 
@@ -192,12 +244,79 @@ def test_stream_and_non_windows_outputs_remain_capturable() -> None:
 
     for run_mode in ("RTMP Streamer", "MJPEG Streamer", "Legacy Streamer"):
         assert not _exclude_local_output_from_capture(
-            {"Run Mode": run_mode},
+            {"Run Mode": run_mode, "Capture Mode": "Monitor"},
             os_name="Windows",
+            monitor_count=1,
         )
     assert not _exclude_local_output_from_capture(
         {"Run Mode": "Local Viewer"},
         os_name="Linux",
+    )
+
+
+def test_same_monitor_window_exclusion_requires_monitor_capture() -> None:
+    from app_runtime.runtime_entry import _should_use_monitor_window_exclusion
+
+    settings = {"Run Mode": "Local Viewer", "Capture Mode": "Monitor"}
+    assert _should_use_monitor_window_exclusion(
+        settings,
+        os_name="Windows",
+        input_monitor_index=1,
+        output_monitor_index=1,
+        monitor_count=1,
+    )
+    assert _should_use_monitor_window_exclusion(
+        settings,
+        os_name="Windows",
+        input_monitor_index=2,
+        output_monitor_index=2,
+        monitor_count=2,
+    )
+    assert not _should_use_monitor_window_exclusion(
+        settings,
+        os_name="Windows",
+        input_monitor_index=1,
+        output_monitor_index=2,
+        monitor_count=2,
+    )
+    assert not _should_use_monitor_window_exclusion(
+        {**settings, "Capture Mode": "Window"},
+        os_name="Windows",
+        input_monitor_index=1,
+        output_monitor_index=1,
+        monitor_count=1,
+    )
+
+
+def test_local_output_defaults_to_input_monitor_for_cursor_hiding() -> None:
+    from app_runtime.runtime_entry import (
+        _exclude_local_output_from_capture,
+        _local_viewer_cursor_passthrough,
+        _resolve_local_output_monitor_index,
+    )
+
+    assert _resolve_local_output_monitor_index(2, None) == 2
+    assert _resolve_local_output_monitor_index(2, 3) == 3
+    assert _exclude_local_output_from_capture(
+        {"Run Mode": "Local Viewer", "Capture Mode": "Monitor"},
+        os_name="Windows",
+        monitor_count=2,
+        input_monitor_index=2,
+        output_monitor_index=_resolve_local_output_monitor_index(2, None),
+    )
+    assert _local_viewer_cursor_passthrough(
+        {"Capture Mode": "Window"},
+        os_name="Windows",
+        input_monitor_index=1,
+        output_monitor_index=1,
+        exclude_from_capture=False,
+    )
+    assert not _local_viewer_cursor_passthrough(
+        {"Capture Mode": "Window"},
+        os_name="Windows",
+        input_monitor_index=1,
+        output_monitor_index=2,
+        exclude_from_capture=False,
     )
 
 

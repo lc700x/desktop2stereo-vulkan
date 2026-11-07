@@ -13,7 +13,7 @@ from stereo_runtime.stage_visual_regression import (
 def test_stage_visual_regression_config_keeps_runtime_defaults() -> None:
     config = StageVisualRegressionConfig()
 
-    assert config.depth_strength == 0.25
+    assert config.depth_strength == 0.48
     assert config.layers == 2
     assert config.hole_fill_mode == "balanced"
 

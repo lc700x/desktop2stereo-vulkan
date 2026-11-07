@@ -11,12 +11,41 @@ from stereo_runtime import (
 from stereo_runtime.model_artifacts import (
     ensure_model_downloaded,
     ensure_onnx_exported,
+    find_local_model_snapshot,
     find_local_model_weight,
     select_existing_migraphx,
     select_existing_onnx,
     select_existing_trt,
 )
 from stereo_runtime.model_registry import ModelRegistry
+
+
+def test_find_local_model_snapshot_resolves_hub_revision_without_refs(
+    tmp_path: Path,
+):
+    spec = ModelRegistry.default().get("Distill-Any-Depth-Large")
+    snapshot = spec.model_dir(tmp_path) / "snapshots" / "0123456789abcdef"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    (snapshot / "pytorch_model.bin").write_bytes(b"cached weights")
+
+    assert find_local_model_snapshot(spec.model_id, tmp_path) == snapshot
+
+
+def test_find_local_model_snapshot_prefers_main_ref(tmp_path: Path):
+    spec = ModelRegistry.default().get("Distill-Any-Depth-Large")
+    model_dir = spec.model_dir(tmp_path)
+    main_snapshot = model_dir / "snapshots" / "main-revision"
+    newer_snapshot = model_dir / "snapshots" / "newer-revision"
+    for snapshot in (main_snapshot, newer_snapshot):
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text("{}", encoding="utf-8")
+        (snapshot / "pytorch_model.bin").write_bytes(b"cached weights")
+    refs = model_dir / "refs"
+    refs.mkdir()
+    (refs / "main").write_text("main-revision\n", encoding="utf-8")
+
+    assert find_local_model_snapshot(spec.model_id, tmp_path) == main_snapshot
 
 
 def test_artifact_paths_follow_d2s_naming():

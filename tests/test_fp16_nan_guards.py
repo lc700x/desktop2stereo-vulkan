@@ -31,6 +31,7 @@ def test_quantize_depth_for_warp_sanitizes_non_finite(monkeypatch) -> None:
     assert torch.isfinite(q.float()).all()
 
 
+@pytest.mark.skipif(MPS is None, reason="requires MPS")
 def test_pack_sbs_host_frame_sanitizes_non_finite() -> None:
     sbs = torch.rand(1, 3, 32, 32, device=DEV)
     sbs[0, 0, 2, 2] = float("nan")

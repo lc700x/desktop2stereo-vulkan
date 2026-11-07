@@ -142,8 +142,8 @@ class ModelOnnxPreprocessor:
         rgb = self._prepare_rgb(rgb)
         _, _, height, width = rgb.shape
         input_h, input_w = self.input_size(height, width)
-        use_antialias = self.device.type == "cuda" and not self._is_zipdepth
-        use_bicubic = use_antialias and not self._is_distill
+        use_antialias = self._is_zipdepth or self.device.type == "cuda"
+        use_bicubic = use_antialias and not self._is_distill and not self._is_zipdepth
         tensor = F.interpolate(
             rgb,
             size=(input_h, input_w),
@@ -164,8 +164,8 @@ class ModelOnnxPreprocessor:
         input size computation.
         """
         rgb = self._prepare_rgb(rgb)
-        use_antialias = self.device.type == "cuda" and not self._is_zipdepth
-        use_bicubic = use_antialias and not self._is_distill
+        use_antialias = self._is_zipdepth or self.device.type == "cuda"
+        use_bicubic = use_antialias and not self._is_distill and not self._is_zipdepth
         tensor = F.interpolate(
             rgb,
             size=(height, width),
@@ -356,8 +356,6 @@ class DistillAnyDepthBaseOnnxCuda:
         start = time.perf_counter()
         depth = predicted.float()
         depth = ensure_b1hw(depth)
-        if self._is_zipdepth:
-            depth = depth.clamp_min(5e-3).reciprocal()
         depth = _normalize_depth(depth)
         depth = upsample_depth(
             depth,

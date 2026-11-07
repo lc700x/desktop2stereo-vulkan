@@ -74,18 +74,19 @@ def _software_throttle_enabled(capture_tool):
     return capture_tool == "WindowsCaptureCUDA"
 
 
-def _windows_capture_kwargs(config, capture_tool):
+def _windows_capture_kwargs(config, capture_tool, *, include_window_exclusion=True):
     if config.capture_mode == "Window":
         kwargs = {"window_name": config.window_title}
     else:
         kwargs = {"monitor_index": config.monitor_index}
-    # The OpenXR pointer is a desktop cursor; keep it in the captured RGB
-    # frame so the presenter can show the arrow along with the laser/ring.
-    kwargs["cursor_capture"] = True
+    kwargs["cursor_capture"] = bool(getattr(config, "cursor_capture", True))
     if capture_tool in {"WindowsCaptureCUDA", "WindowsCaptureROCm"}:
         optional = {
             "minimum_update_interval": _fps_to_minimum_update_interval_ms(getattr(config, "fps", None)),
         }
+        handles_provider = getattr(config, "excluded_window_handles_provider", None)
+        if include_window_exclusion and callable(handles_provider):
+            optional["excluded_window_handles"] = list(handles_provider())
         device_id = getattr(config, "device_id", None)
         if device_id is not None:
             optional["device_id"] = int(device_id)
@@ -197,8 +198,10 @@ def _rocm_capture_adapter_luid(device_id=0):
     return _capture_adapter_luid("WindowsCaptureROCm", device_id)
 
 
-def _copy_frame_buffer(frame_buffer, capture_tool):
+def _copy_frame_buffer(frame_buffer, capture_tool, *, gpu_required=False):
     device = _event_capture_device(capture_tool)
+    if gpu_required and device not in {"cuda", "rocm"}:
+        raise RuntimeError(f"GPU capture required, but {capture_tool} produces CPU frames")
     if device in ("cuda", "rocm") and not _env_bool("D2S_WGC_COPY_FRAME_BUFFER"):
         return frame_buffer, FrameCopyMode.GPU_TENSOR, device
     prefer_clone = device in ("cuda", "rocm")
@@ -280,6 +283,8 @@ class WindowsCaptureEventRunner:
         self._replay_thread = None
         self._capture_monitor_rect = None
         self._capture_adapter_luid = 0
+        self._window_exclusion_disabled = False
+        self._window_exclusion_fallback_logged = False
 
     @property
     def session(self):
@@ -294,6 +299,21 @@ class WindowsCaptureEventRunner:
             self._control.stop()
         elif self._session is not None and hasattr(self._session, "stop"):
             self._session.stop()
+
+    def _fallback_window_exclusion(self, reason: str) -> None:
+        if self._window_exclusion_disabled:
+            return
+        self._window_exclusion_disabled = True
+        callback = getattr(self.config, "on_window_exclusion_fallback", None)
+        if callable(callback):
+            callback(reason)
+        elif not self._window_exclusion_fallback_logged:
+            self._window_exclusion_fallback_logged = True
+            print(
+                "[WindowCapture] Per-session WGC exclusion is unavailable; "
+                f"using global capture exclusion ({reason})",
+                flush=True,
+            )
 
     def _accept_software_paced_frame(self, now: float) -> bool:
         if not _software_throttle_enabled(self.capture_tool):
@@ -525,6 +545,11 @@ class WindowsCaptureEventRunner:
                 self.capture_tool, device_id
             )
             if not self._capture_adapter_luid:
+                if self.config.gpu_required:
+                    raise RuntimeError(
+                        f"{self.capture_tool} GPU capture cannot verify adapter identity: "
+                        f"{identity_error}"
+                    )
                 requested_tool = self.capture_tool
                 self.capture_tool = "WindowsCapture"
                 self.config = replace(self.config, capture_tool=self.capture_tool)
@@ -566,7 +591,34 @@ class WindowsCaptureEventRunner:
                 time.sleep(0.1)
                 continue
 
-            capture_kwargs = _windows_capture_kwargs(self.config, self.capture_tool)
+            capture_kwargs = _windows_capture_kwargs(
+                self.config,
+                self.capture_tool,
+                include_window_exclusion=not self._window_exclusion_disabled,
+            )
+            exclusion_requested = "excluded_window_handles" in capture_kwargs
+            initial_excluded_window_handles = tuple(
+                int(hwnd)
+                for hwnd in capture_kwargs.get("excluded_window_handles", ())
+            )
+            if exclusion_requested and not initial_excluded_window_handles:
+                # An empty exclusion list still opens a WGC session and reports
+                # a configuration iteration, but excludes nothing. That silently
+                # restores the same-monitor feedback loop, so treat it as an
+                # unavailable session exclusion and use global exclusion.
+                capture_kwargs.pop("excluded_window_handles", None)
+                exclusion_requested = False
+                self._fallback_window_exclusion(
+                    "no output window handles were registered before the capture session"
+                )
+            if exclusion_requested and not callable(
+                getattr(WindowsCapture, "set_excluded_windows", None)
+            ):
+                capture_kwargs.pop("excluded_window_handles", None)
+                exclusion_requested = False
+                self._fallback_window_exclusion(
+                    "the installed GPU capture binding has no session-exclusion method"
+                )
             if self.config.capture_mode != "Window":
                 if os.environ.get('D2S_DEBUG', '0') in ('1', 'true', 'yes', 'on'):
                     print(
@@ -574,7 +626,23 @@ class WindowsCaptureEventRunner:
                         f"tool={self.capture_tool} kwargs={capture_kwargs}",
                         flush=True,
                     )
+            if initial_excluded_window_handles:
+                print(
+                    "[WindowCapture] Starting WGC with initial output-window exclusions "
+                    f"{list(initial_excluded_window_handles)}",
+                    flush=True,
+                )
             cap = WindowsCapture(**capture_kwargs)
+            if exclusion_requested and not bool(
+                getattr(cap, "window_exclusion_available", False)
+            ):
+                self._fallback_window_exclusion(
+                    "the installed GPU capture extension has no session-exclusion support"
+                )
+            active_cap = cap
+            active_exclusion_requested = exclusion_requested
+            active_initial_excluded_window_handles = initial_excluded_window_handles
+            active_capture_kwargs = capture_kwargs
             self._session = cap
             self._control = None
             self._software_frame_due = 0.0
@@ -583,8 +651,18 @@ class WindowsCaptureEventRunner:
             if on_session_update is not None:
                 on_session_update(self._session, self._control)
 
+            window_exclusion_ready_sent = False
+
             @cap.event
-            def on_frame_arrived(frame: Frame, internal_capture_control: InternalCaptureControl):
+            def on_frame_arrived(
+                frame: Frame,
+                internal_capture_control: InternalCaptureControl,
+                _cap=active_cap,
+                _exclusion_requested=active_exclusion_requested,
+                _initial_excluded_window_handles=active_initial_excluded_window_handles,
+                _capture_kwargs=active_capture_kwargs,
+            ):
+                nonlocal window_exclusion_ready_sent
                 self._control = internal_capture_control
                 if on_session_update is not None:
                     on_session_update(self._session, self._control)
@@ -597,8 +675,51 @@ class WindowsCaptureEventRunner:
                     return
                 if not self._accept_software_paced_frame(capture_start_time):
                     return
+                configuration_iteration = int(
+                    getattr(frame, "configuration_iteration", 0) or 0
+                )
+                required_iteration = max(
+                    int(
+                        getattr(
+                            _cap,
+                            "_required_configuration_iteration",
+                            0,
+                        )
+                        or 0
+                    ),
+                    int(
+                        getattr(
+                            _cap,
+                            "window_exclusion_configuration_iteration",
+                            0,
+                        )
+                        or 0
+                    ),
+                )
+                if _exclusion_requested and required_iteration <= 0:
+                    return
+                if configuration_iteration < required_iteration:
+                    return
+                if (
+                    _exclusion_requested
+                    and not window_exclusion_ready_sent
+                    and required_iteration > 0
+                ):
+                    ready_callback = getattr(
+                        self.config, "on_window_exclusion_ready", None
+                    )
+                    if callable(ready_callback):
+                        ready_callback()
+                    if _initial_excluded_window_handles:
+                        print(
+                            "[WindowCapture] Initial WGC exclusions active for output windows "
+                            f"{list(_initial_excluded_window_handles)} at configuration "
+                            f"{required_iteration} (frame {configuration_iteration})",
+                            flush=True,
+                        )
+                    window_exclusion_ready_sent = True
                 capture_frame_id = self._next_capture_frame_id()
-                self._log_capture_gap(capture_start_time, capture_kwargs)
+                self._log_capture_gap(capture_start_time, _capture_kwargs)
                 self._log_capture_fps(capture_start_time)
                 copy_start_time = time.perf_counter()
                 native_resource = _borrow_native_resource(frame.frame_buffer)
@@ -610,7 +731,12 @@ class WindowsCaptureEventRunner:
                 raw, copy_mode, frame_raw_device = _copy_frame_buffer(
                     frame.frame_buffer,
                     self.capture_tool,
+                    gpu_required=self.config.gpu_required,
                 )
+                if self.config.gpu_required and copy_mode is not FrameCopyMode.GPU_TENSOR:
+                    raise RuntimeError(
+                        f"{self.capture_tool} did not return a GPU tensor"
+                    )
                 enqueue_start_time = time.perf_counter()
                 if native_resource is not None:
                     resource_contract = native_resource_contract(native_resource)
@@ -650,7 +776,8 @@ class WindowsCaptureEventRunner:
                     metadata={
                         "backend": "windows_capture_event",
                         "capture_frame_id": capture_frame_id,
-                        "cursor_capture": bool(capture_kwargs.get("cursor_capture", True)),
+                        "capture_configuration_iteration": configuration_iteration,
+                        "cursor_capture": True,
                         "cursor_position_uv": _cursor_position_uv(
                             self._capture_monitor_rect
                         ),
@@ -724,6 +851,14 @@ class WindowsCaptureEventRunner:
                 else:
                     cap.start()
             except Exception as exc:
+                if (
+                    not self._window_exclusion_disabled
+                    and callable(
+                        getattr(self.config, "excluded_window_handles_provider", None)
+                    )
+                    and "window exclusion" in str(exc).casefold()
+                ):
+                    self._fallback_window_exclusion(str(exc))
                 if on_error is not None:
                     on_error(exc)
                 else:

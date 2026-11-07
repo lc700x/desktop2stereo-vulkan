@@ -74,6 +74,12 @@ uint pixel_index(int x, int y) {
     return uint(clamp_y(y)) * params.width + uint(clamp_x(x));
 }
 
+float screen_edge_fade_weight(float x) {
+    float edge_distance = min(x + 0.5, float(params.width) - x - 0.5);
+    float t = clamp(edge_distance / 8.0, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
 float global_depth_at(int x, int y) {
     return clamp(depth[pixel_index(x, y)], 0.0, 1.0);
 }
@@ -92,14 +98,16 @@ float layered_depth_scale(float value) {
         + foreground_weight * max(params.foreground_scale, 0.0);
 }
 
-float shift_from_depth(float value) {
+float shift_from_depth(float value, float x) {
     float response = value - params.convergence;
     response *= layered_depth_scale(value);
-    return -response * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5;
+    return -response * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5
+        * screen_edge_fade_weight(x);
 }
 
 float tile_shift_at(int sx, int sy) {
-    return shift_from_depth(tile_depth_at(sx, sy));
+    float source_x = float(int(gl_WorkGroupID.x) * TILE_SIZE + sx - TILE_HALO);
+    return shift_from_depth(tile_depth_at(sx, sy), source_x);
 }
 
 float layer_weight(float value, uint layer_index) {

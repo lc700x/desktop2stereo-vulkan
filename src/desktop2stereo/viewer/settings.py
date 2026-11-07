@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import platform
 
 from stereo_runtime.render_size import RenderSizeConfig, render_size_config_from_settings
 from utils import display_info
 from utils.display import compute_output_resolution, get_fps
-from utils.run_mode import target_fps_for_run_mode
+from utils.run_mode import is_local_same_monitor_3d_mode, target_fps_for_run_mode
 from utils.xr_headset_presets import DEFAULT_XR_HEADSET_MODEL, resolve_xr_headset_preset
 
 from viewer.controller_help import get_controller_help_rows
@@ -97,24 +98,49 @@ def resolve_viewer_settings(settings: dict) -> ViewerSettings:
             "no system displays are available; connect or enable a display and restart"
         )
     display_mode = settings["Display Mode"]
-    saved_stereo_display_index = settings.get("Stereo Output")
-    stereo_display_index = (
-        _resolve_available_display_index(
-            saved_stereo_display_index,
-            settings.get("Stereo Output Identity"),
-            displays,
-            fallback_index=monitor_index,
-        )
-        if saved_stereo_display_index is not None
-        else None
+    capture_mode = settings["Capture Mode"]
+    single_display_local_3d = len(displays) == 1 and is_local_same_monitor_3d_mode(
+        settings.get("Run Mode", "Local Viewer"),
+        os_name=platform.system(),
+        monitor_count=len(displays),
+        capture_mode=capture_mode,
+        input_monitor_index=monitor_index,
+        output_monitor_index=monitor_index,
     )
-    stereo_display_selection = stereo_display_index is not None
-    # Only the 3D Monitor run mode actually renders onto the stereo-output
-    # display, so only it should size the processing resolution to that screen.
-    # Other modes (OpenXR Link, Local Viewer, streamers) must follow the
-    # captured (input) monitor; otherwise a leftover "Stereo Output" index
-    # makes the pipeline process at the wrong screen's resolution.
-    use_stereo_monitor = settings.get("Run Mode") == "3D Monitor"
+    if single_display_local_3d:
+        stereo_display_index = monitor_index
+        stereo_display_selection = True
+    elif len(displays) == 1:
+        # Ignore old output selections when single-display auto-3D does not
+        # apply, such as window capture or platforms without same-monitor mode.
+        stereo_display_index = None
+        stereo_display_selection = False
+    else:
+        saved_stereo_display_index = settings.get("Stereo Output")
+        stereo_display_index = (
+            _resolve_available_display_index(
+                saved_stereo_display_index,
+                settings.get("Stereo Output Identity"),
+                displays,
+                fallback_index=monitor_index,
+            )
+            if saved_stereo_display_index is not None
+            else None
+        )
+        stereo_display_selection = stereo_display_index is not None
+    same_monitor_local_3d = is_local_same_monitor_3d_mode(
+        settings.get("Run Mode", "Local Viewer"),
+        os_name=platform.system(),
+        monitor_count=len(displays),
+        capture_mode=capture_mode,
+        input_monitor_index=monitor_index,
+        output_monitor_index=stereo_display_index,
+    )
+    if same_monitor_local_3d and display_mode not in {
+        "Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB"
+    }:
+        display_mode = "Half-SBS"
+    use_stereo_monitor = same_monitor_local_3d
     output_resolution = compute_output_resolution(
         settings.get("Processing Resolution", "Auto"),
         display_mode,
@@ -123,7 +149,6 @@ def resolve_viewer_settings(settings: dict) -> ViewerSettings:
         use_stereo_monitor=use_stereo_monitor,
     )
     render_size_config = render_size_config_from_settings(settings)
-    capture_mode = settings["Capture Mode"]
     window_title = settings["Window Title"] if capture_mode == "Window" else None
     target_fps = target_fps_for_run_mode(settings)
     fps = target_fps if 1 <= target_fps <= 240 else get_fps(window_title, monitor_index)

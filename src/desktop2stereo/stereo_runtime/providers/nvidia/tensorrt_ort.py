@@ -22,7 +22,6 @@ from ...depth_provider import (
     DepthProviderInfo,
     TorchDepthProvider,
     _prepare_accelerated_artifacts,
-    _is_zipdepth_model,
     _normalize_depth,
     default_lab_cache_dir,
 )
@@ -290,8 +289,6 @@ class DistillAnyDepthBaseTensorRtOrt:
         start = time.perf_counter()
         depth = torch.from_numpy(output_np).float()
         depth = ensure_b1hw(depth)
-        if _is_zipdepth_model(self.model_id):
-            depth = depth.clamp_min(5e-3).reciprocal()
         depth = _normalize_depth(depth)
         depth = upsample_depth(
             depth,

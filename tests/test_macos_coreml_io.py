@@ -83,7 +83,7 @@ def test_native_output_modes_match_runtime_frame_shapes() -> None:
 def test_native_scalar_kernels_use_one_dimensional_threadgroups() -> None:
     source = _NATIVE_SOURCE.read_text()
     normalize_start = source.index("static void d2s_encode_normalize")
-    normalize_end = source.index("static float d2s_half_to_float", normalize_start)
+    normalize_end = source.index("static BOOL d2s_gpu_depth_range", normalize_start)
     normalize = source[normalize_start:normalize_end]
     pack_start = source.index("int32_t d2s_coreml_io_pack")
     pack = source[pack_start:]
@@ -118,7 +118,8 @@ def test_native_output_resolution_depth_gaussian_runs_before_warp_without_color_
     assert "[gaussian_encoder setBuffer:warp_depth_buffer offset:0 atIndex:0]" in pack[gaussian:warp]
     assert gaussian < upsample < warp
     assert "fxaa" not in pack.lower()
-    assert "memcpy(destination, destination_buffer.contents, output_bytes);" in pack
+    assert "memcpy(destination, destination_buffer.contents, output_bytes);" not in pack
+    assert "GPU-only output requires a Metal-compatible destination buffer" in pack
 
 
 def test_native_model_depth_filter_is_separable_and_skips_duplicate_output_aa() -> None:
@@ -177,6 +178,25 @@ def test_native_metal_bridge_preserves_metal_logical_rgb_channel_order() -> None
     assert "(p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f" in pack
     assert "pixel.g * 255.0f" in pack
     assert "(p.stream_bgra != 0 ? pixel.r : pixel.b) * 255.0f" in pack
+
+
+def test_screen_edge_disparity_fade_matches_android_eight_pixel_band() -> None:
+    source_root = Path(__file__).resolve().parents[1] / "src/desktop2stereo"
+    python_shift = (source_root / "stereo_runtime/baseline_shift.py").read_text()
+    fast_plus = (source_root / "stereo_runtime/fast_plus_fused_triton.py").read_text()
+    native_metal = _NATIVE_SOURCE.read_text()
+
+    assert "SCREEN_EDGE_FADE_PX = 8.0" in python_shift
+    assert "edge_distance / 8.0" in fast_plus
+    assert "edge_distance / 8.0f" in native_metal
+    for shader_name in (
+        "d2s_stereo_fused.comp",
+        "d2s_stereo_layered.comp",
+        "d2s_stereo_layered_output.comp",
+        "d2s_stereo_layered_tiled.comp",
+    ):
+        shader = (source_root / "shaders" / shader_name).read_text()
+        assert "edge_distance / 8.0" in shader
 
 
 def test_native_warp_uses_depth_dimensions_for_depth_sampling() -> None:

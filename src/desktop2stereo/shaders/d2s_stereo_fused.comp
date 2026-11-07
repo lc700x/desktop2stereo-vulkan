@@ -56,13 +56,20 @@ uint pixel_index(int x, int y) {
     return uint(clamp_y(y)) * params.width + uint(clamp_x(x));
 }
 
+float screen_edge_fade_weight(float x) {
+    float edge_distance = min(x + 0.5, float(params.width) - x - 0.5);
+    float t = clamp(edge_distance / 8.0, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
 float depth_at(int x, int y) {
     return clamp(depth[pixel_index(x, y)], 0.0, 1.0);
 }
 
 float shift_at(int x, int y) {
     float response = depth_at(x, y) - params.convergence;
-    return -response * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5;
+    return -response * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5
+        * screen_edge_fade_weight(float(x));
 }
 
 float max_shift_magnitude() {

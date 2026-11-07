@@ -375,8 +375,19 @@ def load_model_for_dtype(
         model = model.to(device=device, dtype=dtype).eval()
         return VideoDepthAnythingOnnxExportWrapper(model).eval()
 
+    from .model_artifacts import find_local_model_snapshot
+
+    local_snapshot = find_local_model_snapshot(model_id, cache_dir)
+    model_source = (
+        str(local_snapshot)
+        if local_snapshot is not None or local_files_only
+        else model_id
+    )
+    if local_snapshot is not None or local_files_only:
+        local_files_only = True
+
     model = auto_model_cls.from_pretrained(
-        model_id,
+        model_source,
         dtype=dtype,
         cache_dir=str(cache_dir),
         weights_only=True,

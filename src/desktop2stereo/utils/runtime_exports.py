@@ -10,6 +10,7 @@ from viewer.settings import resolve_viewer_settings
 
 from .capture_tool import resolve_capture_tool
 from .run_mode import resolve_run_mode
+from utils.display_info import enumerate_displays
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,9 @@ class RuntimeExports:
 def resolve_runtime_exports(settings: dict, *, os_name: str) -> RuntimeExports:
     model_mapping = model_name_mapping()
     streaming_config = resolve_streaming_config(settings)
+    display_count = len(enumerate_displays()) if os_name == "Windows" else None
+    depth_settings = resolve_depth_settings(settings, os_name=os_name)
+    viewer_settings = resolve_viewer_settings(settings)
     run_mode_config = resolve_run_mode(
         settings["Run Mode"],
         os_name=os_name,
@@ -85,9 +89,11 @@ def resolve_runtime_exports(settings: dict, *, os_name: str) -> RuntimeExports:
             "NVIDIA Frame Generation",
             settings.get("Lossless Scaling Support", False),
         ),
+        monitor_count=display_count,
+        capture_mode=settings.get("Capture Mode"),
+        input_monitor_index=viewer_settings.monitor_index,
+        output_monitor_index=viewer_settings.stereo_display_index,
     )
-    depth_settings = resolve_depth_settings(settings, os_name=os_name)
-    viewer_settings = resolve_viewer_settings(settings)
 
     return RuntimeExports(
         model_mapping=model_mapping,

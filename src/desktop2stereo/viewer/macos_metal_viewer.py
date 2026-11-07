@@ -223,6 +223,9 @@ class MetalLocalViewer:
         self._ns_view = None
         self._staging_texture = None
         self._staging_size = (0, 0)
+        self._native_pack_size = (0, 0)
+        self._native_pack_slots: list[dict[str, Any]] = []
+        self._native_pack_cursor = 0
         self._exclusive_fullscreen = False
         self._windowed_rect = (40, 40, int(config.window_width), int(config.window_height))
         self._target_monitor = None
@@ -425,6 +428,86 @@ class MetalLocalViewer:
         self._staging_size = (width, height)
         return self._staging_texture
 
+    def _pack_native_coreml_frame(self, frame: Any):
+        native_frame = getattr(frame, "viewer_native", None)
+        if native_frame is None:
+            return None
+        source_size = getattr(native_frame, "source_size", None)
+        if not isinstance(source_size, (tuple, list)) or len(source_size) != 2:
+            raise RuntimeError("native CoreML frame has no source dimensions")
+        source_width, source_height = map(int, source_size)
+        output_format = str(getattr(frame, "output_format", "half_sbs") or "half_sbs")
+        normalized_format = output_format.strip().casefold().replace("-", "_")
+        width = source_width * 2 if normalized_format == "full_sbs" else source_width
+        height = source_height * 2 if normalized_format == "full_tab" else source_height
+        size = (width, height)
+        if min(size) < 1:
+            raise RuntimeError(f"native CoreML output size is invalid: {size}")
+
+        if size != self._native_pack_size:
+            self._native_pack_size = size
+            self._native_pack_cursor = 0
+            self._native_pack_slots = []
+            for _index in range(2):
+                buffer = self.device.newBufferWithLength_options_(
+                    width * height * 4, Metal.MTLResourceStorageModeShared
+                )
+                if buffer is None:
+                    raise RuntimeError("could not allocate a Metal native-output buffer")
+                descriptor = Metal.MTLTextureDescriptor.texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
+                    Metal.MTLPixelFormatRGBA8Unorm, width, height, False
+                )
+                descriptor.setUsage_(Metal.MTLTextureUsageShaderRead)
+                descriptor.setStorageMode_(Metal.MTLStorageModeShared)
+                texture = buffer.newTextureWithDescriptor_offset_bytesPerRow_(
+                    descriptor, 0, width * 4
+                )
+                if texture is None:
+                    raise RuntimeError("could not create a texture view of the Metal output buffer")
+                self._native_pack_slots.append(
+                    {"buffer": buffer, "texture": texture, "busy": False}
+                )
+
+        slot = None
+        for offset in range(len(self._native_pack_slots)):
+            index = (self._native_pack_cursor + offset) % len(self._native_pack_slots)
+            candidate = self._native_pack_slots[index]
+            if not candidate["busy"]:
+                candidate["busy"] = True
+                self._native_pack_cursor = (index + 1) % len(self._native_pack_slots)
+                slot = candidate
+                break
+        if slot is None:
+            native_frame.release()
+            object.__setattr__(frame, "viewer_native", None)
+            return None
+
+        import objc
+
+        pack_started = time.perf_counter()
+        try:
+            native_frame.pack_metal(
+                objc.pyobjc_id(slot["buffer"]),
+                width * height * 4,
+                size,
+                output_format,
+            )
+        except Exception:
+            slot["busy"] = False
+            native_frame.release()
+            object.__setattr__(frame, "viewer_native", None)
+            raise
+        native_frame.release()
+        object.__setattr__(frame, "viewer_native", None)
+        debug = getattr(frame, "debug_info", None)
+        if isinstance(debug, dict):
+            debug["macos_metal_output_pack_ms"] = (
+                time.perf_counter() - pack_started
+            ) * 1000.0
+            debug["macos_metal_host_image_copies"] = 0
+            debug["macos_metal_gpu_output_buffer"] = 1
+        return slot, slot["texture"], width, height
+
     # ── frame flow ──
 
     def present(self, frame: Any) -> bool:
@@ -432,8 +515,10 @@ class MetalLocalViewer:
             raise RuntimeError("Metal local viewer has not been initialized")
         self.poll_events()
 
-        # Deferred shader-warp fast path: the runtime shipped rgb+depth and
-        # the fragment shader does the stereo warp at draw time.
+        gpu_required = os.environ.get("D2S_GPU_IMAGE_PIPELINE_REQUIRED", "0") == "1"
+        native_frame = getattr(frame, "viewer_native", None)
+        # The shader-warp compatibility path uploads depth through CPU memory.
+        # Strict GPU mode uses the native CoreML/Metal packer instead.
         rgb = getattr(frame, "viewer_rgb", None)
         depth = getattr(frame, "viewer_depth", None)
         if (
@@ -442,13 +527,34 @@ class MetalLocalViewer:
             and self._warp_pipeline is not None
             and os.environ.get("D2S_METAL_SHADER_WARP", "0") == "1"
         ):
+            if gpu_required:
+                raise RuntimeError(
+                    "GPU-only Metal presentation cannot use the shader-warp path "
+                    "because its depth upload reads back to CPU memory"
+                )
             return self._present_warp(
                 rgb, depth, bgra=getattr(frame, "viewer_bgra", None)
             )
 
+        if gpu_required and native_frame is None:
+            raise RuntimeError(
+                "GPU-only Metal presentation requires a native CoreML/Metal frame"
+            )
+        native_pack = self._pack_native_coreml_frame(frame)
+        native_slot = None
+        if native_pack is not None:
+            native_slot, texture, width, height = native_pack
+        elif gpu_required:
+            if self.config.on_breakdown_inc is not None:
+                self.config.on_breakdown_inc("viewer_drop", 1)
+            return False
+
         # Runtime-packed host frame: pure memcpy, no device sync.
-        host_np = getattr(frame, "viewer_frame_np", None)
-        if host_np is not None:
+        host_np = None if native_slot is not None else getattr(frame, "viewer_frame_np", None)
+        if native_slot is not None:
+            pixels = None
+            pack_started = time.perf_counter()
+        elif host_np is not None:
             pixels, width, height = host_np
             pack_started = time.perf_counter()
         else:
@@ -465,15 +571,17 @@ class MetalLocalViewer:
             self.config.on_breakdown_add_time(
                 "local_present_pack", time.perf_counter() - pack_started
             )
-        texture = self._ensure_staging_texture(width, height)
-
-        region = Metal.MTLRegionMake2D(0, 0, width, height)
-        texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(
-            region, 0, pixels, width * 4
-        )
+        if native_slot is None:
+            texture = self._ensure_staging_texture(width, height)
+            region = Metal.MTLRegionMake2D(0, 0, width, height)
+            texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(
+                region, 0, pixels, width * 4
+            )
 
         drawable = self.layer.nextDrawable()
         if drawable is None:
+            if native_slot is not None:
+                native_slot["busy"] = False
             return False
 
         fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
@@ -492,6 +600,10 @@ class MetalLocalViewer:
         off_v = (1.0 - sv) / 2.0
 
         command_buffer = self.queue.commandBuffer()
+        if native_slot is not None:
+            command_buffer.addCompletedHandler_(
+                lambda _completed, slot=native_slot: slot.__setitem__("busy", False)
+            )
         pass_desc = Metal.MTLRenderPassDescriptor.renderPassDescriptor()
         color = pass_desc.colorAttachments().objectAtIndexedSubscript_(0)
         color.setTexture_(drawable.texture())
@@ -885,7 +997,8 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
             frame = (
                 result
                 if (
-                    getattr(result, "viewer_rgb", None) is not None
+                    getattr(result, "viewer_native", None) is not None
+                    or getattr(result, "viewer_rgb", None) is not None
                     or getattr(result, "viewer_frame_np", None) is not None
                 )
                 else getattr(result, "sbs", None)

@@ -15,8 +15,8 @@ BASE_SETTINGS = {
     "Stream Target FPS": 30,
     "Language": "EN",
     "Show FPS": False,
-    "Depth Strength": 2.0,
-    "Convergence": 0.0,
+    "Depth Strength": 0.48,
+    "Convergence": 0.5,
     "Fill 16:9": True,
     "Upscaler": "Off",
     "Upscaler Sharpness": 0.35,
@@ -215,6 +215,62 @@ def test_resolve_viewer_settings_keeps_unset_stereo_output_unset():
 
     assert resolved.stereo_display_index is None
     assert resolved.stereo_display_selection is False
+
+
+def test_single_windows_display_uses_local_viewer_as_stereo_output(monkeypatch):
+    from utils import display_info
+
+    single_display = DisplayInfo(
+        1, 1, 0, 0, 1920, 1080, stable_id="display-1", is_primary=True
+    )
+    monkeypatch.setattr(display_info, "enumerate_displays", lambda: [single_display])
+    monkeypatch.setattr("viewer.settings.platform.system", lambda: "Windows")
+
+    monitor_capture = resolve_viewer_settings(
+        dict(BASE_SETTINGS, VSync=False, **{"Display Mode": "Mono", "Stereo Output": 2})
+    )
+    assert monitor_capture.display_mode == "Half-SBS"
+    assert monitor_capture.stereo_display_index == 1
+    assert monitor_capture.stereo_display_selection is True
+
+    window_capture = resolve_viewer_settings(
+        dict(BASE_SETTINGS, VSync=False, **{"Capture Mode": "Window", "Stereo Output": 2})
+    )
+    assert window_capture.stereo_display_index is None
+    assert window_capture.stereo_display_selection is False
+
+
+def test_multi_display_same_input_and_output_enables_local_3d(monkeypatch):
+    monkeypatch.setattr("viewer.settings.platform.system", lambda: "Windows")
+    same_display = resolve_viewer_settings(
+        dict(
+            BASE_SETTINGS,
+            VSync=False,
+            **{
+                "Monitor Index": 2,
+                "Stereo Output": 2,
+                "Display Mode": "Mono",
+            },
+        )
+    )
+    assert same_display.monitor_index == 2
+    assert same_display.stereo_display_index == 2
+    assert same_display.stereo_display_selection is True
+    assert same_display.display_mode == "Half-SBS"
+
+    separate_display = resolve_viewer_settings(
+        dict(
+            BASE_SETTINGS,
+            VSync=False,
+            **{
+                "Monitor Index": 2,
+                "Stereo Output": 1,
+                "Display Mode": "Mono",
+            },
+        )
+    )
+    assert separate_display.stereo_display_index == 1
+    assert separate_display.display_mode == "Mono"
 
 
 def test_resolve_viewer_settings_reads_render_size_config():

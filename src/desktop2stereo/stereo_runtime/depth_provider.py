@@ -145,6 +145,13 @@ def default_lab_cache_dir() -> Path:
     return root / "models"
 
 
+def _local_transformers_model_source(model_id: str, cache_dir: str | Path) -> tuple[str, bool]:
+    from .model_artifacts import find_local_model_snapshot
+
+    snapshot = find_local_model_snapshot(model_id, cache_dir)
+    return (str(snapshot), True) if snapshot is not None else (model_id, False)
+
+
 def distill_base_518_info(cache_dir: str | Path | None = None) -> DepthProviderInfo:
     cache = Path(cache_dir) if cache_dir is not None else default_lab_cache_dir()
     return DepthProviderInfo(
@@ -579,10 +586,21 @@ class DistillAnyDepthBase518:
             "local_files_only": self.local_files_only,
             "force_download": self.force_download,
         }
+        model_source, snapshot_cached = (
+            (DISTILL_ANY_DEPTH_BASE_MODEL_ID, False)
+            if self.force_download
+            else _local_transformers_model_source(
+                DISTILL_ANY_DEPTH_BASE_MODEL_ID,
+                self.cache_dir,
+            )
+        )
+        load_from_source = (
+            model_source if snapshot_cached or self.local_files_only else DISTILL_ANY_DEPTH_BASE_MODEL_ID
+        )
         if self.local_files_only:
             # Explicit offline mode: never touch the network.
             model = AutoModelForDepthEstimation.from_pretrained(
-                DISTILL_ANY_DEPTH_BASE_MODEL_ID,
+                load_from_source,
                 **kwargs,
             )
         else:
@@ -595,7 +613,7 @@ class DistillAnyDepthBase518:
                     None
                     if self.force_download
                     else lambda: AutoModelForDepthEstimation.from_pretrained(
-                        DISTILL_ANY_DEPTH_BASE_MODEL_ID,
+                        model_source,
                         cache_dir=str(self.cache_dir),
                         dtype=self.dtype,
                         weights_only=True,
@@ -727,10 +745,18 @@ class GenericAutoDepthProvider:
             "local_files_only": self.local_files_only,
             "force_download": self.force_download,
         }
+        model_source, snapshot_cached = (
+            (self.model_id, False)
+            if self.force_download
+            else _local_transformers_model_source(self.model_id, self.cache_dir)
+        )
+        load_from_source = (
+            model_source if snapshot_cached or self.local_files_only else self.model_id
+        )
         if self.local_files_only:
             # Explicit offline mode: never touch the network.
             model = AutoModelForDepthEstimation.from_pretrained(
-                self.model_id,
+                load_from_source,
                 **kwargs,
             )
         else:
@@ -742,7 +768,7 @@ class GenericAutoDepthProvider:
                     None
                     if self.force_download
                     else lambda: AutoModelForDepthEstimation.from_pretrained(
-                        self.model_id,
+                        load_from_source,
                         cache_dir=str(self.cache_dir),
                         dtype=self.dtype,
                         weights_only=True,
@@ -786,13 +812,14 @@ class GenericAutoDepthProvider:
             self.model_id,
         )
 
-        use_bicubic = self.device.type == "cuda" and not _is_zipdepth_model(self.model_id)
+        is_zipdepth = _is_zipdepth_model(self.model_id)
+        use_bicubic = self.device.type == "cuda" and not is_zipdepth
         tensor = F.interpolate(
             rgb,
             size=(input_h, input_w),
             mode="bicubic" if use_bicubic else "bilinear",
             align_corners=False,
-            antialias=use_bicubic,
+            antialias=use_bicubic or is_zipdepth,
         ).to(self.dtype)
 
         mean, std = _normalization_tensors_for_model(self.model_id, self.device, self.dtype)
@@ -1104,7 +1131,7 @@ def _is_metric_model(model_id: str) -> bool:
 
 def _postprocess_generic_depth(depth: torch.Tensor, model_id: str) -> torch.Tensor:
     depth = ensure_b1hw(depth).float()
-    if _is_metric_model(model_id) or _is_zipdepth_model(model_id):
+    if _is_metric_model(model_id):
         depth = depth.clamp_min(5e-3).reciprocal()
     return _normalize_depth(depth)
 

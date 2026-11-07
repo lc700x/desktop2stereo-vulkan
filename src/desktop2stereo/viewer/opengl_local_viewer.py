@@ -7,7 +7,10 @@ and tools/opengl_fallback_smoke.py (PBO + FBO + fence).
 from __future__ import annotations
 
 import time
+import sys
 from typing import Any
+
+from viewer.window_control import hide_window_from_capture
 
 
 class OpenGLLocalViewer:
@@ -23,6 +26,7 @@ class OpenGLLocalViewer:
         self.window = None
         self._backend = None
         self._initialized = False
+        self._show_after_capture_protection = False
 
     def initialize(self) -> None:
         try:
@@ -41,11 +45,24 @@ class OpenGLLocalViewer:
         glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
         glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
         glfw.window_hint(glfw.RESIZABLE, True)
+        self._show_after_capture_protection = bool(
+            sys.platform == "win32" and self.config.exclude_from_capture
+        )
+        if self._show_after_capture_protection:
+            glfw.window_hint(glfw.VISIBLE, False)
 
         w, h = int(self.config.window_width), int(self.config.window_height)
         self.window = glfw.create_window(w, h, self.config.title, None, None)
         if not self.window:
             raise RuntimeError("OpenGL fallback: could not create GLFW window")
+
+        if self._show_after_capture_protection:
+            hide_window_from_capture(self.window)
+            print(
+                "[OpenGLLocalViewer] using global capture exclusion; "
+                "remote desktop capture will not show SBS",
+                flush=True,
+            )
 
         glfw.make_context_current(self.window)
 
@@ -98,6 +115,9 @@ class OpenGLLocalViewer:
             self._backend.submit_rgb(arr)
             # Present via glfw swap
             self.glfw.swap_buffers(self.window)
+            if self._show_after_capture_protection:
+                self.glfw.show_window(self.window)
+                self._show_after_capture_protection = False
             return True
         except Exception as exc:
             # Non-fatal per-frame errors should not kill viewer

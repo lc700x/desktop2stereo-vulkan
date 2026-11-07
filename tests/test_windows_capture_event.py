@@ -224,6 +224,48 @@ def test_load_windows_capture_selects_cuda_and_rocm_modules(monkeypatch):
     assert windows_capture_event._load_windows_capture("WindowsCapture")[0] is base.WindowsCapture
 
 
+def test_gpu_required_capture_rejects_cpu_compatibility_frames():
+    with pytest.raises(RuntimeError, match="produces CPU frames"):
+        windows_capture_event._copy_frame_buffer(
+            object(), "WindowsCapture", gpu_required=True
+        )
+
+
+def test_gpu_required_capture_rejects_unverified_adapter_identity(monkeypatch):
+    runner = windows_capture_event.WindowsCaptureEventRunner(
+        CaptureConfig(capture_tool="WindowsCaptureCUDA", gpu_required=True)
+    )
+    monkeypatch.setattr(
+        windows_capture_event,
+        "_capture_adapter_luid",
+        lambda *_args, **_kwargs: (0, "adapter identity missing"),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot verify adapter identity"):
+        runner.run(shutdown_event=threading.Event(), on_frame=lambda _frame: None)
+
+
+def test_gpu_required_capture_rejects_cpu_compatibility_frames():
+    with pytest.raises(RuntimeError, match="produces CPU frames"):
+        windows_capture_event._copy_frame_buffer(
+            object(), "WindowsCapture", gpu_required=True
+        )
+
+
+def test_gpu_required_capture_rejects_unknown_adapter_identity(monkeypatch):
+    runner = windows_capture_event.WindowsCaptureEventRunner(
+        CaptureConfig(capture_tool="WindowsCaptureCUDA", gpu_required=True)
+    )
+    monkeypatch.setattr(
+        windows_capture_event,
+        "_capture_adapter_luid",
+        lambda *_args, **_kwargs: (0, "adapter identity missing"),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot verify adapter identity"):
+        runner.run(shutdown_event=threading.Event(), on_frame=lambda _frame: None)
+
+
 def test_windows_capture_runner_uses_copy_or_clone_buffers(monkeypatch):
     module = _install_capture_module(monkeypatch, "wc_cuda")
     monkeypatch.setenv("D2S_WGC_SOFTWARE_THROTTLE", "0")
@@ -533,7 +575,8 @@ def test_windows_capture_cuda_limiter_runs_before_gpu_buffer_delivery(monkeypatc
     monkeypatch.setattr(runner, "_accept_software_paced_frame", lambda now: next(decisions))
     copied = []
 
-    def record_copy(frame_buffer, capture_tool):
+    def record_copy(frame_buffer, capture_tool, *, gpu_required=False):
+        assert gpu_required is False
         copied.append(frame_buffer)
         return frame_buffer, FrameCopyMode.GPU_TENSOR, "cuda"
 
@@ -786,6 +829,178 @@ def test_windows_capture_cuda_accepts_env_capture_options(monkeypatch):
         "reuse_output_buffer": True,
         "output_buffer_count": 6,
     }
+
+
+def test_windows_capture_keeps_cursor_for_sbs_views():
+    config = CaptureConfig(
+        capture_tool="WindowsCaptureCUDA",
+        capture_mode="Monitor",
+        monitor_index=1,
+    )
+
+    assert windows_capture_event._windows_capture_kwargs(
+        config, "WindowsCaptureCUDA"
+    )["cursor_capture"] is True
+
+
+def test_gpu_capture_kwargs_include_only_current_exclusion_handles():
+    config = CaptureConfig(
+        capture_tool="WindowsCaptureCUDA",
+        capture_mode="Monitor",
+        monitor_index=1,
+        excluded_window_handles_provider=lambda: (123, 456),
+    )
+
+    active = windows_capture_event._windows_capture_kwargs(
+        config,
+        "WindowsCaptureCUDA",
+    )
+    fallback = windows_capture_event._windows_capture_kwargs(
+        config,
+        "WindowsCaptureCUDA",
+        include_window_exclusion=False,
+    )
+
+    assert active["excluded_window_handles"] == [123, 456]
+    assert "excluded_window_handles" not in fallback
+
+
+def test_missing_gpu_session_exclusion_binding_falls_back_with_status(monkeypatch):
+    module = _install_capture_module(monkeypatch, "wc_cuda")
+    monkeypatch.setattr(windows_capture_event, "_setup_dpi_awareness", lambda: None)
+    monkeypatch.setattr(
+        windows_capture_event.WindowsCaptureEventRunner,
+        "_start_keyboard_worker",
+        lambda self, event: None,
+    )
+    fallback = []
+    errors = []
+    shutdown_event = threading.Event()
+    runner = windows_capture_event.WindowsCaptureEventRunner(
+        CaptureConfig(
+            os_name="Windows",
+            capture_tool="WindowsCaptureCUDA",
+            device_id=0,
+            excluded_window_handles_provider=lambda: (0x1234,),
+            on_window_exclusion_fallback=fallback.append,
+        )
+    )
+    monkeypatch.setattr(
+        windows_capture_event,
+        "_capture_adapter_luid",
+        lambda *_args, **_kwargs: (0x1234, None),
+    )
+
+    def on_error(exc):
+        errors.append(exc)
+        shutdown_event.set()
+
+    runner.run(
+        shutdown_event=shutdown_event,
+        on_frame=lambda _frame: None,
+        on_error=on_error,
+    )
+
+    assert "excluded_window_handles" not in module.WindowsCapture.last_instance.kwargs
+    assert fallback and "no session-exclusion method" in fallback[0]
+    assert errors
+
+
+def test_empty_exclusion_handles_fall_back_to_global_exclusion(monkeypatch):
+    # A session opened with an empty exclusion list still reports a
+    # configuration iteration but excludes nothing, which silently restores the
+    # same-monitor feedback loop. It must fall back instead of starting it.
+    module = _install_capture_module(monkeypatch, "wc_cuda")
+    module.WindowsCapture.set_excluded_windows = lambda self, handles: 2
+    monkeypatch.setattr(windows_capture_event, "_setup_dpi_awareness", lambda: None)
+    monkeypatch.setattr(
+        windows_capture_event.WindowsCaptureEventRunner,
+        "_start_keyboard_worker",
+        lambda self, event: None,
+    )
+    monkeypatch.setattr(
+        windows_capture_event,
+        "_capture_adapter_luid",
+        lambda *_args, **_kwargs: (0x1234, None),
+    )
+    fallback = []
+    shutdown_event = threading.Event()
+    runner = windows_capture_event.WindowsCaptureEventRunner(
+        CaptureConfig(
+            os_name="Windows",
+            capture_tool="WindowsCaptureCUDA",
+            device_id=0,
+            excluded_window_handles_provider=lambda: (),
+            on_window_exclusion_fallback=fallback.append,
+        )
+    )
+
+    def on_error(_exc):
+        shutdown_event.set()
+
+    runner.run(
+        shutdown_event=shutdown_event,
+        on_frame=lambda _frame: None,
+        on_error=on_error,
+    )
+
+    assert "excluded_window_handles" not in module.WindowsCapture.last_instance.kwargs
+    assert fallback and "no output window handles" in fallback[0]
+
+
+def test_initial_exclusion_iteration_gates_stale_frames(monkeypatch, capsys):
+    module = _install_capture_module(monkeypatch, "wc_cuda")
+    monkeypatch.setenv("D2S_WGC_SOFTWARE_THROTTLE", "0")
+    module.WindowsCapture.set_excluded_windows = lambda self, handles: 2
+    module.WindowsCapture.window_exclusion_available = True
+    module.WindowsCapture.window_exclusion_configuration_iteration = 2
+    monkeypatch.setattr(windows_capture_event, "_setup_dpi_awareness", lambda: None)
+    monkeypatch.setattr(
+        windows_capture_event.WindowsCaptureEventRunner,
+        "_start_keyboard_worker",
+        lambda self, event: None,
+    )
+    monkeypatch.setattr(
+        windows_capture_event,
+        "_capture_adapter_luid",
+        lambda *_args, **_kwargs: (0x1234, None),
+    )
+
+    ready = []
+    received = []
+    shutdown_event = threading.Event()
+    runner = windows_capture_event.WindowsCaptureEventRunner(
+        CaptureConfig(
+            os_name="Windows",
+            capture_tool="WindowsCaptureCUDA",
+            capture_mode="Monitor",
+            monitor_index=1,
+            excluded_window_handles_provider=lambda: (0x1234,),
+            on_window_exclusion_ready=lambda: ready.append(True),
+        )
+    )
+    runner.run(
+        shutdown_event=shutdown_event,
+        on_frame=received.append,
+        on_error=lambda _exc: shutdown_event.set(),
+    )
+
+    capture = module.WindowsCapture.last_instance
+    handler = capture.handlers[0]
+    shutdown_event.clear()
+
+    stale = FakeFrame(CloneBuffer())
+    stale.configuration_iteration = 1
+    handler(stale, FakeControl())
+    assert received == []
+
+    active = FakeFrame(CloneBuffer())
+    active.configuration_iteration = 2
+    handler(active, FakeControl())
+
+    assert len(received) == 1
+    assert ready == [True]
+    assert "configuration 2 (frame 2)" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("ending", ["shutdown", "hard_idle", "closed", "error"])

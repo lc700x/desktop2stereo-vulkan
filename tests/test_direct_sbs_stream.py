@@ -18,6 +18,7 @@ from streaming.direct_sbs import (
     DirectSbsOutputConsumer,
     FfmpegDirectSbsOutput,
     IntelQsvDirectSbsOutput,
+    MjpegDirectSbsOutput,
     PyNvDirectSbsOutput,
     RuntimeSbsRgbConverter,
     VulkanDirectSbsOutput,
@@ -1658,3 +1659,16 @@ def test_darwin_loopback_routing_hint_only_for_virtual_devices() -> None:
     assert "BlackHole" in direct_sbs._darwin_loopback_routing_hint(":8 Virtual Desktop Speakers")
     assert direct_sbs._darwin_loopback_routing_hint(":2 iMac Microphone") == ""
     assert direct_sbs._darwin_loopback_routing_hint("") == ""
+
+
+def test_gpu_required_stream_rejects_host_rgb_encoder_input():
+    output = object.__new__(FfmpegDirectSbsOutput)
+    output.gpu_required = True
+
+    with pytest.raises(RuntimeError, match="cannot accept host RGB"):
+        output.submit_frame(np.zeros((8, 16, 3), dtype=np.uint8))
+
+
+def test_gpu_required_mjpeg_is_rejected_without_a_gpu_jpeg_encoder():
+    with pytest.raises(RuntimeError, match="CPU JPEG encoding"):
+        MjpegDirectSbsOutput(port=1122, fps=60, quality=90, gpu_required=True)

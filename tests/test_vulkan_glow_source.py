@@ -136,6 +136,7 @@ def test_glow_frame_lease_is_counted_once_and_released() -> None:
     backend._budget_skip_count = 0
     backend._screen_light_rgb = (0.1, 0.2, 0.3)
     backend._edge_light_rgb = tuple((0.1, 0.2, 0.3) for _ in range(24))
+    backend._host_input = False
     backend.poll = lambda: None
 
     first = backend.acquire(8)

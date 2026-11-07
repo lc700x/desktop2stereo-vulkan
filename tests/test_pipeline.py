@@ -63,16 +63,26 @@ def test_attach_capture_debug_marks_depth_complete_for_current_frame():
         frame=np.zeros((2, 2, 3), dtype=np.uint8),
         target_height=2,
         timestamp=1.0,
-        metadata={"capture_frame_id": 42},
+        metadata={
+            "capture_frame_id": 42,
+            "gpu_to_cpu": True,
+            "gpu_copy_count": 2,
+        },
     )
 
     _attach_capture_debug(result, captured, SimpleNamespace())
 
     assert result.capture_frame_id == 42
     assert result.depth_frame_id == 42
+    assert result.depth_age_frames == 0
+    assert result.capture_timestamp == 1.0
     assert result.depth_complete is True
     assert result.debug_info["depth_finite"] == 1
     assert result.debug_info["depth_nonfinite_count"] == 0
+    assert result.debug_info["depth_age_frames"] == 0
+    assert result.debug_info["raw_image_cpu_readbacks"] == 1
+    assert result.debug_info["capture_gpu_copy_count"] == 2
+    assert result.debug_info["capture_to_runtime_ready_ms"] > 0
 
 
 def test_attach_capture_debug_keeps_cursor_reused_depth_source_frame_id():
@@ -99,8 +109,10 @@ def test_attach_capture_debug_keeps_cursor_reused_depth_source_frame_id():
 
     assert result.capture_frame_id == 42
     assert result.depth_frame_id == 41
+    assert result.depth_age_frames == 1
     assert result.debug_info["capture_frame_id"] == 42
     assert result.debug_info["depth_frame_id"] == 41
+    assert result.debug_info["depth_age_frames"] == 1
     assert result.debug_info["depth_reused_cursor_only"] == 1
 
 
@@ -479,6 +491,23 @@ def test_cursor_only_rgb_change_ignores_pointer_region_but_not_scene_motion():
         (0.5, 0.5),
         (0.5, 0.5),
         (3840, 2160),
+    )
+
+
+def test_cursor_depth_reuse_covers_openxr_and_local_fullscreen_only():
+    from stereo_runtime.pipeline import _supports_cursor_depth_reuse
+
+    assert _supports_cursor_depth_reuse(
+        SimpleNamespace(run_mode="OpenXR", output_transport="openxr_swapchain")
+    )
+    assert _supports_cursor_depth_reuse(
+        SimpleNamespace(run_mode="Viewer", output_transport="local_fullscreen")
+    )
+    assert not _supports_cursor_depth_reuse(
+        SimpleNamespace(run_mode="Viewer", output_transport="local_window")
+    )
+    assert not _supports_cursor_depth_reuse(
+        SimpleNamespace(run_mode="Viewer", output_transport="encoded_stream")
     )
 
 

@@ -16,8 +16,8 @@ OpenXROutputMode = Literal["auto", "rgb_depth", "full_synthesis_eyes"]
 
 @dataclass(frozen=True)
 class OpenXRRenderConfig:
-    depth_strength: float = 2.0
-    convergence: float | torch.Tensor = 0.0
+    depth_strength: float = 0.48
+    convergence: float | torch.Tensor = 0.5
     max_disparity_px: float | None = None
     parallax_preset: str = "standard"
     output_mode: OpenXROutputMode = "auto"

@@ -145,6 +145,45 @@ def test_projected_rgba_and_sbs_preserve_float_visibility():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm is required")
+def test_full_resolution_disparity_matches_moonlight_zipdepth_default():
+    pytest.importorskip("triton")
+    from stereo_runtime.baseline_shift import ShiftParams, compute_shift_px
+    from stereo_runtime.warp_composite_triton import warp_composite2
+
+    height, width = 4, 3840
+    rgb = (torch.arange(width, device="cuda", dtype=torch.float32) / (width - 1))
+    rgb = rgb.view(1, 1, 1, width).expand(1, 3, height, width).contiguous()
+    output_columns = []
+    for depth_value in (0.0, 1.0):
+        depth = torch.full((1, 1, height, width), depth_value, device="cuda")
+        shift = compute_shift_px(
+            depth,
+            width,
+            ShiftParams(
+                depth_strength=0.48,
+                convergence=0.5,
+                max_disparity_px=96.0,
+            ),
+        )
+        left, right = warp_composite2(rgb, depth, shift)
+        expected_shift = (1.0 if depth_value == 0.0 else -1.0) * 0.003 * width
+        expected_left = (1000.0 + expected_shift) / (width - 1)
+        expected_right = (1000.0 - expected_shift) / (width - 1)
+        output_columns.append(
+            (
+                float(left[0, 0, height // 2, 1000]),
+                float(right[0, 0, height // 2, 1000]),
+                expected_left,
+                expected_right,
+            )
+        )
+
+    for left_value, right_value, expected_left, expected_right in output_columns:
+        assert abs(left_value - expected_left) < 2.0e-5
+        assert abs(right_value - expected_right) < 2.0e-5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm is required")
 def test_tiled_projected_rgba_matches_linear_kernel_exactly():
     pytest.importorskip("triton")
     import triton

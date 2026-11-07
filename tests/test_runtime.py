@@ -618,7 +618,7 @@ def test_fast_plus_fused_uses_resolved_parallax_budget_contract():
 
     assert "max_disparity_px: tl.constexpr" in fused_source
     assert "max_disparity_px: float" in fused_source
-    assert "depth_strength: tl.constexpr" in fused_source
+    assert '@triton.jit(do_not_specialize=["depth_strength"])' in fused_source
     assert "depth_strength: float" in fused_source
     assert "max_disparity_px * depth_strength * 0.5" in fused_source
     assert "effective_ipd_m" not in fused_source
@@ -630,6 +630,21 @@ def test_fast_plus_fused_uses_resolved_parallax_budget_contract():
     assert "D2S_TRITON_SPARSE_HOLE_THRESHOLD" in fused_source
     assert "max_disparity_px=float(budget.max_disparity_px)" in runtime_source
     assert 'depth_strength=max(0.0, float(getattr(stereo_config, "depth_strength", 1.0)))' in runtime_source
+
+
+def test_stereo_disparity_fades_at_both_screen_edges():
+    from stereo_runtime.baseline_shift import ShiftParams, compute_shift_px
+
+    depth = torch.ones(1, 1, 2, 32)
+    shift = compute_shift_px(
+        depth,
+        32,
+        ShiftParams(depth_strength=1.0, convergence=0.5, max_disparity_px=16.0),
+    )
+
+    assert torch.allclose(shift[..., 0], shift[..., -1])
+    assert torch.allclose(shift[..., 8], shift[..., 16])
+    assert torch.abs(shift[..., 0]).max() < torch.abs(shift[..., 8]).min()
 
 
 def test_fast_plus_fused_runtime_is_bypassed_when_hole_fill_is_disabled(monkeypatch):

@@ -76,6 +76,11 @@ def normalize_config(config: CaptureConfig | None = None) -> CaptureConfig:
         device_id=config.device_id,
         os_name=os_name,
         fps_provider=config.fps_provider,
+        cursor_capture=bool(getattr(config, "cursor_capture", True)),
+        excluded_window_handles_provider=config.excluded_window_handles_provider,
+        on_window_exclusion_ready=config.on_window_exclusion_ready,
+        on_window_exclusion_fallback=config.on_window_exclusion_fallback,
+        gpu_required=bool(config.gpu_required),
     )
 
 
@@ -122,11 +127,23 @@ def create_capture_source(config: CaptureConfig | None = None):
     }
     if config.os_name == "Darwin" and config.capture_tool == "ScreenCaptureKit":
         kwargs["fps_provider"] = config.fps_provider
+        kwargs["gpu_required"] = bool(config.gpu_required)
     return source_cls(**kwargs)
 
 
 def create_capture_runner(config: CaptureConfig | None = None):
     config = normalize_config(config)
+    if config.gpu_required and config.os_name == "Windows":
+        try:
+            import torch
+        except Exception as exc:
+            raise RuntimeError("GPU capture requires the selected CUDA or ROCm runtime") from exc
+        if not torch.cuda.is_available():
+            raise RuntimeError("GPU capture is required, but no CUDA or ROCm device is available")
+        capture_tool = "WindowsCaptureROCm" if torch.version.hip is not None else "WindowsCaptureCUDA"
+        config = replace(config, capture_tool=capture_tool)
+    elif config.gpu_required and config.os_name == "Darwin":
+        config = replace(config, capture_tool="ScreenCaptureKit")
     if config.os_name == "Windows" and config.capture_tool == _WINDOWS_DESKTOP_DUPLICATION:
         if not _desktop_duplication_native_available():
             return DesktopDuplicationFallbackRunner(config)

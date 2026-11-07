@@ -95,6 +95,16 @@ def default_base_depth_model():
     return DEFAULT_MODEL_LIST[0]
 
 
+def default_depth_model(os_name=None):
+    target_os = OS_NAME if os_name is None else os_name
+    preferred = (
+        "Distill-Any-Depth-Small"
+        if target_os == "Darwin"
+        else "ZipDepth-Small"
+    )
+    return preferred if preferred in DEFAULT_MODEL_LIST else default_base_depth_model()
+
+
 def default_coreml_enabled(os_name=None):
     """CoreML is the default Apple depth accelerator, never a vendor default."""
     return (OS_NAME if os_name is None else os_name) == "Darwin"
@@ -107,22 +117,18 @@ DEFAULTS = {
     "Window Title": "",
     "Show FPS": False,
     "Model List": DEFAULT_MODEL_LIST,
-    "Depth Model": (
-        "Distill-Any-Depth-Base"
-        if "Distill-Any-Depth-Base" in DEFAULT_MODEL_LIST
-        else default_base_depth_model()
-    ),
-    "Depth Strength": 0.25,
+    "Depth Model": default_depth_model(),
+    "Depth Strength": 0.48,
     "Depth Quick": "Standard",
     "Depth Resolution": 518,
     "Anti-aliasing": 2,
     "Depth Antialias Strength": 2.0,
     "Depth Pop": 0.0,
-    "Foreground Pop": 1.15,
-    "Midground Pop": 1.05,
-    "Background Pop": 1.05,
-    "Depth Separation Preset": "standard",
-    "Convergence": 0.0,
+    "Foreground Pop": 1.0,
+    "Midground Pop": 1.0,
+    "Background Pop": 1.0,
+    "Depth Separation Preset": "default",
+    "Convergence": 0.5,
     "Dynamic Convergence": False,
     "Dynamic Convergence Strength": 0.0,
     "Stereo Preset": "cinema",

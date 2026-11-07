@@ -458,16 +458,17 @@ def _sample_two_layers(
     if projection_min != 0.0 or projection_max != 0.0:
         return _dibr_warp_at(rgb, depth, base_shift, channel, x, y, class_depth, shift,
                              scale1, width, pixels, active, projection_min, projection_max)
-    x0 = x + shift * scale0
-    x1 = x + shift * scale1
-    v0 = _sample_border_linear_class(rgb, depth, class_depth, channel, y, x0, width, pixels, active)
-    v1 = _sample_border_linear_class(rgb, depth, class_depth, channel, y, x1, width, pixels, active)
-    return v0 * w0 + v1 * w1
+    # Moonlight XR uses one linear pixel displacement per eye. Layer weights
+    # still classify the color edge, but both layer taps share one coordinate.
+    return _sample_border_linear_class(
+        rgb, depth, class_depth, channel, y, x + shift * scale1,
+        width, pixels, active,
+    )
 
 
 @triton.jit
 def _projection_scale(value):
-    return 0.875 + 0.125 / (1.0 + tl.exp((1.0 - 2.0 * value) / 0.08))
+    return 1.0
 
 
 @triton.jit
@@ -841,15 +842,10 @@ def _sample_subpixel_two_layers(
     rgb, depth, class_depth, channel, x, y, shift, scale0, scale1, w0, w1,
     width: tl.constexpr, height: tl.constexpr, pixels: tl.constexpr, active
 ):
-    sample0 = _sample_rgb_bilinear_class(
-        rgb, depth, class_depth, channel, x + shift * scale0, y,
-        width, height, pixels, active
-    )
-    sample1 = _sample_rgb_bilinear_class(
+    return _sample_rgb_bilinear_class(
         rgb, depth, class_depth, channel, x + shift * scale1, y,
         width, height, pixels, active
     )
-    return sample0 * w0 + sample1 * w1
 
 
 @triton.jit

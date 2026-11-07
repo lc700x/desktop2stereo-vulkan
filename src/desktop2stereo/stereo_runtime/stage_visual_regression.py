@@ -24,8 +24,8 @@ from .vulkan_stereo_pass import (
 
 @dataclass(frozen=True)
 class StageVisualRegressionConfig:
-    depth_strength: float = 0.25
-    convergence: float = 0.0
+    depth_strength: float = 0.48
+    convergence: float = 0.5
     max_disparity_px: float | None = None
     parallax_preset: str = "standard"
     layers: int = 2

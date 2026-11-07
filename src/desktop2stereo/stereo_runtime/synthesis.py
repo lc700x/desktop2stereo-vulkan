@@ -49,8 +49,8 @@ class StereoConfig:
     temporal: bool = True
     output_format: OutputFormat = "half_sbs"
     debug_output: bool = False
-    depth_strength: float = 2.0
-    convergence: float | torch.Tensor = 0.0
+    depth_strength: float = 0.48
+    convergence: float | torch.Tensor = 0.5
     max_disparity_px: float | None = None
     parallax_preset: str = "standard"
     foreground_shift_scale: float = 1.0
@@ -264,7 +264,7 @@ def _layered_synthesis(
             left_layers: list[torch.Tensor] = []
             right_layers: list[torch.Tensor] = []
             for idx in range(layer_count):
-                layer_shift = base_shift * (0.75 + 0.25 * (idx + 1) / layer_count)
+                layer_shift = base_shift
                 left_layers.append(warp_horizontal(rgb, layer_shift, eye_sign=1.0))
                 sign = -1.0 if config.symmetric else -0.9
                 right_layers.append(warp_horizontal(rgb, layer_shift, eye_sign=sign))

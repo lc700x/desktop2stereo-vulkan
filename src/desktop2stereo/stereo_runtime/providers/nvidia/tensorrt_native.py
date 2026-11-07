@@ -875,8 +875,6 @@ class DistillAnyDepthBaseNativeTensorRt:
             _record_cuda_event(cuda_events, "depth_post_start", predicted)
             _record_cuda_event(cuda_events, "depth_norm_start", predicted)
             depth = ensure_b1hw(predicted.float())
-            if _is_zipdepth_model(self.model_id):
-                depth = depth.clamp_min(5e-3).reciprocal()
             depth = _normalize_depth(depth)
             _record_cuda_event(cuda_events, "depth_norm_end", depth)
             _record_cuda_event(cuda_events, "depth_upsample_start", depth)

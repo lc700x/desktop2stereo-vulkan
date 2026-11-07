@@ -340,18 +340,18 @@ Model List:
   DepthPro-Large:
     resolutions:
     - 1536
-Depth Model: Distill-Any-Depth-Small
-Depth Strength: 0.25
+Depth Model: Distill-Any-Depth-Base
+Depth Strength: 0.48
 Depth Quick: Standard
 Depth Resolution: 518
 Anti-aliasing: 2
 Depth Antialias Strength: 2.0
 Depth Pop: 0.0
-Foreground Pop: 1.15
-Midground Pop: 1.05
-Background Pop: 1.05
-Depth Separation Preset: standard
-Convergence: 0.0
+Foreground Pop: 1.0
+Midground Pop: 1.0
+Background Pop: 1.0
+Depth Separation Preset: default
+Convergence: 0.5
 Dynamic Convergence: false
 Dynamic Convergence Strength: 0.0
 Stereo Preset: cinema
@@ -393,13 +393,13 @@ MIGraphX: null
 Recompile MIGraphX: false
 Recompile OpenVINO: false
 Computing Device: 0
-Language: EN
-Run Mode: OpenXR Link
+Language: CN
+Run Mode: Local Viewer
 XR Headset Model: Pico 4 / 4 Ultra
 XR Preview Window: false
 VSync: false
 Window Preview: false
-Target FPS: 60
+Target FPS: 0
 Processing Resolution: Auto
 Render Size Policy: scaled
 Render Scale: 4K / 100%
@@ -434,14 +434,14 @@ Display Fit Mode: contain
 Stream Display Fit Mode: contain
 Fill 16:9: true
 Fix Viewer Aspect: true
-Stereo Output: 2
+Stereo Output: 1
 Stereo Output Identity:
-  stable_id: DISPLAY\MTT1337\1&15ecd195&d&UID256
-  name: VITURE
-  manufacturer: MTT
-  model: VITURE
-  serial: '2290649088'
-  left: 3840
+  stable_id: DISPLAY\TUP0270\7&314d3634&4&UID61700
+  name: D270H
+  manufacturer: TUP
+  model: D270H
+  serial: '808728147'
+  left: 0
   top: 0
   width: 3840
   height: 2160
@@ -449,22 +449,4 @@ Show Log Panel: true
 Input Display Resolution Tier: 4K
 Synthetic View: quality_4k
 OpenVINO: null
-OpenXR Screen States:
-  Default:
-    position:
-    - 0.0
-    - 0.0
-    - -20.0
-    width: 23.09
-    height: 12.988125
-    rotation_deg:
-    - 0.0
-    - 0.0
-    - 0.0
-    curved: false
-    curve_half_angle_rad: 0.0
-    crop_width_percent: 0.0
-    crop_height_percent: 0.0
-    dynamic_crop: false
-OpenXR Glow Modes:
-  Default: 'off'
+Stream Target FPS: 0

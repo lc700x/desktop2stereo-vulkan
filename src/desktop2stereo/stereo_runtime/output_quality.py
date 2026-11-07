@@ -10,8 +10,7 @@ import torch.nn.functional as F
 from utils.screen_resolution_policy import OutputSamplingPlan, build_output_sampling_plan
 
 from .output import (
-    downsample_horizontal_lanczos2,
-    downsample_vertical_lanczos2,
+    downsample_horizontal_area_srgb,
     ensure_bchw,
     match_depth,
 )
@@ -229,13 +228,8 @@ def _torch_easu(
     return output
 
 
-def _mps_upscale(image: torch.Tensor, target_height: int, target_width: int) -> torch.Tensor:
-    """Bicubic stand-in for the Triton EASU pass on MPS.
-
-    Neither the Triton kernels nor the tile-looped ``_torch_easu`` reference
-    are viable on Apple GPUs (the reference costs seconds per frame), so the
-    upscale degrades to hardware bicubic there.
-    """
+def _device_bicubic_upscale(image: torch.Tensor, target_height: int, target_width: int) -> torch.Tensor:
+    """Use the device interpolation kernel if Triton EASU is unavailable."""
     upscaled = F.interpolate(
         image.float(),
         size=(target_height, target_width),
@@ -245,12 +239,29 @@ def _mps_upscale(image: torch.Tensor, target_height: int, target_width: int) -> 
     return upscaled.clamp_(0.0, 1.0)
 
 
+_mps_upscale = _device_bicubic_upscale
+
+
 def _mps_rcas(image: torch.Tensor, sharpness: float) -> torch.Tensor:
     """Unsharp-mask stand-in for RCAS on MPS (see _mps_upscale rationale)."""
     source = image.float()
     blurred = F.avg_pool2d(source, kernel_size=3, stride=1, padding=1, count_include_pad=False)
     amount = 1.5 * max(0.0, min(1.0, float(sharpness)))
     return (source + amount * (source - blurred)).clamp_(0.0, 1.0)
+
+
+def _downsample_pixel_coverage_srgb(
+    image: torch.Tensor,
+    target_width: int,
+    target_height: int,
+) -> torch.Tensor:
+    if target_width < int(image.shape[-1]):
+        image = downsample_horizontal_area_srgb(image, target_width)
+    if target_height < int(image.shape[-2]):
+        image = downsample_horizontal_area_srgb(
+            image.transpose(-2, -1), target_height
+        ).transpose(-2, -1)
+    return image
 
 
 def apply_output_quality(
@@ -270,15 +281,17 @@ def apply_output_quality(
         right = _apply_mip_lod(right, mip_lod)
         backend = "torch_trilinear_mip"
     if plan.mode == "downsample_lanczos_rcas":
-        left = downsample_vertical_lanczos2(
-            downsample_horizontal_lanczos2(left, plan.target_width),
-            plan.target_height,
+        left = _downsample_pixel_coverage_srgb(
+            left, plan.target_width, plan.target_height
         )
-        right = downsample_vertical_lanczos2(
-            downsample_horizontal_lanczos2(right, plan.target_width),
-            plan.target_height,
+        right = _downsample_pixel_coverage_srgb(
+            right, plan.target_width, plan.target_height
         )
-        backend = "torch_lanczos2" if backend == "native" else backend + "+torch_lanczos2"
+        backend = (
+            "torch_pixel_coverage_srgb"
+            if backend == "native"
+            else backend + "+torch_pixel_coverage_srgb"
+        )
     elif plan.mode == "upscale_easu":
         try:
             from .output_quality_triton import can_use_output_quality_triton, easu_resize
@@ -289,10 +302,11 @@ def apply_output_quality(
             right = easu_resize(right, plan.target_height, plan.target_width)
             backend = "triton_easu" if backend == "native" else backend + "+triton_easu"
         except Exception:
-            if left.device.type == "mps":
-                left = _mps_upscale(left, plan.target_height, plan.target_width)
-                right = _mps_upscale(right, plan.target_height, plan.target_width)
-                backend = "mps_bicubic" if backend == "native" else backend + "+mps_bicubic"
+            if left.device.type in {"cuda", "mps"}:
+                left = _device_bicubic_upscale(left, plan.target_height, plan.target_width)
+                right = _device_bicubic_upscale(right, plan.target_height, plan.target_width)
+                device_backend = "mps_bicubic" if left.device.type == "mps" else "device_bicubic"
+                backend = device_backend if backend == "native" else backend + "+" + device_backend
             else:
                 left = _torch_easu(left, plan.target_height, plan.target_width)
                 right = _torch_easu(right, plan.target_height, plan.target_width)

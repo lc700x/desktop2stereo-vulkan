@@ -44,9 +44,9 @@ def compute_output_resolution(setting_value, display_mode, input_monitor_index, 
     that same final packing stage.
 
     When ``setting_value`` is Auto, Local Viewer/OpenXR/streamers follow the
-    captured input monitor.  The 3D Monitor path considers both input and stereo
-    output displays and processes at the smaller native size, so a larger output
-    screen does not trigger an expensive pre-upscale before depth/stereo.
+    captured input monitor. Same-monitor Local Viewer stereo output considers
+    the input and output dimensions, avoiding an expensive pre-upscale before
+    depth/stereo when the packed image is presented fullscreen.
     """
     explicit_size = _parse_resolution_size(setting_value)
     if explicit_size is not None:

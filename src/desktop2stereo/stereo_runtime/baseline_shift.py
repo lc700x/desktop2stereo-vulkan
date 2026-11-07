@@ -12,8 +12,8 @@ from .parallax import parallax_debug_info, resolve_parallax_budget
 
 @dataclass(frozen=True)
 class ShiftParams:
-    depth_strength: float = 2.0
-    convergence: float | torch.Tensor = 0.0
+    depth_strength: float = 0.48
+    convergence: float | torch.Tensor = 0.5
     max_disparity_px: float | None = None
     parallax_preset: str = "standard"
     foreground_shift_scale: float = 1.0
@@ -22,6 +22,7 @@ class ShiftParams:
 
 
 _GRID_CACHE: dict[tuple[int, int, int, str, torch.dtype], torch.Tensor] = {}
+SCREEN_EDGE_FADE_PX = 8.0
 _GRID_COMPONENT_CACHE: dict[tuple[int, int, str, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
@@ -111,6 +112,15 @@ def compute_shift_px(depth: torch.Tensor, width: int, params: ShiftParams) -> to
     if fused_shift is None:
         response = _layered_shift_response(depth, budget.depth_response(depth), params)
         fused_shift = response * output_scale
+    depth_width = int(fused_shift.shape[-1])
+    if width > 1 and depth_width > 0:
+        x = torch.arange(depth_width, device=fused_shift.device, dtype=torch.float32) + 0.5
+        x = x * (float(width) / float(depth_width))
+        edge_distance = torch.minimum(x, float(width) - x)
+        fade = (edge_distance / SCREEN_EDGE_FADE_PX).clamp(0.0, 1.0)
+        fade = fade.square() * (3.0 - 2.0 * fade)
+        fade = fade.view(*([1] * (fused_shift.ndim - 1)), depth_width)
+        fused_shift = fused_shift * fade
     scale_bound = max(1.0, params.foreground_shift_scale, params.midground_shift_scale, params.background_shift_scale)
     if isinstance(params.convergence, torch.Tensor):
         bounds = (-abs(output_scale) * scale_bound, abs(output_scale) * scale_bound)

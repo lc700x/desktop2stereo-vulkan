@@ -8,6 +8,7 @@ fully cached. Loading must prefer the local cache with zero network I/O.
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
 from stereo_runtime import depth_provider
 
@@ -90,6 +91,53 @@ def test_load_hf_without_local_first_keeps_online_path(monkeypatch) -> None:
 
     assert result == "online:org/model"
     assert calls == ["org/model"]
+
+
+def test_load_hf_cached_snapshot_survives_missing_hub_refs(monkeypatch) -> None:
+    import transformers
+
+    calls = []
+
+    class FakeModel:
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+    def from_pretrained(model_id, **kwargs):
+        calls.append((model_id, kwargs))
+        return FakeModel()
+
+    monkeypatch.setattr(
+        transformers.AutoModelForDepthEstimation,
+        "from_pretrained",
+        from_pretrained,
+    )
+    monkeypatch.setattr(
+        depth_provider,
+        "_reachable_hf_endpoints",
+        lambda _model_id: (_ for _ in ()).throw(
+            AssertionError("cached snapshot load must not probe the network")
+        ),
+    )
+
+    provider = depth_provider.GenericAutoDepthProvider(
+        model_id="org/model",
+        model_name="model",
+        device="cpu",
+        cache_dir="/tmp/d2s-test-cache",
+        local_files_only=True,
+    )
+    monkeypatch.setattr(
+        "stereo_runtime.model_artifacts.find_local_model_snapshot",
+        lambda model_id, cache_dir: Path("/local/cache/snapshots/revision"),
+    )
+
+    provider.load()
+
+    assert calls[0][0].replace("\\", "/") == "/local/cache/snapshots/revision"
+    assert calls[0][1]["local_files_only"] is True
 
 
 def test_torch_provider_local_files_only_never_probes_network(monkeypatch) -> None:

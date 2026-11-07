@@ -33,6 +33,46 @@ def test_windows_capture_tools_select_event_runner():
         assert runner.__class__.__name__ == "WindowsCaptureEventRunner"
 
 
+def test_gpu_required_windows_capture_selects_cuda_or_rocm(monkeypatch):
+    for hip, expected in ((None, "WindowsCaptureCUDA"), ("7.1", "WindowsCaptureROCm")):
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: True),
+            version=types.SimpleNamespace(hip=hip),
+        )
+        monkeypatch.setitem(sys.modules, "torch", torch)
+
+        runner = create_capture_runner(
+            CaptureConfig(
+                os_name="Windows",
+                capture_tool="DXCamera",
+                gpu_required=True,
+            )
+        )
+
+        assert runner.capture_tool == expected
+
+
+def test_gpu_required_capture_selects_the_installed_vendor_tool(monkeypatch):
+    import types
+
+    for hip, expected in ((None, "WindowsCaptureCUDA"), ("7.1", "WindowsCaptureROCm")):
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: True),
+            version=types.SimpleNamespace(hip=hip),
+        )
+        monkeypatch.setitem(sys.modules, "torch", torch)
+
+        runner = create_capture_runner(
+            CaptureConfig(
+                os_name="Windows",
+                capture_tool="DXCamera",
+                gpu_required=True,
+            )
+        )
+
+        assert runner.capture_tool == expected
+
+
 def test_macos_screencapturekit_selects_sck_backend(monkeypatch):
     _install_fake_backend(monkeypatch, "capture.backends.macos_screencapturekit")
 

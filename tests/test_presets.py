@@ -64,7 +64,9 @@ def test_stereo_presets_map_to_expected_modes():
     assert not hasattr(cinema, "ipd_mm")
     assert not hasattr(cinema, "stereo_scale")
     for config in (traditional, cinema, game, still, debug):
-        assert config.convergence == 0.0
+        assert config.depth_strength == 0.48
+        assert config.convergence == 0.5
+        assert config.parallax_preset == "standard"
         assert config.foreground_shift_scale == 1.0
 
     assert game.backend == "fast_plus"
@@ -73,7 +75,7 @@ def test_stereo_presets_map_to_expected_modes():
     assert game.hole_fill_radius == 0
     assert game.hole_fill_strength == 0.0
     assert cinema.temporal_strength == 0.0
-    assert game.depth_strength < cinema.depth_strength
+    assert game.depth_strength == cinema.depth_strength
 
     assert still.backend == "hq_4k"
     assert still.layers == 3
@@ -99,6 +101,21 @@ def test_preset_output_format_and_overrides():
         stereo_config_for_preset("cinema", overrides={"not_a_field": 1})
 
 
+def test_stereo_presets_keep_moonlight_depth_parameters_across_modes():
+    configs = (
+        stereo_config_for_preset("traditional_fastest"),
+        stereo_config_for_preset("cinema"),
+        stereo_config_for_preset("game_low_latency"),
+        stereo_config_for_preset("still_image_hq"),
+        stereo_config_for_preset("debug_export"),
+    )
+
+    assert {
+        (config.depth_strength, config.convergence, config.parallax_preset)
+        for config in configs
+    } == {(0.48, 0.5, "standard")}
+
+
 def test_openxr_presets_map_shared_stereo_params():
     traditional = openxr_config_for_preset("traditional_fastest")
     openxr = openxr_config_for_preset("game_low_latency", screen_roll=0.5)
@@ -111,10 +128,10 @@ def test_openxr_presets_map_shared_stereo_params():
     assert not hasattr(traditional, "max_shift_ratio")
     assert isinstance(openxr, OpenXRRenderConfig)
     assert openxr.screen_roll == 0.5
-    assert openxr.depth_strength < cinema.depth_strength
-    assert openxr.parallax_preset == "comfort"
+    assert openxr.depth_strength == cinema.depth_strength == 0.48
+    assert openxr.parallax_preset == "standard"
     for config in (traditional, openxr, cinema, openxr_config_for_preset("still_image_hq"), openxr_config_for_preset("debug_export")):
-        assert config.convergence == 0.0
+        assert config.convergence == 0.5
 
 
 def test_auto_mode_classifier_priority():

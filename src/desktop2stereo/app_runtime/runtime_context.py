@@ -17,6 +17,7 @@ from stereo_runtime.presets import normalize_preset
 from stereo_runtime.render_size import RenderSizeConfig
 from stereo_runtime.session_helpers import StereoRuntimeLogger, StereoWarmupTracker
 from utils.breakdown import FPSBreakdown, fps_breakdown_default
+from utils.display_info import enumerate_displays
 from utils.run_mode import resolve_run_mode
 
 
@@ -83,6 +84,10 @@ def _runtime_contract_from_settings(settings: dict, *, os_name: str):
                 settings.get("Lossless Scaling Support", False),
             )
         ),
+        monitor_count=len(enumerate_displays()) if os_name == "Windows" else None,
+        capture_mode=settings.get("Capture Mode"),
+        input_monitor_index=settings.get("Monitor Index"),
+        output_monitor_index=settings.get("Stereo Output"),
     )
     if run_mode_config.run_mode == "OpenXR":
         return "openxr", "openxr_swapchain"
@@ -217,6 +222,13 @@ def create_runtime_context(
             ),
             os_name=os_name,
             fps_provider=capture_fps_provider,
+            gpu_required=(
+                os_name == "Darwin"
+                or (
+                    os_name == "Windows"
+                    and any(token in str(device_info).upper() for token in ("NVIDIA", "AMD", "RADEON"))
+                )
+            ),
         ),
         render_size_config=render_size_config or RenderSizeConfig(),
         application_runtime_target=application_runtime_target,
@@ -248,6 +260,7 @@ def build_capture_callbacks(
         is_hard_idle=is_hard_idle,
         on_session_update=on_session_update,
         on_tick=on_tick,
+        abort=shutdown_event.set,
     )
 
 
@@ -321,4 +334,5 @@ def build_runtime_pipeline_context(
             and len(app_context.capture_config.output_resolution) == 2
             else None
         ),
+        gpu_required=bool(app_context.capture_config.gpu_required),
     )

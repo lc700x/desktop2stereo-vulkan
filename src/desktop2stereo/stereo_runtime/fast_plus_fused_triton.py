@@ -20,9 +20,14 @@ def _shift_from_depth(
     convergence: tl.constexpr,
     max_disparity_px: tl.constexpr,
     depth_strength,
+    x,
+    width: tl.constexpr,
 ):
     depth_value = tl.minimum(tl.maximum(depth_value, 0.0), 1.0)
-    return -(depth_value - convergence) * max_disparity_px * depth_strength * 0.5
+    edge_distance = tl.minimum(x.to(tl.float32) + 0.5, width - x.to(tl.float32) - 0.5)
+    fade = tl.minimum(tl.maximum(edge_distance / 8.0, 0.0), 1.0)
+    fade = fade * fade * (3.0 - 2.0 * fade)
+    return -(depth_value - convergence) * max_disparity_px * depth_strength * 0.5 * fade
 
 
 @triton.jit
@@ -49,7 +54,9 @@ def _sample_eye(
 ):
     tx_i = _clamp_i32(target_x, 0, width - 1)
     depth_value = _load_depth_at(depth, y, tx_i, width, height)
-    shift_px = _shift_from_depth(depth_value, convergence, max_disparity_px, depth_strength)
+    shift_px = _shift_from_depth(
+        depth_value, convergence, max_disparity_px, depth_strength, tx_i, width
+    )
     src_x = target_x.to(tl.float32) + shift_px * eye_sign
     src_x = tl.minimum(tl.maximum(src_x, 0.0), (width - 1) * 1.0)
     x0_f = tl.floor(src_x)
@@ -101,9 +108,15 @@ def _mask_at(
             center_depth = _load_depth_at(depth, yy, xx, width, height)
             right_depth = _load_depth_at(depth, yy, xx + 1, width, height)
             down_depth = _load_depth_at(depth, yy + 1, xx, width, height)
-            center_shift = tl.abs(_shift_from_depth(center_depth, convergence, max_disparity_px, depth_strength))
-            right_shift = tl.abs(_shift_from_depth(right_depth, convergence, max_disparity_px, depth_strength))
-            down_shift = tl.abs(_shift_from_depth(down_depth, convergence, max_disparity_px, depth_strength))
+            center_shift = tl.abs(
+                _shift_from_depth(center_depth, convergence, max_disparity_px, depth_strength, xx, width)
+            )
+            right_shift = tl.abs(
+                _shift_from_depth(right_depth, convergence, max_disparity_px, depth_strength, xx + 1, width)
+            )
+            down_shift = tl.abs(
+                _shift_from_depth(down_depth, convergence, max_disparity_px, depth_strength, xx, width)
+            )
             depth_edge = (tl.abs(right_depth - center_depth) + tl.abs(down_depth - center_depth)) > edge_threshold
             shift_edge = (tl.abs(right_shift - center_shift) + tl.abs(down_shift - center_shift)) > shift_edge_threshold_px
             found = found | (valid & (depth_edge | shift_edge))

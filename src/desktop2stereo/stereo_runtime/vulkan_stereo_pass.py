@@ -12,7 +12,6 @@ from viewer.vulkan_descriptors import (
     VulkanDescriptorArena,
 )
 
-
 VULKAN_HOLE_FILL_BALANCED = 0
 VULKAN_HOLE_FILL_QUALITY = 1
 VULKAN_HOLE_FILL_NONE = 2
@@ -61,9 +60,9 @@ def resolve_vulkan_hole_fill_parameters(
 class VulkanStereoFusedParams:
     """Push constants matching d2s_stereo_fused.comp."""
 
-    depth_strength: float = 2.0
+    depth_strength: float = 0.48
     max_disparity_px: float = 96.0
-    convergence: float = 0.0
+    convergence: float = 0.5
     edge_threshold: float = 0.03
     fill_strength: float = 0.60
     fill_radius: int = 1
@@ -96,9 +95,9 @@ class VulkanStereoFusedParams:
 class VulkanLayeredStereoParams:
     """Push constants matching d2s_stereo_layered.comp."""
 
-    depth_strength: float = 2.0
+    depth_strength: float = 0.48
     max_disparity_px: float = 96.0
-    convergence: float = 0.0
+    convergence: float = 0.5
     edge_threshold: float = 0.04
     fill_strength: float = 1.0
     fill_radius: int = 3
@@ -295,8 +294,6 @@ class VulkanStereoFusedPass:
             self.descriptor_arena.update_storage_buffer(descriptor_set, binding, buffer)
         self._active_descriptor_set = descriptor_set
         effective_params = params or VulkanStereoFusedParams()
-        # Depth is filtered before Vulkan synthesis; keep the shader's legacy
-        # output-AA flag off for every output route.
         if isinstance(effective_params, VulkanLayeredStereoParams):
             self._active_push_constants = effective_params.pack(
                 self.width, self.height, edge_aa_enabled=False)

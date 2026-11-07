@@ -40,8 +40,12 @@ from utils import (
     _get_settings,
     shutdown_event,
 )
-from utils.display_info import resolve_windows_fullscreen_policy
-from utils.run_mode import normalize_run_mode, target_fps_for_run_mode
+from utils.display_info import enumerate_displays, resolve_windows_fullscreen_policy
+from utils.run_mode import (
+    is_local_same_monitor_3d_mode,
+    normalize_run_mode,
+    target_fps_for_run_mode,
+)
 from utils.xr_headset_presets import (
     DEFAULT_XR_HEADSET_MODEL,
     resolve_xr_headset_preset,
@@ -445,10 +449,68 @@ def _openxr_filament_config(
     }
 
 
-def _exclude_local_output_from_capture(settings: dict, *, os_name: str) -> bool:
+def _exclude_local_output_from_capture(
+    settings: dict,
+    *,
+    os_name: str,
+    monitor_count: int | None = None,
+    input_monitor_index: int | None = None,
+    output_monitor_index: int | None = None,
+) -> bool:
+    if monitor_count is None and str(os_name).strip().casefold() == "windows":
+        monitor_count = len(enumerate_displays())
+    return is_local_same_monitor_3d_mode(
+        settings.get("Run Mode", "Local Viewer"),
+        os_name=os_name,
+        monitor_count=monitor_count,
+        capture_mode=settings.get("Capture Mode"),
+        input_monitor_index=input_monitor_index,
+        output_monitor_index=output_monitor_index,
+    )
+
+
+def _resolve_local_output_monitor_index(
+    input_monitor_index: int,
+    output_monitor_index: int | None,
+) -> int:
+    return int(
+        input_monitor_index
+        if output_monitor_index is None
+        else output_monitor_index
+    )
+
+
+def _local_viewer_cursor_passthrough(
+    settings: dict,
+    *,
+    os_name: str,
+    input_monitor_index: int,
+    output_monitor_index: int,
+    exclude_from_capture: bool,
+) -> bool:
+    if exclude_from_capture:
+        return True
     return (
-        str(os_name).strip().lower() == "windows"
-        and settings.get("Run Mode", "Local Viewer") == "3D Monitor"
+        str(os_name).strip().casefold() == "windows"
+        and str(settings.get("Capture Mode", "")).strip().casefold() == "window"
+        and int(input_monitor_index) == int(output_monitor_index)
+    )
+
+
+def _should_use_monitor_window_exclusion(
+    settings: dict,
+    *,
+    os_name: str,
+    input_monitor_index: int,
+    output_monitor_index: int | None,
+    monitor_count: int | None = None,
+) -> bool:
+    return _exclude_local_output_from_capture(
+        settings,
+        os_name=os_name,
+        monitor_count=monitor_count,
+        input_monitor_index=input_monitor_index,
+        output_monitor_index=output_monitor_index,
     )
 
 
@@ -610,6 +672,9 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         settings.get("Run Mode", "Local Viewer")
     )
     if configured_run_mode in {"Local Viewer", "Viewer"} and platform.system() == "Darwin":
+        if bool(settings.get("CoreML", False)):
+            os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")
+            os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")
         # Local Viewer presents to a physical display; skip the headset-tier
         # upscale chain (see output_sampling_plan_for_config).
         os.environ.setdefault("D2S_CAP_OUTPUT_UPSCALE", "1")
@@ -625,7 +690,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         # preprocess would read as blur once packed at input res, so the
         # fused path runs the pipeline at full render size. Explicit user
         # overrides of either env stay authoritative.
-        _mac_viewer = os.environ.get("D2S_MAC_VIEWER") or "vulkan"
+        _mac_viewer = os.environ.get("D2S_MAC_VIEWER") or "metal"
         _vk_fused_on = os.environ.get("D2S_VK_FUSED_WARP", "1") not in {
             "0", "false", "off",
         }
@@ -645,27 +710,13 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         # softened 0.75x depth made object-edge parallax flicker vs v2.5.0,
         # so the Local Viewer runs full export resolution unless this is
         # explicitly set. "0"/"false"/"off" disable it explicitly as well.
-        # Default macOS viewer is now Vulkan (fused Metal warp-pack
-        # kernel beat the CAMetalLayer path in round-24 A/Bs:
-        # 46.7 vs 45.5-45.9 fps). D2S_MAC_VIEWER=metal restores it.
-        os.environ.setdefault("D2S_MAC_VIEWER", "vulkan")
-        # Pack the presentation frame on the runtime thread (queue drained)
-        # so viewers memcpy instead of syncing MPS mid-present.
-        os.environ.setdefault("D2S_VIEWER_HOST_FRAME", "1")
+        # Keep native ScreenCaptureKit/CoreML output resident through Metal presentation.
+        os.environ.setdefault("D2S_MAC_VIEWER", "metal")
+        # Keep the presentation image in GPU memory for the GPU-only pipeline.
+        os.environ.setdefault("D2S_VIEWER_HOST_FRAME", "0")
         # Wrap every SCK frame as an owned CVPixelBuffer+CVMetalTexture so
         # the warp viewer can sample the capture directly (zero-copy).
         os.environ.setdefault("D2S_SCK_ZEROCOPY_TEX", "1")
-        # Native Core ML consumes the IOSurface directly. The capture callback
-        # therefore skips its CPU base-address read; it re-materializes only
-        # if the bridge capability preflight fails.
-        if bool(settings.get("CoreML", False)):
-            # Keep Core ML depth inference off the Apple GPU by default. A
-            # warmed 60 Hz Local Viewer comparison found CPU+ANE slightly
-            # improved throughput and reduced pack/latency outliers while
-            # leaving Metal available for stereo synthesis and presentation.
-            # setdefault preserves an explicit user-selected compute unit.
-            os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")
-            os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")
     elif configured_run_mode in {"Local Viewer", "Viewer"}:
         # The Vulkan local viewer consumes GPU RGBA8 directly.  Pack on the
         # producer GPU so the external buffer transfers 1 byte/channel rather
@@ -714,6 +765,49 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         configured_run_mode,
         DEVICE,
     )
+    input_monitor_index = int(MONITOR_INDEX)
+    output_monitor_index = (
+        int(STEREO_DISPLAY_INDEX)
+        if bool(STEREO_DISPLAY_SELECTION)
+        else None
+    )
+    effective_output_monitor_index = _resolve_local_output_monitor_index(
+        input_monitor_index,
+        output_monitor_index,
+    )
+    window_capture_exclusion_active = False
+    runtime_capture_tool = CAPTURE_TOOL
+    if _should_use_monitor_window_exclusion(
+        settings,
+        os_name=OS_NAME,
+        input_monitor_index=input_monitor_index,
+        output_monitor_index=effective_output_monitor_index,
+    ):
+        try:
+            from gui.capture_sources import get_default_windows_capture_tool
+
+            runtime_capture_tool = get_default_windows_capture_tool()
+            if runtime_capture_tool not in {
+                "WindowsCaptureROCm",
+                "WindowsCaptureCUDA",
+            } and CAPTURE_TOOL in {"WindowsCaptureROCm", "WindowsCaptureCUDA"}:
+                runtime_capture_tool = CAPTURE_TOOL
+            window_capture_exclusion_active = runtime_capture_tool in {
+                "WindowsCaptureROCm",
+                "WindowsCaptureCUDA",
+            }
+            if window_capture_exclusion_active:
+                print(
+                    "[WindowCapture] Same-monitor Local Viewer uses "
+                    f"{runtime_capture_tool} with session window exclusion",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                "[WindowCapture] Could not resolve same-monitor GPU capture; "
+                f"using configured capture tool ({type(exc).__name__})",
+                flush=True,
+            )
     if effective_render_size_config is not RENDER_SIZE_CONFIG:
         print(
             "[Main] Local Viewer v2.5 source path: "
@@ -743,13 +837,25 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         window_title=WINDOW_TITLE,
         capture_mode=CAPTURE_MODE,
         monitor_index=MONITOR_INDEX,
-        capture_tool=CAPTURE_TOOL,
+        capture_tool=runtime_capture_tool,
         os_name=OS_NAME,
         run_mode=RUN_MODE,
         depth_strength=DEPTH_STRENGTH,
         convergence=CONVERGENCE,
         capture_fps_provider=adaptive_capture_rate.current_fps,
     )
+    if context.capture_config.gpu_required:
+        os.environ["D2S_GPU_IMAGE_PIPELINE_REQUIRED"] = "1"
+        if OS_NAME == "Darwin":
+            # Strict mode must use the native Metal warp/pack route. The deferred
+            # shader-warp compatibility path copies depth through CPU memory.
+            os.environ["D2S_METAL_SHADER_WARP"] = "0"
+            os.environ["D2S_VIEWER_HOST_FRAME"] = "0"
+    if context.capture_config.gpu_required and configured_run_mode == "MJPEG Streamer":
+        raise RuntimeError(
+            "MJPEG streaming is unavailable on this GPU-only runtime because "
+            "the bundled JPEG encoder runs on the CPU"
+        )
     nvfruc_calibration = None
     if context.nvfruc_frame_generation:
         nvfruc_probe = probe_nvfruc()
@@ -812,6 +918,13 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         show_fps=bool(SHOW_FPS),
         display_fit_mode=settings.get("Display Fit Mode", "contain"),
     )
+    if window_capture_exclusion_active:
+        context.capture_config = replace(
+            context.capture_config,
+            excluded_window_handles_provider=callbacks.capture_window_handles,
+            on_window_exclusion_ready=callbacks.restore_capture_window_visibility,
+            on_window_exclusion_fallback=callbacks.apply_global_capture_exclusion,
+        )
 
     low_sbs_report_count = 0
 
@@ -958,9 +1071,29 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         ),
     )
 
+    defer_capture_start_until_viewer_ready = bool(
+        window_capture_exclusion_active
+        and OS_NAME == "Windows"
+        and str(RUN_MODE).strip().casefold() == "viewer"
+    )
+    capture_windows_initialized = (
+        threading.Event() if defer_capture_start_until_viewer_ready else None
+    )
+    capture_start_gate = threading.Event()
+    if not defer_capture_start_until_viewer_ready:
+        capture_start_gate.set()
+
+    def _run_capture_session() -> None:
+        while not capture_start_gate.wait(0.05):
+            if shutdown_event.is_set():
+                return
+        if not shutdown_event.is_set():
+            CaptureSessionLoop(context.capture_config, capture_callbacks).run(
+                shutdown_event
+            )
+
     capture_thread = threading.Thread(
-        target=CaptureSessionLoop(context.capture_config, capture_callbacks).run,
-        args=(shutdown_event,),
+        target=_run_capture_session,
         name="VulkanCapture",
         daemon=True,
     )
@@ -1163,6 +1296,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     on_calibration_fps=adaptive_capture_rate.set_calibration_limit,
                     calibration_fingerprint=build_calibration_fingerprint(settings),
                     on_stream_fps_selected=adaptive_capture_rate.finish_stream_probe,
+                    gpu_required=bool(context.capture_config.gpu_required),
                 )
                 backend_decision = resolve_network_video_backend(
                     configured_run_mode,
@@ -1278,6 +1412,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     fit_mode=stream_fit_mode,
                     input_size=stream_input_size,
                     on_stream_fps_selected=adaptive_capture_rate.finish_stream_probe,
+                    gpu_required=bool(context.capture_config.gpu_required),
                 )
             callbacks.set_stream_output(network_output)
             network_output.start()
@@ -1285,6 +1420,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 runtime_q=presentation_q,
                 shutdown_event=shutdown_event,
                 output=network_output,
+                gpu_required=bool(context.capture_config.gpu_required),
                 source_stat_inc=callbacks.source_stat_inc,
                 show_fps_provider=callbacks.show_fps,
                 on_sbs_fps=(
@@ -1311,11 +1447,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 run_vulkan_local_viewer,
             )
 
-            selected_monitor = (
-                int(STEREO_DISPLAY_INDEX)
-                if bool(STEREO_DISPLAY_SELECTION)
-                else int(MONITOR_INDEX)
-            )
+            selected_monitor = effective_output_monitor_index
             fullscreen_policy = "exclusive"
             fullscreen_target = None
             if (
@@ -1348,58 +1480,36 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     f"source={target_source} mode={fullscreen_policy}",
                     flush=True,
                 )
+            if window_capture_exclusion_active:
+                fullscreen_policy = "capture_compatible"
+                print(
+                    "[VulkanLocalViewer] WGC exclusion on the captured monitor uses "
+                    "DWM-composited fullscreen for remote desktop visibility",
+                    flush=True,
+                )
             exclude_from_capture = _exclude_local_output_from_capture(
                 settings,
                 os_name=OS_NAME,
+                input_monitor_index=input_monitor_index,
+                output_monitor_index=effective_output_monitor_index,
             )
-            # Enable cursor passthrough when the SBS fullscreen window covers
-            # the same display that is being captured. This applies to
-            # 3D Monitor single-display (no second output) and to Window capture
-            # when the selected window lives on the chosen stereo-output
-            # monitor. The window is made click-through (WS_EX_TRANSPARENT /
-            # GLFW_MOUSE_PASSTHROUGH) so the system cursor stays visible over
-            # the stereo image and input reaches the underlying desktop.
-            cursor_passthrough = False
-            capture_mode = str(settings.get("Capture Mode", "")).strip()
-            if exclude_from_capture:
-                try:
-                    no_second_output = not bool(STEREO_DISPLAY_SELECTION) or int(
-                        STEREO_DISPLAY_INDEX
-                    ) == int(MONITOR_INDEX)
-                    if no_second_output:
-                        cursor_passthrough = True
-                    else:
-                        try:
-                            import mss
-
-                            with mss.mss() as sct:
-                                if len(sct.monitors) - 1 <= 1:
-                                    cursor_passthrough = True
-                        except Exception:
-                            pass
-                except Exception:
-                    cursor_passthrough = True
-            # Window capture on the same monitor as the stereo output also
-            # needs passthrough even when a second display exists (Local Viewer
-            # or 3 to 2 case). The monitor index for Window mode is the window's
-            # display (via get_monitor_index_for_point), so equality means the
-            # window and the SBS output share one screen.
-            if not cursor_passthrough and capture_mode.casefold() == "window":
-                try:
-                    if bool(STEREO_DISPLAY_SELECTION) and int(
-                        STEREO_DISPLAY_INDEX
-                    ) == int(MONITOR_INDEX):
-                        cursor_passthrough = True
-                except Exception:
-                    pass
-            if cursor_passthrough:
-                reason = (
-                    "single-display 3D Monitor mode"
-                    if exclude_from_capture
-                    else "window capture on stereo-output display"
+            cursor_passthrough = _local_viewer_cursor_passthrough(
+                settings,
+                os_name=OS_NAME,
+                input_monitor_index=input_monitor_index,
+                output_monitor_index=effective_output_monitor_index,
+                exclude_from_capture=exclude_from_capture,
+            )
+            hide_cursor_overlay = cursor_passthrough
+            if hide_cursor_overlay:
+                context.capture_config = replace(
+                    context.capture_config,
+                    cursor_capture=False,
                 )
+            if cursor_passthrough:
                 print(
-                    f"[VulkanLocalViewer] Cursor passthrough enabled for {reason}",
+                    "[VulkanLocalViewer] Cursor passthrough enabled for "
+                    "same-monitor Local Viewer; drawing the native cursor overlay",
                     flush=True,
                 )
             # tex_w,tex_h in legacy viewer: original capture size before packing,
@@ -1451,12 +1561,23 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 window_preview=bool(settings.get("Window Preview", False)),
                 preview_monitor_index=max(0, int(MONITOR_INDEX)),
                 exclude_from_capture=exclude_from_capture,
+                on_capture_window_exclusion=(
+                    callbacks.update_capture_window_exclusion
+                    if window_capture_exclusion_active
+                    else None
+                ),
+                on_capture_windows_initialized=(
+                    capture_windows_initialized.set
+                    if capture_windows_initialized is not None
+                    else None
+                ),
                 show_taskbar_button=(
                     OS_NAME == "Windows"
-                    and configured_run_mode in {"Local Viewer", "3D Monitor"}
+                    and configured_run_mode == "Local Viewer"
                     and bool(settings.get("LSFG Support", False))
                 ),
                 cursor_passthrough=cursor_passthrough,
+                hide_cursor_overlay=hide_cursor_overlay,
                 input_size=input_size,
                 capture_mode=str(settings.get("Capture Mode", "Monitor")),
                 window_title=str(settings.get("Window Title", "") or "") if str(settings.get("Capture Mode", "")).casefold() == "window" else None,
@@ -1570,6 +1691,26 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     daemon=True,
                 )
                 local_viewer_thread.start()
+                if capture_windows_initialized is not None:
+                    deadline = time.monotonic() + 15.0
+                    while (
+                        not capture_windows_initialized.is_set()
+                        and local_viewer_thread.is_alive()
+                        and not shutdown_event.is_set()
+                        and time.monotonic() < deadline
+                    ):
+                        capture_windows_initialized.wait(0.05)
+                    if not capture_windows_initialized.is_set():
+                        shutdown_event.set()
+                        capture_start_gate.set()
+                        raise RuntimeError(
+                            "Single-display Local Viewer output windows were not initialized before WGC capture"
+                        )
+                    print(
+                        "[WindowCapture] Viewer HWNDs registered before initial WGC session",
+                        flush=True,
+                    )
+                    capture_start_gate.set()
         print(
             f"Desktop2Stereo Vulkan runtime started: mode={RUN_MODE} device={DEVICE_INFO}",
             flush=True,

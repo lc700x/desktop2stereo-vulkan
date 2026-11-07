@@ -523,10 +523,12 @@ class DirectSbsOutputConsumer:
         on_sbs_fps: Callable[..., Any] | None = None,
         fps_report_interval: float = 5.0,
         clock: Callable[[], float] = time.perf_counter,
+        gpu_required: bool = False,
     ) -> None:
         self.runtime_q = runtime_q
         self.shutdown_event = shutdown_event
         self.output = output
+        self.gpu_required = bool(gpu_required)
         self.source_stat_inc = source_stat_inc
         self.show_fps_provider = show_fps_provider
         self.on_sbs_fps = on_sbs_fps
@@ -538,6 +540,7 @@ class DirectSbsOutputConsumer:
         self._fps_convert_seconds = 0.0
         self._fps_submit_seconds = 0.0
         self._fps_native_pack_seconds = 0.0
+        self._fps_queue_latency_ms: list[float] = []
         # Pass aspect config to converter for CPU fallback path
         self._frame_converter = RuntimeSbsRgbConverter(
             copy_output=not bool(getattr(output, "synchronous_submit", False)),
@@ -670,6 +673,13 @@ class DirectSbsOutputConsumer:
             if self._fps_sbs_frames
             else 0.0
         )
+        queue_samples = sorted(self._fps_queue_latency_ms)
+        queue_p50_ms = statistics.median(queue_samples) if queue_samples else 0.0
+        queue_p95_index = min(
+            len(queue_samples) - 1,
+            math.ceil(len(queue_samples) * 0.95) - 1,
+        )
+        queue_p95_ms = queue_samples[queue_p95_index] if queue_samples else 0.0
         if self.on_sbs_fps is not None:
             self.on_sbs_fps(sbs_fps, frame_count=self._fps_sbs_frames)
         observe_calibration = getattr(self.output, "observe_calibration_window", None)
@@ -694,7 +704,8 @@ class DirectSbsOutputConsumer:
                 f"network_bitrate={network_bitrate:.1f} Mbps "
                 f"submitted={submitted_fps:.1f} "
                 f"convert_ms={convert_ms:.1f} submit_ms={submit_ms:.1f} "
-                f"native_pack_ms={native_pack_ms:.1f}",
+                f"native_pack_ms={native_pack_ms:.1f} "
+                f"queue_p50_ms={queue_p50_ms:.1f} queue_p95_ms={queue_p95_ms:.1f}",
                 flush=True,
             )
         self._fps_sbs_frames = 0
@@ -702,6 +713,7 @@ class DirectSbsOutputConsumer:
         self._fps_convert_seconds = 0.0
         self._fps_submit_seconds = 0.0
         self._fps_native_pack_seconds = 0.0
+        self._fps_queue_latency_ms.clear()
         self._fps_started = now
 
     def run(self) -> None:
@@ -713,6 +725,20 @@ class DirectSbsOutputConsumer:
             try:
                 runtime_result, _capture_timestamp = item
                 self._fps_sbs_frames += 1
+                capture_timestamp = getattr(
+                    runtime_result, "capture_timestamp", _capture_timestamp
+                )
+                try:
+                    queue_latency_ms = max(
+                        0.0, (time.perf_counter() - float(capture_timestamp)) * 1000.0
+                    )
+                except (TypeError, ValueError):
+                    queue_latency_ms = None
+                if queue_latency_ms is not None:
+                    self._fps_queue_latency_ms.append(queue_latency_ms)
+                    debug_info = getattr(runtime_result, "debug_info", None)
+                    if isinstance(debug_info, dict):
+                        debug_info["stream_queue_latency_ms"] = queue_latency_ms
                 submit_runtime_result = getattr(
                     self.output, "submit_runtime_result", None
                 )
@@ -753,6 +779,10 @@ class DirectSbsOutputConsumer:
                     self._report_fps_if_due()
                     continue
                 if native_stream_frame is not None:
+                    if self.gpu_required and not callable(submit_runtime_result):
+                        raise RuntimeError(
+                            "this stream sink cannot encode the native GPU frame"
+                        )
                     # Native CoreML prediction runs on the pipeline thread;
                     # keep the expensive Metal warp on this independent output
                     # thread so the next depth prediction can use another
@@ -836,6 +866,8 @@ class DirectSbsOutputConsumer:
                 ) is not None and getattr(right_eye, "context", None) is not None:
                     handled = submit_vulkan_stereo(runtime_result)
                     if handled is False:
+                        if self.gpu_required:
+                            raise RuntimeError("GPU Vulkan stream submission failed")
                         self.source_stat_inc("runtime_output_vulkan_fallback")
                         self._report_fps_if_due()
                         continue
@@ -849,6 +881,8 @@ class DirectSbsOutputConsumer:
                 ) is not None:
                     handled = submit_vulkan_stereo(runtime_result)
                     if handled is False:
+                        if self.gpu_required:
+                            raise RuntimeError("deferred GPU Vulkan stream submission failed")
                         self.source_stat_inc("runtime_output_vulkan_fallback")
                         self._report_fps_if_due()
                         continue
@@ -866,6 +900,8 @@ class DirectSbsOutputConsumer:
                 if native_surface is not None and callable(submit_native_surface):
                     handled = submit_native_surface(native_surface)
                     if handled is False:
+                        if self.gpu_required:
+                            raise RuntimeError("native GPU surface submission failed")
                         # The native surface may be video-only (for example Intel
                         # oneVPL). Preserve configured audio by sending this frame
                         # through the shared QSV/FFmpeg path instead of dropping it.
@@ -903,6 +939,10 @@ class DirectSbsOutputConsumer:
                     submit_cuda_frame(cuda_frame)
                     self._fps_submit_seconds += self._clock() - convert_started
                 else:
+                    if self.gpu_required:
+                        raise RuntimeError(
+                            "GPU stream encoder has no compatible device-frame submission path"
+                        )
                     convert_started = self._clock()
                     frame = self._frame_converter.convert(runtime_result)
                     self._fps_convert_seconds += self._clock() - convert_started
@@ -1001,6 +1041,10 @@ class _PyNvDirectSbsOutputMixin:
         # base implementation instead of starting the vendor encoder.
         if self._calibration_controller is not None:
             return FfmpegDirectSbsOutput._start_ffmpeg(self, width, height)
+        if getattr(self, "gpu_required", False) and self.stereo_mix_device and not self.stereo_mix_device.casefold().startswith(("no ", "none", "null")):
+            raise RuntimeError(
+                "NativeNVENC audio muxing is unavailable without a host-frame encoder"
+            )
         # PyNvVideoCodec exposes encoded Annex-B bytes without packet PTS/DTS.
         # FFmpeg cannot reliably repair that metadata during stream-copy RTSP
         # muxing. With audio enabled, use the shared Vulkan/FFmpeg A/V path,
@@ -1116,6 +1160,10 @@ class _PyNvDirectSbsOutputMixin:
         self._frame_size = (width, height)
 
     def _fallback_to_ffmpeg(self, frame: Any, reason: Exception) -> None:
+        if getattr(self, "gpu_required", False):
+            raise RuntimeError(
+                f"GPU-only stream encoder failed: {type(reason).__name__}: {reason}"
+            ) from reason
         if self._native_nvenc_active:
             print(
                 f"[DirectSbsStream] NativeNVENC runtime failure: {reason}; "
@@ -1192,7 +1240,10 @@ class MjpegDirectSbsOutput:
         fit_mode: str = "contain",
         input_size: Tuple[int, int] | None = None,
         on_stream_fps_selected: Callable[[int], Any] | None = None,
+        gpu_required: bool = False,
     ) -> None:
+        if gpu_required:
+            raise RuntimeError("MJPEG output requires CPU JPEG encoding and is unavailable in GPU-only mode")
         self.port = max(1, int(port))
         self.requested_fps = max(1, int(fps))
         self.fps = self.requested_fps
@@ -1201,6 +1252,7 @@ class MjpegDirectSbsOutput:
         self.fit_mode = str(fit_mode or "contain").strip()
         self.input_size = input_size
         self._on_stream_fps_selected = on_stream_fps_selected
+        self.gpu_required = bool(gpu_required)
 
         profile = EncoderProfile(
             codec="mjpeg",
@@ -1302,6 +1354,7 @@ class FfmpegDirectSbsOutput:
         on_calibration_fps: Callable[[int], Any] | None = None,
         calibration_fingerprint: dict[str, str] | None = None,
         on_stream_fps_selected: Callable[[int], Any] | None = None,
+        gpu_required: bool = False,
     ) -> None:
         self.base_dir = Path(base_dir)
         self.protocol = str(protocol or "RTMP").strip().upper()
@@ -1315,6 +1368,7 @@ class FfmpegDirectSbsOutput:
         self._soundcard_audio: SoundcardLoopbackSender | None = None
         self.os_name = str(os_name or platform.system())
         self.prefer_nvenc = bool(prefer_nvenc)
+        self.gpu_required = bool(gpu_required)
         self.display_mode = str(display_mode or "Half-SBS").strip()
         self.fit_mode = str(fit_mode or "contain").strip()
         self.input_size = input_size
@@ -1648,14 +1702,15 @@ class FfmpegDirectSbsOutput:
                     (f"{codec}_qsv", "Intel Quick Sync"),
                     (f"{codec}_vaapi", "VAAPI"),
                 ])
-        software_encoder = "libx265" if self.use_hevc else "libx264"
-        candidates.append((software_encoder, "software"))
+        if not getattr(self, "gpu_required", False):
+            software_encoder = "libx265" if self.use_hevc else "libx264"
+            candidates.append((software_encoder, "software"))
         return candidates
 
     def _select_video_encoder(self, width: int, height: int) -> str:
         codec_label = "H.265/HEVC" if self.use_hevc else "H.264"
         candidates = self._encoder_candidates()
-        for encoder, label in candidates[:-1]:
+        for encoder, label in candidates:
             supported = (
                 self._probe_nvenc(width, height)
                 if encoder.endswith("_nvenc")
@@ -1668,6 +1723,10 @@ class FfmpegDirectSbsOutput:
                     flush=True,
                 )
                 return encoder
+        if getattr(self, "gpu_required", False):
+            raise RuntimeError(
+                f"no GPU video encoder supports {codec_label} at {width}x{height}"
+            )
         software_encoder, _ = candidates[-1]
         self._encoder_selection_reason = "software fallback"
         print(
@@ -2998,6 +3057,8 @@ class FfmpegDirectSbsOutput:
         self._frame_size = None
 
     def submit_frame(self, frame: np.ndarray) -> None:
+        if getattr(self, "gpu_required", False):
+            raise RuntimeError("GPU-only stream output cannot accept host RGB frames")
         height, width = frame.shape[:2]
         size = (int(width), int(height))
         self._apply_pending_audio_delay()
@@ -3559,6 +3620,8 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
         self._native_mux_process = None
 
     def _new_host_fallback(self) -> FfmpegDirectSbsOutput:
+        if getattr(self, "gpu_required", False):
+            raise RuntimeError("GPU-only streaming does not permit host-frame fallback")
         fallback = FfmpegDirectSbsOutput(
             base_dir=self.base_dir,
             protocol=self.protocol,
@@ -3600,6 +3663,7 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
             calibration_port=self.calibration_port,
             on_calibration_fps=self._on_calibration_fps,
             calibration_fingerprint=None,
+            gpu_required=bool(getattr(self, "gpu_required", False)),
         )
         fallback.server_process = self.server_process
         return fallback
@@ -3623,6 +3687,7 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
             calibration_port=self.calibration_port,
             on_calibration_fps=self._on_calibration_fps,
             calibration_fingerprint=None,
+            gpu_required=bool(getattr(self, "gpu_required", False)),
         )
         fallback.server_process = self.server_process
         return fallback
@@ -3680,6 +3745,11 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
                 height, width = int(rgb.shape[0]), int(rgb.shape[1])
             backend = OpenGLFallbackBackend(width, height, pbo_count=3)
             caps = backend.capabilities
+            if getattr(self, "gpu_required", False) and bool(getattr(caps, "gpu_to_cpu", True)):
+                backend.close()
+                raise RuntimeError(
+                    "OpenGL stream fallback requires a GPU-to-CPU image readback"
+                )
             print(
                 f"[OpenGLStream] fallback candidate: context={caps.context_api} "
                 f"texture={caps.texture_format} framebuffer="
@@ -3782,6 +3852,10 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
                     "is available for the vendor-first stage"
                 )
             else:
+                if getattr(self, "gpu_required", False):
+                    raise RuntimeError(
+                        "GPU-only stream has no supported encoder or resource interop"
+                    )
                 # OpenGL has no portable resource-sharing ABI with QSV,
                 # VAAPI, or VideoToolbox. Once the context/PBO/fence probe
                 # succeeds, keep the stable host-upload path and do not upload
@@ -3829,6 +3903,10 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
             return False
 
     def _fallback_to_host(self, frame: Any, reason: Exception) -> None:
+        if getattr(self, "gpu_required", False):
+            raise RuntimeError(
+                f"GPU-only Vulkan stream failed: {type(reason).__name__}: {reason}"
+            ) from reason
         print(
             f"[VulkanStream] native GPU path failed: {type(reason).__name__}: {reason}; "
             "fallback=stable advanced FFmpeg path",
@@ -3857,6 +3935,8 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
         CUDA path, then selects the stable host encoder when no GPU interop is
         available.
         """
+        if getattr(self, "gpu_required", False):
+            raise RuntimeError("GPU-only Vulkan output cannot accept host RGB frames")
         fallback = getattr(self, "_host_fallback", None)
         if fallback is not None:
             fallback.submit_frame(frame)
@@ -4435,6 +4515,10 @@ class _AmdAmfDirectSbsOutputMixin:
             process.stdin.flush()
 
     def _fallback_to_ffmpeg(self, frame, reason: Exception) -> None:
+        if getattr(self, "gpu_required", False):
+            raise RuntimeError(
+                f"GPU-only AMD AMF stream failed: {type(reason).__name__}: {reason}"
+            ) from reason
         print(
             f"[DirectSbsStream] AMD native GPU path unavailable: {reason}; "
             "falling back to FFmpeg hardware/software encoding",

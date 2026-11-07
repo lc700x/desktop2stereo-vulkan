@@ -19,6 +19,11 @@ class CaptureConfig:
     device_id: int | None = None
     os_name: str | None = None
     fps_provider: Callable[[], int] | None = None
+    gpu_required: bool = False
+    cursor_capture: bool = True
+    excluded_window_handles_provider: Callable[[], tuple[int, ...]] | None = None
+    on_window_exclusion_ready: Callable[[], None] | None = None
+    on_window_exclusion_fallback: Callable[[str], None] | None = None
 
 
 class FrameCopyMode(Enum):

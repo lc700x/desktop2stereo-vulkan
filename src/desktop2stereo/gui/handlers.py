@@ -19,7 +19,10 @@ from streaming.audio import (
 )
 from streaming.stream_calibration import automatic_peak_bitrate_mbps
 from streaming.wasapi_audio import query_soundcard_loopback_devices
-from utils.run_mode import target_fps_setting_key
+from utils.run_mode import (
+    is_local_same_monitor_3d_mode,
+    target_fps_setting_key,
+)
 from utils.xr_headset_presets import display_to_xr_headset, xr_headset_options, xr_headset_to_display
 from xr_viewer.settings_menu import OPENXR_RENDER_SCALE_MAX, OPENXR_RENDER_SCALE_MIN
 from . import devices as devices_module
@@ -240,7 +243,7 @@ class GUIHandlerMixin:
     def _sync_lsfg_visibility(self):
         self.lsfg_cb.visible = (
             OS_NAME == "Windows"
-            and self.run_mode_key in {"Local Viewer", "3D Monitor"}
+            and self.run_mode_key == "Local Viewer"
         )
         self.lsfg_cb.disabled = False
 
@@ -482,8 +485,7 @@ class GUIHandlerMixin:
         self._sync_capture_mode_visibility()
         if self.capture_mode_key == "Window":
             self.refresh_window_list()
-        self.update_stereo_monitor_menu()
-        self._fit_window_to_content()
+        self._sync_visibility()
 
     def on_window_selected(self, e):
         label = e.control.value if e else self.window_dd.value
@@ -511,13 +513,12 @@ class GUIHandlerMixin:
 
     def _on_monitor_change(self, e):
         self._missing_monitor_identity = False
-        self.update_stereo_monitor_menu()
-        self._fit_window_to_content()
+        self._sync_visibility()
         self.set_status(f"{UI_MESSAGES[self.locale]['Selected input monitor:']} {e.control.value}")
 
     def _on_stereo_monitor_change(self, _e):
         self._missing_stereo_output_identity = False
-        self._fit_window_to_content()
+        self._sync_visibility()
 
     # ── run mode / visibility handlers ──
 
@@ -564,7 +565,6 @@ class GUIHandlerMixin:
             texts.get("RTMP Streamer", "RTMP Streamer"): "RTMP Streamer",
             texts.get("Moonlight Streamer", "Moonlight Streamer"): "Moonlight Streamer",
             texts.get("MJPEG Streamer", "MJPEG Streamer"): "MJPEG Streamer",
-            texts.get("3D Monitor", "3D Monitor"): "3D Monitor",
         }
         self.run_mode_key = mode_map.get(label, "Local Viewer")
         self._config["Run Mode"] = self.run_mode_key
@@ -1295,11 +1295,11 @@ class GUIHandlerMixin:
         advanced = bool(getattr(self, "advanced_device_cb", None) and self.advanced_device_cb.value)
         for row in getattr(self, "_advanced_device_rows", []):
             row.visible = advanced
-        show_timing = advanced and mode in ["Local Viewer", "3D Monitor", "OpenXR Link"]
+        show_timing = advanced and mode in ["Local Viewer", "OpenXR Link"]
         show_enhance = False
         self.row6b.visible = show_timing
         self.row6c.visible = show_enhance
-        show_render_size = advanced and mode in ["Local Viewer", "3D Monitor", "OpenXR Link"]
+        show_render_size = advanced and mode in ["Local Viewer", "OpenXR Link"]
         self._update_render_size_control_visibility(show_render_size)
         show_openxr_resolution = advanced and mode == "OpenXR Link"
         self.row6g.visible = show_openxr_resolution
@@ -1308,8 +1308,8 @@ class GUIHandlerMixin:
         self.target_fps_label.visible = show_timing
         self.target_fps_dd.visible = show_timing
         self.xr_preview_cb.visible = advanced and mode == "OpenXR Link"
-        self.local_vsync_cb.visible = advanced and mode in ["Local Viewer", "3D Monitor"]
-        self.window_preview_cb.visible = advanced and mode in ["Local Viewer", "3D Monitor"]
+        self.local_vsync_cb.visible = advanced and mode == "Local Viewer"
+        self.window_preview_cb.visible = advanced and mode == "Local Viewer"
         self.upscaler_label.visible = show_enhance
         self.upscaler_dd.visible = show_enhance
         self.upscaler_sharpness_label.visible = show_enhance
@@ -1322,7 +1322,6 @@ class GUIHandlerMixin:
             "Local Viewer": texts["Local Viewer"], "OpenXR Link": texts["OpenXR Link"],
             "RTMP Streamer": texts["RTMP Streamer"], "MJPEG Streamer": texts["MJPEG Streamer"],
             "Moonlight Streamer": texts.get("Moonlight Streamer", "Moonlight Streamer"),
-            "3D Monitor": texts["3D Monitor"],
         }
         self.run_mode_dd.value = mode_reverse.get(mode, texts["Local Viewer"])
         streamer_modes = {"MJPEG Streamer", "RTMP Streamer", "Moonlight Streamer"}
@@ -1348,20 +1347,37 @@ class GUIHandlerMixin:
             if callable(refresh_controls_button):
                 refresh_controls_button()
         self.row7b.visible = is_openxr
-        display_fit_visible = mode in ["Local Viewer", "3D Monitor"]
+        display_fit_visible = mode == "Local Viewer"
         if is_openxr:
             self.showfps_cb.visible = False
         else:
             self.showfps_cb.visible = True
         self.display_fit_dd.visible = display_fit_visible
-        if mode == "3D Monitor":
-            self.display_mode_dd.options = ["Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB"]
-        else:
-            self.display_mode_dd.options = [
-                "Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB",
-                "Depth Map", "Anaglyph", "Interleaved", "Mono", "Leia"]
         mon_count = self._get_monitor_count()
-        stereo_full = mode in ["Local Viewer", "3D Monitor"] and mon_count > 1
+        input_monitor_index = self.monitor_label_to_index.get(self.monitor_dd.value)
+        output_monitor_index = self.monitor_label_to_index.get(
+            self.stereo_monitor_dd.value
+        )
+        same_monitor_local_3d = is_local_same_monitor_3d_mode(
+            mode,
+            os_name=OS_NAME,
+            monitor_count=mon_count,
+            capture_mode=self.capture_mode_key,
+            input_monitor_index=input_monitor_index,
+            output_monitor_index=output_monitor_index,
+        )
+        self.display_mode_dd.options = (
+            ["Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB"]
+            if same_monitor_local_3d
+            else [
+                "Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB",
+                "Depth Map", "Anaglyph", "Interleaved", "Mono", "Leia",
+            ]
+        )
+        if same_monitor_local_3d and self.display_mode_dd.value not in self.display_mode_dd.options:
+            self.display_mode_dd.value = "Half-SBS"
+            self._config["Display Mode"] = "Half-SBS"
+        stereo_full = mode == "Local Viewer" and mon_count > 1
         self.stereo_output_label.visible = stereo_full
         self.stereo_monitor_dd.visible = stereo_full
         if hasattr(self, '_stereo_spacer'):
@@ -1674,7 +1690,6 @@ class GUIHandlerMixin:
                 "Moonlight Streamer": t.get("Moonlight Streamer", "Moonlight Streamer"),
                 "RTMP Streamer": t["RTMP Streamer"],
                 "MJPEG Streamer": t["MJPEG Streamer"],
-                "3D Monitor": t["3D Monitor"],
             }
         else:
             run_mode_texts = {

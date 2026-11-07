@@ -28,7 +28,11 @@ from viewer.vulkan_resources import (
     VulkanExportableImage,
     VulkanExportableSemaphore,
 )
-from viewer.window_control import hide_window_from_capture, set_window_mouse_passthrough
+from viewer.window_control import (
+    hide_window_from_capture,
+    set_window_mouse_passthrough,
+    show_window_in_capture,
+)
 
 
 LOCAL_VIEWER_SOURCE_FORMAT = "VK_FORMAT_R8G8B8A8_SRGB"
@@ -229,7 +233,12 @@ def configure_glfw_taskbar_icon(
     return True
 
 
-def configure_glfw_window_hints(glfw: Any, *, fullscreen: bool) -> None:
+def configure_glfw_window_hints(
+    glfw: Any,
+    *,
+    fullscreen: bool,
+    initially_hidden: bool = False,
+) -> None:
     """Reset process-global GLFW hints before creating each viewer window."""
     glfw.default_window_hints()
     glfw.window_hint(glfw.CLIENT_API, glfw.NO_API)
@@ -239,7 +248,7 @@ def configure_glfw_window_hints(glfw: Any, *, fullscreen: bool) -> None:
     glfw.window_hint(glfw.DECORATED, glfw.TRUE)
     glfw.window_hint(glfw.FLOATING, glfw.FALSE)
     glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.TRUE)
-    if fullscreen and sys.platform == "win32":
+    if (fullscreen or initially_hidden) and sys.platform == "win32":
         # Create the output hidden so the final taskbar style is applied before
         # Windows shows the fullscreen window.
         glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
@@ -697,6 +706,7 @@ class VulkanLocalViewerConfig:
     preview_monitor_index: int | None = None
     manage_glfw_lifecycle: bool = True
     exclude_from_capture: bool = False
+    on_capture_window_exclusion: Callable[[int, bool], bool] | None = None
     show_taskbar_button: bool = False
     cursor_passthrough: bool = False
     # Original capture size (tex_w,tex_h in legacy viewer) for dynamic eye ratio.
@@ -722,6 +732,8 @@ class VulkanLocalViewerConfig:
     inference_gpu_luid: int | None = None
     window_width: int = 1280
     window_height: int = 720
+    on_capture_windows_initialized: Callable[[], None] | None = None
+    hide_cursor_overlay: bool = False
 
 
 class _LocalInteropContext:
@@ -821,6 +833,10 @@ class VulkanLocalViewer:
         self._win32_hwnd = 0
         self._win32_hmonitor = 0
         self._win32_user32 = None
+        self._capture_window_registration_pending = bool(
+            sys.platform == "win32" and config.on_capture_window_exclusion is not None
+        )
+        self._capture_window_registered = False
         self._last_visibility_enforce = 0.0
         self._windowed_rect = (40, 40, config.window_width, config.window_height)
         self._fps_frames = 0
@@ -834,6 +850,7 @@ class VulkanLocalViewer:
         self._fps_overlay: VulkanFpsOverlay | None = None
         self._fps_overlay_reported = False
         self._fps_overlay_swapchain_supported = False
+        self._cursor_overlay: Any | None = None
         # Latency is capture start -> present submission, using the same
         # perf_counter clock as the runtime queue timestamp.
         self._last_latency_ms = 0.0
@@ -889,7 +906,11 @@ class VulkanLocalViewer:
         self.glfw, self.vk = glfw, vk
         if not glfw.init():
             raise RuntimeError("GLFW initialization failed for Vulkan local viewer")
-        configure_glfw_window_hints(glfw, fullscreen=self.config.fullscreen)
+        configure_glfw_window_hints(
+            glfw,
+            fullscreen=self.config.fullscreen,
+            initially_hidden=self._capture_window_registration_pending,
+        )
         monitors = glfw.get_monitors() or []
         monitor = (
             monitors[resolve_glfw_monitor_index(self.config.monitor_index, glfw)]
@@ -957,15 +978,78 @@ class VulkanLocalViewer:
                 self._configure_persistent_fullscreen()
                 glfw.poll_events()
         glfw.set_window_pos(self.window, x, y)
-        if self.config.exclude_from_capture:
-            hide_window_from_capture(self.window)
+        if self.config.cursor_passthrough and self.config.hide_cursor_overlay:
+            try:
+                from viewer.window_control import StereoCursorOverlay
+
+                self._cursor_overlay = StereoCursorOverlay(
+                    int(glfw.get_win32_window(self.window)),
+                    self.config.display_mode,
+                )
+            except Exception as exc:
+                self._cursor_overlay = None
+                print(
+                    "[VulkanLocalViewer] Stereo cursor overlay unavailable: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
         if self.config.cursor_passthrough:
-            set_window_mouse_passthrough(self.window, True)
+            set_window_mouse_passthrough(
+                self.window,
+                True,
+                hide_cursor_overlay=self.config.hide_cursor_overlay,
+            )
+        if self.config.on_capture_window_exclusion is not None and sys.platform == "win32":
+            try:
+                hwnd = int(glfw.get_win32_window(self.window))
+                self._capture_window_registered = bool(
+                    self.config.on_capture_window_exclusion(hwnd, True)
+                )
+            except Exception as exc:
+                self._capture_window_registered = False
+                print(
+                    "[VulkanLocalViewer] Per-session capture exclusion failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            if self._capture_window_registered:
+                if not show_window_in_capture(self.window):
+                    if self.config.exclude_from_capture:
+                        hide_window_from_capture(self.window)
+                        print(
+                            "[VulkanLocalViewer] Could not reset display affinity; "
+                            "using global capture exclusion",
+                            flush=True,
+                        )
+            elif self.config.exclude_from_capture:
+                hide_window_from_capture(self.window)
+                print(
+                    "[VulkanLocalViewer] SBS output uses global capture exclusion; "
+                    "remote desktop capture will not show it.",
+                    flush=True,
+                )
+        elif self.config.exclude_from_capture:
+            hide_window_from_capture(self.window)
         glfw.set_key_callback(self.window, self._on_key)
         self._create_device()
         self._init_fps_overlay()
         self._create_swapchain()
         self._create_sync()
+        if self._capture_window_registered:
+            # WGC exclusion is applied to a visible WindowId before the capture
+            # session starts. The capture gate keeps the first session from
+            # running until on_capture_windows_initialized() releases it.
+            glfw.show_window(self.window)
+            self._capture_window_registration_pending = False
+            if self.config.cursor_passthrough:
+                set_window_mouse_passthrough(
+                    self.window,
+                    True,
+                    hide_cursor_overlay=self.config.hide_cursor_overlay,
+                )
+            if self._exclusive_fullscreen:
+                self._set_win32_topmost(True)
         # Do not include Vulkan setup time in the first measured FPS window.
         self._fps_started = time.perf_counter()
         self._present_window_start = self._fps_started
@@ -1074,7 +1158,11 @@ class VulkanLocalViewer:
             self._refresh_win32_monitor()
             self._set_win32_topmost(self._exclusive_fullscreen)
             if self.config.cursor_passthrough:
-                set_window_mouse_passthrough(self.window, True)
+                set_window_mouse_passthrough(
+                    self.window,
+                    True,
+                    hide_cursor_overlay=self.config.hide_cursor_overlay,
+                )
         except Exception as exc:
             self._win32_hwnd = 0
             self._win32_hmonitor = 0
@@ -1099,6 +1187,9 @@ class VulkanLocalViewer:
         import ctypes
 
         insert_after = -1 if enabled else -2
+        flags = 0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0200
+        if not self._capture_window_registration_pending:
+            flags |= 0x0040  # SWP_SHOWWINDOW
         self._win32_user32.SetWindowPos(
             ctypes.c_void_p(self._win32_hwnd),
             ctypes.c_void_p(insert_after),
@@ -1106,11 +1197,29 @@ class VulkanLocalViewer:
             0,
             0,
             0,
-            0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0200,
+            flags,
         )
+
+    def show_capture_window_after_first_present(self) -> None:
+        if not self._capture_window_registration_pending or self.window is None:
+            return
+        self.glfw.show_window(self.window)
+        self._capture_window_registration_pending = False
+        if self.config.cursor_passthrough:
+            set_window_mouse_passthrough(
+                self.window,
+                True,
+                hide_cursor_overlay=self.config.hide_cursor_overlay,
+            )
+        if self._exclusive_fullscreen:
+            self._set_win32_topmost(True)
 
     def _keep_fullscreen_visible(self) -> None:
         if not self._exclusive_fullscreen or not self._win32_hwnd:
+            return
+        if self._capture_window_registration_pending:
+            # The output window stays hidden until the first presented frame;
+            # the WGC session starts with it in its exclusion list.
             return
         now = time.perf_counter()
         if now - self._last_visibility_enforce < 0.1:
@@ -1151,7 +1260,11 @@ class VulkanLocalViewer:
             self._refresh_win32_monitor()
             self._set_win32_topmost(True)
             if self.config.cursor_passthrough:
-                set_window_mouse_passthrough(self.window, True)
+                set_window_mouse_passthrough(
+                    self.window,
+                    True,
+                    hide_cursor_overlay=self.config.hide_cursor_overlay,
+                )
         else:
             if not self._exclusive_fullscreen:
                 return
@@ -1162,7 +1275,11 @@ class VulkanLocalViewer:
             glfw.set_window_pos(self.window, x, y)
             glfw.set_window_size(self.window, width, height)
             if self.config.cursor_passthrough:
-                set_window_mouse_passthrough(self.window, True)
+                set_window_mouse_passthrough(
+                    self.window,
+                    True,
+                    hide_cursor_overlay=self.config.hide_cursor_overlay,
+                )
         if self.device is not None:
             self.recreate_swapchain()
         print(
@@ -1425,7 +1542,11 @@ class VulkanLocalViewer:
                         if len(self._present_ready_phases) > 120:
                             del self._present_ready_phases[0]
 
-    def calibrate_present_deadline(self, next_deadline: float) -> float:
+    def calibrate_present_deadline(
+        self,
+        next_deadline: float,
+        refresh_hz: float = 60.0,
+    ) -> float:
         """Nudge deadline phase toward the recent producer phase when needed."""
         if len(self._present_ready_phases) < 120 or len(self._present_queue_wait_ms) < 120:
             return next_deadline
@@ -1434,7 +1555,7 @@ class VulkanLocalViewer:
         )
         if queue_wait_p95 <= 2.0:
             return next_deadline
-        interval = 1.0 / 60.0
+        interval = 1.0 / max(20.0, float(refresh_hz))
         angles = [phase * (2.0 * math.pi / interval) for phase in self._present_ready_phases]
         sine = sum(math.sin(angle) for angle in angles)
         cosine = sum(math.cos(angle) for angle in angles)
@@ -2083,8 +2204,20 @@ class VulkanLocalViewer:
         if self.window is None:
             raise RuntimeError("Vulkan local viewer has not been initialized")
         self.poll_events()
+        gpu_required = os.environ.get("D2S_GPU_IMAGE_PIPELINE_REQUIRED", "0") == "1"
         direct_source = getattr(frame, "viewer_frame_direct", None)
         native_frame = getattr(frame, "viewer_native", None)
+        cuda_frame = bool(getattr(frame, "is_cuda", False))
+        if (
+            gpu_required
+            and direct_source is None
+            and native_frame is None
+            and not cuda_frame
+        ):
+            raise RuntimeError(
+                "GPU-only Vulkan presentation requires a CUDA tensor, native frame, "
+                "or direct GPU frame source"
+            )
         if native_frame is not None and direct_source is None:
             try:
                 from stereo_runtime._fused_warp_mps import pack_target
@@ -2115,12 +2248,18 @@ class VulkanLocalViewer:
                     target_size,
                     output_format,
                     fallback_source=self._source,
+                    gpu_required=gpu_required,
                 )
                 ring_fallback = direct_source is self._source
+                if direct_source is None and gpu_required:
+                    native_frame.release()
+                    object.__setattr__(frame, "viewer_native", None)
+                    if self.config.on_breakdown_inc is not None:
+                        self.config.on_breakdown_inc("viewer_drop", 1)
+                    return False
                 if direct_source is None:
-                    # If the persistent map is unavailable too, preserve the
-                    # frame through the standard host-upload path instead of
-                    # dropping it when the three-slot ring is exhausted.
+                    # Compatibility path for non-strict runtimes: preserve the
+                    # frame through the standard host-upload path if the ring is full.
                     fallback_bytes = bytearray(
                         int(target_size[0]) * int(target_size[1]) * 4
                     )
@@ -2192,6 +2331,10 @@ class VulkanLocalViewer:
                 )
                 if self.config.on_breakdown_inc is not None:
                     self.config.on_breakdown_inc("native_present_unavailable", 1)
+                if gpu_required:
+                    raise RuntimeError(
+                        f"GPU-only Vulkan presentation failed: {type(exc).__name__}: {exc}"
+                    ) from exc
                 return False
         if direct_source is not None and not (
             direct_source is self._source or direct_source in self._direct_sources
@@ -2219,6 +2362,10 @@ class VulkanLocalViewer:
             if cuda_rgba is not None:
                 height, width = (int(cuda_rgba.shape[0]), int(cuda_rgba.shape[1]))
             else:
+                if gpu_required:
+                    raise RuntimeError(
+                        "GPU-only Vulkan presentation could not pack the CUDA tensor"
+                    )
                 # Device-side pack first (quantize+permute+alpha on the tensor's
                 # own device, one host copy): the numpy fallback costs ~4
                 # full-frame CPU copies plus an MPS sync and dominated the
@@ -2320,6 +2467,32 @@ class VulkanLocalViewer:
                 self._destroy_swapchain()
                 self.vk.vkDestroyDevice(self.device, None)
         finally:
+            if self.window is not None and self.config.cursor_passthrough:
+                try:
+                    set_window_mouse_passthrough(
+                        self.window,
+                        False,
+                        hide_cursor_overlay=False,
+                    )
+                except Exception:
+                    pass
+            if self._cursor_overlay is not None:
+                try:
+                    self._cursor_overlay.close()
+                except Exception:
+                    pass
+                self._cursor_overlay = None
+            if self._capture_window_registered and self.window is not None:
+                try:
+                    hwnd = int(self.glfw.get_win32_window(self.window))
+                    self.config.on_capture_window_exclusion(hwnd, False)
+                except Exception as exc:
+                    print(
+                        "[VulkanLocalViewer] Could not remove capture exclusion: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                self._capture_window_registered = False
             if self.surface is not None and self.instance is not None:
                 self._instance_function(b"vkDestroySurfaceKHR", "void(*)(VkInstance, VkSurfaceKHR, const VkAllocationCallbacks *)")(self.instance, self.surface, self.vk.ffi.NULL)
             if self.instance is not None:
@@ -2894,14 +3067,24 @@ class _TransferSource:
         overlay_drawn = False
         overlay_ms = 0.0
         overlay_upload_ms = 0.0
+        eye_rects = tuple(
+            destination_rect for _source_rect, destination_rect in regions
+        )
+        if o._cursor_overlay is not None:
+            try:
+                o._cursor_overlay.update(eye_rects)
+            except Exception as exc:
+                o._cursor_overlay = None
+                print(
+                    "[VulkanLocalViewer] Stereo cursor overlay update failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
         if o._fps_overlay is not None and o._fps_overlay.enabled and o._fps_overlay.available:
             # A packed-image blit is only a transfer optimization. Keep the
             # overlay geometry based on the original per-eye presentation
             # regions so SBS stays split into left/right half-width areas and
             # TAB stays split into top/bottom areas.
-            eye_rects = tuple(
-                destination_rect for _source_rect, destination_rect in regions
-            )
             overlay_started = time.perf_counter()
             overlay_drawn = o._fps_overlay.record(cmd, target, index, eye_rects)
             overlay_ms = (time.perf_counter() - overlay_started) * 1000.0
@@ -3018,7 +3201,123 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
         """Bound the VSync queue hand-off wait to roughly one refresh."""
         return min(0.05, max(0.004, 1.25 / _vsync_refresh_hz()))
 
-    present_asap = bool(config.vsync) and (
+    def _initialize_main_viewer() -> None:
+        nonlocal viewer
+        if viewer is not None:
+            return
+        try:
+            viewer = VulkanLocalViewer(config)
+            packer = getattr(runtime_q, "_d2s_packer", None)
+            if packer is not None:
+                viewer.upstream_fps_provider = getattr(
+                    packer, "take_published_fps", None
+                )
+            from utils.sys_load import install_system_load_sampler
+
+            system_load = install_system_load_sampler(cpu=False)
+            if system_load is not None:
+                viewer.sys_load_provider = system_load.snapshot
+            viewer.initialize()
+            print("[VulkanLocalViewer] Vulkan local window initialized", flush=True)
+        except Exception as vulkan_exc:
+            if os.environ.get("D2S_GPU_IMAGE_PIPELINE_REQUIRED", "0") == "1":
+                raise RuntimeError(
+                    f"GPU-only local viewer has no Vulkan display path: "
+                    f"{type(vulkan_exc).__name__}: {vulkan_exc}"
+                ) from vulkan_exc
+            print(
+                f"[VulkanLocalViewer] Vulkan init failed ({vulkan_exc}); trying fallback",
+                flush=True,
+            )
+            if viewer is not None:
+                viewer.close()
+            viewer = None
+            if sys.platform == "darwin":
+                try:
+                    from viewer.metal_local_viewer import MetalLocalViewer
+
+                    viewer = MetalLocalViewer(config)
+                    viewer.initialize()
+                    print("[VulkanLocalViewer] Using Metal fallback viewer", flush=True)
+                except Exception as metal_exc:
+                    print(
+                        f"[MetalLocalViewer] Metal fallback failed ({metal_exc}); "
+                        "trying OpenGL",
+                        flush=True,
+                    )
+                    viewer = None
+            if viewer is None:
+                try:
+                    from viewer.opengl_local_viewer import OpenGLLocalViewer
+
+                    fallback_config = config
+                    if (
+                        sys.platform == "win32"
+                        and config.on_capture_window_exclusion is not None
+                    ):
+                        fallback_config = replace(
+                            config,
+                            on_capture_window_exclusion=None,
+                            on_capture_windows_initialized=None,
+                            exclude_from_capture=True,
+                        )
+                    viewer = OpenGLLocalViewer(fallback_config)
+                    viewer.initialize()
+                    print(
+                        "[VulkanLocalViewer] Using OpenGL fallback viewer",
+                        flush=True,
+                    )
+                except Exception as gl_exc:
+                    raise RuntimeError(
+                        f"All viewer backends failed: Vulkan({vulkan_exc}), "
+                        f"Metal/OpenGL({gl_exc})"
+                    ) from vulkan_exc
+
+    def _initialize_preview_viewer() -> None:
+        nonlocal preview_viewer, preview_disabled
+        if preview_viewer is not None or preview_disabled:
+            return
+        preview_config = replace(
+            config,
+            title=f"{config.title} - Debug Preview",
+            monitor_index=(
+                int(config.preview_monitor_index)
+                if config.preview_monitor_index is not None
+                else int(config.monitor_index)
+            ),
+            fullscreen=False,
+            window_preview=False,
+            show_fps=False,
+            display_mode="Mono",
+            display_fit_mode="contain",
+            display_fit_mode_provider=None,
+            display_fit_enabled=True,
+            on_sbs_fps=None,
+            on_breakdown_inc=None,
+            on_breakdown_add_time=None,
+            direct_staging=False,
+            manage_glfw_lifecycle=False,
+            exclude_from_capture=False,
+        )
+        try:
+            preview_viewer = VulkanLocalViewer(preview_config)
+            preview_viewer.initialize()
+            print(
+                "[VulkanLocalViewer] Additional debug preview initialized",
+                flush=True,
+            )
+        except Exception as exc:
+            if preview_viewer is not None:
+                preview_viewer.close()
+            preview_viewer = None
+            preview_disabled = True
+            print(
+                "[VulkanLocalViewer] Additional debug preview unavailable: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    present_asap = (
         os.environ.get("D2S_PRESENT_ASAP", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     )
@@ -3030,8 +3329,25 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
         )
 
     try:
+        # Always create the viewer before waiting for captured frames. Window
+        # capture can take time to produce its first frame (or fail to find
+        # the target); deferring initialization until that frame leaves the
+        # process alive with no visible window and no actionable log output.
+        _initialize_main_viewer()
+        if config.on_capture_windows_initialized is not None:
+            # Create every capture-excluded HWND before the WGC display session
+            # starts. This build applies the initial exclusion list correctly;
+            # live list updates can report a new iteration without excluding
+            # the window from the next frame.
+            _initialize_preview_viewer()
+            config.on_capture_windows_initialized()
+
         while not shutdown_event.is_set():
-            paced = cached_frame is not None and not config.vsync
+            paced = (
+                cached_frame is not None
+                and not config.vsync
+                and not present_asap
+            )
             frame_grace = (
                 0.002
                 if paced and getattr(runtime_q, "_d2s_packer", None) is not None
@@ -3153,90 +3469,9 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     _release_item(result)
                     continue
             if viewer is None:
-                # Primary: Vulkan. Fallback chain: Metal -> OpenGL (macOS).
-                # Keeps Vulkan as main viewer; Metal/OpenGL are fallbacks when
-                # Vulkan/MoltenVK is unavailable (e.g., missing SDK).
-                try:
-                    viewer = VulkanLocalViewer(config)
-                    packer = getattr(runtime_q, "_d2s_packer", None)
-                    if packer is not None:
-                        viewer.upstream_fps_provider = getattr(
-                            packer, "take_published_fps", None
-                        )
-                    from utils.sys_load import install_system_load_sampler
-
-                    system_load = install_system_load_sampler(cpu=False)
-                    if system_load is not None:
-                        viewer.sys_load_provider = system_load.snapshot
-                    viewer.initialize()
-                    print("[VulkanLocalViewer] Vulkan local window initialized", flush=True)
-                except Exception as vulkan_exc:
-                    print(f"[VulkanLocalViewer] Vulkan init failed ({vulkan_exc}); trying fallback", flush=True)
-                    viewer = None
-                    # Try Metal fallback on macOS
-                    if sys.platform == "darwin":
-                        try:
-                            from viewer.metal_local_viewer import MetalLocalViewer
-
-                            viewer = MetalLocalViewer(config)
-                            viewer.initialize()
-                            print("[VulkanLocalViewer] Using Metal fallback viewer", flush=True)
-                        except Exception as metal_exc:
-                            print(f"[MetalLocalViewer] Metal fallback failed ({metal_exc}); trying OpenGL", flush=True)
-                            viewer = None
-                    # Try OpenGL fallback (cross-platform)
-                    if viewer is None:
-                        try:
-                            from viewer.opengl_local_viewer import OpenGLLocalViewer
-
-                            viewer = OpenGLLocalViewer(config)
-                            viewer.initialize()
-                            print("[VulkanLocalViewer] Using OpenGL fallback viewer", flush=True)
-                        except Exception as gl_exc:
-                            raise RuntimeError(
-                                f"All viewer backends failed: Vulkan({vulkan_exc}), "
-                                f"Metal/OpenGL({gl_exc})"
-                            ) from vulkan_exc
+                _initialize_main_viewer()
             if preview_viewer is None and not preview_disabled:
-                preview_config = replace(
-                    config,
-                    title=f"{config.title} - Debug Preview",
-                    monitor_index=(
-                        int(config.preview_monitor_index)
-                        if config.preview_monitor_index is not None
-                        else int(config.monitor_index)
-                    ),
-                    fullscreen=False,
-                    window_preview=False,
-                    show_fps=False,
-                    display_mode="Mono",
-                    display_fit_mode="contain",
-                    display_fit_mode_provider=None,
-                    display_fit_enabled=True,
-                    on_sbs_fps=None,
-                    on_breakdown_inc=None,
-                    on_breakdown_add_time=None,
-                    direct_staging=False,
-                    manage_glfw_lifecycle=False,
-                    exclude_from_capture=False,
-                )
-                try:
-                    preview_viewer = VulkanLocalViewer(preview_config)
-                    preview_viewer.initialize()
-                    print(
-                        "[VulkanLocalViewer] Additional debug preview initialized",
-                        flush=True,
-                    )
-                except Exception as exc:
-                    if preview_viewer is not None:
-                        preview_viewer.close()
-                    preview_viewer = None
-                    preview_disabled = True
-                    print(
-                        "[VulkanLocalViewer] Additional debug preview unavailable: "
-                        f"{type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
+                _initialize_preview_viewer()
             present_started = time.perf_counter()
             frame_path = (
                 cached_path if reused else
@@ -3245,6 +3480,9 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             )
             cached_present = getattr(viewer, "_present_cached", None)
             presented = cached_present() if reused and callable(cached_present) else viewer.present(frame)
+            show_capture_window = getattr(viewer, "show_capture_window_after_first_present", None)
+            if presented is not False and callable(show_capture_window):
+                show_capture_window()
             presented_at = time.perf_counter()
             if presented is not False and not reused:
                 debug_info = getattr(result, "debug_info", None)
@@ -3292,14 +3530,17 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             # and turn 60 Hz into roughly 57 FPS on macOS.
             if next_present_at == 0.0:
                 next_present_at = present_started
-            interval = 1.0 / 60.0
+            interval = 1.0 / _vsync_refresh_hz()
             next_present_at += interval
             if presented is not False and not reused:
                 calibrate_phase = getattr(
                     viewer, "calibrate_present_deadline", None
                 )
                 if callable(calibrate_phase):
-                    next_present_at = calibrate_phase(next_present_at)
+                    next_present_at = calibrate_phase(
+                        next_present_at,
+                        _vsync_refresh_hz(),
+                    )
             if next_present_at <= presented_at:
                 # Drop elapsed slots. Immediately catching up after a stall
                 # produces a short burst followed by another uneven gap.
@@ -3349,7 +3590,17 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     continue
                 preview_started = time.perf_counter()
                 try:
-                    preview_viewer.present(preview_frame)
+                    preview_presented = preview_viewer.present(preview_frame)
+                    show_capture_window = getattr(
+                        preview_viewer,
+                        "show_capture_window_after_first_present",
+                        None,
+                    )
+                    if (
+                        preview_presented is not False
+                        and callable(show_capture_window)
+                    ):
+                        show_capture_window()
                     if config.on_breakdown_add_time is not None:
                         config.on_breakdown_add_time(
                             "local_preview_present",
@@ -3368,9 +3619,9 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     )
             if presented is not False:
                 last_presented_at = presented_at
-                if config.vsync and not (present_asap and not reused):
+                if reused or not present_asap:
                     # Pace reused frames to the refresh grid. Fresh ASAP frames
-                    # are already paced by the producer and submit immediately.
+                    # submit immediately and are paced by the WSI present mode.
                     interval = 1.0 / _vsync_refresh_hz()
                     if presented_at - present_started < interval * 0.5:
                         remaining = next_present_at - time.perf_counter()

@@ -172,6 +172,75 @@ def test_native_metal_alias_is_compared_to_cpu_handoff_then_reused(monkeypatch) 
     assert registry.pack_native(frame, (4, 2), "half_sbs") is source
 
 
+def test_gpu_only_native_pack_uses_metal_buffer_without_cpu_pack(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr("viewer.direct_sink.sys.platform", "darwin")
+    source = _DirectSource()
+    source._metal_buffer = object()
+    source._metal_buffer_capacity = len(source.direct_view)
+    registry = DirectSinkRegistry()
+    registry.register(source)
+
+    class Native:
+        last_pack_metrics = {}
+
+        def pack(self, *_args):
+            pytest.fail("GPU-only pack must not use the CPU destination")
+
+        def pack_metal(self, _metal, _capacity, _size, _format):
+            source.direct_view[:] = b"metal" + bytes(len(source.direct_view) - 5)
+            self.last_pack_metrics = {"metal_buffer_alias": True}
+
+    frame = Native()
+    assert registry.pack_native(
+        frame, (4, 2), "half_sbs", gpu_required=True
+    ) is source
+    assert registry._metal_alias_verified is True
+    assert source.direct_view[:5] == b"metal"
+
+
+def test_gpu_only_native_pack_rejects_missing_metal_alias(monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr("viewer.direct_sink.sys.platform", "darwin")
+    source = _DirectSource()
+    registry = DirectSinkRegistry()
+    registry.register(source)
+
+    class Native:
+        def pack(self, *_args):
+            pytest.fail("GPU-only pack must not use the CPU destination")
+
+    with pytest.raises(RuntimeError, match="exported Metal buffer"):
+        registry.pack_native(
+            Native(), (4, 2), "half_sbs", gpu_required=True
+        )
+    assert source.claimed is False
+
+
+def test_gpu_only_native_pack_drops_when_ring_is_exhausted(monkeypatch) -> None:
+    monkeypatch.setattr("viewer.direct_sink.sys.platform", "darwin")
+    registry = DirectSinkRegistry()
+    source = SimpleNamespace(
+        size=(4, 2),
+        claimed=True,
+        claim_direct=lambda: False,
+        _mapped_view=bytearray(4 * 2 * 4),
+    )
+    registry.register(source)
+    fallback = SimpleNamespace(size=(4, 2), _mapped_view=bytearray(4 * 2 * 4))
+
+    class Native:
+        def pack(self, *_args):
+            raise AssertionError("GPU-only pack must not use the CPU destination")
+
+    assert registry.pack_native(
+        Native(), (4, 2), "half_sbs", fallback_source=fallback, gpu_required=True
+    ) is None
+    assert fallback._mapped_view == bytearray(4 * 2 * 4)
+
+
 def test_native_pack_uses_mapped_handoff_when_direct_ring_is_exhausted(monkeypatch) -> None:
     monkeypatch.setattr("viewer.direct_sink.sys.platform", "darwin")
     registry = DirectSinkRegistry()

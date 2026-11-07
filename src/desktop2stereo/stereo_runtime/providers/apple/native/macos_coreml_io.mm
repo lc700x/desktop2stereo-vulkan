@@ -100,6 +100,141 @@ struct NormalizeParams {
     float hi;
 };
 
+static inline uint d2s_float_order_key(float value) {
+    uint bits = as_type<uint>(value);
+    return (bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u);
+}
+
+static inline float d2s_order_key_float(uint key) {
+    uint bits = (key & 0x80000000u) != 0u
+        ? (key ^ 0x80000000u) : ~key;
+    return as_type<float>(bits);
+}
+
+kernel void d2s_depth_range_reset(
+    device atomic_uint *state [[buffer(0)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid == 0u) {
+        atomic_store_explicit(&state[0], 0xffffffffu, memory_order_relaxed);
+        atomic_store_explicit(&state[1], 0u, memory_order_relaxed);
+        atomic_store_explicit(&state[2], 0u, memory_order_relaxed);
+        atomic_store_explicit(&state[3], 0u, memory_order_relaxed);
+    }
+    if (gid < 256u) {
+        atomic_store_explicit(&state[4u + gid], 0u, memory_order_relaxed);
+    }
+}
+
+kernel void d2s_depth_range_minmax_half(
+    device const half *source [[buffer(0)]],
+    device atomic_uint *state [[buffer(1)]],
+    constant NormalizeParams& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.count) return;
+    float value = float(source[gid]);
+    if (!isfinite(value)) {
+        atomic_fetch_add_explicit(&state[3], 1u, memory_order_relaxed);
+        return;
+    }
+    uint key = d2s_float_order_key(value);
+    atomic_fetch_min_explicit(&state[0], key, memory_order_relaxed);
+    atomic_fetch_max_explicit(&state[1], key, memory_order_relaxed);
+    atomic_fetch_add_explicit(&state[2], 1u, memory_order_relaxed);
+}
+
+kernel void d2s_depth_range_minmax_float(
+    device const float *source [[buffer(0)]],
+    device atomic_uint *state [[buffer(1)]],
+    constant NormalizeParams& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.count) return;
+    float value = source[gid];
+    if (!isfinite(value)) {
+        atomic_fetch_add_explicit(&state[3], 1u, memory_order_relaxed);
+        return;
+    }
+    uint key = d2s_float_order_key(value);
+    atomic_fetch_min_explicit(&state[0], key, memory_order_relaxed);
+    atomic_fetch_max_explicit(&state[1], key, memory_order_relaxed);
+    atomic_fetch_add_explicit(&state[2], 1u, memory_order_relaxed);
+}
+
+kernel void d2s_depth_range_histogram_half(
+    device const half *source [[buffer(0)]],
+    device atomic_uint *state [[buffer(1)]],
+    constant NormalizeParams& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.count) return;
+    float value = float(source[gid]);
+    if (!isfinite(value)) return;
+    float lo = d2s_order_key_float(atomic_load_explicit(&state[0], memory_order_relaxed));
+    float hi = d2s_order_key_float(atomic_load_explicit(&state[1], memory_order_relaxed));
+    float span = hi - lo;
+    if (!(span > 1.0e-6f)) return;
+    uint bin = min(uint(clamp((value - lo) / span, 0.0f, 1.0f) * 256.0f), 255u);
+    atomic_fetch_add_explicit(&state[4u + bin], 1u, memory_order_relaxed);
+}
+
+kernel void d2s_depth_range_histogram_float(
+    device const float *source [[buffer(0)]],
+    device atomic_uint *state [[buffer(1)]],
+    constant NormalizeParams& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.count) return;
+    float value = source[gid];
+    if (!isfinite(value)) return;
+    float lo = d2s_order_key_float(atomic_load_explicit(&state[0], memory_order_relaxed));
+    float hi = d2s_order_key_float(atomic_load_explicit(&state[1], memory_order_relaxed));
+    float span = hi - lo;
+    if (!(span > 1.0e-6f)) return;
+    uint bin = min(uint(clamp((value - lo) / span, 0.0f, 1.0f) * 256.0f), 255u);
+    atomic_fetch_add_explicit(&state[4u + bin], 1u, memory_order_relaxed);
+}
+
+kernel void d2s_depth_range_reduce(
+    device atomic_uint *state [[buffer(0)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u) return;
+    uint finite = atomic_load_explicit(&state[2], memory_order_relaxed);
+    float lo = 0.0f;
+    float hi = 1.0f;
+    if (finite > 0u) {
+        float raw_lo = d2s_order_key_float(atomic_load_explicit(&state[0], memory_order_relaxed));
+        float raw_hi = d2s_order_key_float(atomic_load_explicit(&state[1], memory_order_relaxed));
+        if (isfinite(raw_lo) && isfinite(raw_hi) && raw_hi > raw_lo + 1.0e-6f) {
+            uint lo_target = max(1u, uint(ceil(float(finite) * 0.02f)));
+            uint hi_target = max(1u, uint(ceil(float(finite) * 0.98f)));
+            uint cumulative = 0u;
+            uint lo_bin = 0u;
+            uint hi_bin = 255u;
+            for (uint bin = 0u; bin < 256u; ++bin) {
+                cumulative += atomic_load_explicit(&state[4u + bin], memory_order_relaxed);
+                if (cumulative >= lo_target) {
+                    lo_bin = bin;
+                    break;
+                }
+            }
+            cumulative = 0u;
+            for (uint bin = 0u; bin < 256u; ++bin) {
+                cumulative += atomic_load_explicit(&state[4u + bin], memory_order_relaxed);
+                if (cumulative >= hi_target) {
+                    hi_bin = bin;
+                    break;
+                }
+            }
+            float span = raw_hi - raw_lo;
+            lo = raw_lo + span * (float(lo_bin) / 256.0f);
+            hi = raw_lo + span * (float(hi_bin + 1u) / 256.0f);
+            if (!isfinite(lo) || !isfinite(hi) || hi <= lo) {
+                lo = raw_lo;
+                hi = raw_hi;
+            }
+        }
+    }
+    atomic_store_explicit(&state[0], as_type<uint>(lo), memory_order_relaxed);
+    atomic_store_explicit(&state[1], as_type<uint>(hi), memory_order_relaxed);
+}
+
 struct WarpParams {
     uint source_width;
     uint source_height;
@@ -284,9 +419,17 @@ static inline float layered_depth_scale(float value, constant WarpParams& p) {
            foreground_weight * max(p.foreground_scale, 0.0f);
 }
 
-static inline float shift_from_depth(float value, constant WarpParams& p) {
+static inline float screen_edge_fade_weight(float x, uint width) {
+    float edge_distance = min(x + 0.5f, float(width) - x - 0.5f);
+    float t = clamp(edge_distance / 8.0f, 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static inline float shift_from_depth(float value, float x,
+                                     constant WarpParams& p) {
     return -(value - p.convergence) * layered_depth_scale(value, p) *
-           max(p.depth_strength, 0.0f) * p.max_disparity_px * 0.5f;
+           max(p.depth_strength, 0.0f) * p.max_disparity_px * 0.5f *
+           screen_edge_fade_weight(x, p.source_width);
 }
 
 static inline float layer_weight(float value, int layer_index,
@@ -305,24 +448,9 @@ static inline float layer_shift_scale(int layer_index, constant WarpParams& p) {
 
 static inline float effective_layer_shift_scale(float value,
                                                  constant WarpParams& p) {
-    int count = clamp(p.layers, 1, 4);
-    if (count == 1) return 1.0f;
-    if (count == 2) {
-        float depth = clamp(value, 0.0f, 1.0f);
-        float foreground_weight = 1.0f /
-            (1.0f + exp((1.0f - 2.0f * depth) /
-                        max(p.softness, 1.0e-4f)));
-        return 0.875f + 0.125f * foreground_weight;
-    }
-    float weighted_scale = 0.0f;
-    float total_weight = 0.0f;
-    for (int layer_index = 0; layer_index < 4; ++layer_index) {
-        if (layer_index >= count) break;
-        float weight = layer_weight(value, layer_index, p);
-        weighted_scale += weight * layer_shift_scale(layer_index, p);
-        total_weight += weight;
-    }
-    return weighted_scale / max(total_weight, 1.0e-6f);
+    // Match Moonlight XR's linear disparity. Layer weights still select the
+    // correct color class, but cannot attenuate the final pixel displacement.
+    return 1.0f;
 }
 
 static inline float2 clamp_source(float2 point, constant WarpParams& p) {
@@ -343,7 +471,7 @@ static inline float3 sample_color(texture2d<float, access::sample> color,
 static inline float projected_target_x(float source_x, float depth_value,
                                        float eye_sign,
                                        constant WarpParams& p) {
-    return source_x - shift_from_depth(depth_value, p) *
+    return source_x - shift_from_depth(depth_value, source_x, p) *
                        effective_layer_shift_scale(depth_value, p) * eye_sign;
 }
 
@@ -594,12 +722,12 @@ static inline float3 dibr_warp_at(
     float target_x, float target_y, float eye_sign,
     constant WarpParams& p) {
     float target_depth = dibr_depth_at(color, depth, target_x, target_y, p);
-    float target_shift = shift_from_depth(target_depth, p) *
+    float target_shift = shift_from_depth(target_depth, target_x, p) *
                          effective_layer_shift_scale(target_depth, p);
     float source_x = clamp(target_x + target_shift * eye_sign, 0.0f,
                            float(p.source_width) - 1.0f);
     float source_depth = dibr_depth_at(color, depth, source_x, target_y, p);
-    float source_shift = shift_from_depth(source_depth, p) *
+    float source_shift = shift_from_depth(source_depth, source_x, p) *
                          effective_layer_shift_scale(source_depth, p);
     float refined_x = clamp(target_x + source_shift * eye_sign, 0.0f,
                             float(p.source_width) - 1.0f);
@@ -608,7 +736,7 @@ static inline float3 dibr_warp_at(
     float threshold = max(p.edge_threshold, 1.0e-6f);
     // No depth can occlude a sample already within the visibility threshold of 1.
     if (source_depth < 1.0f - 0.5f * threshold) {
-        float front_shift = shift_from_depth(1.0f, p);
+        float front_shift = shift_from_depth(1.0f, target_x, p);
         float front_x = clamp(target_x + front_shift * eye_sign, 0.0f,
                               float(p.source_width) - 1.0f);
         float front_depth = p.antialias_strength != 0.0f
@@ -646,9 +774,9 @@ static inline float edge_at(device float *depth, float x, float y,
     float center_depth = processed_depth_at(depth, x, y, p);
     float depth_edge = abs(processed_depth_at(depth, x + 1.0f, y, p) - center_depth) +
                        abs(processed_depth_at(depth, x, y + 1.0f, p) - center_depth);
-    float center_shift = abs(shift_from_depth(center_depth, p));
-    float shift_edge = abs(abs(shift_from_depth(processed_depth_at(depth, x + 1.0f, y, p), p)) - center_shift) +
-                       abs(abs(shift_from_depth(processed_depth_at(depth, x, y + 1.0f, p), p)) - center_shift);
+    float center_shift = abs(shift_from_depth(center_depth, x, p));
+    float shift_edge = abs(abs(shift_from_depth(processed_depth_at(depth, x + 1.0f, y, p), x + 1.0f, p)) - center_shift) +
+                       abs(abs(shift_from_depth(processed_depth_at(depth, x, y + 1.0f, p), x, p)) - center_shift);
     return (depth_edge > p.edge_threshold ||
             shift_edge / max_shift_magnitude(p) > 0.05f) ? 1.0f : 0.0f;
 }
@@ -656,17 +784,17 @@ static inline float edge_at(device float *depth, float x, float y,
 static inline bool antialias_edge_at(device float *depth, float x, float y,
                                      constant WarpParams& p) {
     float center_depth = processed_depth_at(depth, x, y, p);
-    float center_shift = shift_from_depth(center_depth, p);
+    float center_shift = shift_from_depth(center_depth, x, p);
     float depth_edge = max(
         max(abs(processed_depth_at(depth, x - 1.0f, y, p) - center_depth),
             abs(processed_depth_at(depth, x + 1.0f, y, p) - center_depth)),
         max(abs(processed_depth_at(depth, x, y - 1.0f, p) - center_depth),
             abs(processed_depth_at(depth, x, y + 1.0f, p) - center_depth)));
     float shift_edge = max(
-        max(abs(shift_from_depth(processed_depth_at(depth, x - 1.0f, y, p), p) - center_shift),
-            abs(shift_from_depth(processed_depth_at(depth, x + 1.0f, y, p), p) - center_shift)),
-        max(abs(shift_from_depth(processed_depth_at(depth, x, y - 1.0f, p), p) - center_shift),
-            abs(shift_from_depth(processed_depth_at(depth, x, y + 1.0f, p), p) - center_shift)));
+        max(abs(shift_from_depth(processed_depth_at(depth, x - 1.0f, y, p), x - 1.0f, p) - center_shift),
+            abs(shift_from_depth(processed_depth_at(depth, x + 1.0f, y, p), x + 1.0f, p) - center_shift)),
+        max(abs(shift_from_depth(processed_depth_at(depth, x, y - 1.0f, p), x, p) - center_shift),
+            abs(shift_from_depth(processed_depth_at(depth, x, y + 1.0f, p), x, p) - center_shift)));
     return depth_edge > clamp(p.edge_threshold, 0.01f, 0.025f) ||
            shift_edge / max_shift_magnitude(p) > 0.025f;
 }
@@ -734,8 +862,8 @@ static inline float3 fill_eye(texture2d<float, access::sample> color,
     }
     float left_depth = processed_depth_at(depth, x - 1.0f, y, p);
     float right_depth = processed_depth_at(depth, x + 1.0f, y, p);
-    float left_shift = shift_from_depth(left_depth, p);
-    float right_shift = shift_from_depth(right_depth, p);
+    float left_shift = shift_from_depth(left_depth, x - 1.0f, p);
+    float right_shift = shift_from_depth(right_depth, x + 1.0f, p);
     bool reliable = abs(right_depth - left_depth) > p.edge_threshold ||
                     abs(right_shift - left_shift) > 0.05f;
     int direction = right_depth < left_depth ? 1 : -1;
@@ -1215,6 +1343,7 @@ typedef struct {
     __strong id<MTLBuffer> input_buffer;
     __strong id<MTLBuffer> raw_depth_buffer;
     __strong id<MTLBuffer> normalized_depth_buffer;
+    __strong id<MTLBuffer> depth_range_buffer;
     // Retained across slot release so each model-depth allocation is reused.
     __strong id<MTLBuffer> filtered_depth_buffer;
     __strong id<MTLBuffer> filter_intermediate_buffer;
@@ -1243,6 +1372,12 @@ typedef struct {
     __strong id<MTLComputePipelineState> preprocess_pipeline;
     __strong id<MTLComputePipelineState> normalize_half_pipeline;
     __strong id<MTLComputePipelineState> normalize_float_pipeline;
+    __strong id<MTLComputePipelineState> depth_range_reset_pipeline;
+    __strong id<MTLComputePipelineState> depth_range_minmax_half_pipeline;
+    __strong id<MTLComputePipelineState> depth_range_minmax_float_pipeline;
+    __strong id<MTLComputePipelineState> depth_range_histogram_half_pipeline;
+    __strong id<MTLComputePipelineState> depth_range_histogram_float_pipeline;
+    __strong id<MTLComputePipelineState> depth_range_reduce_pipeline;
     __strong id<MTLComputePipelineState> depth_filter_pipeline;
     __strong id<MTLComputePipelineState> depth_upsample_pipeline;
     __strong id<MTLComputePipelineState> depth_global_gaussian_pipeline;
@@ -1328,6 +1463,7 @@ static void d2s_release_slot(D2SSlot *slot) {
     slot->input_buffer = nil;
     slot->raw_depth_buffer = nil;
     slot->normalized_depth_buffer = nil;
+    slot->depth_range_buffer = nil;
     slot->status_buffer = nil;
     slot->color_texture = nil;
     if (slot->color_cv_texture != NULL) {
@@ -1363,6 +1499,12 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     ctx->preprocess_pipeline = nil;
     ctx->normalize_half_pipeline = nil;
     ctx->normalize_float_pipeline = nil;
+    ctx->depth_range_reset_pipeline = nil;
+    ctx->depth_range_minmax_half_pipeline = nil;
+    ctx->depth_range_minmax_float_pipeline = nil;
+    ctx->depth_range_histogram_half_pipeline = nil;
+    ctx->depth_range_histogram_float_pipeline = nil;
+    ctx->depth_range_reduce_pipeline = nil;
     ctx->depth_filter_pipeline = nil;
     ctx->depth_upsample_pipeline = nil;
     ctx->depth_global_gaussian_pipeline = nil;
@@ -1393,14 +1535,31 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     id<MTLFunction> preprocess = [library newFunctionWithName:@"d2s_preprocess"];
     id<MTLFunction> norm_half = [library newFunctionWithName:@"d2s_normalize_half"];
     id<MTLFunction> norm_float = [library newFunctionWithName:@"d2s_normalize_float"];
+    id<MTLFunction> range_reset = [library newFunctionWithName:@"d2s_depth_range_reset"];
+    id<MTLFunction> range_minmax_half = [library newFunctionWithName:@"d2s_depth_range_minmax_half"];
+    id<MTLFunction> range_minmax_float = [library newFunctionWithName:@"d2s_depth_range_minmax_float"];
+    id<MTLFunction> range_histogram_half = [library newFunctionWithName:@"d2s_depth_range_histogram_half"];
+    id<MTLFunction> range_histogram_float = [library newFunctionWithName:@"d2s_depth_range_histogram_float"];
+    id<MTLFunction> range_reduce = [library newFunctionWithName:@"d2s_depth_range_reduce"];
     id<MTLFunction> warp = [library newFunctionWithName:@"d2s_warp_pack"];
-    if (!preprocess || !norm_half || !norm_float || !warp) return NO;
+    if (!preprocess || !norm_half || !norm_float || !range_reset ||
+        !range_minmax_half || !range_minmax_float || !range_histogram_half ||
+        !range_histogram_float || !range_reduce || !warp) return NO;
     ctx->preprocess_pipeline = [ctx->device newComputePipelineStateWithFunction:preprocess error:error];
     ctx->normalize_half_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_half error:error];
     ctx->normalize_float_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_float error:error];
+    ctx->depth_range_reset_pipeline = [ctx->device newComputePipelineStateWithFunction:range_reset error:error];
+    ctx->depth_range_minmax_half_pipeline = [ctx->device newComputePipelineStateWithFunction:range_minmax_half error:error];
+    ctx->depth_range_minmax_float_pipeline = [ctx->device newComputePipelineStateWithFunction:range_minmax_float error:error];
+    ctx->depth_range_histogram_half_pipeline = [ctx->device newComputePipelineStateWithFunction:range_histogram_half error:error];
+    ctx->depth_range_histogram_float_pipeline = [ctx->device newComputePipelineStateWithFunction:range_histogram_float error:error];
+    ctx->depth_range_reduce_pipeline = [ctx->device newComputePipelineStateWithFunction:range_reduce error:error];
     ctx->warp_pipeline = [ctx->device newComputePipelineStateWithFunction:warp error:error];
     if (!(ctx->preprocess_pipeline && ctx->normalize_half_pipeline &&
-           ctx->normalize_float_pipeline && ctx->warp_pipeline)) return NO;
+           ctx->normalize_float_pipeline && ctx->depth_range_reset_pipeline &&
+           ctx->depth_range_minmax_half_pipeline && ctx->depth_range_minmax_float_pipeline &&
+           ctx->depth_range_histogram_half_pipeline && ctx->depth_range_histogram_float_pipeline &&
+           ctx->depth_range_reduce_pipeline && ctx->warp_pipeline)) return NO;
 
     NSError *filter_error = nil;
     id<MTLLibrary> filter_library = [ctx->device newLibraryWithSource:
@@ -1618,94 +1777,63 @@ static void d2s_encode_normalize(D2SCoreMLIO *ctx, D2SSlot *slot,
       threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
 }
 
-static float d2s_half_to_float(uint16_t value) {
-    uint32_t sign = ((uint32_t)value & 0x8000u) << 16;
-    uint32_t exponent = ((uint32_t)value >> 10) & 0x1fu;
-    uint32_t mantissa = (uint32_t)value & 0x3ffu;
-    uint32_t bits;
-    if (exponent == 0) {
-        if (mantissa == 0) bits = sign;
-        else {
-            exponent = 1;
-            while ((mantissa & 0x400u) == 0) { mantissa <<= 1; --exponent; }
-            mantissa &= 0x3ffu;
-            bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
-        }
-    } else if (exponent == 31) {
-        bits = sign | 0x7f800000u | (mantissa << 13);
-    } else {
-        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
-    }
-    float result;
-    memcpy(&result, &bits, sizeof(result));
-    return result;
-}
+static BOOL d2s_gpu_depth_range(D2SCoreMLIO *ctx, D2SSlot *slot,
+                                float *lo, float *hi, uint32_t *nonfinite) {
+    if (slot->depth_range_buffer == nil || ctx->depth_count > UINT32_MAX) return NO;
+    id<MTLCommandBuffer> command = [ctx->queue commandBuffer];
+    if (command == nil) return NO;
+    D2SNormalizeParams params = {(uint32_t)ctx->depth_count, 0.0f, 1.0f};
+    NSUInteger count = (NSUInteger)ctx->depth_count;
 
-static int d2s_float_compare(const void *left, const void *right) {
-    const float a = *(const float *)left;
-    const float b = *(const float *)right;
-    return (a > b) - (a < b);
-}
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    if (encoder == nil) return NO;
+    [encoder setComputePipelineState:ctx->depth_range_reset_pipeline];
+    [encoder setBuffer:slot->depth_range_buffer offset:0 atIndex:0];
+    [encoder dispatchThreads:MTLSizeMake(256, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder endEncoding];
 
-static uint32_t d2s_depth_range(D2SCoreMLIO *ctx, D2SSlot *slot,
-                                float *lo, float *hi) {
-    // Percentile clipping is only used to reject sparse model outliers. A
-    // bounded, evenly spaced sample preserves that behavior without sorting
-    // the full model output on the runtime thread.
-    const size_t sample_capacity = ctx->depth_count < 2048 ? ctx->depth_count : 2048;
-    const size_t sample_stride = (ctx->depth_count + sample_capacity - 1) /
-                                 sample_capacity;
-    float *values = (float *)malloc(sample_capacity * sizeof(float));
-    if (values == NULL) {
-        *lo = 0.0f;
-        *hi = 1.0f;
-        return 0;
-    }
-    uint32_t finite = 0;
-    size_t sampled = 0;
-    uint32_t nonfinite = 0;
-    if (slot->output_is_float16) {
-        const uint16_t *source = (const uint16_t *)slot->raw_depth_buffer.contents;
-        for (size_t i = 0; i < ctx->depth_count; ++i) {
-            float value = d2s_half_to_float(source[i]);
-            if (isfinite(value)) {
-                ++finite;
-                if ((i % sample_stride) == 0 && sampled < sample_capacity) {
-                    values[sampled++] = value;
-                }
-            }
-            else ++nonfinite;
-        }
-    } else {
-        const float *source = (const float *)slot->raw_depth_buffer.contents;
-        for (size_t i = 0; i < ctx->depth_count; ++i) {
-            float value = source[i];
-            if (isfinite(value)) {
-                ++finite;
-                if ((i % sample_stride) == 0 && sampled < sample_capacity) {
-                    values[sampled++] = value;
-                }
-            }
-            else ++nonfinite;
-        }
-    }
-    if (finite == 0 || sampled == 0) {
-        *lo = 0.0f;
-        *hi = 1.0f;
-        free(values);
-        return nonfinite;
-    }
-    qsort(values, sampled, sizeof(float), d2s_float_compare);
-    size_t lo_index = (size_t)floor(0.02 * (double)(sampled - 1));
-    size_t hi_index = (size_t)floor(0.98 * (double)(sampled - 1));
-    *lo = values[lo_index];
-    *hi = values[hi_index];
-    if (!isfinite(*lo) || !isfinite(*hi) || *hi <= *lo) {
-        *lo = 0.0f;
-        *hi = 1.0f;
-    }
-    free(values);
-    return nonfinite;
+    encoder = [command computeCommandEncoder];
+    if (encoder == nil) return NO;
+    [encoder setComputePipelineState:slot->output_is_float16
+        ? ctx->depth_range_minmax_half_pipeline
+        : ctx->depth_range_minmax_float_pipeline];
+    [encoder setBuffer:slot->raw_depth_buffer offset:0 atIndex:0];
+    [encoder setBuffer:slot->depth_range_buffer offset:0 atIndex:1];
+    [encoder setBytes:&params length:sizeof(params) atIndex:2];
+    [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [encoder endEncoding];
+
+    encoder = [command computeCommandEncoder];
+    if (encoder == nil) return NO;
+    [encoder setComputePipelineState:slot->output_is_float16
+        ? ctx->depth_range_histogram_half_pipeline
+        : ctx->depth_range_histogram_float_pipeline];
+    [encoder setBuffer:slot->raw_depth_buffer offset:0 atIndex:0];
+    [encoder setBuffer:slot->depth_range_buffer offset:0 atIndex:1];
+    [encoder setBytes:&params length:sizeof(params) atIndex:2];
+    [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [encoder endEncoding];
+
+    encoder = [command computeCommandEncoder];
+    if (encoder == nil) return NO;
+    [encoder setComputePipelineState:ctx->depth_range_reduce_pipeline];
+    [encoder setBuffer:slot->depth_range_buffer offset:0 atIndex:0];
+    [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [encoder endEncoding];
+
+    [command commit];
+    [command waitUntilCompleted];
+    if (command.status != MTLCommandBufferStatusCompleted) return NO;
+    const uint32_t *state = (const uint32_t *)slot->depth_range_buffer.contents;
+    const float *range = (const float *)state;
+    *lo = range[0];
+    *hi = range[1];
+    *nonfinite = state[3];
+    return isfinite(*lo) && isfinite(*hi) && *hi > *lo;
 }
 
 static int32_t d2s_stabilize_depth_range(D2SCoreMLIO *ctx, uint64_t frame_id,
@@ -1808,9 +1936,16 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
             slot->status_buffer = [ctx->device newBufferWithLength:sizeof(uint32_t)
                                                                options:MTLResourceStorageModeShared];
         }
+        size_t range_bytes = (4u + 256u) * sizeof(uint32_t);
+        if (slot->depth_range_buffer == nil ||
+            slot->depth_range_buffer.length < range_bytes) {
+            slot->depth_range_buffer = [ctx->device newBufferWithLength:range_bytes
+                options:MTLResourceStorageModeShared];
+        }
         slot->output_is_float16 = ctx->output_type == MLMultiArrayDataTypeFloat16;
         if (!slot->color_texture || !slot->input_buffer || !slot->raw_depth_buffer ||
-            !slot->normalized_depth_buffer || !slot->status_buffer) {
+            !slot->normalized_depth_buffer || !slot->status_buffer ||
+            !slot->depth_range_buffer) {
             d2s_set_error(ctx, @"native CoreML Metal buffer allocation failed");
             d2s_release_slot(slot);
             return D2S_COREML_ERROR;
@@ -1883,7 +2018,12 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
         }
         double postprocess_start = d2s_now_ms();
         float lo = 0.0f, hi = 1.0f;
-        uint32_t nonfinite = d2s_depth_range(ctx, slot, &lo, &hi);
+        uint32_t nonfinite = 0;
+        if (!d2s_gpu_depth_range(ctx, slot, &lo, &hi, &nonfinite)) {
+            d2s_set_error(ctx, @"Metal depth range reduction failed");
+            d2s_release_slot(slot);
+            return D2S_COREML_ERROR;
+        }
         const float raw_lo = lo;
         const float raw_hi = hi;
         const int32_t range_history_reset =
@@ -2197,13 +2337,8 @@ static int32_t d2s_coreml_io_pack_internal(
                 (command.GPUEndTime - command.GPUStartTime) * 1000.0;
         }
         if (metal_destination == NULL) {
-            // Keep the established mapped-memory handoff as a safe fallback
-            // when the Vulkan allocation could not be exported to Metal.
-            double copy_started = d2s_now_ms();
-            memcpy(destination, destination_buffer.contents, output_bytes);
-            if (result != NULL) {
-                result->host_handoff_copy_ms = d2s_now_ms() - copy_started;
-            }
+            d2s_set_error(ctx, @"GPU-only output requires a Metal-compatible destination buffer");
+            return D2S_COREML_OUTPUT_BACKING;
         }
         return D2S_COREML_OK;
     }

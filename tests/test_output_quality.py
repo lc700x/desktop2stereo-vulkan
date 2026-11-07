@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from stereo_runtime.output_quality import (
+    _downsample_pixel_coverage_srgb,
     _torch_easu,
     _torch_rcas,
     apply_output_quality,
@@ -97,6 +98,51 @@ def test_forced_mip_lod_filters_native_headset_output_before_packing() -> None:
     assert debug["output_quality_applied"] == 1
     assert debug["output_quality_backend"].startswith("torch_trilinear_mip+")
     assert output_quality_requires_eye_images(config, 16, 8) is True
+
+
+def test_pixel_coverage_downsample_avoids_ringing_and_sharpens_at_final_size(monkeypatch) -> None:
+    import stereo_runtime.output_quality as output_quality
+
+    plan = SimpleNamespace(
+        mode="downsample_lanczos_rcas",
+        target_width=4,
+        target_height=2,
+        scale=0.5,
+        target_kind="test",
+    )
+    monkeypatch.setattr(
+        output_quality, "output_sampling_plan_for_config", lambda *_args: plan
+    )
+    sharpness = []
+
+    def record_rcas(image, value):
+        sharpness.append((tuple(image.shape), value))
+        return image
+
+    monkeypatch.setattr(output_quality, "_torch_rcas", record_rcas)
+    image = torch.zeros((1, 3, 4, 8))
+    image[..., 1::2] = 1.0
+    expected = 0.735356983
+
+    reduced, right, debug = apply_output_quality(
+        image,
+        image,
+        _headset_config(
+            output_min_lod=0.0,
+            output_max_lod=0.0,
+            output_mip_lod_bias=0.0,
+            output_rcas_sharpness=0.5,
+        ),
+    )
+
+    assert tuple(reduced.shape) == (1, 3, 2, 4)
+    assert torch.equal(reduced, right)
+    assert torch.allclose(reduced, torch.full_like(reduced, expected), atol=1e-5)
+    assert sharpness == [((1, 3, 2, 4), 0.5), ((1, 3, 2, 4), 0.5)]
+    assert debug["output_quality_backend"] == (
+        "torch_pixel_coverage_srgb+torch_rcas"
+    )
+    assert tuple(_downsample_pixel_coverage_srgb(image, 4, 2).shape) == (1, 3, 2, 4)
 
 
 def test_max_lod_changes_shared_output_without_raising_min_lod() -> None:

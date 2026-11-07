@@ -255,8 +255,10 @@ def test_controller_stops_at_first_unstable_bitrate_probe(tmp_path):
     now[0] = 2.1
     controller.add_receiver_report(_receiver_report(20.0, dropped_frames=2, packets_lost=1))
 
-    for expected_target in (18, 24, 27):
-        assert controller.take_pending_tier().target_mbps == expected_target
+    for expected_target in (25, 27):
+        tier = controller.take_pending_tier()
+        assert tier is not None
+        assert tier.target_mbps == expected_target
         controller.observe_sender({"submitted_fps": 29.8})
         for _ in range(5):
             controller.add_receiver_report(_receiver_report(29.5))

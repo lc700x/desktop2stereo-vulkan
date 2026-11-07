@@ -17,14 +17,16 @@ def test_lsfg_support_is_visible_for_windows_local_viewer(monkeypatch):
     assert control.disabled is False
 
 
-def test_lsfg_support_is_visible_for_windows_3d_monitor(monkeypatch):
+def test_lsfg_support_is_visible_for_windows_local_3d_output(monkeypatch):
+    # "3D Monitor" was folded into Local Viewer; the LSFG frame-generation
+    # toggle belongs to the Windows local stereo output either way.
     from gui import handlers
 
     monkeypatch.setattr(handlers, "OS_NAME", "Windows")
     control = SimpleNamespace(visible=False, disabled=True)
     target = SimpleNamespace(
         lsfg_cb=control,
-        run_mode_key="3D Monitor",
+        run_mode_key="Local Viewer",
     )
 
     handlers.GUIHandlerMixin._sync_lsfg_visibility(target)

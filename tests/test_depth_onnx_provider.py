@@ -229,6 +229,49 @@ def test_generic_provider_predict_profile_with_fake_transformers_model(monkeypat
     assert float(result.depth.max()) <= 1.0
 
 
+def test_generic_onnx_export_load_uses_local_snapshot_path(monkeypatch, tmp_path):
+    from stereo_runtime.model_registry import ModelRegistry
+    from stereo_runtime.onnx_export import load_model_for_dtype
+
+    spec = ModelRegistry.default().get("Distill-Any-Depth-Large")
+    snapshot = spec.model_dir(tmp_path) / "snapshots" / "local-revision"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    (snapshot / "pytorch_model.bin").write_bytes(b"cached weights")
+    calls = []
+
+    class FakeModel:
+        def to(self, device):
+            return self
+
+        def float(self):
+            return self
+
+        def eval(self):
+            return self
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            calls.append((model_id, kwargs))
+            return FakeModel()
+
+    model = load_model_for_dtype(
+        FakeAutoModel,
+        spec.model_id,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        cache_dir=tmp_path,
+        local_files_only=False,
+        force_download=False,
+    )
+
+    assert isinstance(model, torch.nn.Module)
+    assert calls[0][0] == str(snapshot)
+    assert calls[0][1]["local_files_only"] is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Native TensorRT depth provider requires an NVIDIA CUDA GPU")
 def test_create_depth_provider_supports_native_tensorrt(monkeypatch, tmp_path):
     from stereo_runtime.providers.nvidia.tensorrt_native import NativeTensorRtDepthProvider
 
@@ -272,6 +315,7 @@ def test_create_depth_provider_supports_native_tensorrt(monkeypatch, tmp_path):
     assert provider.engine_path == engine_path
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Native TensorRT depth provider requires an NVIDIA CUDA GPU")
 def test_native_tensorrt_infers_large_metadata_from_model_path(tmp_path):
     from stereo_runtime.providers.nvidia.tensorrt_native import NativeTensorRtDepthProvider
 
@@ -288,6 +332,7 @@ def test_native_tensorrt_infers_large_metadata_from_model_path(tmp_path):
     assert provider.info.model_name == "Distill-Any-Depth-Large"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Native TensorRT depth provider requires an NVIDIA CUDA GPU")
 def test_native_tensorrt_keeps_explicit_metadata(tmp_path):
     from stereo_runtime.providers.nvidia.tensorrt_native import NativeTensorRtDepthProvider
 
@@ -457,6 +502,7 @@ def test_distill_preprocessor_can_use_fixed_tensorrt_input_size():
     assert preprocessor.input_size(2160, 1920) == (294, 518)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Native TensorRT depth provider requires an NVIDIA CUDA GPU")
 def test_native_tensorrt_defers_load_until_frame_artifact_size_is_known(tmp_path):
     from stereo_runtime.providers.nvidia.tensorrt_native import NativeTensorRtDepthProvider
 
@@ -471,6 +517,7 @@ def test_native_tensorrt_defers_load_until_frame_artifact_size_is_known(tmp_path
     assert provider._engine is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Native TensorRT depth provider requires an NVIDIA CUDA GPU")
 def test_native_tensorrt_preserves_requested_execution_slots(tmp_path):
     from stereo_runtime.providers.nvidia.tensorrt_native import NativeTensorRtDepthProvider
 
@@ -483,6 +530,7 @@ def test_native_tensorrt_preserves_requested_execution_slots(tmp_path):
     assert provider.execution_slot_count == 3
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Native TensorRT depth provider requires an NVIDIA CUDA GPU")
 def test_native_tensorrt_load_prints_compact_engine_path(monkeypatch, tmp_path, capsys):
     import stereo_runtime.providers.nvidia.tensorrt_native as native_module
 
@@ -515,6 +563,7 @@ def test_native_tensorrt_load_prints_compact_engine_path(monkeypatch, tmp_path, 
     assert " dll_dirs=" not in output
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Native TensorRT depth provider requires an NVIDIA CUDA GPU")
 def test_native_tensorrt_provider_uses_engine_static_input_size(monkeypatch, tmp_path):
     import stereo_runtime.providers.nvidia.tensorrt_native as native_module
 
@@ -551,6 +600,7 @@ def test_native_tensorrt_provider_uses_engine_static_input_size(monkeypatch, tmp
     assert result.depth.shape == (1, 1, 2160, 1920)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Native TensorRT depth provider requires an NVIDIA CUDA GPU")
 def test_native_tensorrt_provider_reports_execution_slot(monkeypatch, tmp_path):
     import stereo_runtime.providers.nvidia.tensorrt_native as native_module
 

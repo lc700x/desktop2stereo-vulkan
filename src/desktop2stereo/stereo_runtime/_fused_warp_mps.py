@@ -332,7 +332,7 @@ static inline float sample_class_common(
 }
 
 static inline float projection_scale_common(float value) {
-    return 0.875f + 0.125f / (1.0f + exp((1.0f - 2.0f * value) / 0.08f));
+    return 1.0f;
 }
 
 static inline float projected_common(
@@ -429,7 +429,7 @@ static inline float blend_common(
         return projected_common(col, dep, shift, batch, channel, W, H, C,
                                 x, y, d, base, eye_sign, projection_bounds);
     }
-    float shift0 = base * 0.875f;
+    float shift0 = base;
     float shift1 = base;
     float2 depth_class = edge_depth_class_common(
         col, dep, batch, x, y, W, H, C, d

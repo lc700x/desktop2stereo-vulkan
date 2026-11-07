@@ -36,7 +36,10 @@ from .capture_sources import get_primary_monitor_index, list_windows
 from .localization import UI_MESSAGES, translate_status
 from .log_handler import GuiLogHandler
 from utils.logging_setup import _NoisyThirdPartyDebugFilter
-from utils.run_mode import target_fps_setting_key
+from utils.run_mode import (
+    is_local_same_monitor_3d_mode,
+    target_fps_setting_key,
+)
 from streaming.stream_calibration import (
     build_calibration_fingerprint,
     calibration_fingerprint_matches,
@@ -1456,26 +1459,41 @@ class GUIProcessMixin:
     # ── save & run ──
 
     def _validate_config_before_run(self):
-        if self.run_mode_key == "Local Viewer" and self._get_monitor_count() <= 1:
+        monitor_count = self._get_monitor_count()
+        input_monitor_index = self.monitor_label_to_index.get(self.monitor_dd.value)
+        output_monitor_index = self.monitor_label_to_index.get(
+            self.stereo_monitor_dd.value
+        )
+        same_monitor_local_3d = is_local_same_monitor_3d_mode(
+            self.run_mode_key,
+            os_name=OS_NAME,
+            monitor_count=monitor_count,
+            capture_mode=self.capture_mode_key,
+            input_monitor_index=input_monitor_index,
+            output_monitor_index=output_monitor_index,
+        )
+        if (
+            self.run_mode_key == "Local Viewer"
+            and monitor_count <= 1
+            and not same_monitor_local_3d
+        ):
             return False, UI_MESSAGES[self.locale]["Local Viewer requires a second display"]
         if self.capture_mode_key == "Monitor" and (
             getattr(self, "_missing_monitor_identity", False)
             or not self.monitor_dd.value
         ):
             return False, UI_MESSAGES[self.locale]["Selected input display is unavailable"]
-        if self.run_mode_key in {"Local Viewer", "3D Monitor"} and (
-            getattr(self, "_missing_stereo_output_identity", False)
-            or not self.stereo_monitor_dd.value
+        if (
+            self.run_mode_key == "Local Viewer"
+            and not same_monitor_local_3d
+            and (
+                getattr(self, "_missing_stereo_output_identity", False)
+                or not self.stereo_monitor_dd.value
+            )
         ):
-            # 3D Monitor with a single display has no second output monitor;
-            # cursor passthrough keeps the system cursor visible over the
-            # fullscreen SBS window covering the captured display.
-            if self.run_mode_key == "3D Monitor" and self._get_monitor_count() <= 1:
-                pass
-            else:
-                return False, UI_MESSAGES[self.locale][
-                    "Selected stereo output display is unavailable"
-                ]
+            return False, UI_MESSAGES[self.locale][
+                "Selected stereo output display is unavailable"
+            ]
         try:
             port_val = int(self.stream_port_tf.value) if self.stream_port_tf.value else DEFAULT_PORT
             if not (1 <= port_val <= 65535):

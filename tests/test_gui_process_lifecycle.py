@@ -284,6 +284,9 @@ def test_calibration_stops_runtime_before_showing_result(monkeypatch, tmp_path):
         def _collect_config(self):
             events.append("collect")
 
+        def _set_stream_bitrate_controls(self, target, peak):
+            events.append(("controls", target, peak))
+
         def _safe_update(self, *controls):
             pass
 
@@ -445,6 +448,9 @@ def test_startup_restores_profile_values_after_shutdown_race(monkeypatch, tmp_pa
 
         def _target_fps_to_display(self, fps):
             return str(fps)
+
+        def _set_stream_bitrate_controls(self, target, peak):
+            pass
 
     gui = Harness()
     gui._config = {
@@ -771,6 +777,9 @@ def test_intentional_gui_stop_suppresses_openxr_fatal_auto_relaunch(monkeypatch)
 
         def _set_running_ui(self, running):
             statuses.append(("running", running))
+
+        def _sync_moonlight_button_state(self):
+            pass
 
     proc = FakeProcess()
     gui = Harness()

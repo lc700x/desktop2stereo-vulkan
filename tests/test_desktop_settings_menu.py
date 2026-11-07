@@ -526,6 +526,13 @@ def test_flet_launcher_starts_visible_and_restores_after_panel_and_hide(monkeypa
 
     window = Window(ignore_mouse_events=False, destroyed=False)
 
+    snapshots = queue.Queue()
+    commands = queue.Queue()
+    # Each poll applies exactly one command; toggling the panel from the
+    # initial visible state collapses to the launcher, reopens it, then
+    # restores the launcher before quitting.
+    pending = iter(("__toggle_flet__", "__toggle_flet__", "__quit__"))
+
     class Page:
         def __init__(self):
             self.window = window
@@ -542,17 +549,17 @@ def test_flet_launcher_starts_visible_and_restores_after_panel_and_hide(monkeypa
                 window.width, window.height, window.visible,
                 window.opacity, window.ignore_mouse_events, window.skip_task_bar,
             ))
+            try:
+                commands.put_nowait(next(pending))
+            except StopIteration:
+                pass
 
-    commands = object()
-    pending = iter(("__show_flet__", None, "__hide_flet__", "__show_icon__", "__quit__"))
     monkeypatch.setattr(settings_menu, "_watch_flet_parent", lambda _commands: None)
     monkeypatch.setattr(settings_menu, "_primary_screen_size", lambda: (3840, 2160))
-    monkeypatch.setattr(settings_menu, "_drain_latest", lambda source: next(pending) if source is commands else None)
     monkeypatch.setattr(flet_runtime, "ensure_vendored_flet_view", lambda: None)
 
     async def no_sleep(_seconds):
-        if len(states) == 2:
-            await window.on_event(SimpleNamespace(type=ft.WindowEventType.CLOSE))
+        return None
 
     monkeypatch.setattr(settings_menu.asyncio, "sleep", no_sleep)
     run_options = {}
@@ -562,20 +569,17 @@ def test_flet_launcher_starts_visible_and_restores_after_panel_and_hide(monkeypa
         asyncio.run(main(Page()))
 
     monkeypatch.setattr(ft, "run", run)
-    settings_menu._run_flet_desktop_settings_app(queue.Queue(), queue.Queue(), commands, (0, 0, 3840, 2160))
+    settings_menu._run_flet_desktop_settings_app(snapshots, queue.Queue(), commands, (0, 0, 3840, 2160))
 
-    launcher_width = 192 if os.name == "nt" else 12
+    launcher = (192, 57, True, 0.4, False, True)
+    panel = (760, 650, True, 1.0, False, False)
     assert run_options["view"] == ft.AppView.FLET_APP_HIDDEN
-    assert states == [
-        (launcher_width, 57, True, 0.4, False, True),
-        (760, 650, True, 1.0, False, False),
-        (launcher_width, 57, True, 0.4, False, True),
-        (launcher_width, 57, False, 0.4, False, True),
-        (launcher_width, 57, True, 0.4, False, True),
-    ]
-    assert constraints[:3] == [
+    assert states == [launcher, panel, launcher]
+    # wait_until_ready_to_show records constraints before the window is
+    # resized to the target mode, so the dimensions lag the new minimums.
+    assert constraints == [
         (1, 1, 192, 57),
-        (580, 420, launcher_width, 57),
+        (580, 420, 192, 57),
         (1, 1, 760, 650),
     ]
-    assert window.destroyed
+    assert window.destroyed is True

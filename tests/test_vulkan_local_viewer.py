@@ -387,6 +387,97 @@ def test_fullscreen_and_debug_preview_reset_independent_window_hints() -> None:
     assert glfw.hints[glfw.FOCUS_ON_SHOW] == glfw.TRUE
 
 
+def test_capture_protected_viewer_starts_hidden_until_first_present(monkeypatch) -> None:
+    if sys.platform != "win32":
+        pytest.skip("capture-protected startup uses Win32 window affinity")
+    calls = []
+    cursor_calls = []
+    glfw = SimpleNamespace(show_window=lambda window: calls.append(window))
+    monkeypatch.setattr(
+        local_viewer_module,
+        "set_window_mouse_passthrough",
+        lambda *args, **kwargs: cursor_calls.append((args, kwargs)),
+    )
+    viewer = VulkanLocalViewer(
+        VulkanLocalViewerConfig(
+            on_capture_window_exclusion=lambda _hwnd, _include: True,
+            cursor_passthrough=True,
+            hide_cursor_overlay=True,
+        )
+    )
+    viewer.glfw = glfw
+    viewer.window = object()
+    viewer._exclusive_fullscreen = False
+    viewer._capture_window_registration_pending = True
+
+    viewer.show_capture_window_after_first_present()
+    viewer.show_capture_window_after_first_present()
+
+    assert len(calls) == 1
+    assert viewer._capture_window_registration_pending is False
+    assert cursor_calls == [
+        ((viewer.window, True), {"hide_cursor_overlay": True})
+    ]
+
+
+def test_capture_protected_output_does_not_reshow_before_first_present() -> None:
+    if sys.platform != "win32":
+        pytest.skip("capture-protected startup uses Win32 window affinity")
+    calls = []
+    viewer = VulkanLocalViewer(
+        VulkanLocalViewerConfig(on_capture_window_exclusion=lambda _hwnd, _include: True)
+    )
+    viewer._exclusive_fullscreen = True
+    viewer._win32_hwnd = 4242
+    viewer._capture_window_registration_pending = True
+    viewer._win32_user32 = SimpleNamespace(
+        IsWindowVisible=lambda hwnd: calls.append(("visible", hwnd)) or False,
+        IsIconic=lambda hwnd: calls.append(("iconic", hwnd)) or False,
+        GetWindowLongW=lambda hwnd, index: 0,
+        ShowWindowAsync=lambda hwnd, n: calls.append(("show", hwnd)) or 1,
+        SetWindowPos=lambda *args: calls.append(("setpos", args)) or 1,
+    )
+
+    viewer._keep_fullscreen_visible()
+
+    assert calls == []
+
+
+def test_capture_protected_output_reshows_after_first_present() -> None:
+    if sys.platform != "win32":
+        pytest.skip("capture-protected startup uses Win32 window affinity")
+    calls = []
+    viewer = VulkanLocalViewer(
+        VulkanLocalViewerConfig(on_capture_window_exclusion=lambda _hwnd, _include: True)
+    )
+    viewer._exclusive_fullscreen = True
+    viewer._win32_hwnd = 4242
+    viewer._capture_window_registration_pending = False
+    viewer._last_visibility_enforce = 0.0
+    viewer._win32_user32 = SimpleNamespace(
+        IsWindowVisible=lambda hwnd: calls.append(("visible", hwnd)) or False,
+        IsIconic=lambda hwnd: calls.append(("iconic", hwnd)) or False,
+        GetWindowLongW=lambda hwnd, index: 0x00000008,
+        ShowWindowAsync=lambda hwnd, n: calls.append(("show", hwnd)) or 1,
+        SetWindowPos=lambda *args: calls.append(("setpos", args)) or 1,
+    )
+
+    viewer._keep_fullscreen_visible()
+
+    assert ("visible", 4242) in calls
+    assert ("show", 4242) in calls
+
+
+def test_capture_exclusion_can_hide_windowed_viewer_at_creation() -> None:
+    if sys.platform != "win32":
+        pytest.skip("capture-protected startup uses Win32 window hints")
+    glfw = _WindowHintGlfw()
+
+    configure_glfw_window_hints(glfw, fullscreen=False, initially_hidden=True)
+
+    assert glfw.hints[glfw.VISIBLE] == glfw.FALSE
+
+
 def test_taskbar_window_style_can_show_or_hide_the_vulkan_viewer() -> None:
     base_style = 0x00000008 | 0x08000000
 
@@ -727,7 +818,11 @@ def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync, 
         assert waits == pytest.approx([1 / 60 - .003 - grace])
 
 
-def test_vsync_present_asap_skips_fresh_frame_sleep_but_paces_reuse(monkeypatch):
+@pytest.mark.parametrize("vsync", [True, False])
+def test_present_asap_skips_fresh_frame_sleep_but_paces_reuse(
+    monkeypatch,
+    vsync,
+):
     shutdown = threading.Event()
     timeouts = []
     sleeps = []
@@ -776,7 +871,7 @@ def test_vsync_present_asap_skips_fresh_frame_sleep_but_paces_reuse(monkeypatch)
     run_vulkan_local_viewer(
         runtime_q=FrameQueue(),
         shutdown_event=shutdown,
-        config=VulkanLocalViewerConfig(vsync=True),
+        config=VulkanLocalViewerConfig(vsync=vsync),
     )
 
     assert timeouts == pytest.approx([0.05, 1.25 / 60.0])
@@ -854,7 +949,20 @@ def test_present_deadline_calibration_tracks_slow_ready_phase_tail() -> None:
     assert viewer._present_phase_target_ms > 10.0
 
 
+def test_present_deadline_calibration_uses_output_refresh_rate() -> None:
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    interval = 1.0 / 120.0
+    viewer._present_ready_phases = [0.004] * 120
+    viewer._present_queue_wait_ms = [2.1] * 120
+    deadline = 20 * interval
+
+    adjusted = viewer.calibrate_present_deadline(deadline, 120.0)
+
+    assert abs(adjusted - deadline) == pytest.approx(.0001)
+
+
 def test_local_viewer_pacing_does_not_accumulate_timer_oversleep(monkeypatch) -> None:
+    monkeypatch.setenv("D2S_PRESENT_ASAP", "0")
     shutdown = threading.Event()
     clock = [1.0]
     starts = []
@@ -900,6 +1008,7 @@ def test_local_viewer_pacing_does_not_accumulate_timer_oversleep(monkeypatch) ->
 
 
 def test_local_viewer_skips_missed_deadlines_after_a_stall(monkeypatch) -> None:
+    monkeypatch.setenv("D2S_PRESENT_ASAP", "0")
     shutdown = threading.Event()
     clock = [1.0]
     starts = []
@@ -971,6 +1080,40 @@ def test_local_viewer_passes_direct_source_without_host_payload(monkeypatch) -> 
     assert viewer._source.calls == [(None, True)]
     assert frame.viewer_frame_direct is None
     assert releases == []
+
+
+def test_gpu_required_local_viewer_packs_cuda_tensors_without_host_fallback(monkeypatch) -> None:
+    packed_cuda = SimpleNamespace(shape=(2, 4, 4))
+    calls = []
+    source = SimpleNamespace(
+        size=(4, 2),
+        format=None,
+        present=lambda pixels, **kwargs: calls.append((pixels, kwargs)) or True,
+    )
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    viewer.window = object()
+    viewer.source_format = None
+    viewer._source = source
+    monkeypatch.setenv("D2S_GPU_IMAGE_PIPELINE_REQUIRED", "1")
+    monkeypatch.setattr(viewer, "poll_events", lambda: None)
+    monkeypatch.setattr(
+        local_viewer_module,
+        "frame_to_cuda_rgba",
+        lambda _frame: packed_cuda,
+    )
+    monkeypatch.setattr(
+        local_viewer_module,
+        "pack_frame_to_rgba8",
+        lambda _frame: (_ for _ in ()).throw(AssertionError("GPU frame read back")),
+    )
+    monkeypatch.setattr(
+        local_viewer_module,
+        "frame_to_rgba_bytes",
+        lambda _frame: (_ for _ in ()).throw(AssertionError("GPU frame read back")),
+    )
+
+    assert viewer.present(SimpleNamespace(is_cuda=True)) is True
+    assert calls == [(packed_cuda, {"direct": False})]
 
 
 def test_cached_present_reuses_vulkan_image_without_pixel_conversion(monkeypatch) -> None:
@@ -1214,3 +1357,74 @@ def test_depth_color_map_transitions_from_far_blue_to_near_red() -> None:
         [1.0, 1.0, 0.0],
         [1.0, 0.0, 0.0],
     ]
+
+
+def test_capture_windows_initialize_before_initial_capture_session(monkeypatch) -> None:
+    shutdown = threading.Event()
+    ready = threading.Event()
+    runtime_q = queue.Queue()
+    registered = set()
+    events = []
+    ready_handles = []
+    viewers = []
+
+    class FakeViewer:
+        def __init__(self, config):
+            self.config = config
+            self.title = config.title
+            self.hwnd = 0x1000 + len(viewers)
+            viewers.append(self)
+
+        def initialize(self):
+            events.append(("initialize", self.title))
+            callback = self.config.on_capture_window_exclusion
+            if callback is not None:
+                assert callback(self.hwnd, True) is True
+                registered.add(self.hwnd)
+
+        def poll_events(self):
+            events.append(("poll", self.title))
+            shutdown.set()
+
+        def show_capture_window_after_first_present(self):
+            events.append(("show", self.title))
+
+        def close(self):
+            callback = self.config.on_capture_window_exclusion
+            if callback is not None:
+                callback(self.hwnd, False)
+                registered.discard(self.hwnd)
+            events.append(("close", self.title))
+
+    def ready_callback():
+        ready_handles.extend(sorted(registered))
+        events.append(("ready", tuple(sorted(registered))))
+        ready.set()
+
+    def register_window(_hwnd, _included):
+        return True
+
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    thread = threading.Thread(
+        target=run_vulkan_local_viewer,
+        kwargs={
+            "runtime_q": runtime_q,
+            "shutdown_event": shutdown,
+            "config": VulkanLocalViewerConfig(
+                window_preview=True,
+                on_capture_window_exclusion=register_window,
+                on_capture_windows_initialized=ready_callback,
+            ),
+        },
+        daemon=True,
+    )
+    thread.start()
+    assert ready.wait(2.0)
+    shutdown.set()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert ready_handles == [0x1000, 0x1001]
+    ready_index = next(index for index, event in enumerate(events) if event[0] == "ready")
+    first_poll_index = next(index for index, event in enumerate(events) if event[0] == "poll")
+    assert ready_index < first_poll_index

@@ -123,9 +123,11 @@ def _env_flag(name: str) -> bool:
 
 
 def _native_coreml_capture_enabled(ctx) -> bool:
-    """Allow native SCK only for Darwin viewers and opted-in stream sinks."""
+    """Use native ScreenCaptureKit input when the runtime requires GPU frames."""
     if platform.system() != "Darwin":
         return False
+    if bool(getattr(ctx, "gpu_required", False)):
+        return True
     if ctx.run_mode in {"Local Viewer", "Viewer"}:
         return True
     return bool(
@@ -335,6 +337,11 @@ class RuntimePipelineContext:
     capture_size_hint: tuple[int, int] | None = None
     runtime_config: object | None = None
     openxr_presenter_pressure: Callable[[], bool] | None = None
+    gpu_required: bool = False
+
+
+class GPURequiredError(RuntimeError):
+    """The active runtime could not preserve a GPU-resident image path."""
 
 
 def _drain_latest_nowait(q: object | None):
@@ -631,6 +638,12 @@ def _capture_debug_fields(captured_frame: CapturedFrame | None, frame_rgb) -> di
     }
     if captured_frame is not None:
         metadata = captured_frame.metadata if isinstance(captured_frame.metadata, dict) else {}
+        gpu_to_cpu = metadata.get("gpu_to_cpu")
+        if gpu_to_cpu is None:
+            gpu_to_cpu = metadata.get("directml_gpu_to_cpu")
+        fields["raw_image_cpu_readbacks"] = (
+            None if gpu_to_cpu is None else int(bool(gpu_to_cpu))
+        )
         fields.update(
             capture_tool=captured_frame.capture_tool,
             capture_mode=captured_frame.capture_mode,
@@ -687,6 +700,16 @@ def _attach_capture_debug(
     if captured_frame is None:
         return
     metadata = captured_frame.metadata if isinstance(captured_frame.metadata, dict) else {}
+    try:
+        capture_timestamp = float(captured_frame.timestamp)
+    except (TypeError, ValueError):
+        capture_timestamp = None
+    if capture_timestamp is not None:
+        object.__setattr__(runtime_result, "capture_timestamp", capture_timestamp)
+        if isinstance(debug_info, dict):
+            debug_info["capture_to_runtime_ready_ms"] = max(
+                0.0, (time.perf_counter() - capture_timestamp) * 1000.0
+            )
     if isinstance(debug_info, dict):
         debug_info["replayed_static_frame"] = int(bool(metadata.get("replayed_static_frame")))
     capture_frame_id = metadata.get("capture_frame_id")
@@ -706,8 +729,10 @@ def _attach_capture_debug(
     except (TypeError, ValueError):
         depth_frame_id = capture_frame_id
     depth_complete = depth_finite and getattr(runtime_result, "depth", None) is not None
+    depth_age_frames = max(0, capture_frame_id - depth_frame_id)
     object.__setattr__(runtime_result, "capture_frame_id", capture_frame_id)
     object.__setattr__(runtime_result, "depth_frame_id", depth_frame_id)
+    object.__setattr__(runtime_result, "depth_age_frames", depth_age_frames)
     object.__setattr__(runtime_result, "depth_finite", depth_finite)
     object.__setattr__(runtime_result, "depth_complete", depth_complete)
     if isinstance(debug_info, dict):
@@ -715,6 +740,7 @@ def _attach_capture_debug(
         debug_info.update(
             capture_frame_id=capture_frame_id,
             depth_frame_id=depth_frame_id,
+            depth_age_frames=depth_age_frames,
             depth_complete=int(depth_complete),
             depth_finite=int(depth_finite),
             depth_nonfinite_count=int(timing.get("depth_nonfinite_count", 0)),
@@ -731,12 +757,41 @@ def _attach_pipeline_debug(
     render_size_config,
     application_runtime_target=None,
     output_transport=None,
+    gpu_required=False,
+    depth_backend=None,
 ) -> None:
     debug_info = getattr(runtime_result, "debug_info", None)
     if not isinstance(debug_info, dict):
         return
     debug_info["capture_size"] = _size_debug_text(capture_size)
     debug_info["render_size"] = _size_debug_text(render_size)
+    debug_info["gpu_pipeline_required"] = int(bool(gpu_required))
+    if depth_backend:
+        debug_info["depth_backend_actual"] = str(depth_backend)
+    synthesis_backend = (
+        debug_info.get("direct_sbs_backend")
+        or debug_info.get("warp_composite_backend")
+        or debug_info.get("stereo_backend")
+    )
+    if synthesis_backend:
+        debug_info["stereo_backend_actual"] = str(synthesis_backend)
+    eye_size = getattr(runtime_result, "output_eye_size", None)
+    if not isinstance(eye_size, (tuple, list)) or len(eye_size) != 2:
+        display_size = getattr(runtime_result, "output_display_size", None)
+        if isinstance(display_size, (tuple, list)) and len(display_size) == 2:
+            width, height = int(display_size[0]), int(display_size[1])
+            output_format = str(getattr(runtime_result, "output_format", "half_sbs")).casefold()
+            if "sbs" in output_format:
+                width //= 2
+            elif "tab" in output_format:
+                height //= 2
+            eye_size = (width, height)
+    if isinstance(eye_size, (tuple, list)) and len(eye_size) == 2:
+        debug_info["output_eye_size"] = _size_debug_text(eye_size)
+    runtime_image = getattr(runtime_result, "sbs", None)
+    runtime_device = getattr(runtime_image, "device", None)
+    if runtime_device is not None:
+        debug_info["stereo_output_device"] = str(runtime_device)
     debug_info["application_runtime_target"] = _application_target_debug_label(
         run_mode,
         application_runtime_target=application_runtime_target,
@@ -1099,6 +1154,13 @@ def _cursor_rgb_sample(frame_rgb):
         return None
 
 
+def _supports_cursor_depth_reuse(ctx) -> bool:
+    return bool(
+        getattr(ctx, "run_mode", None) == "OpenXR"
+        or getattr(ctx, "output_transport", None) == "local_fullscreen"
+    )
+
+
 def _cursor_only_rgb_change(
     previous,
     current,
@@ -1249,6 +1311,8 @@ class RuntimePipelineLoop:
         self._cursor_uv_reference = None
         self._prepared = False
         self._consecutive_runtime_errors = 0
+        self._runtime_error_backoff_s = 0.05
+        self._runtime_retry_after = 0.0
         self._dual_pending_cooldown_until = 0.0
         self._parallel_depth_scheduler = None
         self._parallel_mps_serial_notice_emitted = False
@@ -1306,7 +1370,7 @@ class RuntimePipelineLoop:
         runtime = ctx.stereo_runtime
         stereo_config = getattr(runtime, "stereo_config", None)
         if (
-            ctx.run_mode != "OpenXR"
+            not _supports_cursor_depth_reuse(ctx)
             or captured_frame is None
             or captured_frame.capture_tool not in {"WindowsCaptureCUDA", "WindowsCaptureROCm"}
             or str(captured_frame.capture_mode).lower() != "monitor"
@@ -1615,6 +1679,8 @@ class RuntimePipelineLoop:
             threshold = 3
         if self._consecutive_runtime_errors < threshold:
             return
+        if bool(getattr(self, "_runtime_retry_after", 0.0)):
+            return
         rebuild = getattr(self.context.stereo_runtime, "_rebuild_depth_provider", None)
         if not callable(rebuild):
             self.context.source_stat_inc("runtime_rebuild_unavailable")
@@ -1641,6 +1707,44 @@ class RuntimePipelineLoop:
             )
         finally:
             self._consecutive_runtime_errors = 0
+
+    @staticmethod
+    def _is_model_network_error(exc: Exception) -> bool:
+        message = str(exc).casefold()
+        network_markers = (
+            "unable to access model download endpoints",
+            "couldn't connect to '",
+            "could not connect to '",
+            "connectionerror",
+            "connection refused",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "getaddrinfo failed",
+            "network is unreachable",
+            "max retries exceeded",
+        )
+        return any(marker in message for marker in network_markers)
+
+    def _defer_model_network_retry(self, exc: Exception) -> bool:
+        if not self._is_model_network_error(exc):
+            self._runtime_retry_after = 0.0
+            self._runtime_error_backoff_s = 0.05
+            return False
+        delay = float(getattr(self, "_runtime_error_backoff_s", 0.05))
+        delay = max(1.0, min(60.0, delay))
+        self._runtime_retry_after = time.perf_counter() + delay
+        self._runtime_error_backoff_s = min(60.0, delay * 2.0)
+        self._consecutive_runtime_errors = 0
+        self.context.source_stat_inc(
+            "runtime_model_network_retry_deferred",
+            retry_delay_s=delay,
+        )
+        print(
+            "[RuntimePipeline] Model cache unavailable and download endpoint is "
+            f"offline; next retry in {delay:.0f}s",
+            flush=True,
+        )
+        return True
 
     def _ensure_parallel_depth_scheduler(self) -> None:
         if getattr(self, "_parallel_depth_scheduler", None) is not None:
@@ -1863,6 +1967,13 @@ class RuntimePipelineLoop:
     def run(self) -> None:
         ctx = self.context
         while not ctx.shutdown_event.is_set():
+            retry_after = float(getattr(self, "_runtime_retry_after", 0.0))
+            if retry_after:
+                remaining = retry_after - time.perf_counter()
+                if remaining > 0.0:
+                    time.sleep(min(remaining, 0.25))
+                    continue
+                self._runtime_retry_after = 0.0
             self._publish_ready_cuda_timing_results()
             ctx.log_source_health()
             native_sck = False
@@ -1948,6 +2059,13 @@ class RuntimePipelineLoop:
                     and getattr(captured_frame, "sck_zero_copy", None) is not None
                     and _native_coreml_capture_enabled(ctx)
                 )
+                if ctx.gpu_required and not native_sck:
+                    input_device = getattr(getattr(frame_input, "device", None), "type", None)
+                    if input_device not in {"cuda", "mps"}:
+                        raise GPURequiredError(
+                            "GPU capture is required, but the capture backend returned "
+                            f"{input_device or 'host'} image data"
+                        )
                 native_ready = False
                 if native_sck and callable(
                     getattr(ctx.stereo_runtime, "native_coreml_io_ready", None)
@@ -1973,6 +2091,13 @@ class RuntimePipelineLoop:
                         f"reason={getattr(info, 'native_io_reason', None)!r}",
                         flush=True,
                     )
+                if native_sck and ctx.gpu_required and not native_ready:
+                    provider = getattr(ctx.stereo_runtime, "depth_provider", None)
+                    info = getattr(provider, "info", None)
+                    reason = getattr(info, "native_io_reason", None)
+                    raise GPURequiredError(
+                        str(reason or "ScreenCaptureKit to Metal inference preflight failed")
+                    )
                 if native_ready:
                     import torch
 
@@ -1984,6 +2109,10 @@ class RuntimePipelineLoop:
                     setattr(frame_rgb, "_d2s_preprocess_backend", "native_coreml_metal")
                 else:
                     if native_sck:
+                        if ctx.gpu_required:
+                            raise GPURequiredError(
+                                "ScreenCaptureKit GPU capture requires native CoreML/Metal inference"
+                            )
                         # Capability preflight failed, so make the explicitly
                         # retained IOSurface available to the existing Python
                         # Core ML path instead of silently producing blanks.
@@ -1998,6 +2127,11 @@ class RuntimePipelineLoop:
                         frame_raw_device=captured_frame.frame_raw_device if captured_frame else None,
                         capture_copy_mode=_capture_copy_mode(captured_frame),
                         capture_zero_copy=_capture_zero_copy(captured_frame),
+                    )
+                frame_device = getattr(getattr(frame_rgb, "device", None), "type", None)
+                if ctx.gpu_required and frame_device not in {"cuda", "mps", "meta"}:
+                    raise GPURequiredError(
+                        f"GPU preprocessing is required, but produced {frame_device or 'host'} data"
                     )
                 if not self._logged_rgb_shape and os.environ.get('D2S_DEBUG', '0') in ('1', 'true', 'yes', 'on'):
                     self._logged_rgb_shape = True
@@ -2296,9 +2430,14 @@ class RuntimePipelineLoop:
                             ),
                             depth_frame_id=depth_source_frame_id,
                         )
-                    except Exception:
+                    except Exception as exc:
                         if not native_sck or native_capture is None:
                             raise
+                        if ctx.gpu_required:
+                            native_capture.release()
+                            raise GPURequiredError(
+                                f"native Metal processing failed: {type(exc).__name__}: {exc}"
+                            ) from exc
                         # Native capability can change after a successful
                         # preflight (driver/resource pressure). Materialize
                         # this retained frame once, release its native lease,
@@ -2333,6 +2472,22 @@ class RuntimePipelineLoop:
                             depth_frame_id=depth_source_frame_id,
                         )
                 ctx.breakdown_add_time("rt_call", time.perf_counter() - runtime_call_start_time)
+                if ctx.gpu_required:
+                    runtime_image = getattr(runtime_result, "sbs", None)
+                    output_device = getattr(getattr(runtime_image, "device", None), "type", None)
+                    native_output = any(
+                        getattr(runtime_result, name, None) is not None
+                        for name in (
+                            "native_stream_frame",
+                            "viewer_native",
+                            "native_resource_handle",
+                            "vulkan_compute_request",
+                        )
+                    )
+                    if output_device not in {"cuda", "mps", "meta"} and not native_output:
+                        raise GPURequiredError(
+                            f"GPU stereo synthesis is required, but produced {output_device or 'host'} output"
+                        )
                 if runtime_result.depth is None:
                     self._clear_cursor_depth_cache()
                 elif cursor_depth_candidate is not None:
@@ -2344,6 +2499,13 @@ class RuntimePipelineLoop:
                         runtime_result,
                         reused=cursor_depth_reused,
                     )
+                depth_provider_info = getattr(
+                    getattr(ctx.stereo_runtime, "depth_provider", None), "info", None
+                )
+                depth_backend = (
+                    getattr(depth_provider_info, "execution_provider", None)
+                    or getattr(depth_provider_info, "depth_backend", None)
+                )
                 _attach_pipeline_debug(
                     runtime_result,
                     capture_size=size,
@@ -2352,6 +2514,8 @@ class RuntimePipelineLoop:
                     render_size_config=ctx.render_size_config,
                     application_runtime_target=ctx.application_runtime_target,
                     output_transport=ctx.output_transport,
+                    gpu_required=ctx.gpu_required,
+                    depth_backend=depth_backend,
                 )
                 debug_info = getattr(runtime_result, "debug_info", None)
                 if isinstance(debug_info, dict):
@@ -2532,14 +2696,16 @@ class RuntimePipelineLoop:
                     ctx.source_stat_inc("native_io_busy")
                     continue
                 self._consecutive_runtime_errors += 1
-                fatal_error = _is_fatal_runtime_preparation_error(exc)
+                fatal_error = isinstance(exc, GPURequiredError) or _is_fatal_runtime_preparation_error(exc)
                 ctx.source_stat_inc(
                     "runtime_errors",
                     last_error=f"process_runtime_loop {type(exc).__name__}: {exc}",
                 )
                 ctx.source_stat_inc("runtime_inference_failures")
                 ctx.breakdown_inc("runtime_inference_failures")
-                self._rebuild_after_consecutive_failures()
+                network_retry_deferred = self._defer_model_network_retry(exc)
+                if not network_retry_deferred:
+                    self._rebuild_after_consecutive_failures()
                 if fatal_error:
                     ctx.source_stat_inc("runtime_fatal_errors")
                     print(f"[process_runtime_loop] Fatal: {type(exc).__name__}: {exc}", flush=True)
@@ -2549,7 +2715,8 @@ class RuntimePipelineLoop:
                         pass
                     break
                 print(f"[process_runtime_loop] Error: {type(exc).__name__}: {exc}", flush=True)
-                time.sleep(0.05)
+                if not network_retry_deferred:
+                    time.sleep(0.05)
                 continue
         if self._parallel_depth_scheduler is not None:
             self._parallel_depth_scheduler.close()

@@ -58,8 +58,8 @@ class StereoRuntimeConfig:
     openxr_visual_regression_dir: str | Path | None = None
     depth_upsample: DepthUpsampleMode = "joint_bilateral"
     depth_upsample_edge_strength: float = 0.35
-    depth_strength: float = 2.0
-    convergence: float = 0.0
+    depth_strength: float = 0.48
+    convergence: float = 0.5
     max_disparity_px: float | None = None
     parallax_preset: str = "standard"
     foreground_shift_scale: float = 1.0
@@ -250,6 +250,16 @@ def runtime_config_from_d2s_settings(
         temporal_strength = 0.0
 
     headset_tier = _output_headset_tier_from_settings(settings)
+    cuda_graph_setting = settings.get(
+        "Depth CUDA Graph", settings.get("CUDA Graph")
+    )
+    if cuda_graph_setting is None:
+        cuda_graph_setting = (
+            str(settings.get("Run Mode", "")).strip().casefold()
+            == "moonlight streamer"
+            and bool(settings.get("TensorRT", False))
+            and parallel_workers == 1
+        )
     return StereoRuntimeConfig(
         model_id=str(model_name),
         cache_dir=cache_dir,
@@ -265,7 +275,7 @@ def runtime_config_from_d2s_settings(
         build_migraphx_graph=bool(settings.get("MIGraphX", False)),
         force_rebuild_migraphx=bool(settings.get("Recompile MIGraphX", False)),
         use_cuda_graph=(
-            _to_bool(settings.get("Depth CUDA Graph", settings.get("CUDA Graph", False)))
+            _to_bool(cuda_graph_setting)
             and device_type == "cuda"
             and not is_rocm
         ),
@@ -276,8 +286,8 @@ def runtime_config_from_d2s_settings(
         ),
         export_height=export_height,
         export_width=export_width,
-        depth_strength=float(settings.get("Depth Strength", 2.0)),
-        convergence=float(settings.get("Convergence", 0.0)),
+        depth_strength=float(settings.get("Depth Strength", 0.48)),
+        convergence=float(settings.get("Convergence", 0.5)),
         max_disparity_px=_optional_float_setting(settings, "Max Disparity Px", "Max Disparity PX"),
         parallax_preset=str(settings.get("Parallax Budget Preset", settings.get("Parallax Preset", "standard"))),
         foreground_shift_scale=float(settings.get("Foreground Pop", 1.0)),
@@ -352,32 +362,8 @@ def _output_headset_tier_from_settings(settings: dict[str, Any]) -> int:
     return int(preset.resolution_tier_k)
 
 
-def _streamer_mode_output_quality_disabled(settings: dict[str, Any]) -> bool:
-    """Return whether stream output-quality resampling should be skipped.
-
-    Streamers publish to browsers/network players, not a headset, so upscaling
-    the packed SBS to the headset 4K tier only adds hundreds of ms of EASU
-    work per frame (the torch fallback is ~300 ms at 1920x1200). Local Viewer,
-    3D Monitor and OpenXR keep the upscale.
-    """
-    try:
-        from utils.run_mode import normalize_run_mode
-    except Exception:
-        return False
-    run_mode = normalize_run_mode(str(settings.get("Run Mode", "") or ""))
-    return run_mode in {
-        "MJPEG Streamer",
-        "RTMP Streamer",
-        "Streamer",
-        "MJPEG",
-        "RTMP",
-    }
-
-
 def _output_quality_disabled(settings: dict[str, Any]) -> bool:
-    """Skip producer-side resampling when the consumer is OpenXR or a stream."""
-    if _streamer_mode_output_quality_disabled(settings):
-        return True
+    """Leave OpenXR source resolution native for runtime-owned projection sampling."""
     try:
         from utils.run_mode import normalize_run_mode
     except Exception:
@@ -595,6 +581,12 @@ def depth_provider_config_from_runtime(config: StereoRuntimeConfig) -> "DepthPro
     build_engine = config.build_migraphx_graph if backend == "migraphx_rocm" else config.build_trt_engine
     force_rebuild = config.force_rebuild_migraphx if backend == "migraphx_rocm" else config.force_rebuild_trt
     is_zipdepth = "zipdepth" in config.resolved_model_id.lower()
+    execution_slot_count = config.parallel_inference_workers
+    if config.use_cuda_graph:
+        # CUDA graph inference has a fixed launch graph; a second execution
+        # slot overlaps the next prediction while stereo consumes the current
+        # one, without changing model output or stereo parameters.
+        execution_slot_count = max(2, execution_slot_count)
 
     return DepthProviderConfig(
         backend=backend,
@@ -620,7 +612,7 @@ def depth_provider_config_from_runtime(config: StereoRuntimeConfig) -> "DepthPro
         use_coreml=bool(getattr(config, "use_coreml", False)),
         recompile_coreml=bool(getattr(config, "recompile_coreml", False)),
         use_torch_compile=bool(getattr(config, "use_torch_compile", False)),
-        execution_slot_count=config.parallel_inference_workers,
+        execution_slot_count=execution_slot_count,
         depth_upsample=config.depth_upsample,
         depth_upsample_edge_strength=config.depth_upsample_edge_strength,
     )
@@ -641,8 +633,8 @@ def openxr_render_config_from_snapshot(
     from .openxr_render import OpenXRRenderConfig
     from .parallax import resolve_parallax_budget
 
-    depth_strength = 2.0 if snapshot.depth_strength is None else float(snapshot.depth_strength)
-    convergence = 0.0 if snapshot.convergence is None else float(snapshot.convergence)
+    depth_strength = 0.48 if snapshot.depth_strength is None else float(snapshot.depth_strength)
+    convergence = 0.5 if snapshot.convergence is None else float(snapshot.convergence)
     parallax_preset = str(snapshot.parallax_preset or preset or "standard")
     max_disparity_px = snapshot.max_disparity_px
     if max_disparity_px is None and render_size is not None:

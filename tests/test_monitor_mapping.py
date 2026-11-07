@@ -116,7 +116,7 @@ def test_list_monitors_uses_windows_display_numbers(monkeypatch):
     assert [mon["capture_index"] for mon in monitors] == [3, 2, 1]
 
 
-def test_two_monitors_exclude_captured_input_from_local_output():
+def test_two_monitors_allow_same_monitor_local_output():
     monitors = [
         {"capture_index": 1, "display_number": 1, "left": 0, "top": 0, "width": 1920, "height": 1080},
         {"capture_index": 2, "display_number": 2, "left": 1920, "top": 0, "width": 2560, "height": 1440},
@@ -130,8 +130,10 @@ def test_two_monitors_exclude_captured_input_from_local_output():
 
     assert gui.monitor_dd.value == current
     assert gui.monitor_label_to_index[current] == 2
+    # The captured input monitor stays selectable as the same-monitor output.
     assert gui.stereo_monitor_dd.options == [
         "1: 1920x1080 @ (0,0) (Primary)",
+        "2: 2560x1440 @ (1920,0)",
     ]
     assert gui.stereo_monitor_dd.value == "1: 1920x1080 @ (0,0) (Primary)"
     assert gui.fit_count == 1
@@ -152,6 +154,7 @@ def test_populate_monitors_falls_back_to_primary_when_current_missing():
     assert gui.monitor_dd.value == primary
     assert gui.stereo_monitor_dd.options == [
         "1: 1920x1080 @ (0,0)",
+        "2: 2560x1440 @ (1920,0) (Primary)",
     ]
     assert gui.stereo_monitor_dd.value == "1: 1920x1080 @ (0,0)"
 
@@ -166,7 +169,7 @@ def test_populate_monitors_includes_detected_model_name():
             "width": 3840,
             "height": 2160,
             "model": "VITURE",
-            "name": "Generic PnP Monitor",
+            "name": "VITURE",
         },
     ]
     gui = FakeMonitorGui()
@@ -202,10 +205,11 @@ def test_three_monitors_default_output_to_last_available_monitor():
     monitor_mixin.populate_monitors(gui)
 
     assert gui.stereo_monitor_dd.options == [
+        "1: 1920x1080 @ (0,0) (Primary)",
         "2: 2560x1440 @ (1920,0)",
         "3: 3840x2160 @ (4480,0)",
     ]
-    assert gui.stereo_monitor_dd.value == "3: 3840x2160 @ (4480,0)"
+    assert gui.stereo_monitor_dd.value == "2: 2560x1440 @ (1920,0)"
 
 
 def test_switching_local_input_to_output_monitor_selects_last_other_monitor():
@@ -225,11 +229,26 @@ def test_switching_local_input_to_output_monitor_selects_last_other_monitor():
     assert gui.stereo_monitor_dd.options == [
         "1: 1920x1080 @ (0,0)",
         "2: 2560x1440 @ (1920,0)",
+        "3: 3840x2160 @ (4480,0)",
     ]
-    assert gui.stereo_monitor_dd.value == "2: 2560x1440 @ (1920,0)"
+    assert gui.stereo_monitor_dd.value == "3: 3840x2160 @ (4480,0)"
 
 
-def test_invalid_saved_local_output_requires_explicit_reselection():
+def test_saved_local_output_rejects_unknown_monitor():
+    gui = FakeMonitorGui(monitor_value="2: 2560x1440 @ (1920,0)")
+    gui.monitor_label_to_index = {
+        "1: 1920x1080 @ (0,0)": 1,
+        "2: 2560x1440 @ (1920,0)": 2,
+    }
+    gui._get_monitor_count = lambda: 2
+    monitor_mixin = _load_monitor_methods([], primary_index=1)
+
+    monitor_mixin._apply_stereo_output(gui, {"Stereo Output": 99})
+
+    assert gui.stereo_monitor_dd.value == ""
+
+
+def test_saved_local_output_selects_same_monitor_when_it_matches_input():
     shared = "2: 2560x1440 @ (1920,0)"
     gui = FakeMonitorGui(monitor_value=shared)
     gui.monitor_label_to_index = {
@@ -241,7 +260,7 @@ def test_invalid_saved_local_output_requires_explicit_reselection():
 
     monitor_mixin._apply_stereo_output(gui, {"Stereo Output": 2})
 
-    assert gui.stereo_monitor_dd.value == ""
+    assert gui.stereo_monitor_dd.value == shared
 
 
 def test_3d_monitor_output_can_match_input_monitor():
@@ -262,12 +281,22 @@ def test_3d_monitor_output_can_match_input_monitor():
     assert gui.stereo_monitor_dd.value == shared
 
 
-def test_single_monitor_local_viewer_requires_virtual_display():
+def test_single_monitor_local_viewer_uses_same_monitor_3d_mode():
+    # With a single display, Local Viewer + Monitor capture auto-enters the
+    # same-monitor 3D mode (SBS replaces the captured frame in-place).
     from gui.process import GUIProcessMixin
 
     class Gui:
         run_mode_key = "Local Viewer"
         locale = "CN"
+        capture_mode_key = "Monitor"
+        monitor_label_to_index = {"1: 1920x1080 @ (0,0)": 1}
+        stereo_monitor_dd = FakeDropdown("1: 1920x1080 @ (0,0)")
+        monitor_dd = FakeDropdown("1: 1920x1080 @ (0,0)")
+        stream_port_tf = FakeDropdown("1122")
+        crf_tf = FakeDropdown("23")
+        audio_delay_tf = FakeDropdown("0.0")
+        stream_key_tf = FakeDropdown("live")
 
         @staticmethod
         def _get_monitor_count():
@@ -275,5 +304,4 @@ def test_single_monitor_local_viewer_requires_virtual_display():
 
     ok, message = GUIProcessMixin._validate_config_before_run(Gui())
 
-    assert not ok
-    assert "虚拟显示屏" in message
+    assert ok

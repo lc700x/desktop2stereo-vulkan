@@ -292,6 +292,46 @@ def find_local_model_weight(model_dir: str | Path) -> Path | None:
     return None
 
 
+def find_local_model_snapshot(model_id: str, cache_dir: str | Path) -> Path | None:
+    """Find a complete local Transformers directory inside the Hub cache."""
+    model_dir = resolve_model_dir(model_id, cache_dir)
+
+    def is_loadable(path: Path) -> bool:
+        return (
+            (path / "config.json").is_file()
+            and find_local_model_weight(path) is not None
+        )
+
+    if is_loadable(model_dir):
+        return model_dir
+
+    snapshots_dir = model_dir / "snapshots"
+    if not snapshots_dir.is_dir():
+        return None
+
+    revisions = []
+    main_ref = model_dir / "refs" / "main"
+    if main_ref.is_file():
+        revision = main_ref.read_text(encoding="utf-8").strip()
+        if revision:
+            revisions.append(revision)
+    revisions.extend(
+        path.name
+        for path in sorted(
+            snapshots_dir.iterdir(),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        if path.is_dir() and path.name not in revisions
+    )
+
+    for revision in revisions:
+        snapshot = snapshots_dir / revision
+        if snapshot.is_dir() and is_loadable(snapshot):
+            return snapshot
+    return None
+
+
 def select_existing_onnx(paths: ModelArtifactPaths, dtype: OnnxDtypeMode = "auto") -> Path | None:
     if dtype == "fp16":
         if paths.onnx_fp16_path.exists():
@@ -491,9 +531,8 @@ def prepare_model_artifacts(
                 height=export_height,
                 width=export_width,
                 dtype=onnx_dtype,
-                # A downloaded weight does not imply that the Hub metadata is
-                # cached. Let from_pretrained use the selected endpoint unless
-                # the user explicitly requested offline mode.
+                # A complete local repository always exports offline, including
+                # when Hugging Face refs metadata is missing or inconsistent.
                 local_files_only=local_files_only or model_cache_complete,
                 export_if_missing=True,
             )

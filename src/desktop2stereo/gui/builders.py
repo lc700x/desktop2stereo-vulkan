@@ -402,8 +402,10 @@ class GUIBuilderMixin:
         # Row 3: Convergence + Depth Strength
         self.depth_strength_label = ft.Text("Depth Strength:", size=FONT_SIZE, width=S(130))
         ds_options = [f"{i / 100:.2f}" for i in range(0, 51, 5)]
+        ds_options.append("0.48")
+        ds_options.sort(key=float)
         self.depth_strength_dd = CompactDropdown(width=S(130),
-            options=[v for v in ds_options], value="0.25",
+            options=[v for v in ds_options], value="0.48",
             on_select=self.on_stereo_hot_param_change)
         convergence_depth_row = ft.Row([
             self.convergence_label, self.convergence_dd,
@@ -1279,7 +1281,7 @@ class GUIBuilderMixin:
     @staticmethod
     def _get_streamer_row_map():
         return {
-            "Local Viewer": [], "3D Monitor": [], "OpenXR Link": [],
+            "Local Viewer": [], "OpenXR Link": [],
             "MJPEG Streamer": [0, 4],
             "RTMP Streamer": [0, 1, 2, 3, 4, 5, 6, 7, 9],
             "Moonlight Streamer": [],
@@ -1384,16 +1386,8 @@ class GUIBuilderMixin:
         ):
             self.stereo_monitor_dd.value = ""
             return
-        input_label = (
-            self.monitor_dd.value
-            if self.run_mode_key == "Local Viewer"
-            and self.capture_mode_key == "Monitor"
-            else None
-        )
-        output_labels = [
-            label for label in self.monitor_label_to_index
-            if label != input_label
-        ]
+        output_labels = list(self.monitor_label_to_index)
+        input_label = self.monitor_dd.value
         saved = cfg.get("Stereo Output")
         if saved is not None:
             label = next(
@@ -1409,7 +1403,10 @@ class GUIBuilderMixin:
                 return
             self.stereo_monitor_dd.value = ""
             return
-        self.stereo_monitor_dd.value = output_labels[-1] if output_labels else ""
+        self.stereo_monitor_dd.value = next(
+            (label for label in output_labels if label != input_label),
+            output_labels[0] if output_labels else "",
+        )
 
     @staticmethod
     def _get_monitor_count():
@@ -1423,23 +1420,18 @@ class GUIBuilderMixin:
     def update_stereo_monitor_menu(self):
         if not hasattr(self, 'stereo_monitor_dd'):
             return
-        input_label = (
-            self.monitor_dd.value
-            if self.run_mode_key == "Local Viewer"
-            and self.capture_mode_key == "Monitor"
-            else None
-        )
-        opts = [
-            label for label in self.monitor_label_to_index
-            if label != input_label
-        ]
+        opts = list(self.monitor_label_to_index)
+        input_label = self.monitor_dd.value
         current = self.stereo_monitor_dd.value
         valid = current in opts
         self.stereo_monitor_dd.options = opts
         if getattr(self, "_missing_stereo_output_identity", False):
             self.stereo_monitor_dd.value = ""
         else:
-            self.stereo_monitor_dd.value = current if valid else (opts[-1] if opts else "")
+            self.stereo_monitor_dd.value = current if valid else next(
+                (label for label in opts if label != input_label),
+                opts[0] if opts else "",
+            )
         self.stereo_monitor_dd.update()
 
     def update_depth_resolution_options(self, model_name):

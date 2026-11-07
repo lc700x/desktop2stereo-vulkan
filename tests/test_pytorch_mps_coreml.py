@@ -2,6 +2,9 @@
 
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 from stereo_runtime.depth_provider import (
     DepthProviderConfig,
     DepthProviderInfo,
@@ -155,6 +158,7 @@ def test_coreml_provider_info_reports_active_backend_without_fallback():
     assert provider.info.fallback_reason is None
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="PyTorch MPS backend is required")
 def test_coreml_engine_sanitizes_nonfinite_output():
     import numpy as np
     import torch

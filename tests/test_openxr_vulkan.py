@@ -3289,7 +3289,7 @@ def test_curved_screen_fps_overlay_uses_matching_cylinder_layer() -> None:
     position, _rotation = presenter._screen_overlay_pose(local)
 
     entry = {"swapchain": "fps-swapchain"}
-    layer = presenter._make_tool_quad_layer(
+    layers = presenter._make_tool_quad_layer(
         entry,
         640,
         96,
@@ -3298,48 +3298,44 @@ def test_curved_screen_fps_overlay_uses_matching_cylinder_layer() -> None:
         (0.0, 0.0, 0.0, 1.0),
         key="screen_fps",
     )
+    assert isinstance(layers, list)
+    assert layers
+    assert all(layer["layer_type"] == "quad" for layer in layers)
 
-    assert layer["layer_type"] == "cylinder"
+    layer = layers[0]
     assert layer["space"] == "reference"
     assert layer["eye_visibility"] == "both"
-    assert layer["radius"] == pytest.approx(2.4 / (2.0 * 0.72))
-    assert layer["central_angle"] == pytest.approx(0.8 / layer["radius"])
-    assert layer["aspect_ratio"] == pytest.approx(0.8 / 0.16)
     assert layer["sub_image"]["swapchain"] == "fps-swapchain"
-    radius = layer["radius"]
-    theta = -0.7 / radius
-    expected_normal = (-math.sin(theta), 0.0, math.cos(theta))
-    expected_position = (
-        radius * math.sin(theta) + expected_normal[0] * 0.003,
-        -0.8,
-        -2.0 + radius * (1.0 - math.cos(theta)) + expected_normal[2] * 0.003,
-    )
-    actual_position = layer["pose"]["position"]
-    assert (actual_position["x"], actual_position["y"], actual_position["z"]) == pytest.approx(
-        expected_position
-    )
-
-    presenter._openxr_cylinder_supported = False
-    fallback_layer = presenter._make_tool_quad_layer(
-        entry,
-        640,
-        96,
-        position,
-        (0.8, 0.16),
-        (0.0, 0.0, 0.0, 1.0),
-        key="screen_fps",
-    )
-    assert 4 <= len(fallback_layer) <= 8
-    assert all(layer["layer_type"] == "quad" for layer in fallback_layer)
-    rectangles = [layer["sub_image"]["image_rect"] for layer in fallback_layer]
+    rectangles = [item["sub_image"]["image_rect"] for item in layers]
     assert rectangles[0]["offset"]["x"] == 0
     assert rectangles[-1]["offset"]["x"] + rectangles[-1]["extent"]["width"] == 640
     assert all(
         left["offset"]["x"] + left["extent"]["width"] == right["offset"]["x"]
         for left, right in zip(rectangles, rectangles[1:])
     )
-    rotations = [layer["pose"]["orientation"] for layer in fallback_layer]
+    assert all(
+        item["sub_image"]["image_rect"]["extent"]["height"] == 96 for item in layers
+    )
+    rotations = [item["pose"]["orientation"] for item in layers]
     assert rotations[0] != rotations[-1]
+
+    # Curved overlays rebuild resize-aware tangent quad segments rather than
+    # shipping a single compositor cylinder per frame.
+    assert 4 <= len(layers) <= 8
+
+    presenter._openxr_cylinder_supported = False
+    presenter._screen_curved = False
+    flat_layer = presenter._make_tool_quad_layer(
+        entry,
+        640,
+        96,
+        position,
+        (0.8, 0.16),
+        (0.0, 0.0, 0.0, 1.0),
+        key="screen_fps",
+    )
+    assert not isinstance(flat_layer, list)
+    assert flat_layer["layer_type"] == "quad"
 
 
 def test_msdf_osd_canvas_width_follows_text_advance() -> None:
@@ -4622,11 +4618,13 @@ def test_persisted_screen_state_is_applied_and_reset_restores_head_pose(tmp_path
     presenter._head_forward_w = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
     presenter._initialize_filament_screen_from_head()
 
+    # The persisted screen sits behind the headset, so initialization realigns
+    # it in front of the current head pose before accepting it.
     assert presenter._filament_screen == (
-        (1.0, 1.6, -2.5),
+        (5.5, 1.6, 2.0),
         3.2,
         1.8,
-        (-90.0, 5.0, 0.0),
+        (-90.0, 0.0, 0.0),
     )
     assert presenter._screen_curved is True
 
@@ -4636,7 +4634,7 @@ def test_persisted_screen_state_is_applied_and_reset_restores_head_pose(tmp_path
     assert position == pytest.approx((21.0, 1.6, 2.0))
     assert width == pytest.approx(23.09)
     assert height == pytest.approx(12.988125)
-    assert rotation == pytest.approx((-90.0, 5.0, 0.0))
+    assert rotation == pytest.approx((-90.0, 0.0, 0.0))
     assert presenter._screen_curved is True
     assert presenter._screen_curve_half_angle == pytest.approx(0.72)
     assert calls[-1][0] == "persist_openxr_screen_state"

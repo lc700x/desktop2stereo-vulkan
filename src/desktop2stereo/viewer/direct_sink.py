@@ -2,10 +2,9 @@
 
 The native macOS path keeps capture, Core ML preprocessing/inference, depth
 sanitization, and warp packing on the GPU. When ``VK_EXT_metal_objects`` can
-export the mapped transfer allocation as an ``MTLBuffer``, the warp writes
-directly into the Vulkan ring slot; otherwise it keeps the explicit GPU-to-CPU
-visible Vulkan-buffer handoff copy. The viewer submits ``CopyBufferToImage``
-from the claimed ring slot without CPU color conversion or NumPy packing.
+export the transfer allocation as an ``MTLBuffer``, the warp writes directly
+into the Vulkan ring slot. GPU-only mode requires this alias and never uses the
+mapped-buffer handoff; the non-strict compatibility path can still use it.
 
 Hand-off safety: a source is "pending" from the moment the packer takes
 it until the viewer's fence confirms the GPU finished reading it (the
@@ -88,9 +87,14 @@ class DirectSinkRegistry:
         output_format: str,
         *,
         fallback_source=None,
+        gpu_required: bool = False,
     ):
         """Pack under the registry lock so unregister/unmap waits for writes."""
         if not direct_staging_enabled():
+            if gpu_required:
+                raise RuntimeError(
+                    "GPU-only native output requires Vulkan Metal direct staging"
+                )
             return self._pack_mapped_fallback(
                 frame, size, output_format, fallback_source
             )
@@ -104,7 +108,19 @@ class DirectSinkRegistry:
                         getattr(source, "_metal_buffer_capacity", 0) or 0
                     )
                     pack_metal = getattr(frame, "pack_metal", None)
-                    if (
+                    if gpu_required:
+                        if metal_buffer is None or not callable(pack_metal):
+                            raise RuntimeError(
+                                "GPU-only native output requires an exported Metal buffer"
+                            )
+                        pack_metal(
+                            metal_buffer,
+                            metal_capacity,
+                            size,
+                            output_format,
+                        )
+                        self._metal_alias_verified = True
+                    elif (
                         metal_buffer is not None
                         and callable(pack_metal)
                         and self._metal_alias_verified is not False
@@ -163,6 +179,12 @@ class DirectSinkRegistry:
                     source._release_direct()
                     raise
                 return source
+            if gpu_required:
+                if any(getattr(source, "size", None) == size for source in self._sources):
+                    return None
+                raise RuntimeError(
+                    f"GPU-only native output has no registered Metal staging slot for {size}"
+                )
             return self._pack_mapped_fallback(
                 frame, size, output_format, fallback_source
             )

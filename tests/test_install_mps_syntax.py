@@ -4,9 +4,28 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _bash_usable() -> bool:
+    if shutil.which("bash") is None:
+        return False
+    try:
+        return subprocess.run(
+            ["bash", "--version"],
+            capture_output=True,
+            timeout=10,
+        ).returncode == 0
+    except Exception:
+        return False
+
+
+_BASH_USABLE = _bash_usable()
+
+
+@pytest.mark.skipif(not _BASH_USABLE, reason="bash is not runnable in this environment")
 def test_install_mps_shell_syntax() -> None:
     shutil.which("bash") is not None
     for name in ("install-mps", "install-mps0"):

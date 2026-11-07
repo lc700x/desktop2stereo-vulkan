@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import flet as ft
 
@@ -18,12 +19,15 @@ GUI_SOURCE = APP_ROOT / "gui" / "gui.py"
 
 def test_left_settings_area_uses_a_bounded_scroll_viewport() -> None:
     source = BUILDERS_SOURCE.read_text(encoding="utf-8")
-    scroll_start = source.index("scroll_area = ft.Column([")
+    scroll_start = source.index("self._scroll_area = ft.Column([")
     scroll_end = source.index("self.log_level_dd", scroll_start)
     scroll_source = source[scroll_start:scroll_end]
 
     assert "scroll=ft.ScrollMode.AUTO" in scroll_source
-    assert "expand=True" in scroll_source
+    # The device group fills the leftover height below the bounded scroll area.
+    device_start = source.index("device_group = ft.Container(")
+    device_end = source.index("self.device_group = device_group", device_start)
+    assert "expand=True" in source[device_start:device_end]
 
 
 def test_compact_dropdown_setters_tolerate_unattached_flet_controls() -> None:
@@ -100,11 +104,17 @@ def test_torch_device_detection_is_deferred_until_after_window_show() -> None:
     assert "async def populate_devices_after_startup" in builders
 
 
-def test_left_scroll_area_contains_the_action_footer() -> None:
+def test_action_footer_stays_outside_the_scroll_area() -> None:
     source = BUILDERS_SOURCE.read_text(encoding="utf-8")
 
-    assert "scroll_area.controls.append(footer)" in source
-    assert "content=scroll_area" in source
+    # Buttons float below the scrollable content instead of scrolling with it.
+    assert "scroll_area.controls.append(footer)" not in source
+    btn_start = source.index("self._btn_container = ft.Container(")
+    btn_end = source.index("self._log_status_gap", btn_start)
+    assert "content=self._btn_bar" in source[btn_start:btn_end]
+    column_start = source.index("self._content_with_buttons = ft.Column(")
+    column_end = source.index("page.add(self._content_with_buttons)", column_start)
+    assert "self._btn_container" in source[column_start:column_end]
 
 
 def test_stop_and_run_buttons_are_inset_from_the_right_edge() -> None:
@@ -113,8 +123,13 @@ def test_stop_and_run_buttons_are_inset_from_the_right_edge() -> None:
     row_end = source.index("self._btn_bar =", row_start)
 
     row_source = source[row_start:row_end]
-    assert "padding=ft.Padding(0, 0, S(40), 0)" in row_source
     assert "spacing=S(20)" in row_source
+
+    container_start = source.index("self._btn_container = ft.Container(")
+    container_end = source.index("self._log_status_gap", container_start)
+    container_source = source[container_start:container_end]
+    assert "padding=ft.Padding(S(4), S(1), S(4), S(1))" in container_source
+    assert "alignment=ft.alignment.Alignment(1, 0)" in container_source
 
 
 def test_stop_and_run_buttons_have_matching_widths() -> None:
@@ -123,13 +138,13 @@ def test_stop_and_run_buttons_have_matching_widths() -> None:
     controls_end = source.index("lang_row =", controls_start)
     controls_source = source[controls_start:controls_end]
 
-    assert controls_source.count("width=S(130)") == 2
+    assert controls_source.count("width=S(110)") == 2
 
 
 def test_main_panels_stretch_to_the_page_height() -> None:
     source = BUILDERS_SOURCE.read_text(encoding="utf-8")
     root_start = source.index("self._root_row = ft.Row(")
-    root_end = source.index("page.add(self._root_row)", root_start)
+    root_end = source.index("self._status_bar_contain = ft.Container(", root_start)
     root_source = source[root_start:root_end]
 
     assert "vertical_alignment=ft.CrossAxisAlignment.STRETCH" in root_source
@@ -243,8 +258,8 @@ def test_advanced_streaming_exposes_shared_calibration_rows() -> None:
     end = source.index("\n    # ── data population ──", start)
     row_map = source[start:end]
 
-    assert '"RTMP Streamer": [0, 1, 2, 3, 5, 6, 7, 8, 10]' in row_map
-    assert '"MJPEG Streamer": [0, 5]' in row_map
+    assert '"RTMP Streamer": [0, 1, 2, 3, 4, 5, 6, 7, 9]' in row_map
+    assert '"MJPEG Streamer": [0, 4]' in row_map
     assert '"GPU Streamer"' not in row_map
 
 
@@ -255,18 +270,20 @@ def test_manual_stream_bitrate_controls_are_bilingual_and_runtime_bound() -> Non
     runtime = (APP_ROOT / "app_runtime" / "runtime_entry.py").read_text(encoding="utf-8")
     localization = (APP_ROOT / "gui" / "localization.py").read_text(encoding="utf-8")
 
-    assert "self.stream_target_bitrate_tf = CompactTextField" in builders
-    assert "self.stream_peak_bitrate_tf = CompactTextField" in builders
+    assert "self.stream_target_bitrate_slider = ft.Slider(" in builders
+    assert "self.stream_peak_bitrate_value = ft.Text(" in builders
     assert "on_select=self._on_stream_calibration_mode_change" in builders
     assert '"Stream Target Bitrate:":' in localization
     assert '"Stream Peak Bitrate:":' in localization
     assert '"tooltip_stream_target_bitrate":' in localization
     assert '"tooltip_stream_peak_bitrate":' in localization
-    assert '(self.stream_target_bitrate_tf, "tooltip_stream_target_bitrate")' in handlers
-    assert '(self.stream_peak_bitrate_tf, "tooltip_stream_peak_bitrate")' in handlers
+    assert '(self.stream_target_bitrate_slider, "tooltip_stream_target_bitrate")' in handlers
+    assert '(self.stream_peak_bitrate_value, "tooltip_stream_peak_bitrate")' in handlers
     config_mgr = (APP_ROOT / "gui" / "config_mgr.py").read_text(encoding="utf-8")
-    assert '"Stream Target Bitrate Mbps": self._parse_int(' in config_mgr
-    assert "self.stream_target_bitrate_tf.value" in config_mgr
+    assert '"Stream Target Bitrate Mbps": stream_target_bitrate,' in config_mgr
+    assert "self.stream_target_bitrate_slider.value" in config_mgr
+    assert "min(35, int(round(float(self.stream_target_bitrate_slider.value))))" in config_mgr
+    assert "automatic_peak_bitrate_mbps(" in config_mgr
     assert 'target_bitrate_mbps=stream_config.target_bitrate_mbps' in runtime
     assert 'peak_bitrate_mbps=stream_config.peak_bitrate_mbps' in runtime
     assert "5 <= target_bitrate <= 35" in process
@@ -288,7 +305,7 @@ def test_window_height_reserves_the_complete_action_footer() -> None:
     estimator_end = source.index("# ── label alignment", estimator_start)
     estimator_source = source[estimator_start:estimator_end]
 
-    assert "footer_height = S(104)" in estimator_source
+    assert "footer_height = S(40)" in estimator_source
     assert "safety_margin = S(0)" in estimator_source
     assert "max_height = S(1040)" in estimator_source
 
@@ -326,11 +343,12 @@ def test_window_preview_is_an_independent_advanced_checkbox_after_vsync() -> Non
     assert row_source.index("self.local_vsync_cb") < row_source.index("self.window_preview_cb")
 
 
-def test_reset_defaults_disable_depth_antialiasing() -> None:
+def test_reset_defaults_ship_unified_depth_antialiasing() -> None:
     source = BUILDERS_SOURCE.read_text(encoding="utf-8")
 
-    assert DEFAULTS["Anti-aliasing"] == 0
-    assert DEFAULTS["Depth Antialias Strength"] == 0.0
+    # Depth AA defaults to 2 since the unified depth AA presentation work.
+    assert DEFAULTS["Anti-aliasing"] == 2
+    assert DEFAULTS["Depth Antialias Strength"] == 2.0
     assert DEFAULTS["CRF"] == 23
     assert DEFAULTS["Stream Protocol"] == "WebRTC"
     assert 'options=[v for v in aa_options], value="0"' in source
@@ -362,8 +380,8 @@ def test_every_stream_parameter_control_has_an_explanatory_tooltip() -> None:
         "video_backend_dd": "tooltip_video_backend",
         "stream_calibration_mode_dd": "tooltip_stream_calibration_mode",
         "stream_calibration_btn": "tooltip_stream_calibration_start",
-        "stream_target_bitrate_tf": "tooltip_stream_target_bitrate",
-        "stream_peak_bitrate_tf": "tooltip_stream_peak_bitrate",
+        "stream_target_bitrate_slider": "tooltip_stream_target_bitrate",
+        "stream_peak_bitrate_value": "tooltip_stream_peak_bitrate",
     }
 
     for control, tooltip_key in tooltip_bindings.items():
@@ -378,13 +396,13 @@ def test_every_stream_parameter_control_has_an_explanatory_tooltip() -> None:
 def test_model_and_mode_tooltips_explain_recommendations_and_tradeoffs() -> None:
     localization = (APP_ROOT / "gui" / "localization.py").read_text(encoding="utf-8")
 
-    assert "Distill-Any-Depth first" in localization
-    assert "InfiniDepth second" in localization
-    assert "首先使用 Distill-Any-Depth" in localization
-    assert "其次选择 InfiniDepth" in localization
+    assert "ZipDepth-Small is the Moonlight XR reference model" in localization
+    assert "Other model families remain available" in localization
+    assert "ZipDepth-Small 是 Moonlight XR 对齐基准" in localization
+    assert "其他模型仍可使用" in localization
     assert "Monitor captures the selected full display" in localization
     assert "屏幕模式捕获选定显示器的完整画面" in localization
-    assert "Advanced Streaming publishes compressed H.264/H.265" in localization
+    assert "Advanced Network Streaming publishes compressed H.264/H.265" in localization
     assert "高级网络推流：通过 WebRTC/RTSP/RTMP 发布 H.264/H.265" in localization
     assert "Half-SBS packs left/right views" in localization
     assert "Half-SBS：左右眼并排" in localization
@@ -443,17 +461,17 @@ def test_display_mode_is_to_the_right_of_headset_model() -> None:
     run_row_start = source.index("self.row7a = ft.Row(")
     headset_row_start = source.index("self.xr_headset_row = ft.Row(")
     headset_row_end = source.index("self.row7b = ft.Row(", headset_row_start)
-    assembly_start = source.index("device_group = ft.Container(")
-    assembly_end = source.index("lang_group = ft.Container(", assembly_start)
-    assembly = source[assembly_start:assembly_end]
+    content_start = source.index("device_content = ft.Column([")
+    content_end = source.index("device_group = ft.Container(", content_start)
+    content = source[content_start:content_end]
 
     run_row = source[run_row_start:headset_row_start]
     headset_row = source[headset_row_start:headset_row_end]
     assert "self.display_mode_label" not in run_row
     assert headset_row.index("self.xr_headset_label") < headset_row.index("self.display_mode_label")
     assert headset_row.index("self.xr_headset_dd") < headset_row.index("self.display_mode_dd")
-    assert assembly.index("self.row7a") < assembly.index("self.xr_headset_row")
-    assert assembly.index("self.xr_headset_row") < assembly.index("self.row7b")
+    assert content.index("self.row7a") < content.index("self.xr_headset_row")
+    assert content.index("self.xr_headset_row") < content.index("self.row7b")
 
 
 def test_headset_model_remains_visible_in_every_run_mode() -> None:
@@ -475,3 +493,35 @@ def test_refresh_button_follows_the_capture_source_dropdown() -> None:
     assert "ft.Container(expand=True)" not in row_source
     assert row_source.index("self.monitor_dd") < row_source.index("self.refresh_btn")
     assert row_source.index("self.window_dd") < row_source.index("self.refresh_btn")
+
+
+def test_stereo_output_menu_includes_the_captured_display():
+    gui = SimpleNamespace(
+        monitor_label_to_index={"Input": 1, "Output": 2},
+        monitor_dd=SimpleNamespace(value="Input"),
+        stereo_monitor_dd=SimpleNamespace(
+            value="Input", options=[], update=lambda: None
+        ),
+        _missing_stereo_output_identity=False,
+    )
+
+    GUIBuilderMixin.update_stereo_monitor_menu(gui)
+
+    assert gui.stereo_monitor_dd.options == ["Input", "Output"]
+    assert gui.stereo_monitor_dd.value == "Input"
+
+
+def test_saved_stereo_output_can_match_the_captured_display():
+    gui = SimpleNamespace(
+        _get_monitor_count=lambda: 2,
+        _missing_stereo_output_identity=False,
+        monitor_label_to_index={"Input": 1, "Output": 2},
+        monitor_dd=SimpleNamespace(value="Input"),
+        stereo_monitor_dd=SimpleNamespace(value=""),
+        run_mode_key="Local Viewer",
+        capture_mode_key="Monitor",
+    )
+
+    GUIBuilderMixin._apply_stereo_output(gui, {"Stereo Output": 1})
+
+    assert gui.stereo_monitor_dd.value == "Input"

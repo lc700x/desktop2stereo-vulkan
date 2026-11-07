@@ -27,6 +27,30 @@ def test_zipdepth_resizes_short_edge_and_aligns_to_32(height, width, expected):
     ) == expected
 
 
+def test_zipdepth_input_resize_antialiases_before_inference(monkeypatch):
+    provider = ZipDepthProvider(
+        model_id="pablovela5620/zipdepth",
+        model_name="ZipDepth-Small",
+        device="cpu",
+        depth_resolution=32,
+        patch_size=32,
+    )
+    provider._model = _FirstChannelDepth()
+    original_interpolate = torch.nn.functional.interpolate
+    resize_calls = []
+
+    def track_interpolate(input, *args, **kwargs):
+        if input.shape[1] == 3:
+            resize_calls.append(kwargs.get("antialias"))
+        return original_interpolate(input, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "interpolate", track_interpolate)
+
+    provider.predict_profile(torch.rand(1, 3, 64, 96))
+
+    assert resize_calls and resize_calls[0] is True
+
+
 def test_zipdepth_base_and_npu_architectures_select_different_upsamplers():
     base = create_model(variant="base", upsample_unfold=True)
     assert base.decoder.convex_up.use_unfold is True
@@ -36,15 +60,17 @@ def test_zipdepth_base_and_npu_architectures_select_different_upsamplers():
     assert small.decoder.convex_up.use_unfold is False
 
 
-def test_zipdepth_inverse_depth_is_converted_and_non_finite_values_are_removed():
+def test_zipdepth_inverse_depth_is_preserved_and_non_finite_values_are_removed():
     inverse_depth = torch.tensor([[[[1.0, 0.5, 0.25, float("nan")]]]])
 
     depth = _postprocess_generic_depth(inverse_depth, "pablovela5620/zipdepth")
 
     assert torch.isfinite(depth).all()
-    assert depth[0, 0, 0, 0] < depth[0, 0, 0, 2]
+    assert depth[0, 0, 0, 0] > depth[0, 0, 0, 2]
     assert depth.min() >= 0.0
     assert depth.max() <= 1.0
+
+
 
 
 class _FirstChannelDepth(torch.nn.Module):

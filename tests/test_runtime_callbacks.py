@@ -44,6 +44,70 @@ def _callbacks(depth_strength: float = 0.75) -> RuntimeCallbacks:
     return RuntimeCallbacks(context)
 
 
+def test_capture_window_registers_before_initial_wgc_session() -> None:
+    callbacks = _callbacks()
+    hwnd = 0x1234
+
+    assert callbacks.update_capture_window_exclusion(hwnd, True) is True
+    assert callbacks.capture_window_handles() == (hwnd,)
+
+    callbacks.capture_session_update(
+        SimpleNamespace(
+            _window_exclusion_requested=True,
+            window_exclusion_available=True,
+        ),
+        None,
+    )
+
+    assert callbacks._capture_window_initial_session_handles == {hwnd}
+
+
+def test_late_capture_window_stays_globally_hidden_until_next_initial_session(
+    monkeypatch,
+) -> None:
+    from viewer.window_control import WDA_EXCLUDEFROMCAPTURE, WDA_NONE
+
+    callbacks = _callbacks()
+    initial_hwnd = 0x1234
+    late_hwnd = 0x5678
+    affinity_calls = []
+    monkeypatch.setattr(
+        "viewer.window_control.set_hwnd_capture_affinity",
+        lambda hwnd, affinity: affinity_calls.append((hwnd, affinity)) or True,
+    )
+
+    assert callbacks.update_capture_window_exclusion(initial_hwnd, True) is True
+    callbacks.capture_session_update(
+        SimpleNamespace(
+            _window_exclusion_requested=True,
+            window_exclusion_available=True,
+        ),
+        None,
+    )
+
+    assert callbacks.update_capture_window_exclusion(late_hwnd, True) is False
+    callbacks.restore_capture_window_visibility()
+    assert affinity_calls == [
+        (late_hwnd, WDA_EXCLUDEFROMCAPTURE),
+        (initial_hwnd, WDA_NONE),
+        (late_hwnd, WDA_EXCLUDEFROMCAPTURE),
+    ]
+
+    callbacks.capture_session_update(
+        SimpleNamespace(
+            _window_exclusion_requested=True,
+            window_exclusion_available=True,
+        ),
+        None,
+    )
+    callbacks.restore_capture_window_visibility()
+    assert affinity_calls[-2:] == [
+        (initial_hwnd, WDA_NONE),
+        (late_hwnd, WDA_NONE),
+    ]
+    assert callbacks._capture_window_late_hidden_handles == set()
+
+
 def test_local_breakdown_is_not_gated_by_openxr_render_state() -> None:
     callbacks = _callbacks()
     callbacks.context.run_mode = "Viewer"

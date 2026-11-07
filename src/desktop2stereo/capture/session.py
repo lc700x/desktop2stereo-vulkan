@@ -19,6 +19,7 @@ class CaptureSessionCallbacks:
     is_hard_idle: Callable[[], bool]
     on_session_update: Callable[[Any, Any], None]
     on_tick: Callable[[], None]
+    abort: Callable[[], None] | None = None
 
 
 
@@ -39,17 +40,22 @@ class CaptureSessionLoop:
 
     def run(self, shutdown_event) -> None:
         runner = create_capture_runner(self.config)
-        runner.run(
-            shutdown_event=shutdown_event,
-            on_frame=self._frame_arrived,
-            on_error=self._capture_error,
-            on_closed=self._capture_closed,
-            is_paused=self.callbacks.is_paused,
-            is_hard_idle=self.callbacks.is_hard_idle,
-            on_paused=self._capture_paused,
-            on_session_update=self.callbacks.on_session_update,
-            on_tick=self.callbacks.on_tick,
-        )
+        try:
+            runner.run(
+                shutdown_event=shutdown_event,
+                on_frame=self._frame_arrived,
+                on_error=self._capture_error,
+                on_closed=self._capture_closed,
+                is_paused=self.callbacks.is_paused,
+                is_hard_idle=self.callbacks.is_hard_idle,
+                on_paused=self._capture_paused,
+                on_session_update=self.callbacks.on_session_update,
+                on_tick=self.callbacks.on_tick,
+            )
+        except Exception as exc:
+            self._capture_error(exc)
+            if not self.config.gpu_required:
+                raise
 
     def _capture_paused(self, reason: str) -> None:
         self.callbacks.clear_raw_queue()
@@ -88,7 +94,11 @@ class CaptureSessionLoop:
             last_error=f"capture_loop {type(exc).__name__}: {exc}",
         )
         print(f"[capture_loop] Capture session error: {type(exc).__name__}: {exc}", flush=True)
+        if self.config.gpu_required and self.callbacks.abort is not None:
+            self.callbacks.abort()
 
     def _capture_closed(self) -> None:
         if not self.callbacks.is_shutdown():
             print("[capture_loop] Capture session closed")
+            if self.config.gpu_required and self.callbacks.abort is not None:
+                self.callbacks.abort()

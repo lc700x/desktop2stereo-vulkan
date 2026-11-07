@@ -65,6 +65,14 @@ uint pixel_index(int x, int y) {
     return uint(clamp_y(y)) * params.width + uint(clamp_x(x));
 }
 
+// Ported from Moonlight XR: let horizontal disparity fade to zero over the
+// outer eight source pixels so border clamping cannot smear an eye edge.
+float screen_edge_fade_weight(float x) {
+    float edge_distance = min(x + 0.5, float(params.width) - x - 0.5);
+    float t = clamp(edge_distance / 8.0, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
 float depth_at(int x, int y) {
     return clamp(depth[pixel_index(x, y)], 0.0, 1.0);
 }
@@ -102,7 +110,8 @@ float layered_depth_scale(float value) {
 float base_shift_at(int x, int y) {
     float response = depth_at(x, y) - params.convergence;
     response *= layered_depth_scale(depth_at(x, y));
-    return -response * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5;
+    return -response * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5
+        * screen_edge_fade_weight(float(x));
 }
 
 float layer_weight(float value, uint layer_index) {
@@ -121,23 +130,9 @@ float layer_shift_scale(uint layer_index) {
 }
 
 float effective_layer_shift_scale(float value) {
-    uint count = clamp(params.layers, 1u, 4u);
-    if (count == 1u) return 1.0;
-    if (count == 2u) {
-        float normalized = clamp(value, 0.0, 1.0);
-        float foreground_weight = 1.0 / (1.0 + exp((1.0 - 2.0 * normalized)
-            / max(params.softness, 1.0e-4)));
-        return 0.875 + 0.125 * foreground_weight;
-    }
-    float weighted_scale = 0.0;
-    float total_weight = 0.0;
-    for (uint layer_index = 0u; layer_index < 4u; ++layer_index) {
-        if (layer_index >= count) break;
-        float weight = layer_weight(value, layer_index);
-        weighted_scale += weight * layer_shift_scale(layer_index);
-        total_weight += weight;
-    }
-    return weighted_scale / max(total_weight, 1.0e-6);
+    // Match Moonlight XR's linear disparity: layers classify color, but the
+    // final pixel displacement remains depth_strength * budget * (depth - c).
+    return 1.0;
 }
 
 float clamp_coordinate(float coordinate, float extent) {
@@ -163,10 +158,10 @@ vec3 sample_rgb(float x, float y) {
     return mix(top, bottom, ty);
 }
 
-float forward_shift(float value) {
+float forward_shift(float value, float x) {
     return -(value - params.convergence) * layered_depth_scale(value)
         * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5
-        * effective_layer_shift_scale(value);
+        * effective_layer_shift_scale(value) * screen_edge_fade_weight(x);
 }
 
 int dibr_search_radius() {
@@ -240,7 +235,7 @@ vec3 dibr_gather_at(float target_x, float target_y, float eye_sign) {
         float source_x = float(source_ix);
         if (source_x >= 0.0 && source_x < float(params.width)) {
             float value = sampled_depth(source_x, target_y);
-            float error = source_x - forward_shift(value) * eye_sign - target_x;
+            float error = source_x - forward_shift(value, source_x) * eye_sign - target_x;
             float coverage = max(0.0, 1.0 - abs(error));
             if (coverage > 0.0 && (value > best_depth ||
                 (value == best_depth && coverage > best_coverage))) {
@@ -278,7 +273,7 @@ vec3 dibr_gather_at(float target_x, float target_y, float eye_sign) {
         float source_x = best_x + float(offset);
         if (source_x >= 0.0 && source_x < float(params.width)) {
             float value = sampled_depth(source_x, target_y);
-            float error = source_x - forward_shift(value) * eye_sign - target_x;
+            float error = source_x - forward_shift(value, source_x) * eye_sign - target_x;
             float class_weight = 1.0 - smoothstep(0.5 * threshold, threshold, best_depth - value);
             float coverage = max(0.0, 1.0 - abs(error)) * class_weight;
             if (coverage > 0.0) {
@@ -296,15 +291,11 @@ vec3 dibr_gather_at(float target_x, float target_y, float eye_sign) {
 
 vec3 dibr_warp_at(float target_x, float target_y, float eye_sign) {
     float target_depth = sampled_depth(target_x, target_y);
-    float target_shift = -(target_depth - params.convergence) * layered_depth_scale(target_depth)
-        * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5
-        * effective_layer_shift_scale(target_depth);
+    float target_shift = forward_shift(target_depth, target_x);
     float source_x = clamp(target_x + target_shift * eye_sign, 0.0,
                            float(params.width - 1u));
     float source_depth = sampled_depth(source_x, target_y);
-    float source_shift = -(source_depth - params.convergence) * layered_depth_scale(source_depth)
-        * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5
-        * effective_layer_shift_scale(source_depth);
+    float source_shift = forward_shift(source_depth, source_x);
     float refined_x = clamp(target_x + source_shift * eye_sign, 0.0,
                             float(params.width - 1u));
     float source_residual = abs(refined_x - source_x);
@@ -312,8 +303,7 @@ vec3 dibr_warp_at(float target_x, float target_y, float eye_sign) {
     float threshold = max(params.edge_threshold, 1.0e-6);
     // No depth can occlude a sample already within the visibility threshold of 1.
     if (source_depth < 1.0 - 0.5 * threshold) {
-        float front_shift = -(1.0 - params.convergence) * max(params.foreground_scale, 0.0)
-            * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5;
+        float front_shift = forward_shift(1.0, target_x);
         float front_x = clamp(target_x + front_shift * eye_sign, 0.0,
                               float(params.width - 1u));
         front_confidence = smoothstep(0.5 * threshold, threshold,

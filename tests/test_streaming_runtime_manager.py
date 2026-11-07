@@ -77,6 +77,10 @@ def test_ensure_runtime_installs_complete_ffmpeg_package(
     assert config.read_bytes() == b"paths: {}"
 
 
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason="Unix symlink extraction requires a privileged user",
+)
 def test_zip_symlink_members_extract_as_symlinks(tmp_path: Path) -> None:
     # The darwin FFmpeg zip stores versioned aliases (libavdevice.63.dylib)
     # as symlinks; zipfile.extractall() would materialize them as plain

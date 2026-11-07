@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 from stereo_runtime.adapter import StereoRuntimeConfig
 from stereo_runtime.hot_reload import (
     StereoHotReloader,
@@ -215,6 +218,7 @@ def test_hot_reload_hole_fill_off_disables_fill_and_ignores_stale_strength() -> 
     assert runtime_stereo_overrides(runtime)["hole_fill"] == "none"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA is required for native TensorRT hot-reload backend mapping")
 def test_hot_reload_depth_provider_rebuild_fields_only_when_changed():
     config = make_config(
         model_id="Distill-Any-Depth-Base",

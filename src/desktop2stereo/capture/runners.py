@@ -98,7 +98,9 @@ class PollingCaptureRunner:
                             size,
                             capture_start_time,
                             config=self.config,
-                            copy_mode=FrameCopyMode.COPY,
+                            copy_mode=(
+                                FrameCopyMode.NONE if zero_copy is not None else FrameCopyMode.COPY
+                            ),
                             original_format=str(getattr(self._source, "frame_format", "") or ""),
                             capture_size=(
                                 (int(size[0]), int(size[1]))
@@ -108,6 +110,7 @@ class PollingCaptureRunner:
                             sck_zero_copy=zero_copy,
                             metadata={
                                 "backend": type(self._source).__name__,
+                                "gpu_required": bool(self.config.gpu_required),
                                 "capture_poll_started_at": capture_start_time,
                                 "capture_poll_returned_at": time.perf_counter(),
                                 "sck_callback_time": getattr(

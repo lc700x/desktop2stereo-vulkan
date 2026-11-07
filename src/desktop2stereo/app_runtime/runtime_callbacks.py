@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import replace
@@ -22,6 +23,11 @@ class RuntimeCallbacks:
         self.context = context
         self.capture_control = None
         self.capture_session = None
+        self._capture_window_handles: set[int] = set()
+        self._capture_window_initial_session_handles: set[int] = set()
+        self._capture_window_late_hidden_handles: set[int] = set()
+        self._capture_window_lock = threading.RLock()
+        self._capture_exclusion_fallback_logged = False
         self._controller_saved_depth_strength = max(
             0.0,
             float(getattr(context.stereo_runtime.stereo_config, "depth_strength", 1.0)),
@@ -564,6 +570,135 @@ class RuntimeCallbacks:
     def capture_session_update(self, session, control):
         self.capture_session = session
         self.capture_control = control
+        with self._capture_window_lock:
+            if (
+                session is not None
+                and bool(getattr(session, "_window_exclusion_requested", False))
+                and bool(getattr(session, "window_exclusion_available", False))
+            ):
+                self._capture_window_initial_session_handles = set(
+                    self._capture_window_handles
+                )
+            else:
+                self._capture_window_initial_session_handles.clear()
+
+    def capture_window_handles(self) -> tuple[int, ...]:
+        with self._capture_window_lock:
+            return tuple(sorted(self._capture_window_handles))
+
+    def update_capture_window_exclusion(self, hwnd: int, included: bool) -> bool:
+        handle = int(hwnd)
+        if handle <= 0:
+            return False
+        with self._capture_window_lock:
+            already_registered = handle in self._capture_window_handles
+            session = self.capture_session
+            if included:
+                self._capture_window_handles.add(handle)
+            else:
+                self._capture_window_handles.discard(handle)
+                self._capture_window_late_hidden_handles.discard(handle)
+            if session is None:
+                # The initial exclusion list is applied when the WGC session
+                # starts. Keep the window hidden until its first presented frame.
+                return True
+            if not included or already_registered:
+                return True
+            self._capture_window_late_hidden_handles.add(handle)
+
+        # Updating this Windows build's live WGC exclusion list returns a new
+        # configuration iteration but still includes a visible Vulkan window
+        # in subsequent frames. Hide a late-created window globally until the
+        # capture session is rebuilt with it in its initial list.
+        from viewer.window_control import (
+            WDA_EXCLUDEFROMCAPTURE,
+            set_hwnd_capture_affinity,
+        )
+
+        if set_hwnd_capture_affinity(handle, WDA_EXCLUDEFROMCAPTURE):
+            print(
+                "[WindowCapture] Late output window uses global capture exclusion "
+                f"until the next WGC session rebuild (HWND {handle}); "
+                "remote capture will not show that window",
+                flush=True,
+            )
+        else:
+            self.apply_global_capture_exclusion(
+                "late output window could not be added to the active WGC session"
+            )
+        return False
+
+    def apply_global_capture_exclusion(self, reason: str) -> None:
+        from viewer.window_control import WDA_EXCLUDEFROMCAPTURE, set_hwnd_capture_affinity
+
+        handles = self.capture_window_handles()
+        failed = [
+            hwnd
+            for hwnd in handles
+            if not set_hwnd_capture_affinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        ]
+        if not self._capture_exclusion_fallback_logged:
+            self._capture_exclusion_fallback_logged = True
+            print(
+                "[WindowCapture] Per-session WGC exclusion is unavailable; "
+                f"using WDA_EXCLUDEFROMCAPTURE ({reason})",
+                flush=True,
+            )
+            try:
+                from utils import _get_settings
+
+                language = (
+                    str(_get_settings().get("Language", "EN")).strip().upper()
+                )
+            except Exception:  # noqa: BLE001 - status text is best effort
+                language = "EN"
+            message = (
+                "SBS 输出已对全部捕获接口隐藏，远程串流/桌面共享将看不到它。"
+                if language == "CN"
+                else "SBS output is hidden from all capture APIs; remote desktop "
+                "streaming cannot see it."
+            )
+            print(f"[D2S_STATUS] {message}", flush=True)
+        if failed:
+            print(
+                f"[WindowCapture] Could not globally exclude HWNDs {failed}",
+                flush=True,
+            )
+
+    def restore_capture_window_visibility(self) -> None:
+        from viewer.window_control import WDA_NONE, set_hwnd_capture_affinity
+
+        with self._capture_window_lock:
+            initial_handles = set(self._capture_window_initial_session_handles)
+            late_hidden = set(self._capture_window_late_hidden_handles)
+            restore_handles = initial_handles.intersection(self._capture_window_handles)
+            hidden_handles = late_hidden.difference(initial_handles)
+            self._capture_window_late_hidden_handles.difference_update(initial_handles)
+
+        failed = [
+            hwnd
+            for hwnd in sorted(restore_handles)
+            if not set_hwnd_capture_affinity(hwnd, WDA_NONE)
+        ]
+        if failed:
+            print(
+                f"[WindowCapture] Could not restore capture visibility for HWNDs {failed}",
+                flush=True,
+            )
+        if hidden_handles:
+            from viewer.window_control import WDA_EXCLUDEFROMCAPTURE
+
+            failed_hidden = [
+                hwnd
+                for hwnd in sorted(hidden_handles)
+                if not set_hwnd_capture_affinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+            ]
+            if failed_hidden:
+                print(
+                    "[WindowCapture] Could not keep late HWNDs hidden from capture "
+                    f"{failed_hidden}",
+                    flush=True,
+                )
 
     def put_raw_latest(self, item):
         was_full = self.context.raw_q.full()

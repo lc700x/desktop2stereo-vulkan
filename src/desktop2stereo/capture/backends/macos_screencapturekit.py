@@ -214,12 +214,16 @@ class _SCKFrameReceiver(NSObject):
         self._latest_frame = None
         self._latest_mtl_texture = None
         self._latest_owned = None
+        self._native_only = False
         self._latest_texture_size = (0, 0)
         self._frame_count = 0
         self._frame_status_counts = {}
         self._texture_diag_logged = False
         self._condition = threading.Condition(self._lock)
         return self
+
+    def set_native_only(self, required):
+        self._native_only = bool(required)
 
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, outputType):
         callback_time = time.perf_counter()
@@ -268,10 +272,10 @@ class _SCKFrameReceiver(NSObject):
             # skipping the 8MB device->host->device color round-trip.
             # D2S_SCK_ZEROCOPY_TEX=0 reverts to v2.5 parity (CPU readout only;
             # the old D2S_SCK_METAL_TEXTURE_DIAG=1 diagnostic still prints).
-            zc_enabled = os.environ.get("D2S_SCK_ZEROCOPY_TEX", "1") != "0"
-            native_only = os.environ.get("D2S_SCK_NATIVE_ONLY", "0").strip().lower() in {
+            native_only = self._native_only or os.environ.get("D2S_SCK_NATIVE_ONLY", "0").strip().lower() in {
                 "1", "true", "yes", "on"
             }
+            zc_enabled = native_only or os.environ.get("D2S_SCK_ZEROCOPY_TEX", "1") != "0"
             diag_enabled = os.environ.get("D2S_SCK_METAL_TEXTURE_DIAG") == "1"
             if native_only and zc_enabled:
                 # Native Core ML creates the CVMetalTexture from this same
@@ -407,7 +411,7 @@ class _SCKFrameReceiver(NSObject):
         memcpy per frame; D2S_SCK_LATEST_FRAME_COPY=1 restores it.
         """
         defensive_copy = os.environ.get("D2S_SCK_LATEST_FRAME_COPY") == "1"
-        native_only = os.environ.get("D2S_SCK_NATIVE_ONLY", "0").strip().lower() in {
+        native_only = self._native_only or os.environ.get("D2S_SCK_NATIVE_ONLY", "0").strip().lower() in {
             "1", "true", "yes", "on"
         }
         with self._condition:
@@ -466,7 +470,7 @@ class _SCKFrameReceiver(NSObject):
 class DesktopGrabber:
     def __init__(self, output_resolution=1080, fps=60, window_title=None,
                 capture_mode="Monitor", monitor_index=1, with_cursor=True,
-                fps_provider=None):
+                fps_provider=None, gpu_required=False):
         # OUTPUT_RESOLUTION may be an int or a (width, height) tuple when
         # "Processing Resolution: Auto"; the grabber needs a target height.
         if isinstance(output_resolution, (tuple, list)):
@@ -474,6 +478,7 @@ class DesktopGrabber:
         self.scaled_height = int(output_resolution)
         self.fps = max(1, min(240, int(fps)))
         self._fps_provider = fps_provider
+        self.gpu_required = bool(gpu_required)
         self.with_cursor = with_cursor
         # Native ScreenCaptureKit pixel format handed to consumers by grab().
         self.frame_format = "bgra"
@@ -619,6 +624,7 @@ class DesktopGrabber:
             config.setQueueDepth_(queue_depth)
 
         self._receiver = _SCKFrameReceiver.alloc().init()
+        self._receiver.set_native_only(self.gpu_required)
         self._stream = SCK.SCStream.alloc().initWithFilter_configuration_delegate_(
             filt, config, self._receiver)
         self._stream_config = config

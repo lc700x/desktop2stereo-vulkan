@@ -2079,9 +2079,19 @@ class StereoRuntime:
             stereo_config = replace(stereo_config, depth_antialias_strength=0.0)
         convergence = stereo_config.convergence
         if openxr_config is not None:
+            openxr_convergence = (
+                convergence
+                if bool(getattr(self.config, "dynamic_convergence_enabled", False))
+                else openxr_config.convergence
+            )
             openxr_config_for_frame = replace(
                 openxr_config,
-                convergence=convergence,
+                convergence=openxr_convergence,
+                max_disparity_px=(
+                    stereo_config.max_disparity_px
+                    if openxr_config.max_disparity_px is None
+                    else openxr_config.max_disparity_px
+                ),
                 foreground_shift_scale=float(getattr(stereo_config, "foreground_shift_scale", 1.0)),
                 midground_shift_scale=float(getattr(stereo_config, "midground_shift_scale", 1.0)),
                 background_shift_scale=float(getattr(stereo_config, "background_shift_scale", 1.0)),
@@ -2099,6 +2109,12 @@ class StereoRuntime:
         openxr_stereo_config = replace(
             stereo_config,
             depth_strength=max(0.0, float(openxr_config_for_frame.depth_strength)),
+            convergence=openxr_config_for_frame.convergence,
+            max_disparity_px=openxr_config_for_frame.max_disparity_px,
+            parallax_preset=str(openxr_config_for_frame.parallax_preset),
+            foreground_shift_scale=float(openxr_config_for_frame.foreground_shift_scale),
+            midground_shift_scale=float(openxr_config_for_frame.midground_shift_scale),
+            background_shift_scale=float(openxr_config_for_frame.background_shift_scale),
         )
         depth, motion_depth_debug = stabilize_captured_depth(
             depth,

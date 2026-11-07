@@ -116,7 +116,12 @@ def test_windows_scripts_are_preserved_as_crlf_bytes() -> None:
         path
         for pattern in ("*.bat", "*.cmd", "*.reg")
         for path in REPO_ROOT.rglob(pattern)
-        if ".git" not in path.parts and "..python3" not in path.parts
+        if (
+            ".git" not in path.parts
+            and "..python3" not in path.parts
+            and ".scratch" not in path.parts
+            and "outputs" not in path.parts
+        )
     ]
     assert windows_files
     for path in windows_files:
