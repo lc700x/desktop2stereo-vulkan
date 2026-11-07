@@ -53,3 +53,14 @@ def test_set_panel_converts_before_command_recording():
     assert size == panel.size
     assert pixels == panel.convert("RGBA").tobytes()
     assert overlay._panel_dirty is True
+
+
+def test_set_rgba_accepts_exact_buffer_without_pillow():
+    overlay = object.__new__(VulkanFpsOverlay)
+    overlay._pending_panel = None
+    overlay._panel_dirty = False
+
+    overlay.set_rgba(b"\x00\x01\x02\x03" * 6, (3, 2))
+
+    assert overlay._pending_panel == (b"\x00\x01\x02\x03" * 6, (3, 2))
+    assert overlay._panel_dirty is True

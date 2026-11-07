@@ -245,6 +245,7 @@ pub struct WcCapture {
     monitor_index: Option<usize>,
     window_hwnd: Option<isize>,
     window_title: Option<String>,
+    cursor_capture: bool,
     initial_excluded_window_handles: Option<Vec<u64>>,
     shared_slot: Arc<FrameSlot>,
     thread_handle: Mutex<Option<thread::JoinHandle<()>>>,
@@ -258,12 +259,13 @@ pub struct WcCapture {
 #[pymethods]
 impl WcCapture {
     #[new]
-    #[pyo3(signature = (luid=None, monitor_index=None, window_hwnd=None, window_title=None, excluded_window_handles=None))]
+    #[pyo3(signature = (luid=None, monitor_index=None, window_hwnd=None, window_title=None, cursor_capture=true, excluded_window_handles=None))]
     fn new(
         luid: Option<(u32, i32)>,
         monitor_index: Option<usize>,
         window_hwnd: Option<isize>,
         window_title: Option<String>,
+        cursor_capture: bool,
         excluded_window_handles: Option<Vec<u64>>,
     ) -> Self {
         Self {
@@ -271,6 +273,7 @@ impl WcCapture {
             monitor_index,
             window_hwnd,
             window_title,
+            cursor_capture,
             initial_excluded_window_handles: excluded_window_handles,
             shared_slot: Arc::new(FrameSlot {
                 data: Mutex::new((None, 0)),
@@ -301,6 +304,7 @@ impl WcCapture {
         let window_hwnd = self.window_hwnd;
         let window_title = self.window_title.clone();
         let excluded_window_handles = self.initial_excluded_window_handles.clone();
+                let cursor_capture = self.cursor_capture;
         let thread_id_ptr = self.thread_id.clone();
         let should_stop = self.should_stop.clone();
         let last_error = self.last_error.clone();
@@ -364,7 +368,11 @@ impl WcCapture {
                     d3d_device_context,
                     item_type,
                     callback_arc,
-                    CursorCaptureSettings::Default,
+                    if cursor_capture {
+                        CursorCaptureSettings::WithCursor
+                    } else {
+                        CursorCaptureSettings::WithoutCursor
+                    },
                     DrawBorderSettings::Default,
                     SecondaryWindowSettings::Default,
                     MinimumUpdateIntervalSettings::Default,

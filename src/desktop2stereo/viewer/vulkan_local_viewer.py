@@ -29,6 +29,10 @@ from viewer.vulkan_resources import (
     VulkanExportableSemaphore,
 )
 from viewer.window_control import (
+    capture_cursor_snapshot,
+    cursor_overlay_rects,
+    cursor_screen_position,
+    cursor_snapshot_key,
     hide_window_from_capture,
     set_window_mouse_passthrough,
     show_window_in_capture,
@@ -850,7 +854,9 @@ class VulkanLocalViewer:
         self._fps_overlay: VulkanFpsOverlay | None = None
         self._fps_overlay_reported = False
         self._fps_overlay_swapchain_supported = False
-        self._cursor_overlay: Any | None = None
+        self._cursor_texture_overlay: VulkanFpsOverlay | None = None
+        self._cursor_snapshot = None
+        self._cursor_snapshot_key = None
         # Latency is capture start -> present submission, using the same
         # perf_counter clock as the runtime queue timestamp.
         self._last_latency_ms = 0.0
@@ -978,22 +984,6 @@ class VulkanLocalViewer:
                 self._configure_persistent_fullscreen()
                 glfw.poll_events()
         glfw.set_window_pos(self.window, x, y)
-        if self.config.cursor_passthrough and self.config.hide_cursor_overlay:
-            try:
-                from viewer.window_control import StereoCursorOverlay
-
-                self._cursor_overlay = StereoCursorOverlay(
-                    int(glfw.get_win32_window(self.window)),
-                    self.config.display_mode,
-                )
-            except Exception as exc:
-                self._cursor_overlay = None
-                print(
-                    "[VulkanLocalViewer] Stereo cursor overlay unavailable: "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-
         if self.config.cursor_passthrough:
             set_window_mouse_passthrough(
                 self.window,
@@ -1034,6 +1024,7 @@ class VulkanLocalViewer:
         glfw.set_key_callback(self.window, self._on_key)
         self._create_device()
         self._init_fps_overlay()
+        self._init_cursor_texture_overlay()
         self._create_swapchain()
         self._create_sync()
         if self._capture_window_registered:
@@ -1061,6 +1052,59 @@ class VulkanLocalViewer:
                 "(Alt+Enter)",
                 flush=True,
             )
+
+    def _init_cursor_texture_overlay(self) -> None:
+        if (
+            sys.platform != "win32"
+            or not self.config.cursor_passthrough
+            or not self.config.hide_cursor_overlay
+        ):
+            return
+        try:
+            self._cursor_texture_overlay = VulkanFpsOverlay(self)
+        except Exception as exc:
+            self._cursor_texture_overlay = None
+            print(
+                "[VulkanLocalViewer] Cursor texture overlay unavailable: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return
+        if not self._cursor_texture_overlay.available:
+            print(
+                "[VulkanLocalViewer] Cursor texture overlay unavailable: "
+                f"{self._cursor_texture_overlay.reason}",
+                flush=True,
+            )
+            self._cursor_texture_overlay.close()
+            self._cursor_texture_overlay = None
+
+    def _update_cursor_texture_overlay(self, eye_rects):
+        overlay = self._cursor_texture_overlay
+        if overlay is None:
+            return ()
+        key = cursor_snapshot_key(self.config.display_mode)
+        if key is None:
+            return ()
+        if key != self._cursor_snapshot_key or self._cursor_snapshot is None:
+            snapshot = capture_cursor_snapshot(self.config.display_mode)
+            if snapshot is None:
+                self._cursor_snapshot = None
+                self._cursor_snapshot_key = None
+                return ()
+            self._cursor_snapshot = snapshot
+            self._cursor_snapshot_key = key
+            overlay.set_rgba(snapshot.rgba, (snapshot.width, snapshot.height))
+        owner_hwnd = int(
+            self._win32_hwnd
+            or self.glfw.get_win32_window(self.window)
+        )
+        return cursor_overlay_rects(
+            owner_hwnd,
+            eye_rects,
+            self._cursor_snapshot,
+            cursor_screen_position(),
+        )
 
     def _init_fps_overlay(self) -> None:
         """Prepare an optional panel without making Vulkan setup fatal."""
@@ -2008,15 +2052,22 @@ class VulkanLocalViewer:
         image_usage = vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT
         overlay_supported = True
         overlay = self._fps_overlay
-        if overlay is not None and overlay.available:
+        cursor_overlay = self._cursor_texture_overlay
+        available_overlays = tuple(
+            item
+            for item in (overlay, cursor_overlay)
+            if item is not None and item.available
+        )
+        if available_overlays:
             supported_usage = int(getattr(caps, "supportedUsageFlags", 0))
             if supported_usage & int(vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT):
                 image_usage |= int(vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
             else:
                 overlay_supported = False
-                overlay.set_enabled(False)
+                for item in available_overlays:
+                    item.set_enabled(False)
                 print(
-                    "[VulkanLocalViewer] On-screen FPS unavailable: surface "
+                    "[VulkanLocalViewer] Overlay unavailable: surface "
                     "lacks COLOR_ATTACHMENT usage",
                     flush=True,
                 )
@@ -2056,15 +2107,17 @@ class VulkanLocalViewer:
         if self.image_available is not None:
             self._create_render_finished_semaphores()
         self.extent = int(extent.width), int(extent.height)
+        if available_overlays and overlay_supported:
+            for item in available_overlays:
+                item.on_swapchain_recreated(self.swap_images, int(fmt.format))
         if overlay is not None:
             if overlay.available and overlay_supported:
-                overlay.on_swapchain_recreated(self.swap_images, int(fmt.format))
                 self._fps_overlay_swapchain_supported = overlay.available
             if self._fps_overlay_swapchain_supported:
                 provider = self.config.show_fps_provider
                 show_fps = bool(provider()) if provider is not None else self.config.show_fps
                 overlay.set_enabled(show_fps)
-            elif not overlay.available:
+            elif overlay_supported and not overlay.available:
                 print(
                     "[VulkanLocalViewer] On-screen FPS overlay disabled: "
                     f"{overlay.reason}",
@@ -2130,6 +2183,8 @@ class VulkanLocalViewer:
         if self.swapchain is not None:
             if self._fps_overlay is not None:
                 self._fps_overlay.on_swapchain_destroyed()
+            if self._cursor_texture_overlay is not None:
+                self._cursor_texture_overlay.on_swapchain_destroyed()
             self._release_full_screen_exclusive()
             self._device_function(
                 b"vkDestroySwapchainKHR",
@@ -2452,6 +2507,9 @@ class VulkanLocalViewer:
                 if self._fps_overlay is not None:
                     self._fps_overlay.close()
                     self._fps_overlay = None
+                if self._cursor_texture_overlay is not None:
+                    self._cursor_texture_overlay.close()
+                    self._cursor_texture_overlay = None
                 for source in [self._source, *self._direct_sources]:
                     if source is not None:
                         source.close()
@@ -2476,12 +2534,6 @@ class VulkanLocalViewer:
                     )
                 except Exception:
                     pass
-            if self._cursor_overlay is not None:
-                try:
-                    self._cursor_overlay.close()
-                except Exception:
-                    pass
-                self._cursor_overlay = None
             if self._capture_window_registered and self.window is not None:
                 try:
                     hwnd = int(self.glfw.get_win32_window(self.window))
@@ -3070,32 +3122,58 @@ class _TransferSource:
         eye_rects = tuple(
             destination_rect for _source_rect, destination_rect in regions
         )
-        if o._cursor_overlay is not None:
+        target_layout = vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        cursor_rects = ()
+        if o._cursor_texture_overlay is not None:
             try:
-                o._cursor_overlay.update(eye_rects)
+                cursor_rects = o._update_cursor_texture_overlay(eye_rects)
             except Exception as exc:
-                o._cursor_overlay = None
                 print(
-                    "[VulkanLocalViewer] Stereo cursor overlay update failed: "
+                    "[VulkanLocalViewer] Cursor texture update failed: "
                     f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
+                cursor_rects = ()
+        if o._cursor_texture_overlay is not None and cursor_rects:
+            overlay_started = time.perf_counter()
+            if o._cursor_texture_overlay.record_rects(
+                cmd,
+                target,
+                index,
+                cursor_rects,
+                source_layout=target_layout,
+            ):
+                overlay_drawn = True
+                target_layout = vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+            overlay_ms += (time.perf_counter() - overlay_started) * 1000.0
+            overlay_upload_ms += float(
+                getattr(o._cursor_texture_overlay, "last_upload_ms", 0.0) or 0.0
+            )
         if o._fps_overlay is not None and o._fps_overlay.enabled and o._fps_overlay.available:
             # A packed-image blit is only a transfer optimization. Keep the
             # overlay geometry based on the original per-eye presentation
             # regions so SBS stays split into left/right half-width areas and
             # TAB stays split into top/bottom areas.
             overlay_started = time.perf_counter()
-            overlay_drawn = o._fps_overlay.record(cmd, target, index, eye_rects)
-            overlay_ms = (time.perf_counter() - overlay_started) * 1000.0
-            overlay_upload_ms = float(
+            fps_drawn = o._fps_overlay.record(
+                cmd,
+                target,
+                index,
+                eye_rects,
+                source_layout=target_layout,
+            )
+            if fps_drawn:
+                overlay_drawn = True
+                target_layout = vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+            overlay_ms += (time.perf_counter() - overlay_started) * 1000.0
+            overlay_upload_ms += float(
                 getattr(o._fps_overlay, "last_upload_ms", 0.0) or 0.0
             )
         if not overlay_drawn:
             self._transition(
                 cmd,
                 target,
-                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                target_layout,
                 vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             )
         if gpu_source:

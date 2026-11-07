@@ -81,6 +81,7 @@ def patched_source(source: str) -> str:
         (
             f"        self._window_hwnd = window_hwnd{newline}",
             f"        self._window_hwnd = window_hwnd{newline}"
+            f"        self._cursor_capture = bool(cursor_capture){newline}"
             f"        self._native_window_exclusion_available = callable(getattr(_NativeWcCapture, 'set_excluded_windows', None)){newline}"
             f"        self._excluded_window_handles = tuple(sorted({{int(hwnd) for hwnd in (excluded_window_handles or ())}})){newline}"
             f"        if any(hwnd <= 0 for hwnd in self._excluded_window_handles):{newline}"
@@ -95,6 +96,7 @@ def patched_source(source: str) -> str:
             ),
             (
                 f"            use_gpu_fence=use_gpu_fence,{newline}"
+                f"            cursor_capture=self._cursor_capture,{newline}"
                 f"            excluded_window_handles=({newline}"
                 f"                list(self._excluded_window_handles){newline}"
                 f"                if self._window_exclusion_requested and self._native_window_exclusion_available{newline}"

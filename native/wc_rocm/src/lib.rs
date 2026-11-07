@@ -376,6 +376,7 @@ pub struct WcCapture {
     window_hwnd: Option<isize>,
     window_title: Option<String>,
     use_gpu_fence: bool,
+    cursor_capture: bool,
     initial_excluded_window_handles: Option<Vec<u64>>,
     shared_slot: Arc<FrameSlot>,
     thread_handle: Mutex<Option<thread::JoinHandle<()>>>,
@@ -389,13 +390,14 @@ pub struct WcCapture {
 #[pymethods]
 impl WcCapture {
     #[new]
-    #[pyo3(signature = (luid=None, monitor_index=None, window_hwnd=None, window_title=None, use_gpu_fence=true, excluded_window_handles=None))]
+    #[pyo3(signature = (luid=None, monitor_index=None, window_hwnd=None, window_title=None, use_gpu_fence=true, cursor_capture=true, excluded_window_handles=None))]
     fn new(
         luid: Option<(u32, i32)>,
         monitor_index: Option<usize>,
         window_hwnd: Option<isize>,
         window_title: Option<String>,
         use_gpu_fence: bool,
+        cursor_capture: bool,
         excluded_window_handles: Option<Vec<u64>>,
     ) -> Self {
         Self {
@@ -404,6 +406,7 @@ impl WcCapture {
             window_hwnd,
             window_title,
             use_gpu_fence,
+            cursor_capture,
             initial_excluded_window_handles: excluded_window_handles,
             shared_slot: Arc::new(FrameSlot {
                 data: Mutex::new((None, 0)),
@@ -435,6 +438,7 @@ impl WcCapture {
         let window_title = self.window_title.clone();
         let use_gpu_fence = self.use_gpu_fence;
         let excluded_window_handles = self.initial_excluded_window_handles.clone();
+                let cursor_capture = self.cursor_capture;
         let window_exclusion_control = self.window_exclusion_control.clone();
         let thread_id_ptr = self.thread_id.clone();
         let should_stop = self.should_stop.clone();
@@ -503,7 +507,11 @@ impl WcCapture {
                     d3d_device_context,
                     item_type,
                     callback_arc,
-                    CursorCaptureSettings::Default,
+                    if cursor_capture {
+                        CursorCaptureSettings::WithCursor
+                    } else {
+                        CursorCaptureSettings::WithoutCursor
+                    },
                     DrawBorderSettings::Default,
                     SecondaryWindowSettings::Default,
                     MinimumUpdateIntervalSettings::Default,

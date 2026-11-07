@@ -420,6 +420,61 @@ def test_capture_protected_viewer_starts_hidden_until_first_present(monkeypatch)
     ]
 
 
+def test_cursor_texture_overlay_uploads_snapshot_and_maps_both_eyes(monkeypatch) -> None:
+    viewer = VulkanLocalViewer(
+        VulkanLocalViewerConfig(display_mode="Half-SBS")
+    )
+    uploaded = []
+    viewer._win32_hwnd = 123
+    viewer.window = object()
+    viewer.glfw = SimpleNamespace(get_win32_window=lambda _window: 456)
+    viewer._cursor_texture_overlay = SimpleNamespace(
+        set_rgba=lambda rgba, size: uploaded.append((rgba, size)),
+    )
+    snapshot = SimpleNamespace(
+        rgba=b"rgba",
+        width=24,
+        height=48,
+        hotspot_x=2,
+        hotspot_y=3,
+    )
+    mapped = []
+    monkeypatch.setattr(
+        local_viewer_module,
+        "cursor_snapshot_key",
+        lambda _mode: (11, "half-sbs"),
+    )
+    monkeypatch.setattr(
+        local_viewer_module,
+        "capture_cursor_snapshot",
+        lambda _mode: snapshot,
+    )
+    monkeypatch.setattr(
+        local_viewer_module,
+        "cursor_screen_position",
+        lambda: (20, 30),
+    )
+    monkeypatch.setattr(
+        local_viewer_module,
+        "cursor_overlay_rects",
+        lambda owner, rects, snap, position: mapped.append(
+            (owner, rects, snap, position)
+        )
+        or ((1, 2, 24, 48), (100, 2, 24, 48)),
+    )
+
+    rects = viewer._update_cursor_texture_overlay(((0, 0, 100, 200), (200, 0, 300, 200)))
+
+    assert rects == ((1, 2, 24, 48), (100, 2, 24, 48))
+    assert uploaded == [(b"rgba", (24, 48))]
+    assert mapped == [
+        (123, ((0, 0, 100, 200), (200, 0, 300, 200)), snapshot, (20, 30))
+    ]
+
+    viewer._update_cursor_texture_overlay(((0, 0, 100, 200), (200, 0, 300, 200)))
+    assert uploaded == [(b"rgba", (24, 48))]
+
+
 def test_capture_protected_output_does_not_reshow_before_first_present() -> None:
     if sys.platform != "win32":
         pytest.skip("capture-protected startup uses Win32 window affinity")

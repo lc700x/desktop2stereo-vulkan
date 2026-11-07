@@ -2,6 +2,7 @@ import atexit
 import ctypes
 import platform
 import time
+from dataclasses import dataclass
 from ctypes import wintypes
 
 
@@ -212,6 +213,199 @@ if OS_NAME == "Windows":
             height = max(1, round(height * 0.5))
         return width, height
 
+    @dataclass(frozen=True)
+    class CursorSnapshot:
+        key: tuple[int, str]
+        rgba: bytes
+        width: int
+        height: int
+        hotspot_x: int
+        hotspot_y: int
+
+    def cursor_snapshot_key(display_mode: str) -> tuple[int, str] | None:
+        current = CursorInfo()
+        current.cbSize = ctypes.sizeof(current)
+        if not user32.GetCursorInfo(ctypes.byref(current)) or not current.hCursor:
+            return None
+        if not (int(current.flags) & 0x00000001):
+            return None
+        mode = str(display_mode or "Half-SBS").strip().casefold().replace("_", "-")
+        return (int(current.hCursor), mode)
+
+    def cursor_screen_position() -> tuple[int, int] | None:
+        current = CursorInfo()
+        current.cbSize = ctypes.sizeof(current)
+        if not user32.GetCursorInfo(ctypes.byref(current)):
+            return None
+        if not (int(current.flags) & 0x00000001):
+            return None
+        return (int(current.ptScreenPos.x), int(current.ptScreenPos.y))
+
+    def capture_cursor_snapshot(display_mode: str) -> CursorSnapshot | None:
+        current = CursorInfo()
+        current.cbSize = ctypes.sizeof(current)
+        if not user32.GetCursorInfo(ctypes.byref(current)) or not current.hCursor:
+            return None
+        if not (int(current.flags) & 0x00000001):
+            return None
+
+        cursor_key = int(current.hCursor)
+        copied_cursor = 0
+        cursor_handle = _cursor_handle_map.get(cursor_key)
+        if cursor_handle is None:
+            copied_cursor = int(user32.CopyIcon(current.hCursor) or 0)
+            cursor_handle = copied_cursor
+        if not cursor_handle:
+            return None
+
+        cursor = wintypes.HANDLE(cursor_handle)
+        icon = IconInfo()
+        source_width = source_height = 0
+        width = height = 0
+        hotspot_x = hotspot_y = 0
+        screen = None
+        dc = None
+        bitmap = None
+        old_bitmap = None
+        bits = ctypes.c_void_p()
+        try:
+            if not user32.GetIconInfo(cursor, ctypes.byref(icon)):
+                return None
+            bitmap_handle = icon.hbmColor or icon.hbmMask
+            dimensions = Bitmap()
+            if not bitmap_handle or not gdi32.GetObjectW(
+                bitmap_handle,
+                ctypes.sizeof(dimensions),
+                ctypes.byref(dimensions),
+            ):
+                return None
+            source_width, source_height = _cursor_bitmap_size(icon, dimensions)
+            if (
+                source_width <= 0
+                or source_height <= 0
+                or source_width > 384
+                or source_height > 384
+            ):
+                return None
+            width, height = _cursor_eye_size(
+                source_width, source_height, display_mode
+            )
+            screen = user32.GetDC(None)
+            dc = gdi32.CreateCompatibleDC(screen)
+            if not dc:
+                return None
+            bitmap_info = BitmapInfo()
+            bitmap_info.bmiHeader.biSize = ctypes.sizeof(BitmapInfoHeader)
+            bitmap_info.bmiHeader.biWidth = width
+            bitmap_info.bmiHeader.biHeight = -height
+            bitmap_info.bmiHeader.biPlanes = 1
+            bitmap_info.bmiHeader.biBitCount = 32
+            bitmap = gdi32.CreateDIBSection(
+                dc,
+                ctypes.byref(bitmap_info),
+                0,
+                ctypes.byref(bits),
+                None,
+                0,
+            )
+            if not bitmap or not bits:
+                return None
+            old_bitmap = gdi32.SelectObject(dc, bitmap)
+            ctypes.memset(bits, 0, width * height * 4)
+            if not user32.DrawIconEx(
+                dc,
+                0,
+                0,
+                cursor,
+                width,
+                height,
+                0,
+                None,
+                0x0001 | 0x0002,
+            ):
+                return None
+
+            raw = ctypes.string_at(bits, width * height * 4)
+            rgba = bytearray(len(raw))
+            for offset in range(0, len(raw), 4):
+                blue, green, red, alpha = raw[offset : offset + 4]
+                if alpha:
+                    red = min(255, (red * 255 + alpha // 2) // alpha)
+                    green = min(255, (green * 255 + alpha // 2) // alpha)
+                    blue = min(255, (blue * 255 + alpha // 2) // alpha)
+                else:
+                    blue = green = red = 0
+                rgba[offset : offset + 4] = bytes((red, green, blue, alpha))
+
+            if not any(rgba[3::4]):
+                for offset in range(0, len(rgba), 4):
+                    if any(rgba[offset : offset + 3]):
+                        rgba[offset + 3] = 255
+            hotspot_x = round(int(icon.xHotspot) * width / source_width)
+            hotspot_y = round(int(icon.yHotspot) * height / source_height)
+            mode = str(display_mode or "Half-SBS").strip().casefold().replace("_", "-")
+            return CursorSnapshot(
+                key=(cursor_key, mode),
+                rgba=bytes(rgba),
+                width=width,
+                height=height,
+                hotspot_x=hotspot_x,
+                hotspot_y=hotspot_y,
+            )
+        finally:
+            if icon.hbmMask:
+                gdi32.DeleteObject(icon.hbmMask)
+            if icon.hbmColor:
+                gdi32.DeleteObject(icon.hbmColor)
+            if copied_cursor:
+                user32.DestroyIcon(copied_cursor)
+            if dc and old_bitmap:
+                gdi32.SelectObject(dc, old_bitmap)
+            if bitmap:
+                gdi32.DeleteObject(bitmap)
+            if dc:
+                gdi32.DeleteDC(dc)
+            if screen:
+                user32.ReleaseDC(None, screen)
+
+    def cursor_overlay_rects(
+        owner_hwnd: int,
+        eye_rects,
+        snapshot: CursorSnapshot,
+        position: tuple[int, int] | None,
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        if position is None:
+            return ()
+        origin = wintypes.POINT(0, 0)
+        rect = wintypes.RECT()
+        if not (
+            user32.ClientToScreen(owner_hwnd, ctypes.byref(origin))
+            and user32.GetClientRect(owner_hwnd, ctypes.byref(rect))
+        ):
+            return ()
+        client_width = int(rect.right - rect.left)
+        client_height = int(rect.bottom - rect.top)
+        local_x = int(position[0]) - origin.x
+        local_y = int(position[1]) - origin.y
+        if (
+            client_width <= 0
+            or client_height <= 0
+            or not (0 <= local_x < client_width and 0 <= local_y < client_height)
+        ):
+            return ()
+        u = local_x / client_width
+        v = local_y / client_height
+        result = []
+        for left, top, right, bottom in eye_rects:
+            region_width = int(right - left)
+            region_height = int(bottom - top)
+            if region_width <= 0 or region_height <= 0:
+                continue
+            x = int(left) + round(u * region_width) - snapshot.hotspot_x
+            y = int(top) + round(v * region_height) - snapshot.hotspot_y
+            result.append((x, y, snapshot.width, snapshot.height))
+        return tuple(result)
+
     def _restore_cursor_scheme() -> None:
         global _hide_calls, _cursor_hidden
         for _ in range(_hide_calls):
@@ -371,15 +565,16 @@ if OS_NAME == "Windows":
             self._ensure_cursor_buffer(32, 32)
             try:
                 for _ in range(2):
+                    # Independent top-level HWNDs are visible to Remote Desktop
+                    # while the WGC exclusion list can keep them out of the source.
                     hwnd = user32.CreateWindowExW(
                         0x00080000 | 0x08000000 | 0x80 | WS_EX_TRANSPARENT,
                         "STATIC", None, 0x80000000, 0, 0, 384, 384,
-                        self.owner_hwnd, None, None, None,
+                        None, None, None, None,
                     )
                     if not hwnd:
                         raise RuntimeError("native cursor overlay window creation failed")
                     self.window_handles.append(int(hwnd))
-                    set_hwnd_capture_affinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
                     user32.ShowWindow(hwnd, 0)
             except Exception:
                 self.close()
@@ -513,6 +708,20 @@ if OS_NAME == "Windows":
                 gdi32.DeleteDC(self.cursor_dc)
 
 else:
+    CursorSnapshot = None
+
+    def cursor_snapshot_key(*args, **kwargs):
+        return None
+
+    def cursor_screen_position(*args, **kwargs):
+        return None
+
+    def capture_cursor_snapshot(*args, **kwargs):
+        return None
+
+    def cursor_overlay_rects(*args, **kwargs):
+        return ()
+
     def native_cursor_suppressed():
         return False
 

@@ -831,16 +831,33 @@ def test_windows_capture_cuda_accepts_env_capture_options(monkeypatch):
     }
 
 
-def test_windows_capture_keeps_cursor_for_sbs_views():
+def test_windows_capture_can_disable_source_cursor_for_sbs_overlay():
     config = CaptureConfig(
         capture_tool="WindowsCaptureCUDA",
         capture_mode="Monitor",
         monitor_index=1,
+        cursor_capture=False,
     )
 
     assert windows_capture_event._windows_capture_kwargs(
         config, "WindowsCaptureCUDA"
-    )["cursor_capture"] is True
+    )["cursor_capture"] is False
+
+
+@pytest.mark.parametrize("crate", ("wc_cuda", "wc_rocm"))
+def test_native_gpu_capture_maps_cursor_capture_false_to_without_cursor(crate):
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "native"
+        / crate
+        / "src"
+        / "lib.rs"
+    ).read_text(encoding="utf-8")
+    assert "cursor_capture: bool" in source
+    assert "CursorCaptureSettings::WithoutCursor" in source
+    assert "cursor_capture=true" in source
 
 
 def test_gpu_capture_kwargs_include_only_current_exclusion_handles():

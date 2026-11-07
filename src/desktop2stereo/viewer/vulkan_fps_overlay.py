@@ -551,6 +551,14 @@ class VulkanFpsOverlay:
             return
         self._panel_dirty = True
 
+    def set_rgba(self, rgba: bytes, size: tuple[int, int]) -> None:
+        """Queue raw RGBA bytes for a generic overlay texture."""
+        width, height = (int(value) for value in size)
+        if width <= 0 or height <= 0 or len(rgba) != width * height * 4:
+            return
+        self._pending_panel = (bytes(rgba), (width, height))
+        self._panel_dirty = True
+
     def _upload_panel(self, cmd: Any) -> bool:
         self.last_upload_ms = 0.0
         pending_panel = self._pending_panel
@@ -734,6 +742,9 @@ class VulkanFpsOverlay:
         elif old == vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
             source_stage = vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
             source_access = vk.VK_ACCESS_SHADER_READ_BIT
+        elif old == vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+            source_stage = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+            source_access = vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
         else:
             source_stage = vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
             source_access = 0
@@ -788,20 +799,10 @@ class VulkanFpsOverlay:
         swapchain_image: Any,
         swap_image_index: int,
         eye_rects: tuple[tuple[int, int, int, int], ...],
+        *,
+        source_layout: int | None = None,
     ) -> bool:
         """Blend the panel onto one swapchain image. Returns True when drawn."""
-        if not self.available or not self._framebuffers:
-            return False
-        # Upload a freshly rasterized panel; once it lands, keep drawing the
-        # same texture every frame until a new one is queued.
-        self._upload_panel(cmd)
-        if self._image_view is None or self._panel_size == (0, 0):
-            return False
-        panel_w, panel_h = self._panel_size
-        if panel_w <= 0 or panel_h <= 0:
-            return False
-        if swap_image_index >= len(self._framebuffers):
-            return False
         display_size = overlay_size_for_display_mode(
             self._panel_size,
             getattr(getattr(self.viewer, "config", None), "display_mode", "Half-SBS"),
@@ -810,12 +811,44 @@ class VulkanFpsOverlay:
             overlay_rect_for_eye(eye_rect, display_size)
             for eye_rect in eye_rects
         ] or [overlay_rect_for_eye((0, 0) + self.viewer.extent, display_size)]
+        return self.record_rects(
+            cmd,
+            swapchain_image,
+            swap_image_index,
+            rects,
+            source_layout=source_layout,
+        )
+
+    def record_rects(
+        self,
+        cmd: Any,
+        swapchain_image: Any,
+        swap_image_index: int,
+        rects: tuple[tuple[int, int, int, int], ...],
+        *,
+        source_layout: int | None = None,
+    ) -> bool:
+        """Blend the current texture into explicit destination rectangles."""
+        if not self.available or not self._framebuffers:
+            return False
+        self._upload_panel(cmd)
+        if self._image_view is None or self._panel_size == (0, 0):
+            return False
+        panel_w, panel_h = self._panel_size
+        if panel_w <= 0 or panel_h <= 0 or not rects:
+            return False
+        if swap_image_index >= len(self._framebuffers):
+            return False
         try:
             vk = self.vk
             self._transition(
                 cmd,
                 swapchain_image,
-                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                (
+                    vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                    if source_layout is None
+                    else source_layout
+                ),
                 vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             )
             _, framebuffer = self._framebuffers[swap_image_index]

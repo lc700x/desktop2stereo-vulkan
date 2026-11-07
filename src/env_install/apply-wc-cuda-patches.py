@@ -57,6 +57,7 @@ def patched_source(source: str) -> str:
             "        self._required_configuration_iteration = 0\n"
             "        self._inner = _NativeWcCapture(\n"
             "            luid=luid, monitor_index=monitor_index, window_hwnd=window_hwnd, window_title=window_name,\n"
+            "            cursor_capture=bool(cursor_capture),\n"
             "            excluded_window_handles=(\n"
             "                list(self._excluded_window_handles) if self._window_exclusion_requested and self._native_window_exclusion_available else None\n"
             "            ),\n"
