@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+APP_ROOT = ROOT / "src" / "desktop2stereo"
 sys.path.insert(0, str(APP_ROOT))
 
 from stereo_runtime.output import OUTPUT_FORMAT_CHOICES
@@ -15,14 +16,29 @@ from stereo_runtime.output import OUTPUT_FORMAT_CHOICES
 
 def summarize(values: list[float]) -> dict[str, float]:
     if not values:
-        return {"count": 0, "mean_ms": 0.0, "median_ms": 0.0, "p90_ms": 0.0}
+        return {
+            "count": 0,
+            "mean_ms": 0.0,
+            "median_ms": 0.0,
+            "p90_ms": 0.0,
+            "p95_ms": 0.0,
+            "p99_ms": 0.0,
+            "max_ms": 0.0,
+        }
     sorted_values = sorted(values)
-    p90_idx = min(len(sorted_values) - 1, round((len(sorted_values) - 1) * 0.9))
+
+    def percentile(q: float) -> float:
+        index = min(len(sorted_values) - 1, round((len(sorted_values) - 1) * q))
+        return float(sorted_values[index])
+
     return {
         "count": len(values),
         "mean_ms": float(statistics.mean(values)),
         "median_ms": float(statistics.median(values)),
-        "p90_ms": float(sorted_values[p90_idx]),
+        "p90_ms": percentile(0.90),
+        "p95_ms": percentile(0.95),
+        "p99_ms": percentile(0.99),
+        "max_ms": float(max(values)),
     }
 
 
@@ -45,16 +61,14 @@ def main() -> None:
     parser.add_argument("--onnx", default=None)
     parser.add_argument("--trt-engine", default=None)
     parser.add_argument("--no-fused", action="store_true")
-    parser.add_argument("--depth-strength", type=float, default=2.0)
-    parser.add_argument("--convergence", type=float, default=0.0)
-    parser.add_argument("--ipd", type=float, default=0.064)
-    parser.add_argument("--max-shift-ratio", type=float, default=0.05)
-    parser.add_argument("--temporal", action="store_true")
-    parser.add_argument("--temporal-strength", type=float, default=0.85)
+    parser.add_argument("--depth-strength", type=float, default=0.48)
+    parser.add_argument("--convergence", type=float, default=0.5)
+    parser.add_argument("--temporal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--temporal-strength", type=float, default=0.75)
+    parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--auto-reset-temporal", action="store_true")
     parser.add_argument("--scene-reset-threshold", type=float, default=0.22)
-    parser.add_argument("--foreground-scale", type=float, default=0.0)
-    parser.add_argument("--depth-antialias-strength", type=float, default=0.0)
+    parser.add_argument("--depth-antialias-strength", type=float, default=2.0)
     parser.add_argument("--edge-dilation", type=int, default=2)
     parser.add_argument("--edge-threshold", type=float, default=0.04)
     parser.add_argument("--cross-eyed", action="store_true")
@@ -76,7 +90,10 @@ def main() -> None:
         device=device,
         onnx_path=args.onnx,
         engine_path=args.trt_engine,
+        cache_dir=APP_ROOT / "models",
         use_dlpack=args.depth_backend == "onnx_cuda_dlpack",
+        use_cuda_graph=args.cuda_graph,
+        execution_slot_count=2 if args.cuda_graph else 1,
     )
     provider = create_depth_provider(depth_config)
     if hasattr(provider, "load"):
@@ -94,6 +111,15 @@ def main() -> None:
         "provider": provider.info.to_report(),
         "stereo_backend": args.backend,
         "layers": args.layers,
+        "cuda_graph": args.cuda_graph,
+        "processing_config": {
+            "depth_strength": args.depth_strength,
+            "convergence": args.convergence,
+            "temporal": args.temporal,
+            "temporal_strength": args.temporal_strength,
+            "depth_antialias_strength": args.depth_antialias_strength,
+            "output_quality_enabled": False,
+        },
         "formats": {},
     }
 
@@ -104,13 +130,10 @@ def main() -> None:
             output_format=output_format,
             depth_strength=args.depth_strength,
             convergence=args.convergence,
-            ipd=args.ipd,
-            max_shift_ratio=args.max_shift_ratio,
             temporal=args.temporal,
             temporal_strength=args.temporal_strength,
             auto_reset_temporal=args.auto_reset_temporal,
             scene_reset_threshold=args.scene_reset_threshold,
-            foreground_scale=args.foreground_scale,
             depth_antialias_strength=args.depth_antialias_strength,
             edge_dilation=args.edge_dilation,
             edge_threshold=args.edge_threshold,
@@ -167,6 +190,8 @@ def main() -> None:
             "total": total_summary,
             "mean_fps": 1000.0 / mean_ms if mean_ms else 0.0,
             "median_fps": 1000.0 / median_ms if median_ms else 0.0,
+            "p95_frame_budget_fps": 1000.0 / total_summary["p95_ms"] if total_summary["p95_ms"] else 0.0,
+            "p99_frame_budget_fps": 1000.0 / total_summary["p99_ms"] if total_summary["p99_ms"] else 0.0,
         }
 
     out = Path(args.out)

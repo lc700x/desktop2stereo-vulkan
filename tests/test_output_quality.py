@@ -130,6 +130,42 @@ def test_cap_keeps_quality_scale_sources_eligible_for_fused_direct_sbs(monkeypat
     assert output_quality_requires_eye_images(config, *size) is False
 
 
+def test_native_4k_plan_is_identical_with_and_without_the_cap(monkeypatch) -> None:
+    """At 100% the cap is provably a no-op.
+
+    An earlier benchmark showed 100% as ~0.5 ms slower with the cap on, but
+    that was first-case warm-up in a fresh process: the resolved plan and
+    fused-path eligibility are identical for both cap states.
+    """
+    from stereo_runtime.output_quality import (
+        output_quality_requires_eye_images,
+        output_sampling_plan_for_config,
+    )
+    from stereo_runtime.render_size import RenderSizeConfig, resolve_render_size
+
+    size = resolve_render_size((3840, 2160), RenderSizeConfig(scale_factor="100%"))
+    config = _headset_config(
+        output_min_lod=0.0,
+        output_max_lod=0.35,
+        output_mip_lod_bias=-0.35,
+    )
+    snapshots = []
+    for cap in ("1", "0"):
+        monkeypatch.setenv("D2S_CAP_OUTPUT_UPSCALE", cap)
+        plan = output_sampling_plan_for_config(config, *size)
+        snapshots.append(
+            (
+                plan.mode,
+                plan.target_width,
+                plan.target_height,
+                plan.scale,
+                plan.target_kind,
+                output_quality_requires_eye_images(config, *size),
+            )
+        )
+    assert snapshots[0] == snapshots[1] == ("native_mip", *size, 1.0, "headset", False)
+
+
 def test_legacy_headset_upscale_would_disable_the_fused_path(monkeypatch) -> None:
     from stereo_runtime.output_quality import (
         output_quality_requires_eye_images,

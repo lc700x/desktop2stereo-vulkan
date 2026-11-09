@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -254,11 +255,25 @@ def runtime_config_from_d2s_settings(
         "Depth CUDA Graph", settings.get("CUDA Graph")
     )
     if cuda_graph_setting is None:
+        # CUDA graph replay covers only depth inference, never the output
+        # consumer. With one inference worker it raises execution_slot_count
+        # to 2, letting the next prediction overlap stereo consumption.
+        # OpenXR is deliberately opt-in: on cross-adapter (NVIDIA CUDA +
+        # AMD Vulkan) rigs the measured rt_slot_wait dominates, and a short
+        # live A/B was inconclusive, so keep the conservative default.
+        # D2S_OPENXR_CUDA_GRAPH=1 enables it for a controlled A/B.
+        run_mode_key = str(settings.get("Run Mode", "")).strip().casefold()
+        openxr_graph_opt_in = os.environ.get(
+            "D2S_OPENXR_CUDA_GRAPH", "0"
+        ).strip().lower() not in {"0", "false", "no", "off"}
         cuda_graph_setting = (
-            # Enable replay for local presentation without changing stereo
-            # parameters or the defaults of OpenXR and other stream outputs.
-            str(settings.get("Run Mode", "")).strip().casefold()
-            in {"local viewer", "3d monitor", "moonlight streamer"}
+            (
+                run_mode_key in {"local viewer", "3d monitor", "moonlight streamer"}
+                or (
+                    run_mode_key in {"openxr link", "openxr"}
+                    and openxr_graph_opt_in
+                )
+            )
             and bool(settings.get("TensorRT", False))
             and parallel_workers == 1
         )

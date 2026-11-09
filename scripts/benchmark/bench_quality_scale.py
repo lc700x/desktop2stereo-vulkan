@@ -190,6 +190,14 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--scales", default=",".join(SCALES))
     parser.add_argument(
+        "--cap-order",
+        choices=("on-first", "off-first", "balanced"),
+        default="balanced",
+        help="Order of the cap ON/OFF cases. The first case in a fresh process "
+             "pays residual Triton JIT / GPU clock ramp-up; 'balanced' runs "
+             "ON,OFF,OFF,ON and averages both samples per cap state.",
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=ROOT / "outputs" / "visual_regression" / "quality_scale_gpu.json",
@@ -203,8 +211,15 @@ def main() -> int:
           f"capture={CAPTURE_SIZE[0]}x{CAPTURE_SIZE[1]}", flush=True)
     print(f"default output_upscale_capped={output_upscale_capped()}", flush=True)
 
+    if args.cap_order == "on-first":
+        cap_sequence = (True, False)
+    elif args.cap_order == "off-first":
+        cap_sequence = (False, True)
+    else:
+        cap_sequence = (True, False, False, True)
+
     cases: list[dict] = []
-    for cap in (True, False):
+    for cap in cap_sequence:
         for scale in scales:
             label = f"scale={scale:<5} cap={'ON ' if cap else 'OFF'}"
             try:
@@ -224,11 +239,20 @@ def main() -> int:
                 print(f"{label} ERROR {type(exc).__name__}: {exc}", flush=True)
 
     by_scale: dict[str, dict] = {}
+    samples: dict[tuple[str, bool], list[dict]] = {}
     for case in cases:
         if "error" in case:
             continue
-        entry = by_scale.setdefault(case["scale"], {})
-        entry["cap_on" if case["cap"] else "cap_off"] = case
+        samples.setdefault((case["scale"], bool(case["cap"])), []).append(case)
+    for (scale, cap), group in samples.items():
+        entry = by_scale.setdefault(scale, {})
+        merged = dict(group[-1])
+        if len(group) > 1:
+            merged["total_mean_ms"] = round(
+                statistics.fmean(c["total_mean_ms"] for c in group), 4
+            )
+            merged["total_samples_ms"] = [c["total_mean_ms"] for c in group]
+        entry["cap_on" if cap else "cap_off"] = merged
     comparison = {}
     for scale, pair in by_scale.items():
         if "cap_on" in pair and "cap_off" in pair:
@@ -246,6 +270,7 @@ def main() -> int:
             "capture_size": list(CAPTURE_SIZE),
             "warmup": args.warmup,
             "iters": args.iters,
+            "cap_order": args.cap_order,
             "note": "CUDA-synchronised wall time for preprocess + synthesis only "
                     "(includes CPU launch overhead). Model-grid depth AA disabled; "
                     "smooth depth ramp. Excludes capture, depth inference, present, "

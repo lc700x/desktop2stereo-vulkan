@@ -123,14 +123,97 @@ def test_cuda_graph_uses_two_inference_slots_without_changing_depth_config() -> 
     assert depth_config.depth_upsample == config.depth_upsample
 
 
-@pytest.mark.parametrize("run_mode", ["OpenXR Link", "MJPEG Streamer", "RTMP Streamer", ""])
+@pytest.mark.parametrize(
+    "run_mode", ["OpenXR Link", "MJPEG Streamer", "RTMP Streamer", ""]
+)
 def test_cuda_graph_default_does_not_change_other_outputs(monkeypatch, run_mode) -> None:
+    monkeypatch.delenv("D2S_OPENXR_CUDA_GRAPH", raising=False)
     monkeypatch.setattr(torch.version, "hip", None)
     config = runtime_config_from_d2s_settings({
         "Depth Model": "Distill-Any-Depth-Small",
         "Run Mode": run_mode,
         "TensorRT": True,
     })
+    assert config.use_cuda_graph is False
+
+
+@pytest.mark.parametrize(
+    "run_mode", ["Local Viewer", "3D Monitor", "Moonlight Streamer"]
+)
+def test_presenters_get_two_inference_slots_by_default(monkeypatch, run_mode) -> None:
+    """Local presentation keeps the CUDA graph and its two execution slots."""
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.delenv("D2S_OPENXR_CUDA_GRAPH", raising=False)
+    config = runtime_config_from_d2s_settings(
+        {
+            "Depth Model": "Distill-Any-Depth-Small",
+            "Run Mode": run_mode,
+            "TensorRT": True,
+        },
+        cache_dir="/tmp/d2s-models",
+        device="cuda",
+    )
+    assert config.use_cuda_graph is True
+    assert depth_provider_config_from_runtime(config).execution_slot_count == 2
+    assert config.depth_strength == 0.48
+    assert config.convergence == 0.5
+
+
+def test_openxr_cuda_graph_is_opt_in_and_keeps_opt_out(monkeypatch) -> None:
+    """Cross-adapter OpenXR keeps the conservative single-slot default.
+
+    A live A/B on this machine was order-confounded by headset warm-up, so
+    the two-slot graph remains a measured opt-in, not a silent default change.
+    """
+    monkeypatch.setattr(torch.version, "hip", None)
+    settings = {
+        "Depth Model": "Distill-Any-Depth-Small",
+        "Run Mode": "OpenXR Link",
+        "TensorRT": True,
+    }
+
+    monkeypatch.delenv("D2S_OPENXR_CUDA_GRAPH", raising=False)
+    default = runtime_config_from_d2s_settings(settings, cache_dir="/tmp/d2s-models", device="cuda")
+    assert default.use_cuda_graph is False
+    assert depth_provider_config_from_runtime(default).execution_slot_count == 1
+
+    monkeypatch.setenv("D2S_OPENXR_CUDA_GRAPH", "1")
+    enabled = runtime_config_from_d2s_settings(settings, cache_dir="/tmp/d2s-models", device="cuda")
+    assert enabled.use_cuda_graph is True
+    assert depth_provider_config_from_runtime(enabled).execution_slot_count == 2
+    # Scheduling only: no depth or stereo visual parameters change.
+    assert enabled.depth_strength == default.depth_strength == 0.48
+    assert enabled.convergence == default.convergence == 0.5
+
+
+@pytest.mark.parametrize("on", ["1", "true", "yes", "on"])
+def test_openxr_cuda_graph_opt_in_aliases(monkeypatch, on) -> None:
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setenv("D2S_OPENXR_CUDA_GRAPH", on)
+    config = runtime_config_from_d2s_settings(
+        {
+            "Depth Model": "Distill-Any-Depth-Small",
+            "Run Mode": "OpenXR Link",
+            "TensorRT": True,
+        },
+        cache_dir="/tmp/d2s-models",
+        device="cuda",
+    )
+    assert config.use_cuda_graph is True
+
+
+def test_explicit_cuda_graph_setting_still_wins_for_openxr(monkeypatch) -> None:
+    monkeypatch.setenv("D2S_OPENXR_CUDA_GRAPH", "1")
+    config = runtime_config_from_d2s_settings(
+        {
+            "Depth Model": "Distill-Any-Depth-Small",
+            "Run Mode": "OpenXR Link",
+            "TensorRT": True,
+            "Depth CUDA Graph": False,
+        },
+        cache_dir="/tmp/d2s-models",
+        device="cuda",
+    )
     assert config.use_cuda_graph is False
 
 
