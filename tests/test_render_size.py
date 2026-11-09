@@ -26,7 +26,7 @@ def test_render_size_config_from_settings_parses_gui_fields():
 
     assert config == RenderSizeConfig(
         policy=RenderSizePolicy.SCALED,
-        scale_factor="2K / 75%",
+        scale_factor="75%",
         fixed_width=1600,
         fixed_height=900,
         max_pixels=2073600,
@@ -58,24 +58,28 @@ def test_resolve_render_size_native_aligns_capture_size():
         ((3840, 1600), "2K / 75%", (2880, 1200)),
     ],
 )
-def test_resolve_render_size_scaled_uses_fixed_4k_scale_tiers_for_4k_inputs(capture_size, tier, expected):
+def test_resolve_render_size_scaled_preserves_legacy_tiers_and_alignment(capture_size, tier, expected):
     config = RenderSizeConfig(policy=RenderSizePolicy.SCALED, scale_factor=tier, align=16)
 
     assert resolve_render_size(capture_size, config) == expected
 
 
-@pytest.mark.parametrize("capture_size", [(2560, 1440), (3440, 1440), (1080, 1920), (1000, 3000)])
-def test_resolve_render_size_scaled_keeps_non_4k_tier_input_native(capture_size):
-    config = RenderSizeConfig(policy=RenderSizePolicy.SCALED, scale_factor="1K / 50%", align=1)
+@pytest.mark.parametrize("capture_size", [
+    (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160), (3440, 1440), (1080, 1920), (320, 200),
+])
+@pytest.mark.parametrize("percent", ["100%", "85%", "75%", "50%"])
+def test_resolve_render_size_scales_every_input_without_minimum_side(capture_size, percent):
+    config = RenderSizeConfig(scale_factor=percent, min_dimension=480)
+    factor = int(percent[:-1]) / 100.0
+    expected = tuple(round(side * factor) for side in capture_size)
+    assert resolve_render_size(capture_size, config) == expected
 
-    assert resolve_render_size(capture_size, config) == capture_size
 
-
-@pytest.mark.parametrize("legacy_value", ["0.75", "75%", "2K", "3K", "1K"])
+@pytest.mark.parametrize("legacy_value", ["0.75", "2K", "3K", "1K", "42%", None])
 def test_render_scale_rejects_legacy_numeric_and_short_aliases(legacy_value):
     config = render_size_config_from_settings({"Render Size Policy": "scaled", "Render Scale": legacy_value})
 
-    assert config.scale_factor == "4K / 100%"
+    assert config.scale_factor == "100%"
     assert resolve_render_size((3840, 2160), config) == (3840, 2160)
 
 
@@ -106,3 +110,23 @@ def test_runtime_output_size_text_validates_size():
     assert runtime_output_size_text(None) == "unknown"
     with pytest.raises(ValueError):
         runtime_output_size_text((0, 1080))
+
+
+@pytest.mark.parametrize(("old", "new"), [
+    ("4K / 100%", "100%"), ("3K / 85%", "85%"), ("2K / 75%", "75%"), ("1K / 50%", "50%"),
+])
+def test_render_scale_roundtrips_old_settings_as_percentages(tmp_path, old, new):
+    import yaml
+
+    settings = {"Render Scale": old, "Render Size Policy": "scaled", "Depth Resolution": 336}
+    original = yaml.safe_dump(settings)
+    path = tmp_path / "settings.yaml"
+    path.write_text(original, encoding="utf-8")
+    config = render_size_config_from_settings(yaml.safe_load(path.read_text(encoding="utf-8")))
+    assert config.scale_factor == new
+    assert path.read_text(encoding="utf-8") == original
+    settings["Render Scale"] = config.scale_factor
+    path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+    reloaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert render_size_config_from_settings(reloaded) == config
+    assert reloaded["Depth Resolution"] == 336

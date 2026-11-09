@@ -17,6 +17,7 @@ from streaming.audio import (
     query_ffmpeg_dshow_audio_devices,
     query_ffmpeg_wasapi_audio_devices,
 )
+from stereo_runtime.render_size import _normalize_render_scale_tier
 from streaming.stream_calibration import automatic_peak_bitrate_mbps
 from streaming.wasapi_audio import query_soundcard_loopback_devices
 from utils.run_mode import (
@@ -71,12 +72,7 @@ class GUIHandlerMixin:
         return [t["Native"], t["Scaled"], t["Fixed"], t["Dynamic"]]
 
     def _render_scale_options(self):
-        return [
-            "4K / 100%",
-            "3K / 85%",
-            "2K / 75%",
-            "1K / 50%",
-        ]
+        return ["100%", "85%", "75%", "50%"]
 
     def _openxr_render_resolution_options(self):
         return ["Auto (Headset)", "50%", "75%", "100%", "124%", "125%", "150%", "175%", "200%", "250%", "300%", "350%", "400%"]
@@ -125,10 +121,7 @@ class GUIHandlerMixin:
         return self._normalize_render_scale_tier(value)
 
     def _normalize_render_scale_tier(self, value):
-        text = str(value or "").strip()
-        if text in self._render_scale_options():
-            return text
-        return DEFAULTS["Render Scale"]
+        return _normalize_render_scale_tier(value)
 
     def _render_policy_to_display(self, value):
         return UI_MESSAGES[self.locale].get("Scaled", "Scaled")
@@ -1299,7 +1292,9 @@ class GUIHandlerMixin:
         show_enhance = False
         self.row6b.visible = show_timing
         self.row6c.visible = show_enhance
-        show_render_size = advanced and mode in ["Local Viewer", "OpenXR Link"]
+        show_render_size = advanced and mode in {
+            "Local Viewer", "OpenXR Link", "MJPEG Streamer", "RTMP Streamer", "Moonlight Streamer",
+        }
         self._update_render_size_control_visibility(show_render_size)
         show_openxr_resolution = advanced and mode == "OpenXR Link"
         self.row6g.visible = show_openxr_resolution
@@ -1607,6 +1602,7 @@ class GUIHandlerMixin:
         self.computing_device_label.value = t["Computing Device:"]
         self.advanced_device_cb.label = t["Advanced Device Options"]
         self.showfps_cb.label = t["Show FPS"]
+        self.showfps_cb.tooltip = t["tooltip_show_fps"]
         self.capture_tool_label.value = t["Capture Tool:"]
         self.run_mode_label.value = t["Run Mode:"]
         self.display_mode_label.value = t["Display Mode:"]
@@ -1666,7 +1662,7 @@ class GUIHandlerMixin:
         self.display_fit_dd.set_tooltip(t["tooltip_display_fit"])
         if hasattr(self, "stream_display_fit_label"):
             self.stream_display_fit_label.value = t.get("Stream Fit:", "Stream Fit:")
-            self.stream_display_fit_label.tooltip = t["tooltip_display_fit"]
+            self.stream_display_fit_label.tooltip = t["tooltip_stream_fit"]
         self.lossless_cb.label = t["Lossless Scaling Support"]
         self.lossless_cb.tooltip = t["tooltip_nvfruc"]
         self.lsfg_cb.label = t["LSFG Support"]
@@ -1702,7 +1698,6 @@ class GUIHandlerMixin:
         self.capture_mode_dd.reapply_width()
         self.stream_url_label.value = t["Streamer URL"]
         self.stream_port_label.value = t["Streamer Port:"]
-        self.stream_quality_label.value = t["Stream Quality:"]
         self.stream_proto_label.value = t["Stream Protocol:"]
         self.stream_key_label.value = t["Stream Key"]
         self.moonlight_pairing_btn.content = ft.Text(
@@ -1825,7 +1820,7 @@ class GUIHandlerMixin:
             (self.theme_dd, "tooltip_theme"),
             (self.stream_url_tf, "tooltip_stream_url"),
             (self.preview_btn, "tooltip_stream_preview"),
-            (self.stream_quality_dd, "tooltip_stream_quality"),
+            (self.stream_display_fit_dd, "tooltip_stream_fit"),
             (self.stream_proto_dd, "tooltip_stream_proto"),
             (self.audio_dd, "tooltip_audio"),
             (self.stream_port_tf, "tooltip_stream_port"),

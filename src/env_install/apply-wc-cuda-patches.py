@@ -24,6 +24,40 @@ def patched_source(source: str) -> str:
     has_capture_binding = "class WindowsCapture:" in source and "_NativeWcCapture" in source
     changes = (
         (
+            "        self._bridge = None\n",
+            "        self._bridge = None\n"
+            "        self._bridges = {}\n",
+        ),
+        (
+            "                    if self._bridge is None or self._bridge.width != w or self._bridge.height != h:\n"
+            "                        self._bridge = _DX11ToPyTorchBridge(\n"
+            "                            gpu_frame.texture_ptr,\n"
+            "                            w,\n"
+            "                            h,\n"
+            "                            self.device_id,\n"
+            "                            reuse_output_buffer=self._reuse_output_buffer,\n"
+            "                            output_buffer_count=self._output_buffer_count,\n"
+            "                        )\n",
+            "                    texture_ptr = int(gpu_frame.texture_ptr)\n"
+            "                    bridge_key = (w, h, texture_ptr)\n"
+            "                    bridge = self._bridges.get(bridge_key)\n"
+            "                    if bridge is None:\n"
+            "                        bridge = _DX11ToPyTorchBridge(\n"
+            "                            gpu_frame.texture_ptr,\n"
+            "                            w,\n"
+            "                            h,\n"
+            "                            self.device_id,\n"
+            "                            reuse_output_buffer=self._reuse_output_buffer,\n"
+            "                            output_buffer_count=self._output_buffer_count,\n"
+            "                        )\n"
+            "                        self._bridges[bridge_key] = bridge\n"
+            "                    self._bridge = bridge\n",
+        ),
+        (
+            "                    tensor = self._bridge.update(self._stream)\n",
+            "                    tensor = bridge.update(self._stream)\n",
+        ),
+        (
             "class Frame:\n"
             "    def __init__(self, tensor: torch.Tensor, width: int, height: int):\n"
             "        self.frame_buffer = tensor  # This is the PyTorch CUDA Tensor\n"
@@ -173,6 +207,7 @@ def patched_source(source: str) -> str:
                 "window_exclusion",
                 "configuration_iteration",
                 "set_excluded_windows",
+                "self._bridge",
             )
         ):
             continue

@@ -94,6 +94,13 @@ class StereoResult:
 
 
 def _record_cuda_event(events: dict[str, object], name: str, tensor: torch.Tensor | None) -> None:
+    if os.environ.get("D2S_CUDA_STAGE_EVENTS", "0").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
     if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
         return
     try:

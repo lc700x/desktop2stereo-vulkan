@@ -432,7 +432,9 @@ class MetalLocalViewer:
         native_frame = getattr(frame, "viewer_native", None)
         if native_frame is None:
             return None
-        source_size = getattr(native_frame, "source_size", None)
+        source_size = getattr(frame, "output_eye_size", None)
+        if source_size is None:
+            source_size = getattr(native_frame, "source_size", None)
         if not isinstance(source_size, (tuple, list)) or len(source_size) != 2:
             raise RuntimeError("native CoreML frame has no source dimensions")
         source_width, source_height = map(int, source_size)

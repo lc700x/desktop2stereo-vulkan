@@ -789,9 +789,15 @@ class GenericAutoDepthProvider:
 
     def predict_profile(self, rgb: torch.Tensor) -> DepthProfileResult:
         cuda_events: dict[str, Any] = {}
+        record_stages = os.environ.get("D2S_CUDA_STAGE_EVENTS", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         def record(name: str) -> None:
-            if self.device.type != "cuda":
+            if not record_stages or self.device.type != "cuda":
                 return
             try:
                 event = torch.cuda.Event(blocking=False, enable_timing=True)

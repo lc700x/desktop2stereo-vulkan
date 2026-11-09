@@ -758,6 +758,8 @@ def test_stream_rate_selector_keeps_headroom_across_gpu_speeds():
     select = FfmpegDirectSbsOutput._select_sustainable_stream_fps
 
     assert select(40.0, 60) == 30
+    assert select(43.0, 60) == 42
+    assert select(44.3, 60) == 42
     assert select(30.1, 30) == 30
     assert select(29.9, 30) == 25
     assert select(28.0, 60) == 25
@@ -1513,7 +1515,8 @@ def test_rtsp_selection_uses_selected_port_for_internal_publish():
     assert output._server_environment()["MTX_RTSPADDRESS"] == ":9554"
 
 
-def test_pynv_encoder_uses_live_low_latency_nvenc_settings():
+@pytest.mark.parametrize("cuda_stream", [0, 12345])
+def test_pynv_encoder_uses_live_low_latency_nvenc_settings(cuda_stream):
     captured = {}
 
     class FakeNvc:
@@ -1523,13 +1526,14 @@ def test_pynv_encoder_uses_live_low_latency_nvenc_settings():
             captured["kwargs"] = kwargs
             return SimpleNamespace()
 
-    nvidia_encoder.PyNvVideoCodecEncoder(
+    encoder = nvidia_encoder.PyNvVideoCodecEncoder(
         FakeNvc(),
         3840,
         2160,
         hevc=False,
         fps=25,
         bitrate=21_000_000,
+        cuda_stream=cuda_stream,
     )
 
     assert captured["args"] == (3840, 2160, "NV12", False)
@@ -1542,6 +1546,7 @@ def test_pynv_encoder_uses_live_low_latency_nvenc_settings():
     assert captured["kwargs"]["bf"] == 0
     assert captured["kwargs"]["repeatspspps"] == 1
     assert captured["kwargs"]["gpu_id"] == 0
+    assert captured["kwargs"]["cudastream"] == encoder._cuda_stream == cuda_stream
 
 
 def test_native_timestamped_packets_are_wrapped_as_mpegts_with_pts():
@@ -1672,3 +1677,300 @@ def test_gpu_required_stream_rejects_host_rgb_encoder_input():
 def test_gpu_required_mjpeg_is_rejected_without_a_gpu_jpeg_encoder():
     with pytest.raises(RuntimeError, match="CPU JPEG encoding"):
         MjpegDirectSbsOutput(port=1122, fps=60, quality=90, gpu_required=True)
+
+
+@pytest.mark.parametrize("display_mode", ["Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB"])
+@pytest.mark.parametrize("fit_mode", ["contain", "cover", "stretch"])
+@pytest.mark.parametrize("percent", ["100%", "85%", "75%", "50%"])
+def test_quality_scale_uses_scaled_transport_without_reupscale(
+    display_mode, fit_mode, percent
+):
+    from stereo_runtime.render_size import RenderSizeConfig, resolve_render_size
+
+    original = (160, 100)
+    source = resolve_render_size(original, RenderSizeConfig(scale_factor=percent))
+    config = SimpleNamespace(output_quality_enabled=False, output_format=display_mode.lower().replace("-", "_"))
+    target = direct_sbs.stream_target_size_for_config(source, config, fit_mode)
+    unscaled_target = direct_sbs.stream_target_size_for_config(original, config, fit_mode)
+    if percent == "100%":
+        assert target == unscaled_target
+    else:
+        assert target[0] <= unscaled_target[0]
+        assert target[1] <= unscaled_target[1]
+    width = source[0] * (2 if display_mode == "Full-SBS" else 1)
+    height = source[1] * (2 if display_mode == "Full-TAB" else 1)
+    pixels = np.zeros((height, width, 3), dtype=np.uint8)
+    if display_mode.endswith("SBS"):
+        pixels[:, :width // 2, 0] = 255
+        pixels[:, width // 2:, 1] = 255
+    else:
+        pixels[:height // 2, :, 0] = 255
+        pixels[height // 2:, :, 1] = 255
+    converter = RuntimeSbsRgbConverter(
+        display_mode=display_mode, fit_mode=fit_mode, input_size=original, target_size=target,
+    )
+    result = converter.convert(pixels)
+    assert result.shape[:2] == (target[1], target[0])
+    if display_mode.endswith("SBS"):
+        left, right = result[:, :target[0] // 2], result[:, target[0] // 2:]
+    else:
+        left, right = result[:target[1] // 2], result[target[1] // 2:]
+    assert left[..., 0].max() == 255 and left[..., 1].max() == 0
+    assert right[..., 1].max() == 255 and right[..., 0].max() == 0
+
+
+@pytest.mark.parametrize("source_size", [(1920, 1080), (3840, 2160), (1080, 1920)])
+def test_stream_target_preserves_existing_output_quality(source_size, monkeypatch):
+    from stereo_runtime.output_quality import output_sampling_plan_for_config
+    from streaming.aspect import transport_canvas_size
+
+    monkeypatch.delenv("D2S_CAP_OUTPUT_UPSCALE", raising=False)
+    config = SimpleNamespace(output_quality_enabled=True, output_headset_tier_k=4, output_format="half_sbs")
+    plan = output_sampling_plan_for_config(config, *source_size)
+    expected = transport_canvas_size(
+        (plan.target_width, plan.target_height), "contain", input_size=source_size, display_mode="Half-SBS",
+    )
+    assert direct_sbs.stream_target_size_for_config(source_size, config, "contain") == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.parametrize("display_mode", ["Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB"])
+@pytest.mark.parametrize("fit_mode", ["contain", "cover", "stretch"])
+def test_scaled_gpu_consumer_restores_encoder_canvas_without_host_readback(monkeypatch, display_mode, fit_mode):
+    shutdown = threading.Event()
+    submitted = []
+    width, height = (160, 50) if display_mode == "Full-SBS" else (80, 100) if display_mode == "Full-TAB" else (80, 50)
+    image = torch.zeros((height, width, 3), device="cuda", dtype=torch.uint8)
+    if display_mode.endswith("SBS"):
+        image[:, :width // 2, 0] = 255
+        image[:, width // 2:, 1] = 255
+    else:
+        image[:height // 2, :, 0] = 255
+        image[height // 2:, :, 1] = 255
+    config = SimpleNamespace(output_quality_enabled=False, output_format=display_mode.lower().replace("-", "_"))
+    target = direct_sbs.stream_target_size_for_config((160, 100), config, fit_mode)
+    output = SimpleNamespace(display_mode=display_mode, fit_mode=fit_mode, input_size=(160, 100))
+
+    def submit(frame):
+        assert frame.is_cuda
+        submitted.append(frame)
+        shutdown.set()
+
+    output.submit_cuda_frame = submit
+    monkeypatch.setattr(torch.Tensor, "cpu", lambda *_a, **_k: pytest.fail("GPU frame was read back"))
+    consumer = DirectSbsOutputConsumer(
+        runtime_q=queue.Queue(), shutdown_event=shutdown, output=output,
+        source_stat_inc=lambda *_a, **_k: None, gpu_required=True, target_size=target,
+    )
+    consumer.runtime_q.put((SimpleNamespace(sbs=image), 0.0))
+    consumer.run()
+    assert len(submitted) == 1
+    assert tuple(submitted[0].shape) == (target[1], target[0], 3)
+
+
+def test_native_consumer_receives_target_canvas_before_submission():
+    shutdown = threading.Event()
+    seen = []
+
+    def submit(result, *, target_size):
+        seen.append((result.vulkan_compute_request, target_size))
+        shutdown.set()
+        return True
+
+    output = SimpleNamespace(submit_vulkan_stereo_frame=submit, fit_mode="stretch", display_mode="Half-SBS")
+    consumer = DirectSbsOutputConsumer(
+        runtime_q=queue.Queue(), shutdown_event=shutdown, output=output,
+        source_stat_inc=lambda *_a, **_k: None, target_size=(1920, 1080), gpu_required=True,
+    )
+    request = object()
+    consumer.runtime_q.put((SimpleNamespace(vulkan_compute_request=request), 0.0))
+    consumer.run()
+    assert seen == [(request, (1920, 1080))]
+
+
+def test_mjpeg_target_canvas_is_owned_by_existing_resize_profile(monkeypatch):
+    captured = []
+
+    def streamer(**kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(direct_sbs, "MJPEGStreamer", streamer)
+    MjpegDirectSbsOutput(port=1122, fps=60, quality=90, target_size=(1920, 1080))
+    assert captured[0]["profile"].resize_size == (1920, 1080)
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float32])
+@pytest.mark.parametrize("layout", ["hwc", "chw", "bchw", "bhwc", "strided_rgba"])
+def test_nv12_fused_conversion_matches_existing_gpu_bytes(monkeypatch, dtype, layout):
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("NVENC conversion requires a CUDA GPU, not ROCm")
+    from stereo_runtime import triton_runtime
+
+    if not triton_runtime.triton_runtime_available(torch.device("cuda")):
+        pytest.skip("optional CUDA Triton runtime is unavailable")
+    generator = torch.Generator(device="cuda").manual_seed(731)
+    image = torch.randint(0, 256, (1080, 1920, 4), device="cuda", dtype=torch.uint8, generator=generator)
+    if dtype == torch.float32:
+        image = image.float() / 255.0 * 1.4 - 0.2
+    if layout == "strided_rgba":
+        image = image[:, ::2, :]
+    else:
+        image = image[..., :3]
+        if layout in {"chw", "bchw"}:
+            image = image.permute(2, 0, 1).contiguous()
+        if layout in {"bchw", "bhwc"}:
+            image = image.unsqueeze(0)
+    fused = nvidia_encoder.rgb_cuda_to_nv12(image)
+    monkeypatch.setattr(triton_runtime, "triton_runtime_available", lambda _device: False)
+    reference = nvidia_encoder.rgb_cuda_to_nv12(image)
+    assert all(torch.equal(actual, expected) for actual, expected in zip(fused, reference))
+    assert fused[0].untyped_storage().data_ptr() == fused[1].untyped_storage().data_ptr()
+    assert fused[0].dtype == fused[1].dtype == torch.uint8
+    assert fused[0].is_cuda and fused[1].is_cuda
+
+
+@pytest.mark.parametrize("failure", [ImportError, RuntimeError])
+def test_nv12_optional_kernel_failure_keeps_existing_conversion(monkeypatch, failure):
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("NVENC conversion requires a CUDA GPU, not ROCm")
+    from stereo_runtime import triton_runtime
+
+    image = torch.linspace(-0.25, 1.25, 32 * 64 * 3, device="cuda").reshape(32, 64, 3)
+    monkeypatch.setattr(triton_runtime, "triton_runtime_available", lambda _device: False)
+    reference = nvidia_encoder.rgb_cuda_to_nv12(image)
+    monkeypatch.setattr(triton_runtime, "triton_runtime_available", lambda _device: True)
+
+    def unavailable():
+        raise failure("optional compiler unavailable")
+
+    monkeypatch.setattr(nvidia_encoder, "_nv12_kernel", unavailable)
+    fallback = nvidia_encoder.rgb_cuda_to_nv12(image)
+    assert all(torch.equal(actual, expected) for actual, expected in zip(fallback, reference))
+
+
+def test_nv12_rejects_host_frame_without_a_readback():
+    with pytest.raises(ValueError, match="requires a CUDA tensor"):
+        nvidia_encoder.rgb_cuda_to_nv12(torch.zeros(32, 64, 3))
+
+
+@pytest.mark.parametrize("handoff", ["shared", "different", "default"])
+@pytest.mark.parametrize("fused", [False, True])
+def test_nv12_waits_only_when_encoder_stream_is_not_shared(monkeypatch, handoff, fused):
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("NVENC stream hand-off requires a CUDA GPU, not ROCm")
+    from stereo_runtime import triton_runtime
+
+    if fused and not triton_runtime.triton_runtime_available(torch.device("cuda")):
+        pytest.skip("optional CUDA Triton runtime is unavailable")
+    if not fused:
+        monkeypatch.setattr(triton_runtime, "triton_runtime_available", lambda _device: False)
+    producer = torch.cuda.Stream()
+    other = torch.cuda.Stream()
+    original_sync = torch.cuda.Stream.synchronize
+    waits = []
+
+    def synchronize(stream):
+        waits.append(stream.cuda_stream)
+        original_sync(stream)
+
+    with torch.cuda.stream(producer):
+        image = torch.linspace(0, 1, 32 * 64 * 3, device="cuda").reshape(32, 64, 3)
+        reference = nvidia_encoder.rgb_cuda_to_nv12(image)
+        monkeypatch.setattr(torch.cuda.Stream, "synchronize", synchronize)
+        stream_handle = (
+            producer.cuda_stream if handoff == "shared" else other.cuda_stream if handoff == "different" else 0
+        )
+        planes = nvidia_encoder.rgb_cuda_to_nv12(image, encoder_stream=stream_handle)
+    assert waits == ([] if handoff == "shared" else [producer.cuda_stream])
+    original_sync(producer)
+    assert all(torch.equal(actual, expected) for actual, expected in zip(planes, reference))
+    assert planes[0].is_cuda and planes[1].is_cuda
+
+
+@pytest.mark.parametrize("encoder_kind", ["pynv", "direct_nv12"])
+@pytest.mark.parametrize("hevc", [False, True])
+@pytest.mark.parametrize("vertical", [False, True])
+def test_shared_stream_nvenc_decode_preserves_eye_colors_and_frame_order(tmp_path, hevc, vertical, encoder_kind):
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("NVENC/NVDEC hardware round-trip requires a CUDA GPU, not ROCm")
+    nvc = direct_sbs._load_pynvvideo_codec()
+    if nvc is None:
+        pytest.skip("optional PyNvVideoCodec runtime is unavailable")
+    stream = torch.cuda.Stream()
+    width, height, count = 256, 144, 12
+    with torch.cuda.stream(stream):
+        if encoder_kind == "direct_nv12":
+            from streaming.nvenc_cudaarray_bridge import NvencCudaNv12Encoder
+
+            try:
+                encoder = NvencCudaNv12Encoder(width, height, hevc=hevc, fps=60, bitrate=8_000_000, device="cuda:0")
+            except (AttributeError, OSError, RuntimeError) as exc:
+                pytest.skip(f"native NV12 bridge is unavailable: {exc}")
+        else:
+            encoder = nvidia_encoder.PyNvVideoCodecEncoder(
+                nvc, width, height, hevc=hevc, fps=60, bitrate=8_000_000,
+                cuda_stream=stream.cuda_stream,
+            )
+        packets = []
+        for index in range(count):
+            image = torch.zeros((height, width, 3), device="cuda", dtype=torch.uint8)
+            if vertical:
+                image[:height // 2, :, index % 2] = 255
+                image[height // 2:, :, 1 - index % 2] = 255
+            else:
+                image[:, :width // 2, index % 2] = 255
+                image[:, width // 2:, 1 - index % 2] = 255
+            emitted = encoder.encode_access_units(image, frame_index=index, force_idr=index in {0, 6})
+            if encoder_kind == "direct_nv12":
+                assert [packet["frame_index"] for packet in emitted] == [index], "encoder buffered a frame"
+                if index in {0, 6}:
+                    from streaming.moonlight_output import MoonlightSbsOutput
+
+                    assert MoonlightSbsOutput._is_idr(emitted[0]["data"], "hevc" if hevc else "h264")
+            packets.extend(emitted)
+        packets.extend(encoder.flush_access_units())
+        close = getattr(encoder, "close", None)
+        if callable(close):
+            close()
+            close()  # Resource cleanup remains idempotent.
+    assert [packet["frame_index"] for packet in packets] == list(range(count))
+    bitstream = tmp_path / ("stereo.hevc" if hevc else "stereo.h264")
+    bitstream.write_bytes(b"".join(packet["data"] for packet in packets))
+    decoder = nvc.CreateDecoder(
+        gpuid=0, codec=nvc.cudaVideoCodec.HEVC if hevc else nvc.cudaVideoCodec.H264,
+        cudastream=stream.cuda_stream, usedevicememory=True,
+        outputColorType=nvc.OutputColorType.RGBP, latency=nvc.DisplayDecodeLatencyType.ZERO,
+    )
+    decoded_count = 0
+    with torch.cuda.stream(stream):
+        for packet in nvc.CreateDemuxer(str(bitstream)):
+            for frame in decoder.Decode(packet):
+                rgb = torch.from_dlpack(frame)
+                assert rgb.is_cuda and tuple(rgb.shape) == (3, height, width)
+                first = rgb[:, height // 4, width // 2] if vertical else rgb[:, height // 2, width // 4]
+                second = rgb[:, 3 * height // 4, width // 2] if vertical else rgb[:, height // 2, 3 * width // 4]
+                channel = decoded_count % 2
+                assert first[channel].item() > 180 and first[1 - channel].item() < 60
+                assert second[1 - channel].item() > 180 and second[channel].item() < 60
+                decoded_count += 1
+    assert decoded_count == count
+
+
+@pytest.mark.parametrize("fused", [True, False])
+def test_nv12_registered_destination_reuses_exact_existing_gpu_planes(monkeypatch, fused):
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        pytest.skip("NVENC NV12 conversion requires NVIDIA CUDA")
+    from stereo_runtime import triton_runtime
+
+    if not fused:
+        monkeypatch.setattr(triton_runtime, "triton_runtime_available", lambda _device: False)
+    image = torch.linspace(-0.1, 1.1, 32 * 64 * 3, device="cuda").reshape(32, 64, 3)
+    expected = nvidia_encoder.rgb_cuda_to_nv12(image)
+    target = torch.empty((48, 64, 1), dtype=torch.uint8, device="cuda")
+    planes = nvidia_encoder.rgb_cuda_to_nv12(image, destination=target)
+    assert all(plane.untyped_storage().data_ptr() == target.data_ptr() for plane in planes)
+    assert all(torch.equal(actual, reference) for actual, reference in zip(planes, expected))
+    for invalid in (target.float(), target[:32], target[:, ::2], target.transpose(0, 1)):
+        with pytest.raises(ValueError, match="NV12 destination"):
+            nvidia_encoder.rgb_cuda_to_nv12(image, destination=invalid)

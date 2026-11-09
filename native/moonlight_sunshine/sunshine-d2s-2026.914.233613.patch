@@ -63,14 +63,15 @@ index f4a954d..977bc49 100644
  
      DNS_SERVICE_INSTANCE instance {};
 diff --git a/src/video.cpp b/src/video.cpp
-index 843a19a..fd130a4 100644
+index 843a19a..a78f41f 100644
 --- a/src/video.cpp
 +++ b/src/video.cpp
-@@ -7,12 +7,18 @@
+@@ -7,12 +7,19 @@
  #include <array>
  #include <atomic>
  #include <bitset>
 +#include <charconv>
++#include <cmath>
 +#include <cstdlib>
 +#include <cstring>
 +#include <istream>
@@ -85,7 +86,7 @@ index 843a19a..fd130a4 100644
  
  extern "C" {
  #include <libavutil/imgutils.h>
-@@ -1947,6 +1953,246 @@ namespace video {
+@@ -1947,6 +1954,282 @@ namespace video {
      return -1;
    }
  
@@ -213,7 +214,7 @@ index 843a19a..fd130a4 100644
 +      const float client_offset_y = stretch ? 0.0f : (config.height - source_height * scale) * 0.5f;
 +      const int touch_width = stretch ? source_width : config.width;
 +      const int touch_height = stretch ? source_height : config.height;
-+      touch_port_event->raise(input::touch_port_t {
++      input::touch_port_t touch_port {
 +        {source_left, source_top, touch_width, touch_height, source_width, source_height},
 +        desktop_width,
 +        desktop_height,
@@ -223,7 +224,40 @@ index 843a19a..fd130a4 100644
 +        1.0f,
 +        desktop_width,
 +        desktop_height
-+      });
++      };
++      if (auto regions = ready.find("input_regions"); regions != ready.end()) {
++        if (!regions->is_array() || regions->size() != touch_port.input_regions.size()) {
++          throw std::runtime_error("Invalid D2S input regions");
++        }
++        for (std::size_t i = 0; i < touch_port.input_regions.size(); ++i) {
++          const auto &value = (*regions)[i];
++          auto &r = touch_port.input_regions[i];
++          if (!value.is_array() || value.size() != r.size()) {
++            throw std::runtime_error("Invalid D2S input region");
++          }
++          for (std::size_t j = 0; j < r.size(); ++j) {
++            if (!value[j].is_number()) {
++              throw std::runtime_error("Invalid D2S input coordinate");
++            }
++            r[j] = value[j].get<float>();
++            const float bound = j < 4 ? (j % 2 ? config.height : config.width) : (j % 2 ? source_height : source_width);
++            if (!std::isfinite(r[j]) || r[j] < 0.0f || r[j] > bound) {
++              throw std::runtime_error("D2S input coordinate is out of bounds");
++            }
++          }
++          if (r[0] >= r[2] || r[1] >= r[3] || r[4] >= r[6] || r[5] >= r[7]) {
++            throw std::runtime_error("D2S input region is empty");
++          }
++        }
++        const auto &a = touch_port.input_regions[0];
++        const auto &b = touch_port.input_regions[1];
++        if (a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]) {
++          throw std::runtime_error("D2S input regions overlap");
++        }
++        touch_port.stream_width = config.width;
++        touch_port.stream_height = config.height;
++      }
++      touch_port_event->raise(std::move(touch_port));
 +
 +      BOOST_LOG(info) << "Moonlight D2S encoded-frame bridge connected "sv
 +                      << config.width << "x"sv << config.height << "@"sv
@@ -248,8 +282,10 @@ index 843a19a..fd130a4 100644
 +      };
 +
 +      socket.non_blocking(true);
-+      std::vector<char> pending;
-+      pending.reserve(1024 * 1024);
++      std::vector<char> pending(
++        asio::buffers_begin(response.data()), asio::buffers_end(response.data())
++      );
++      pending.reserve(std::max<std::size_t>(pending.size(), 1024 * 1024));
 +      std::array<char, 256 * 1024> receive_buffer {};
 +      constexpr std::size_t HEADER_SIZE = 28;
 +      constexpr uint32_t MAX_ACCESS_UNIT_SIZE = 32 * 1024 * 1024;
@@ -267,17 +303,16 @@ index 843a19a..fd130a4 100644
 +
 +        boost::system::error_code socket_error;
 +        const auto received = socket.read_some(asio::buffer(receive_buffer), socket_error);
-+        if (socket_error == asio::error::would_block || socket_error == asio::error::try_again) {
-+          std::this_thread::sleep_for(1ms);
-+          continue;
-+        }
++        const bool would_block = socket_error == asio::error::would_block || socket_error == asio::error::try_again;
 +        if (socket_error == asio::error::eof) {
 +          break;
 +        }
-+        if (socket_error) {
++        if (socket_error && !would_block) {
 +          throw boost::system::system_error(socket_error);
 +        }
-+        pending.insert(pending.end(), receive_buffer.begin(), receive_buffer.begin() + received);
++        if (!would_block) {
++          pending.insert(pending.end(), receive_buffer.begin(), receive_buffer.begin() + received);
++        }
 +
 +        std::size_t consumed = 0;
 +        while (pending.size() - consumed >= HEADER_SIZE) {
@@ -317,6 +352,8 @@ index 843a19a..fd130a4 100644
 +        }
 +        if (consumed != 0) {
 +          pending.erase(pending.begin(), pending.begin() + consumed);
++        } else if (would_block) {
++          std::this_thread::sleep_for(1ms);
 +        }
 +      }
 +
@@ -332,7 +369,7 @@ index 843a19a..fd130a4 100644
    /**
     * @brief Create an AVCodec encode session.
     *
-@@ -2968,6 +3214,11 @@ namespace video {
+@@ -2968,6 +3251,11 @@ namespace video {
      config_t config,
      void *channel_data
    ) {
@@ -344,6 +381,25 @@ index 843a19a..fd130a4 100644
      config = resolve_dynamic_range(*chosen_encoder, config);
  
      auto idr_events = mail->event<bool>(mail::idr);
+@@ -3264,6 +3552,18 @@ namespace video {
+   }
+
+   int probe_encoders() {
++    if (const char *bridge_port = std::getenv("D2S_MOONLIGHT_BRIDGE_PORT"); bridge_port && *bridge_port) {
++      // D2S already owns capture and hardware encoding. Probing Sunshine's
++      // encoders opens additional desktop/GPU sessions at startup and launch.
++      // Advertise only the SDR 4:2:0 formats the authenticated bridge accepts.
++      chosen_encoder = nullptr;
++      active_hevc_mode = config::video.hevc_mode == 1 ? 1 : 2;
++      active_av1_mode = 1;
++      last_encoder_probe_supported_ref_frames_invalidation = false;
++      last_encoder_probe_supported_yuv444_for_codec.fill(false);
++      BOOST_LOG(info) << "D2S encoded-frame bridge: skipping Sunshine capture/encoder probing"sv;
++      return 0;
++    }
+     if (!allow_encoder_probing()) {
+       // Error already logged
+       return -1;
 
 diff --git a/src/nvhttp.cpp b/src/nvhttp.cpp
 index 8e33cad..ab6d2a7 100644
@@ -526,3 +582,326 @@ index a03f56d..24ebc10 100644
        if (!nvprefs_instance.owning_undo_file()) {
          nvprefs_instance.restore_from_and_delete_undo_file_if_exists();
        }
+diff --git a/src/input.cpp b/src/input.cpp
+index a12514d..9eeeb68 100644
+--- a/src/input.cpp
++++ b/src/input.cpp
+@@ -740,6 +740,16 @@ namespace input {
+       return std::nullopt;
+     }
+
++    if (touch_port.stream_width > 0 && touch_port.stream_height > 0) {
++      if (size.first <= 0.0f || size.second <= 0.0f || !std::isfinite(val.first) || !std::isfinite(val.second)) {
++        return std::nullopt;
++      }
++      return touch_port.map_stereo_input(
++        std::clamp(val.first / size.first, 0.0f, 1.0f) * touch_port.stream_width,
++        std::clamp(val.second / size.second, 0.0f, 1.0f) * touch_port.stream_height
++      );
++    }
++
+     auto scalarX = touch_port.width / size.first;
+     auto scalarY = touch_port.height / size.second;
+
+diff --git a/src/input.h b/src/input.h
+index d383e42..0651a24 100644
+--- a/src/input.h
++++ b/src/input.h
+@@ -5,6 +5,8 @@
+ #pragma once
+
+ // standard includes
++#include <algorithm>
++#include <array>
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
+@@ -188,6 +190,42 @@ namespace input {
+     int env_logical_width;  ///< Width of the full capture environment after display scaling.
+     int env_logical_height;  ///< Height of the full capture environment after display scaling.
+
++    int stream_width {};  ///< Encoded D2S canvas width, or zero for legacy input mapping.
++    int stream_height {};  ///< Encoded D2S canvas height, or zero for legacy input mapping.
++    std::array<std::array<float, 8>, 2> input_regions {};  ///< Per-eye viewport and capture crop bounds.
++
++    /**
++     * @brief Map an encoded-canvas point through its closest eye's actual image rectangle.
++     *
++     * Letterbox input clamps to the nearest visible image edge. Cover input uses
++     * the reported capture crop rather than the uncropped desktop dimensions.
++     *
++     * @param x Horizontal encoded-canvas coordinate.
++     * @param y Vertical encoded-canvas coordinate.
++     * @return Host-relative coordinates, including the capture origin and DPI scale.
++     */
++    std::pair<float, float> map_stereo_input(float x, float y) const {
++      const auto *selected = &input_regions[0];
++      float nearest = -1.0f;
++      for (const auto &region : input_regions) {
++        const float dx = x - std::clamp(x, region[0], region[2]);
++        const float dy = y - std::clamp(y, region[1], region[3]);
++        const float distance = dx * dx + dy * dy;
++        // Equal distances select the second eye at an SBS/TAB dividing line.
++        if (nearest < 0.0f || distance <= nearest) {
++          nearest = distance;
++          selected = &region;
++        }
++      }
++      const auto &r = *selected;
++      const float u = std::clamp((x - r[0]) / (r[2] - r[0]), 0.0f, 1.0f);
++      const float v = std::clamp((y - r[1]) / (r[3] - r[1]), 0.0f, 1.0f);
++      return {
++        offset_x + (r[4] + u * (r[6] - r[4])) / scalar_tpcoords,
++        offset_y + (r[5] + v * (r[7] - r[5])) / scalar_tpcoords
++      };
++    }
++
+     /**
+      * @brief Check whether the touch-port bounds are initialized.
+      */
+diff --git a/tests/unit/test_mouse.cpp b/tests/unit/test_mouse.cpp
+index eb0148f..2f289ee 100644
+--- a/tests/unit/test_mouse.cpp
++++ b/tests/unit/test_mouse.cpp
+@@ -210,3 +210,62 @@ TEST_P(MouseHIDTest, AbsMoveInputTest) {
+   EXPECT_NEAR(new_loc->x, expected_pos.x, mouse_position_tolerance);
+   EXPECT_NEAR(new_loc->y, expected_pos.y, mouse_position_tolerance);
+ }
++
++
++/**
++ * @brief Full-SBS input maps both letterboxed eyes to the same physical desktop point.
++ */
++TEST(D2SStereoInput, FullSbsContainAndBars) {
++  input::touch_port_t port {};
++  port.offset_x = -1920;
++  port.offset_y = 120;
++  port.scalar_tpcoords = 1.0f;
++  port.input_regions = {{{0, 270, 960, 810, 0, 0, 1920, 1080}, {960, 270, 1920, 810, 0, 0, 1920, 1080}}};
++  for (float x : {480.0f, 1440.0f}) {
++    const auto [px, py] = port.map_stereo_input(x, 540);
++    EXPECT_FLOAT_EQ(px, -960);
++    EXPECT_FLOAT_EQ(py, 660);
++    EXPECT_FLOAT_EQ(port.map_stereo_input(x, 0).second, 120);
++    EXPECT_FLOAT_EQ(port.map_stereo_input(x, 1080).second, 1200);
++  }
++  // The dividing line belongs to the right eye, not the far edge of the left eye.
++  EXPECT_FLOAT_EQ(port.map_stereo_input(960, 540).first, -1920);
++}
++
++/**
++ * @brief TAB cover input preserves each eye's capture crop and display scaling.
++ */
++TEST(D2SStereoInput, TabCoverCropAndDpi) {
++  input::touch_port_t port {};
++  port.offset_x = 100;
++  port.offset_y = 200;
++  port.scalar_tpcoords = 2.0f;
++  port.input_regions = {{{0, 0, 1920, 540, 0, 270, 1920, 810}, {0, 540, 1920, 1080, 0, 270, 1920, 810}}};
++  for (float y : {270.0f, 810.0f}) {
++    const auto [px, py] = port.map_stereo_input(960, y);
++    EXPECT_FLOAT_EQ(px, 580);
++    EXPECT_FLOAT_EQ(py, 470);
++  }
++  EXPECT_FLOAT_EQ(port.map_stereo_input(0, 0).second, 335);
++  EXPECT_FLOAT_EQ(port.map_stereo_input(1920, 1080).second, 605);
++  EXPECT_FLOAT_EQ(port.map_stereo_input(960, 540).second, 335);
++}
++
++/**
++ * @brief Stretch mapping clamps points and absent metadata leaves the legacy path selected.
++ */
++TEST(D2SStereoInput, StretchAndLegacyDefaults) {
++  input::touch_port_t port {};
++  EXPECT_EQ(port.stream_width, 0);
++  EXPECT_EQ(port.stream_height, 0);
++  port.scalar_tpcoords = 1.0f;
++  port.input_regions = {{{0, 0, 100, 200, 0, 0, 800, 600}, {100, 0, 200, 200, 0, 0, 800, 600}}};
++  const auto [left_x, left_y] = port.map_stereo_input(25, 150);
++  const auto [right_x, right_y] = port.map_stereo_input(125, 150);
++  EXPECT_FLOAT_EQ(left_x, 200);
++  EXPECT_FLOAT_EQ(right_x, left_x);
++  EXPECT_FLOAT_EQ(left_y, 450);
++  EXPECT_FLOAT_EQ(right_y, left_y);
++  EXPECT_FLOAT_EQ(port.map_stereo_input(-10, -10).first, 0);
++  EXPECT_FLOAT_EQ(port.map_stereo_input(210, 210).first, 800);
++}
+
+diff --git a/tests/unit/test_video.cpp b/tests/unit/test_video.cpp
+index a7f0426..d50f0a7 100644
+--- a/tests/unit/test_video.cpp
++++ b/tests/unit/test_video.cpp
+@@ -8,12 +8,18 @@
+ // standard includes
+ #include <algorithm>
+ #include <array>
++#include <cstdlib>
++#include <cstring>
+ #include <limits>
+ #include <optional>
++#include <thread>
+ #include <tuple>
+ #include <utility>
+ #include <vector>
+
++// lib includes
++#include <boost/asio.hpp>
++
+ // ffmpeg includes
+ extern "C" {
+ #include <libavutil/frame.h>
+@@ -409,3 +415,154 @@ TEST(SoftwareEncoderConversion, Bgr0AndNv12) {
+   fallback_nv12_img.row_pitch = w;
+   EXPECT_EQ(device.convert(fallback_nv12_img), 0);
+ }
++
++
++/**
++ * @brief D2S bridge probing advertises only delegated SDR codecs without touching GPU capture.
++ */
++TEST(D2SBridgeProbe, SkipsHardwareAndRestrictsCapabilities) {
++  const char *previous = std::getenv("D2S_MOONLIGHT_BRIDGE_PORT");
++  const std::optional<std::string> original = previous ? std::optional<std::string>(previous) : std::nullopt;
++  const auto original_hevc = config::video.hevc_mode;
++  const auto original_active_hevc = video::active_hevc_mode;
++  const auto original_active_av1 = video::active_av1_mode;
++  const auto original_ref_frames = video::last_encoder_probe_supported_ref_frames_invalidation;
++  const auto original_yuv444 = video::last_encoder_probe_supported_yuv444_for_codec;
++#ifdef _WIN32
++  _putenv_s("D2S_MOONLIGHT_BRIDGE_PORT", "12345");
++#else
++  setenv("D2S_MOONLIGHT_BRIDGE_PORT", "12345", 1);
++#endif
++  config::video.hevc_mode = 0;
++  EXPECT_EQ(video::probe_encoders(), 0);
++  EXPECT_EQ(video::active_hevc_mode, 2);
++  EXPECT_EQ(video::active_av1_mode, 1);
++  EXPECT_FALSE(video::last_encoder_probe_supported_ref_frames_invalidation);
++  for (bool supported : video::last_encoder_probe_supported_yuv444_for_codec) {
++    EXPECT_FALSE(supported);
++  }
++  config::video.hevc_mode = 1;
++  EXPECT_EQ(video::probe_encoders(), 0);
++  EXPECT_EQ(video::active_hevc_mode, 1);
++  config::video.hevc_mode = original_hevc;
++  video::active_hevc_mode = original_active_hevc;
++  video::active_av1_mode = original_active_av1;
++  video::last_encoder_probe_supported_ref_frames_invalidation = original_ref_frames;
++  video::last_encoder_probe_supported_yuv444_for_codec = original_yuv444;
++#ifdef _WIN32
++  _putenv_s("D2S_MOONLIGHT_BRIDGE_PORT", original ? original->c_str() : "");
++#else
++  if (original) {
++    setenv("D2S_MOONLIGHT_BRIDGE_PORT", original->c_str(), 1);
++  } else {
++    unsetenv("D2S_MOONLIGHT_BRIDGE_PORT");
++  }
++#endif
++}
++
++
++/**
++ * @brief Exercise the actual bridge with a coalesced handshake/AU and a fragmented next AU.
++ */
++TEST(D2SBridgeTransport, PreservesCoalescedAndFragmentedAccessUnits) {
++  namespace asio = boost::asio;
++  using tcp = asio::ip::tcp;
++  asio::io_context io;
++  tcp::acceptor listener(io, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
++  tcp::socket peer(io);
++  const std::array<std::pair<const char *, std::string>, 8> environment {{
++    {"D2S_MOONLIGHT_BRIDGE_PORT", std::to_string(listener.local_endpoint().port())},
++    {"D2S_MOONLIGHT_BRIDGE_TOKEN", std::string(64, 'a')},
++    {"D2S_MOONLIGHT_SOURCE_WIDTH", "1920"},
++    {"D2S_MOONLIGHT_SOURCE_HEIGHT", "1080"},
++    {"D2S_MOONLIGHT_SOURCE_LEFT", "0"},
++    {"D2S_MOONLIGHT_SOURCE_TOP", "0"},
++    {"D2S_MOONLIGHT_DESKTOP_WIDTH", "1920"},
++    {"D2S_MOONLIGHT_DESKTOP_HEIGHT", "1080"},
++  }};
++  const auto set_environment = [](const char *name, const char *value) {
++#ifdef _WIN32
++    _putenv_s(name, value ? value : "");
++#else
++    if (value) {
++      setenv(name, value, 1);
++    } else {
++      unsetenv(name);
++    }
++#endif
++  };
++  std::array<std::optional<std::string>, environment.size()> previous;
++  for (std::size_t i = 0; i < environment.size(); ++i) {
++    if (const auto *value = std::getenv(environment[i].first)) {
++      previous[i] = value;
++    }
++    set_environment(environment[i].first, environment[i].second.c_str());
++  }
++  const auto original_mail = mail::man;
++  mail::man = std::make_shared<safe::mail_raw_t>();
++  auto restore = util::fail_guard([&]() {
++    mail::man = original_mail;
++    for (std::size_t i = 0; i < environment.size(); ++i) {
++      set_environment(environment[i].first, previous[i] ? previous[i]->c_str() : nullptr);
++    }
++  });
++  auto local_mail = std::make_shared<safe::mail_raw_t>();
++  auto shutdown = local_mail->event<bool>(mail::shutdown);
++  auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
++  video::config_t config {};
++  config.width = 1280;
++  config.height = 720;
++  config.framerate = 60;
++  config.bitrate = 20000;
++  int channel_marker = 0;
++  std::thread receiver([&]() {
++    video::capture(local_mail, config, &channel_marker);
++  });
++  auto stop = util::fail_guard([&]() {
++    shutdown->raise(true);
++    boost::system::error_code ignored;
++    peer.shutdown(tcp::socket::shutdown_both, ignored);
++    peer.close(ignored);
++    receiver.join();
++  });
++  listener.accept(peer);
++  asio::streambuf hello;
++  asio::read_until(peer, hello, '\n');
++
++  const auto make_record = [](uint64_t index, const std::vector<uint8_t> &payload, bool idr) {
++    std::string record = "D2SF";
++    const auto append_integer = [&](uint64_t value, int bytes) {
++      for (int i = bytes - 1; i >= 0; --i) {
++        record.push_back(static_cast<char>((value >> (i * 8)) & 0xff));
++      }
++    };
++    append_integer(index, 8);
++    append_integer(123456789, 8);
++    append_integer(idr ? 1 : 0, 4);
++    append_integer(payload.size(), 4);
++    record.append(reinterpret_cast<const char *>(payload.data()), payload.size());
++    return record;
++  };
++  const std::vector<uint8_t> first {0, 0, 0, 1, 0x65, 1, 2, 3};
++  const auto coalesced = std::string("{\"ok\":true}\n") + make_record(7, first, true);
++  asio::write(peer, asio::buffer(coalesced));
++  auto packet = packets->pop(2s);
++  ASSERT_TRUE(packet);
++  EXPECT_EQ(packet->frame_index(), 7);
++  EXPECT_TRUE(packet->is_idr());
++  EXPECT_EQ(packet->channel_data, &channel_marker);
++  ASSERT_EQ(packet->data_size(), first.size());
++  EXPECT_EQ(std::memcmp(packet->data(), first.data(), first.size()), 0);
++
++  const std::vector<uint8_t> second(300000, 0x42);
++  const auto fragmented = make_record(8, second, false);
++  asio::write(peer, asio::buffer(fragmented.data(), 12));
++  std::this_thread::sleep_for(2ms);
++  asio::write(peer, asio::buffer(fragmented.data() + 12, fragmented.size() - 12));
++  packet = packets->pop(2s);
++  ASSERT_TRUE(packet);
++  EXPECT_EQ(packet->frame_index(), 8);
++  EXPECT_FALSE(packet->is_idr());
++  ASSERT_EQ(packet->data_size(), second.size());
++  EXPECT_EQ(std::memcmp(packet->data(), second.data(), second.size()), 0);
++}

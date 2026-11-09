@@ -89,7 +89,10 @@ class HostFramePacker:
                 from viewer.direct_sink import DIRECT_SINK
 
                 output_format = str(getattr(result, "output_format", None) or "half_sbs")
-                size = pack_target(*native.source_size, output_format)
+                source_size = getattr(result, "output_eye_size", None)
+                if source_size is None:
+                    source_size = native.source_size
+                size = pack_target(*source_size, output_format)
                 try:
                     source = DIRECT_SINK.pack_native(native, size, output_format)
                 except Exception as exc:

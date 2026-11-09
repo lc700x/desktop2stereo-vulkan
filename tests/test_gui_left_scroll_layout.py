@@ -258,8 +258,8 @@ def test_advanced_streaming_exposes_shared_calibration_rows() -> None:
     end = source.index("\n    # ── data population ──", start)
     row_map = source[start:end]
 
-    assert '"RTMP Streamer": [0, 1, 2, 3, 4, 5, 6, 7, 9]' in row_map
-    assert '"MJPEG Streamer": [0, 4]' in row_map
+    assert '"RTMP Streamer": [0, 1, 2, 3, 4, 5, 6, 8]' in row_map
+    assert '"MJPEG Streamer": [0]' in row_map
     assert '"GPU Streamer"' not in row_map
 
 
@@ -371,7 +371,8 @@ def test_every_stream_parameter_control_has_an_explanatory_tooltip() -> None:
         "stream_url_tf": "tooltip_stream_url",
         "preview_btn": "tooltip_stream_preview",
         "stream_port_tf": "tooltip_stream_port",
-        "stream_quality_dd": "tooltip_stream_quality",
+        "render_scale_dd": "tooltip_render_scale",
+        "stream_display_fit_dd": "tooltip_stream_fit",
         "stream_proto_dd": "tooltip_stream_proto",
         "stream_key_tf": "tooltip_stream_key",
         "crf_tf": "tooltip_crf",

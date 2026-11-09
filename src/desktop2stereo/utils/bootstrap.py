@@ -88,7 +88,7 @@ def _normalize_legacy_settings(settings: dict, *, os_name: str | None = None) ->
         "Stereo Output": None,
         "Stereo Output Identity": None,
         "Render Size Policy": "scaled",
-        "Render Scale": "4K / 100%",
+        "Render Scale": "100%",
         "XR Render": 1.0,
         "XR Render Mode": "auto",
         "Render Fixed Width": 1920,

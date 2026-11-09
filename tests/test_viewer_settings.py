@@ -56,6 +56,37 @@ def test_network_stream_uses_its_mode_scoped_target_fps():
     assert resolved.fps == 30
 
 
+def test_4k_network_stream_auto_fps_uses_detected_refresh_rate(monkeypatch):
+    from utils import display_info
+    import viewer.settings as viewer_settings
+
+    monkeypatch.setattr(
+        display_info,
+        "enumerate_displays",
+        lambda: [
+            DisplayInfo(
+                1, 1, 0, 0, 3840, 2160, stable_id="4k-display", is_primary=True
+            )
+        ],
+    )
+    monkeypatch.setattr(viewer_settings, "get_fps", lambda *_args: 120)
+    settings = dict(
+        BASE_SETTINGS,
+        VSync=False,
+        **{
+            "Run Mode": "Moonlight Streamer",
+            "Processing Resolution": "3840x2160",
+            "Target FPS": 0,
+            "Stream Target FPS": 0,
+        },
+    )
+
+    resolved = resolve_viewer_settings(settings)
+
+    assert resolved.target_fps == 120
+    assert resolved.fps == 120
+
+
 def test_resolve_viewer_settings_reads_vsync_key():
     settings = dict(BASE_SETTINGS, VSync=False)
 
@@ -291,7 +322,7 @@ def test_resolve_viewer_settings_reads_render_size_config():
     resolved = resolve_viewer_settings(settings)
 
     assert resolved.render_size_config.policy is RenderSizePolicy.SCALED
-    assert resolved.render_size_config.scale_factor == "1K / 50%"
+    assert resolved.render_size_config.scale_factor == "50%"
     assert resolved.render_size_config.fixed_width == 1600
     assert resolved.render_size_config.fixed_height == 900
     assert resolved.render_size_config.max_pixels == 2073600

@@ -874,9 +874,11 @@ def test_local_viewer_reuse_does_not_add_capture_queue_wait(monkeypatch, vsync, 
 
 
 @pytest.mark.parametrize("vsync", [True, False])
-def test_present_asap_skips_fresh_frame_sleep_but_paces_reuse(
+@pytest.mark.parametrize("refresh_hz", [60.0, 144.0])
+def test_present_asap_skips_fresh_frame_sleep_but_paces_vsync_reuse(
     monkeypatch,
     vsync,
+    refresh_hz,
 ):
     shutdown = threading.Event()
     timeouts = []
@@ -898,7 +900,7 @@ def test_present_asap_skips_fresh_frame_sleep_but_paces_reuse(
 
     class FakeViewer:
         def __init__(self, _config):
-            self._output_refresh_hz = 60.0
+            self._output_refresh_hz = refresh_hz
             self.calls = 0
 
         def initialize(self):
@@ -920,8 +922,11 @@ def test_present_asap_skips_fresh_frame_sleep_but_paces_reuse(
 
     monkeypatch.delenv("D2S_PRESENT_ASAP", raising=False)
     monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
-    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: clock[0])
-    monkeypatch.setattr(local_viewer_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        local_viewer_module,
+        "time",
+        SimpleNamespace(perf_counter=lambda: clock[0], sleep=fake_sleep),
+    )
 
     run_vulkan_local_viewer(
         runtime_q=FrameQueue(),
@@ -929,9 +934,13 @@ def test_present_asap_skips_fresh_frame_sleep_but_paces_reuse(
         config=VulkanLocalViewerConfig(vsync=vsync),
     )
 
-    assert timeouts == pytest.approx([0.05, 1.25 / 60.0])
-    assert len(sleeps) == 1
-    assert 0.0 < sleeps[0] < 1.0 / 60.0
+    expected_timeout = 1.25 / refresh_hz if vsync else 1.0 / refresh_hz - 0.003
+    assert timeouts == pytest.approx([0.05, expected_timeout])
+    if vsync:
+        assert len(sleeps) == 1
+        assert 0.0 < sleeps[0] < 1.0 / refresh_hz
+    else:
+        assert sleeps == []
 
 
 def test_local_viewer_latency_ends_after_successful_present(monkeypatch) -> None:
@@ -1332,6 +1341,7 @@ def test_window_preview_duplicates_output_without_replacing_fullscreen(monkeypat
             fullscreen=True,
             window_preview=True,
             preview_monitor_index=1,
+            hide_cursor_overlay=True,
         ),
     )
 
@@ -1342,6 +1352,8 @@ def test_window_preview_duplicates_output_without_replacing_fullscreen(monkeypat
     assert preview.config.fullscreen is False
     assert preview.config.monitor_index == 1
     assert preview.config.exclude_from_capture is False
+    assert output.config.hide_cursor_overlay is True
+    assert preview.config.hide_cursor_overlay is False
     assert output.frames == [frame]
     assert preview.frames == [depth_frame]
 
@@ -1483,3 +1495,432 @@ def test_capture_windows_initialize_before_initial_capture_session(monkeypatch) 
     ready_index = next(index for index, event in enumerate(events) if event[0] == "ready")
     first_poll_index = next(index for index, event in enumerate(events) if event[0] == "poll")
     assert ready_index < first_poll_index
+
+
+def test_local_viewer_reports_windows_gpu_fields_without_duplicates(capsys) -> None:
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig(show_fps=True))
+    viewer._exclusive_fullscreen = True
+    viewer.sys_load_provider = lambda: {
+        "gpu": 42.0,
+        "gpu_max": 57.0,
+        "gpu_3d": 42.0,
+        "gpu_encode": 8.0,
+        "gpu_vram_used_mb": 1024.0,
+        "gpu_vram_total_mb": 8192.0,
+    }
+    viewer._report_present_fps(60.0, 300)
+    fields = capsys.readouterr().out
+    assert fields.count("sys_gpu=42") == 1
+    assert "gpu_3d=42" in fields
+    assert "gpu_encode=8" in fields
+    assert "gpu_vram_used_mb=1024" in fields
+    assert "gpu_vram_total_mb=8192" in fields
+
+
+def test_local_viewer_binds_gpu_sampler_to_initialized_adapter(monkeypatch) -> None:
+    import utils.sys_load as sys_load
+
+    shutdown = threading.Event()
+    events = []
+    sampler = SimpleNamespace(snapshot=lambda: {}, set_adapter_luid=lambda luid: events.append(luid))
+
+    class FakeViewer:
+        def __init__(self, config):
+            self._adapter_luid = 0
+
+        def initialize(self):
+            self._adapter_luid = 0x1234
+            events.append("initialize")
+
+        def present(self, frame):
+            shutdown.set()
+            return True
+
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(sys_load, "install_system_load_sampler", lambda **kwargs: sampler)
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    runtime_q = queue.Queue()
+    runtime_q.put((SimpleNamespace(sbs=object()), 0.0))
+    run_vulkan_local_viewer(runtime_q=runtime_q, shutdown_event=shutdown, config=VulkanLocalViewerConfig())
+    assert events == ["initialize", 0x1234, "close"]
+
+
+@pytest.mark.parametrize(("callback", "returned", "expected", "label"), [
+    (1.016, 1.018, 24.0, "sck_callback"),
+    (None, 1.018, 22.0, "capture_return"),
+    (float("nan"), 1.018, 22.0, "capture_return"),
+    (float("inf"), 1.018, 22.0, "capture_return"),
+    (1.100, 1.018, 22.0, "capture_return"),
+    (0.990, 1.018, 22.0, "capture_return"),
+    ("invalid", None, 40.0, "poll"),
+    (None, float("nan"), 40.0, "poll"),
+    (None, None, 40.0, "poll"),
+])
+def test_latency_uses_valid_frame_availability_anchor(monkeypatch, callback, returned, expected, label):
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    monkeypatch.delenv("D2S_LATENCY_ANCHOR", raising=False)
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: 1.040)
+    viewer.record_frame_latency(1.0, stage_timing={
+        "sck_callback_time": callback, "capture_poll_returned_at": returned,
+        "sck_presentation_time": 1.039,
+    })
+    assert viewer._latency_history == pytest.approx([expected])
+    assert viewer._latency_anchor == label
+
+
+@pytest.mark.parametrize("option", ["poll", "start", "legacy"])
+def test_latency_old_anchor_switch_remains_available(monkeypatch, option):
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    monkeypatch.setenv("D2S_LATENCY_ANCHOR", option)
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: 1.040)
+    viewer.record_frame_latency(1.0, anchor_time=1.018, stage_timing={"sck_callback_time": 1.016})
+    assert viewer._latency_history == pytest.approx([40.0])
+    assert viewer._latency_anchor == "poll"
+
+
+def test_latency_explicit_anchor_and_percentiles_keep_one_clock(monkeypatch, capsys):
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    monkeypatch.delenv("D2S_LATENCY_ANCHOR", raising=False)
+    clock = [1.040]
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: clock[0])
+    viewer.record_frame_latency(1.0, anchor_time=1.018)
+    assert viewer._latency_history == pytest.approx([22.0])
+    viewer.record_frame_latency(1.0, stage_timing={"capture_poll_returned_at": 1.020})
+    clock[0] = 1.044
+    viewer.record_frame_latency(1.0, stage_timing={"capture_poll_returned_at": 1.020})
+    assert viewer._latency_history == pytest.approx([20.0, 24.0])
+    viewer._log_present_metrics(60.0, None)
+    line = capsys.readouterr().out
+    assert "latency_anchor=capture_return" in line
+    assert "avg_latency_ms=22.00" in line
+    assert "latency_p50_ms=22.00" in line
+
+
+@pytest.mark.parametrize("present_success", [True, False])
+def test_viewer_loop_samples_only_fresh_successful_frames(monkeypatch, present_success):
+    owner = VulkanLocalViewer(VulkanLocalViewerConfig())
+    shutdown = threading.Event()
+    clock = [1.020]
+    returned = [False]
+
+    class Frames:
+        def get(self, *, timeout):
+            if not returned[0]:
+                returned[0] = True
+                return SimpleNamespace(sbs=object(), debug_info={
+                    "sck_callback_time": 1.016, "capture_poll_returned_at": 1.018,
+                }), 1.0
+            shutdown.set()
+            raise queue.Empty
+
+        def get_nowait(self):
+            raise queue.Empty
+
+    class Viewer:
+        record_frame_latency = owner.record_frame_latency
+
+        def __init__(self, config):
+            pass
+
+        def initialize(self):
+            pass
+
+        def present(self, frame):
+            clock[0] += 0.004
+            if not present_success:
+                shutdown.set()
+            return present_success
+
+        def poll_events(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", Viewer)
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: clock[0])
+    monkeypatch.delenv("D2S_LATENCY_ANCHOR", raising=False)
+    run_vulkan_local_viewer(runtime_q=Frames(), shutdown_event=shutdown,
+                            config=VulkanLocalViewerConfig(vsync=False))
+    assert owner._latency_history == pytest.approx([8.0] if present_success else [])
+
+
+def test_latency_anchor_cannot_be_after_presentation_completion(monkeypatch):
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    monkeypatch.delenv("D2S_LATENCY_ANCHOR", raising=False)
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: 1.050)
+    viewer.record_frame_latency(1.0, stage_timing={
+        "sck_callback_time": 1.042, "capture_poll_returned_at": 1.018, "presented_at": 1.040,
+    })
+    assert viewer._latency_history == pytest.approx([22.0])
+    assert viewer._latency_anchor == "capture_return"
+
+
+@pytest.mark.parametrize("refresh_hz", [60.0, 144.0])
+def test_asap_without_vsync_keeps_reuse_paced_and_fresh_frames_immediate(monkeypatch, refresh_hz):
+    shutdown = threading.Event()
+    clock = [1.0]
+    timeouts = []
+    fresh_at = []
+    reuse_at = []
+    frames = [object(), object()]
+
+    class FrameQueue:
+        def get(self, *, timeout):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                return SimpleNamespace(sbs=frames[0]), clock[0]
+            if len(timeouts) == 3:
+                # The next real frame arrives before the reusable-frame deadline.
+                clock[0] += 0.001
+                return SimpleNamespace(sbs=frames[1]), clock[0]
+            clock[0] += timeout
+            raise queue.Empty
+
+        def get_nowait(self):
+            raise queue.Empty
+
+    class FakeViewer:
+        def __init__(self, _config):
+            self._output_refresh_hz = refresh_hz
+            self.calls = 0
+
+        def initialize(self):
+            pass
+
+        def present(self, frame):
+            (fresh_at if frame is frames[len(fresh_at)] else reuse_at).append(clock[0])
+            self.calls += 1
+            clock[0] += 0.001
+            if self.calls == 5:
+                shutdown.set()
+            return True
+
+        def _present_cached(self):
+            reuse_at.append(clock[0])
+            self.calls += 1
+            clock[0] += 0.001
+            if self.calls == 5:
+                shutdown.set()
+            return True
+
+        def close(self):
+            pass
+
+    monkeypatch.delenv("D2S_PRESENT_ASAP", raising=False)
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(local_viewer_module.time, "sleep", lambda _s: pytest.fail("fresh frame got a post-present sleep"))
+    run_vulkan_local_viewer(
+        runtime_q=FrameQueue(), shutdown_event=shutdown, config=VulkanLocalViewerConfig(vsync=False),
+    )
+    assert len(fresh_at) == 2 and len(reuse_at) == 3
+    assert all(timeout > 0 for timeout in timeouts[1:])
+    assert fresh_at[1] - reuse_at[0] == pytest.approx(0.002)
+    assert reuse_at[-1] - reuse_at[-2] == pytest.approx(1.0 / refresh_hz)
+
+
+def test_viewer_loop_logs_vulkan_present_stage_percentiles(monkeypatch, capsys):
+    import utils.sys_load as sys_load
+
+    owner = VulkanLocalViewer(VulkanLocalViewerConfig())
+    shutdown = threading.Event()
+    returned = [False]
+    stage_metrics = {
+        "runtime_execution_ms": 3.0,
+        "runtime_gpu_wait_ms": 40.0,
+        "runtime_completion_ms": 43.0,
+        "vk_fence_wait_ms": 1.25,
+        "vk_acquire_ms": 2.5,
+        "vk_upload_ms": 3.75,
+        "vk_record_ms": 4.0,
+        "vk_submit_ms": 0.25,
+        "vk_present_ms": 0.75,
+        "vk_total_ms": 12.5,
+    }
+
+    class Frames:
+        def get(self, *, timeout):
+            if not returned[0]:
+                returned[0] = True
+                return SimpleNamespace(
+                    sbs=object(),
+                    debug_info={"capture_poll_returned_at": 1.018},
+                ), 1.0
+            raise queue.Empty
+
+        def get_nowait(self):
+            raise queue.Empty
+
+    class Viewer:
+        record_frame_latency = owner.record_frame_latency
+
+        def __init__(self, _config):
+            self._last_present_source = None
+
+        def initialize(self):
+            pass
+
+        def present(self, _frame):
+            self._last_present_source = SimpleNamespace(
+                _last_present_metrics=stage_metrics
+            )
+            shutdown.set()
+            return True
+
+        def poll_events(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sys_load, "install_system_load_sampler", lambda **_kwargs: None)
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", Viewer)
+    monkeypatch.setattr(
+        local_viewer_module,
+        "time",
+        SimpleNamespace(perf_counter=lambda: 1.024, sleep=lambda _seconds: None),
+    )
+    monkeypatch.delenv("D2S_LATENCY_ANCHOR", raising=False)
+    run_vulkan_local_viewer(
+        runtime_q=Frames(),
+        shutdown_event=shutdown,
+        config=VulkanLocalViewerConfig(vsync=False),
+    )
+
+    sample = owner._latency_stage_history[-1]
+    assert {name: sample[name] for name in stage_metrics} == stage_metrics
+    owner._log_present_metrics(60.0, None)
+    line = capsys.readouterr().out
+    for name, value in stage_metrics.items():
+        assert f"{name}_p95={value:.2f}" in line
+
+
+@pytest.mark.parametrize("status", [None, 0, 2, "timeout", -4])
+def test_present_readiness_wait_preserves_pending_gpu_resources(monkeypatch, status):
+    class VkTimeout(Exception):
+        pass
+
+    calls = []
+
+    def wait(*args):
+        calls.append(("wait", args[-1]))
+        if status == "timeout":
+            raise VkTimeout
+        return status
+
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    viewer.device, viewer.fence = object(), object()
+    viewer.vk = SimpleNamespace(
+        VK_SUCCESS=0, VK_TIMEOUT=2, VkTimeout=VkTimeout, vkWaitForFences=wait,
+    )
+    viewer._source = SimpleNamespace(_complete_direct=lambda: calls.append(("complete", "main")))
+    viewer._direct_sources = [
+        SimpleNamespace(_complete_direct=lambda: calls.append(("complete", "ring"))),
+    ]
+    monkeypatch.setattr(viewer, "poll_events", lambda: calls.append(("poll", None)))
+
+    if status == -4:
+        with pytest.raises(RuntimeError, match="fence failed"):
+            viewer.wait_for_present_ready()
+    else:
+        assert viewer.wait_for_present_ready() is (status is None or status == 0)
+
+    assert calls[:2] == [("poll", None), ("wait", 1_000_000)]
+    assert calls[2:] == (
+        [("complete", "main"), ("complete", "ring")]
+        if status is None or status == 0 else []
+    )
+
+
+@pytest.mark.parametrize("ordered", [False, True])
+def test_latest_frame_is_selected_after_previous_gpu_submission_completes(monkeypatch, ordered):
+    shutdown = threading.Event()
+    ready = [ordered]
+    releases = []
+    presented = []
+    readiness_checks = []
+    clock = [1.0]
+    latencies = []
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: clock[0])
+
+    class RuntimeQueue(queue.Queue):
+        def get(self, *args, **kwargs):
+            assert ready[0], "dequeued a frame while the previous GPU submission was pending"
+            return super().get(*args, **kwargs)
+
+    runtime_q = RuntimeQueue()
+    runtime_q._d2s_ordered = ordered
+
+    def frame(name):
+        return SimpleNamespace(
+            sbs=name,
+            native_resource=SimpleNamespace(release=lambda: releases.append(name)),
+        )
+
+    runtime_q.put((frame("old"), 0.0))
+
+    class FakeViewer:
+        def __init__(self, _config):
+            pass
+
+        def initialize(self):
+            pass
+
+        def wait_for_present_ready(self):
+            assert not ordered, "ordered presentation was changed"
+            readiness_checks.append(1)
+            if len(readiness_checks) == 1:
+                clock[0] += 0.100
+                runtime_q.put((frame("newest"), clock[0]))
+                return False
+            clock[0] += 0.001
+            ready[0] = True
+            return True
+
+        def present(self, value):
+            presented.append(value)
+            shutdown.set()
+            return True
+
+        def record_frame_latency(self, started, *, stage_timing, **_kwargs):
+            latencies.append((started, stage_timing))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    run_vulkan_local_viewer(
+        runtime_q=runtime_q, shutdown_event=shutdown, config=VulkanLocalViewerConfig(),
+    )
+
+    assert presented == (["old"] if ordered else ["newest"])
+    assert readiness_checks == ([] if ordered else [1, 1])
+    assert releases == (["old"] if ordered else ["old", "newest"])
+    started, stages = latencies[0]
+    if ordered:
+        assert "viewer_ready_wait_ms" not in stages
+    else:
+        assert stages["viewer_ready_wait_ms"] == pytest.approx(101.0)
+        assert (stages["presented_at"] - started) * 1000.0 == pytest.approx(1.0)
+
+
+def test_viewer_event_poll_updates_monitor_scoped_cursor_hiding(monkeypatch):
+    calls = []
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig(cursor_passthrough=True, hide_cursor_overlay=True))
+    viewer.window = object()
+    viewer.glfw = SimpleNamespace(
+        poll_events=lambda: calls.append("events"),
+        window_should_close=lambda _window: False,
+    )
+    monkeypatch.setattr(viewer, "_keep_fullscreen_visible", lambda: calls.append("fullscreen"))
+    monkeypatch.setattr(
+        local_viewer_module, "update_native_cursor_suppression",
+        lambda: calls.append("cursor"), raising=False,
+    )
+
+    viewer.poll_events()
+
+    assert calls == ["events", "fullscreen", "cursor"]

@@ -17,7 +17,8 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -192,6 +193,7 @@ class MoonlightSbsOutput:
         input_size: tuple[int, int] | None,
         input_bounds: tuple[int, int, int, int, int, int] | None,
         device: str,
+        target_size: tuple[int, int] | None = None,
         encoder_backend: str = "auto",
         bitrate_mbps: int = 0,
     ) -> None:
@@ -201,6 +203,7 @@ class MoonlightSbsOutput:
         self.fit_mode = str(fit_mode or "contain")
         self.input_size = input_size
         self.input_bounds = input_bounds
+        self.target_size = target_size
         self.device = str(device)
         self.encoder_backend = str(encoder_backend or "auto").casefold()
         self.bitrate_mbps = max(0, int(bitrate_mbps))
@@ -234,8 +237,17 @@ class MoonlightSbsOutput:
         self._native_metrics_warp_gpu_ms = 0.0
         self._native_metrics_encode_ms = 0.0
         self._native_metrics_send_ms = 0.0
+        self._cuda_metrics_lock = threading.Lock()
+        self._cuda_metrics_started = time.monotonic()
+        self._cuda_metrics_encoded = 0
+        self._cuda_metrics_sent = 0
+        self._cuda_metrics_dropped = 0
+        self._cuda_metrics_fit_ms = 0.0
+        self._cuda_metrics_encode_ms = 0.0
+        self._cuda_metrics_send_ms = 0.0
         self._negotiated_bitrate_mbps = float(self.bitrate_mbps)
         self._encoder_lock = threading.RLock()
+        self._encode_stream = None
         self._encoder = None
         self._encoder_config: MoonlightClientConfig | None = None
         self._sunshine: subprocess.Popen[str] | None = None
@@ -541,9 +553,27 @@ class MoonlightSbsOutput:
                 return base_port
         raise RuntimeError("No free Sunshine port family is available.")
 
+    @staticmethod
+    def _sunshine_endpoint_in_use(port: int = _SUNSHINE_DEFAULT_PORT) -> bool:
+        """Return whether another local Sunshine server owns its control port."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.2)
+                return probe.connect_ex(("127.0.0.1", int(port))) == 0
+        except OSError:
+            return False
+
     def start(self) -> None:
         if self._sunshine is not None:
             return
+        if self._sunshine_endpoint_in_use():
+            print(
+                "[Moonlight] WARNING: Another Sunshine server is listening on "
+                f"port {_SUNSHINE_DEFAULT_PORT}; selecting a compatible free "
+                "port family. A second Sunshine host can still contend for "
+                "desktop capture and GPU encoder resources.",
+                flush=True,
+            )
         if not self._sunshine_exe.is_file():
             raise RuntimeError(
                 "Bundled Sunshine is unavailable. Build/install the D2S Moonlight server component."
@@ -627,9 +657,56 @@ class MoonlightSbsOutput:
         except (OSError, ValueError):
             return
 
+    def _client_ready_response(self, config: MoonlightClientConfig) -> dict[str, Any]:
+        """Describe the actual per-eye viewport for full SBS and TAB absolute input."""
+        response = {"accepted_width": config.width, "accepted_height": config.height}
+        mode = self.display_mode.strip().casefold().replace("_", "-")
+        if mode not in {"full-sbs", "half-tab", "full-tab"}:
+            return response  # Half-SBS clients retain their established input contract.
+        from streaming.aspect import presentation_blit_regions
+
+        width, height = config.source_width, config.source_height
+        is_tab = mode.endswith("tab")
+        source = (
+            (width * 2, height) if mode == "full-sbs"
+            else (width, height * 2) if mode == "full-tab"
+            else (width, height)
+        )
+        regions = presentation_blit_regions(
+            source, (config.width, config.height), self.fit_mode, self.display_mode, (width, height),
+        )
+        eye_width = source[0] // 2 if not is_tab else source[0]
+        eye_height = source[1] // 2 if is_tab else source[1]
+        mapping = []
+        for index, (crop, viewport) in enumerate(regions):
+            ox, oy = (0, index * eye_height) if is_tab else (index * eye_width, 0)
+            mapping.append([*viewport,
+                (crop[0] - ox) * width / eye_width, (crop[1] - oy) * height / eye_height,
+                (crop[2] - ox) * width / eye_width, (crop[3] - oy) * height / eye_height])
+        response["input_regions"] = mapping
+        return response
+
+    def _encoder_config_for_target(
+        self, config: MoonlightClientConfig
+    ) -> MoonlightClientConfig:
+        if self.target_size is None:
+            return config
+        target_width, target_height = (int(value) for value in self.target_size)
+        if target_width < 2 or target_height < 2:
+            return config
+        scale = min(
+            1.0,
+            config.width / float(target_width),
+            config.height / float(target_height),
+        )
+        width = max(2, int(round(target_width * scale)))
+        height = max(2, int(round(target_height * scale)))
+        return replace(config, width=width - (width % 2), height=height - (height % 2))
+
     def _configure_encoder(self, config: MoonlightClientConfig) -> dict[str, Any] | None:
         if config.width > 8192 or config.height > 8192 or config.fps > 120:
             return None
+        config = self._encoder_config_for_target(config)
         try:
             if sys.platform == "darwin":
                 if self.encoder_backend not in {"auto", "videotoolbox"}:
@@ -691,7 +768,7 @@ class MoonlightSbsOutput:
                     f"{config.codec.upper()}, {config.bitrate_kbps / 1000.0:g} Mbps",
                     flush=True,
                 )
-                return {"accepted_width": config.width, "accepted_height": config.height}
+                return self._client_ready_response(config)
 
             import torch
 
@@ -733,21 +810,36 @@ class MoonlightSbsOutput:
                     from streaming.direct_sbs import _load_pynvvideo_codec
                     from streaming.nvidia_encoder import PyNvVideoCodecEncoder
 
-                    codec = _load_pynvvideo_codec()
-                    if codec is None:
-                        return None
                     device = torch.device(self.device)
                     gpu_id = 0 if device.index is None else max(0, int(device.index))
-                    self._encoder = PyNvVideoCodecEncoder(
-                        codec,
-                        config.width,
-                        config.height,
-                        hevc=config.codec == "hevc",
-                        fps=round(config.fps),
-                        bitrate=config.bitrate_kbps * 1000,
-                        gpu_id=gpu_id,
-                    )
+                    self._encode_stream = torch.cuda.Stream(device=device)
+                    if self.encoder_backend == "auto":
+                        from streaming.nvenc_cudaarray_bridge import NvencCudaNv12Encoder
+
+                        try:
+                            self._encoder = NvencCudaNv12Encoder(
+                                config.width, config.height, hevc=config.codec == "hevc",
+                                fps=round(config.fps), bitrate=config.bitrate_kbps * 1000, device=device,
+                            )
+                            print("[Moonlight] NVENC direct NV12: no multi-frame output buffering", flush=True)
+                        except (AttributeError, ImportError, OSError, RuntimeError) as exc:
+                            print(f"[Moonlight] Direct NV12 unavailable; keeping PyNvVideoCodec: {exc}", flush=True)
+                    if self._encoder is None:
+                        codec = _load_pynvvideo_codec()
+                        if codec is None:
+                            return None
+                        self._encoder = PyNvVideoCodecEncoder(
+                            codec,
+                            config.width,
+                            config.height,
+                            hevc=config.codec == "hevc",
+                            fps=round(config.fps),
+                            bitrate=config.bitrate_kbps * 1000,
+                            gpu_id=gpu_id,
+                            cuda_stream=self._encode_stream.cuda_stream,
+                        )
                 self._encoder_config = config
+                self._negotiated_bitrate_mbps = config.bitrate_kbps / 1000.0
                 self._frame_index = 0
                 self._frame_timestamps.clear()
                 self._amd_pending_frames.clear()
@@ -762,7 +854,7 @@ class MoonlightSbsOutput:
                 f"{'AMF' if use_rocm else 'NVENC'}",
                 flush=True,
             )
-            return {"accepted_width": config.width, "accepted_height": config.height}
+            return self._client_ready_response(config)
         except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
             print(f"[Moonlight] Could not configure GPU encoder: {type(exc).__name__}: {exc}", flush=True)
             self._client_disconnected()
@@ -1059,8 +1151,15 @@ class MoonlightSbsOutput:
             height, width = int(frame.shape[0]), int(frame.shape[1])
         if (width, height) == (config.width, config.height):
             return frame
-        from streaming.aspect import apply_aspect_on_gpu
+        from streaming.aspect import apply_aspect_on_gpu, try_packed_area_blit
+        import torch
 
+        if getattr(frame, "dtype", None) == torch.uint8:
+            fitted = try_packed_area_blit(
+                frame, (config.width, config.height), self.fit_mode, self.display_mode, self.input_size,
+            )
+            if fitted is not None:
+                return fitted
         return apply_aspect_on_gpu(
             frame,
             source_size=(width, height),
@@ -1141,7 +1240,39 @@ class MoonlightSbsOutput:
             self._frame_timestamps.setdefault(source_index, capture_ns)
         return access_units
 
-    def submit_runtime_result(self, runtime_result: Any, capture_timestamp: float) -> None:
+    @contextmanager
+    def _encoder_frame_context(self, runtime_result: Any, frame: Any):
+        """Order CUDA encode work on the encoder stream without blocking on host.
+
+        The pipeline publishes a completion event when available. Waiting on
+        that event keeps the dependency on the GPU while record_stream keeps
+        the producer allocation alive until encoding finishes.
+        """
+        import torch
+
+        with self._encoder_lock:
+            if not isinstance(frame, getattr(torch, "Tensor", ())):
+                yield  # Keep legacy device-frame adapters and test doubles unchanged.
+                return
+            stream = self._encode_stream
+            if stream is None or stream.device != frame.device:
+                stream = self._encode_stream = torch.cuda.Stream(device=frame.device)
+            frame.record_stream(stream)
+            ready_event = getattr(runtime_result, "cuda_ready_event", None)
+            if ready_event is not None:
+                stream.wait_event(ready_event)
+            with torch.cuda.stream(stream):
+                yield
+
+    def submit_runtime_result(
+        self,
+        runtime_result: Any,
+        capture_timestamp: float,
+        *,
+        target_size: tuple[int, int] | None = None,
+    ) -> None:
+        if target_size is not None:
+            self.target_size = target_size
         if sys.platform == "darwin":
             native_frame = getattr(runtime_result, "native_stream_frame", None)
             ownership_transferred = False
@@ -1227,13 +1358,15 @@ class MoonlightSbsOutput:
         bridge = self._bridge
         if bridge is None or not bridge.connected:
             return
-        with self._encoder_lock:
+        with self._encoder_frame_context(runtime_result, frame):
             encoder = self._encoder
             config = self._encoder_config
             if encoder is None or config is None:
                 return
             frame_index = self._frame_index
             capture_ns = max(0, int(float(capture_timestamp) * 1_000_000_000))
+            fit_ms = 0.0
+            encode_ms = 0.0
 
             if hasattr(encoder, "encode_access_units"):
                 frame_index = self._frame_index
@@ -1243,12 +1376,16 @@ class MoonlightSbsOutput:
                 self._frame_timestamps[frame_index] = capture_ns
                 if len(self._frame_timestamps) > 64:
                     self._frame_timestamps.pop(min(self._frame_timestamps))
+                fit_started = time.perf_counter()
                 fitted_frame = self._fit_frame(frame, config)
+                fit_ms = (time.perf_counter() - fit_started) * 1000.0
+                encode_started = time.perf_counter()
                 access_units = encoder.encode_access_units(
                     fitted_frame,
                     frame_index=frame_index,
                     force_idr=force_idr,
                 )
+                encode_ms = (time.perf_counter() - encode_started) * 1000.0
             else:
                 now = time.perf_counter()
                 target_fps = max(1.0, float(config.fps))
@@ -1289,20 +1426,56 @@ class MoonlightSbsOutput:
                 access_units.extend(
                     self._drain_amd_packets(encoder, config, capture_ns)
                 )
+            send_ms = 0.0
+            if access_units:
+                send_started = time.monotonic()
+                for access_unit in access_units:
+                    source_index = int(access_unit.get("frame_index", frame_index))
+                    timestamp_ns = self._frame_timestamps.pop(source_index, capture_ns)
+                    payload = bytes(access_unit["data"])
+                    idr = bool(access_unit.get("idr")) or self._is_idr(
+                        payload, config.codec
+                    )
+                    bridge.send_access_unit(
+                        source_index,
+                        timestamp_ns,
+                        payload,
+                        idr=idr,
+                    )
+                send_ms = (time.monotonic() - send_started) * 1000.0
 
-            for access_unit in access_units:
-                source_index = int(access_unit.get("frame_index", frame_index))
-                timestamp_ns = self._frame_timestamps.pop(source_index, capture_ns)
-                payload = bytes(access_unit["data"])
-                idr = bool(access_unit.get("idr")) or self._is_idr(
-                    payload, config.codec
-                )
-                bridge.send_access_unit(
-                    source_index,
-                    timestamp_ns,
-                    payload,
-                    idr=idr,
-                )
+            with self._cuda_metrics_lock:
+                self._cuda_metrics_encoded += 1
+                self._cuda_metrics_sent += len(access_units)
+                self._cuda_metrics_fit_ms += fit_ms
+                self._cuda_metrics_encode_ms += encode_ms
+                self._cuda_metrics_send_ms += send_ms
+                now_mono = time.monotonic()
+                elapsed = now_mono - self._cuda_metrics_started
+                if elapsed >= 5.0:
+                    encoded = self._cuda_metrics_encoded
+                    sent = self._cuda_metrics_sent
+                    dropped = self._cuda_metrics_dropped
+                    fit_total = self._cuda_metrics_fit_ms
+                    encode_total = self._cuda_metrics_encode_ms
+                    send_total = self._cuda_metrics_send_ms
+                    self._cuda_metrics_started = now_mono
+                    self._cuda_metrics_encoded = 0
+                    self._cuda_metrics_sent = 0
+                    self._cuda_metrics_dropped = 0
+                    self._cuda_metrics_fit_ms = 0.0
+                    self._cuda_metrics_encode_ms = 0.0
+                    self._cuda_metrics_send_ms = 0.0
+                    print(
+                        "[Moonlight] CUDA: "
+                        f"encoded={encoded / elapsed:.1f} fps, "
+                        f"sent={sent / elapsed:.1f} fps, "
+                        f"dropped={dropped}, "
+                        f"fit={fit_total / max(1, encoded):.1f} ms, "
+                        f"encode={encode_total / max(1, encoded):.1f} ms, "
+                        f"send={send_total / max(1, max(1, sent)):.1f} ms",
+                        flush=True,
+                    )
 
     def submit_cuda_frame(self, frame: Any) -> None:
         class _RuntimeResult:

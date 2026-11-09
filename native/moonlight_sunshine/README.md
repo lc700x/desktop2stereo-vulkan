@@ -12,11 +12,17 @@ This folder contains a standalone Sunshine-derived GameStream host component. De
 
 The bridge is enabled only in the child Sunshine process started by Desktop2Stereo. D2S supplies encoded GPU frames over an authenticated loopback socket; Sunshine retains pairing, audio capture, remote input, GameStream packetization, and network transport. When the bridge environment variables are absent, Sunshine keeps its ordinary capture path.
 
+In D2S bridge mode, the child skips Sunshine's redundant desktop/encoder probes and advertises only SDR H.264/HEVC 4:2:0. The handshake acknowledgment is serialized ahead of the first encoded frame; any frame bytes prefetched with that acknowledgment remain in the bridge parser. Capture, stereo, per-eye fitting, and NV12 conversion stay GPU-resident. The loopback socket carries only compressed access units, not RGB images; GPU-local conversions/copies and the compressed-byte transfer to networking still exist.
+
+Do not run another Sunshine server (including `SunshineService`) while Desktop2Stereo Moonlight is active. The second host can capture the desktop and open another NVENC session, which starves the D2S encoder and drops the stream to roughly 10 FPS even though Local Viewer remains fast. If the standard Sunshine port is occupied, Desktop2Stereo selects a compatible free port family and continues; this avoids a bind collision but does not prevent GPU or capture-resource contention. Stop the other service for best streaming performance.
+
+Full-SBS and TAB absolute input uses the optional `input_regions` handshake metadata. Each eye maps its visible viewport to the original capture crop independently, including contain bars, cover cropping, and stretch. Missing metadata and Half-SBS retain the legacy input path; relative mouse input is unchanged.
+
 ## Bundled files
 
 - `sunshine.exe`: upstream Sunshine plus the D2S bridge, version `2026.914.233613`.
 - `zlib1.dll` and `assets/`: Sunshine runtime dependencies and web UI assets.
-- `d2s_amd_encoder.dll`: ABI 2 Windows AMF bridge used only by Moonlight mode on ROCm. The ordinary Desktop2Stereo AMD encoder DLL is left untouched.
+- `d2s_amd_encoder.dll`: low-latency Windows AMF bridge used only by Moonlight mode on ROCm. The ordinary Desktop2Stereo AMD encoder DLL is left untouched.
 - The AMF runtime and GPU driver come from the installed AMD driver package.
 
 The bundled host runs as a child process in the current user session. It does not install a Sunshine service, Windows driver, firewall rule, or UPnP mapping. Audio uses the current default Windows output device.
@@ -48,5 +54,5 @@ The patch pins the Boost dependency to the UCRT64 toolchain version used for thi
 
 ## Build identity
 
-- Sunshine SHA-256: `32134E57B1373D94343B6C794BAC7DA4B54235D6511BA0546DEF10B9E86A2FD0`
+- Sunshine SHA-256: `EF7B2FA9A3135F6F2FBBA0C5576DF8AFF1F708396BAF07865A24D97840B33F80`
 - AMF bridge SHA-256: `5510DD74DEDE5C20814DC75650FED2A0DB2878D3992813038CCBDF25A3C599A8`

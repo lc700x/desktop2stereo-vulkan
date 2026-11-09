@@ -19,14 +19,19 @@ small snapshot of:
   decaying average over roughly a minute, not an instantaneous window.
 
 The presenting thread only reads a dict, so a slow sample can never add latency
-to a frame. Sampling is only started with ``D2S_METRICS_VERBOSE=1``; set
-``D2S_SYS_LOAD=0`` to disable it even then.
+to a frame. GPU-only sampling is used by the viewer; CPU sampling is opt-in.
+Set ``D2S_SYS_LOAD=0`` to disable sampling.
+
+On Windows, built-in PDH GPU counters are filtered to the viewer's adapter
+LUID. Dedicated VRAM usage comes from PDH and its capacity from DXGI.
+CPU-side keys remain macOS-only.
 """
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -73,6 +78,258 @@ _OFF_SYSTEM_TIME = 24
 _GPU_KEYS = ("Device Utilization %", "Tiler Utilization %", "Renderer Utilization %")
 
 
+# Windows PDH GPU counters (registered once, sampled on the background thread).
+_PDH_FMT_DOUBLE = 0x00000200
+_PDH_MORE_DATA = 0x800007D2 - (1 << 32)
+_PDH_GPU_ENGINE_PATH = r"\GPU Engine(*)\Utilization Percentage"
+_PDH_VRAM_USED_PATH = r"\GPU Adapter Memory(*)\Dedicated Usage"
+_ENGINE_NAME_MAP = {
+    "3d": "gpu_3d",
+    "copy": "gpu_copy",
+    "videodecode": "gpu_decode",
+    "videoencode": "gpu_encode",
+    "compute": "gpu_compute",
+}
+_LUID_RE = re.compile(r"luid_0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)")
+
+
+class _PdhFmtCounterValue(ctypes.Structure):
+    _fields_ = [("CStatus", ctypes.c_uint32), ("doubleValue", ctypes.c_double)]
+
+
+class _PdhItem(ctypes.Structure):
+    _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _PdhFmtCounterValue)]
+
+
+def _instance_luid(name: str) -> int | None:
+    """Parse ``luid_0xHIGH_0xLOW`` from a PDH GPU instance name."""
+    match = _LUID_RE.search(name or "")
+    if not match:
+        return None
+    return (int(match.group(1), 16) << 32) | int(match.group(2), 16)
+
+
+class _DxgiGuid(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _DxgiLuid(ctypes.Structure):
+    _fields_ = [("LowPart", ctypes.c_uint32), ("HighPart", ctypes.c_int32)]
+
+
+class _DxgiAdapterDesc1(ctypes.Structure):
+    _fields_ = [
+        ("Description", ctypes.c_wchar * 128),
+        ("VendorId", ctypes.c_uint32),
+        ("DeviceId", ctypes.c_uint32),
+        ("SubSysId", ctypes.c_uint32),
+        ("Revision", ctypes.c_uint32),
+        ("DedicatedVideoMemory", ctypes.c_size_t),
+        ("DedicatedSystemMemory", ctypes.c_size_t),
+        ("SharedSystemMemory", ctypes.c_size_t),
+        ("AdapterLuid", _DxgiLuid),
+        ("Flags", ctypes.c_uint32),
+    ]
+
+
+_IID_IDXGIFACTORY1 = _DxgiGuid(
+    0x770AAE78, 0xF26F, 0x4DBA,
+    (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87),
+)
+
+
+def _com_vtable(obj):
+    return ctypes.cast(
+        ctypes.cast(obj, ctypes.POINTER(ctypes.c_void_p))[0],
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+
+
+def _query_dxgi_adapter_vram() -> dict[int, int]:
+    """Read dedicated VRAM capacity by adapter LUID without a GPU dependency."""
+    if sys.platform != "win32":
+        return {}
+    try:
+        dxgi = ctypes.WinDLL("dxgi.dll")
+        create = dxgi.CreateDXGIFactory1
+        create.argtypes = [ctypes.POINTER(_DxgiGuid), ctypes.POINTER(ctypes.c_void_p)]
+        create.restype = ctypes.c_int32
+        factory = ctypes.c_void_p()
+        if int(create(ctypes.byref(_IID_IDXGIFACTORY1), ctypes.byref(factory))) != 0:
+            return {}
+        table = _com_vtable(factory)
+        enum_adapters1 = ctypes.WINFUNCTYPE(
+            ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p),
+        )(table[12])
+        release = ctypes.WINFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p)(table[2])
+        totals: dict[int, int] = {}
+        try:
+            index = 0
+            while True:
+                adapter = ctypes.c_void_p()
+                if int(enum_adapters1(factory, index, ctypes.byref(adapter))) != 0 or not adapter:
+                    break
+                adapter_table = _com_vtable(adapter)
+                adapter_release = ctypes.WINFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p)(adapter_table[2])
+                try:
+                    get_desc1 = ctypes.WINFUNCTYPE(
+                        ctypes.c_int32, ctypes.c_void_p, ctypes.POINTER(_DxgiAdapterDesc1),
+                    )(adapter_table[10])
+                    desc = _DxgiAdapterDesc1()
+                    if int(get_desc1(adapter, ctypes.byref(desc))) == 0 and desc.DedicatedVideoMemory:
+                        luid = ((int(desc.AdapterLuid.HighPart) & 0xFFFFFFFF) << 32) | int(desc.AdapterLuid.LowPart)
+                        totals[luid] = int(desc.DedicatedVideoMemory)
+                finally:
+                    adapter_release(adapter)
+                index += 1
+        finally:
+            release(factory)
+        return totals
+    except (AttributeError, OSError, ValueError):
+        return {}
+
+
+class _WindowsPdhGpuSampler:
+    """Sample per-engine GPU utilization and dedicated VRAM via native PDH."""
+
+    def __init__(self) -> None:
+        self._pdh = None
+        self._query = None
+        self._engine_counter = None
+        self._vram_used_counter = None
+        self._adapter_luid = 0
+        self._adapter_vram_bytes: dict[int, int] = {}
+        self._last_hr = 0
+        self._ok = False
+        self._warned = False
+
+    def set_adapter_luid(self, luid: int) -> None:
+        self._adapter_luid = int(luid or 0)
+
+    def _warn(self, hr: int) -> None:
+        if not self._warned:
+            self._warned = True
+            print(f"[SysLoad] Windows GPU counters unavailable (hr=0x{int(hr) & 0xFFFFFFFF:08X})", flush=True)
+
+    def _add_counter(self, path: str):
+        counter = ctypes.c_void_p()
+        hr = int(self._pdh.PdhAddEnglishCounterW(self._query, path, 0, ctypes.byref(counter)))
+        self._last_hr = hr
+        return counter if hr == 0 else None
+
+    def start(self) -> bool:
+        try:
+            pdh = ctypes.WinDLL("pdh.dll")
+        except (AttributeError, OSError) as exc:
+            self._warn(getattr(exc, "winerror", 0) or 0)
+            return False
+        pdh.PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
+        pdh.PdhOpenQueryW.restype = ctypes.c_int32
+        pdh.PdhAddEnglishCounterW.argtypes = [
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p),
+        ]
+        pdh.PdhAddEnglishCounterW.restype = ctypes.c_int32
+        pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+        pdh.PdhCollectQueryData.restype = ctypes.c_int32
+        pdh.PdhGetFormattedCounterArrayW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(_PdhItem),
+        ]
+        pdh.PdhGetFormattedCounterArrayW.restype = ctypes.c_int32
+        pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
+        pdh.PdhCloseQuery.restype = ctypes.c_int32
+        self._pdh = pdh
+        query = ctypes.c_void_p()
+        hr = int(pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)))
+        if hr != 0:
+            self._warn(hr)
+            return False
+        self._query = query
+        self._engine_counter = self._add_counter(_PDH_GPU_ENGINE_PATH)
+        if self._engine_counter is None:
+            self._warn(self._last_hr)
+            self.close()
+            return False
+        self._vram_used_counter = self._add_counter(_PDH_VRAM_USED_PATH)
+        self._adapter_vram_bytes = _query_dxgi_adapter_vram()
+        pdh.PdhCollectQueryData(self._query)
+        self._ok = True
+        return True
+
+    def close(self) -> None:
+        if self._pdh is not None and self._query is not None:
+            self._pdh.PdhCloseQuery(self._query)
+        self._query = None
+        self._ok = False
+
+    def _read_counter(self, counter) -> list[tuple[str, float]]:
+        if counter is None:
+            return []
+        size = ctypes.c_uint32(0)
+        count = ctypes.c_uint32(0)
+        hr = int(self._pdh.PdhGetFormattedCounterArrayW(
+            counter, _PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count), None,
+        ))
+        if hr != _PDH_MORE_DATA or not size.value:
+            return []
+        buffer = ctypes.create_string_buffer(size.value)
+        items = ctypes.cast(buffer, ctypes.POINTER(_PdhItem))
+        hr = int(self._pdh.PdhGetFormattedCounterArrayW(
+            counter, _PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count), items,
+        ))
+        if hr != 0:
+            return []
+        # Both VALID_DATA (0) and NEW_DATA (1) are successful PDH statuses.
+        return [
+            (items[i].szName or "", float(items[i].FmtValue.doubleValue))
+            for i in range(int(count.value)) if int(items[i].FmtValue.CStatus) in {0, 1}
+        ]
+
+    def sample(self) -> dict[str, float | str]:
+        if not self._ok or self._query is None:
+            return {}
+        if int(self._pdh.PdhCollectQueryData(self._query)) != 0:
+            return {}
+        by_adapter: dict[int, dict[str, float]] = {}
+        for name, value in self._read_counter(self._engine_counter):
+            luid = _instance_luid(name)
+            engine = _ENGINE_NAME_MAP.get(name.rsplit("_engtype_", 1)[-1].strip().lower())
+            if luid is None or engine is None:
+                continue
+            bucket = by_adapter.setdefault(luid, {})
+            bucket[engine] = bucket.get(engine, 0.0) + float(value)
+        chosen = self._adapter_luid
+        if not chosen and by_adapter:
+            chosen = max(by_adapter, key=lambda luid: max(by_adapter[luid].values(), default=0.0))
+        result: dict[str, float | str] = {}
+        engines = by_adapter.get(chosen, {})
+        if engines:
+            result.update({key: max(0.0, min(100.0, value)) for key, value in engines.items()})
+            result["gpu"] = max(result.values(), default=0.0)
+            if not self._adapter_luid:
+                result["gpu_adapter"] = "auto"
+        used_by: dict[int, float] = {}
+        for name, value in self._read_counter(self._vram_used_counter):
+            luid = _instance_luid(name)
+            if luid is not None:
+                used_by[luid] = used_by.get(luid, 0.0) + float(value)
+        # Never mix another GPU's VRAM into a viewer-bound utilization sample.
+        if not chosen and used_by:
+            chosen = max(used_by, key=used_by.get)
+            result["gpu_adapter"] = "auto"
+        if chosen in used_by:
+            result["gpu_vram_used_mb"] = used_by[chosen] / (1024.0 * 1024.0)
+        total = self._adapter_vram_bytes.get(chosen)
+        if total:
+            result["gpu_vram_total_mb"] = float(total) / (1024.0 * 1024.0)
+        return result
+
+
 class _HostCpuLoadInfo(ctypes.Structure):
     _fields_ = [("cpu_ticks", ctypes.c_uint32 * _CPU_STATE_MAX)]
 
@@ -84,10 +341,9 @@ class _MachTimebaseInfo(ctypes.Structure):
 class SystemLoadSampler:
     """Sampled machine load, published as a plain dict.
 
-    ``cpu=False`` keeps only the GPU counters: they come from a single IOKit
-    property read (~50µs, no subprocess, no process enumeration), so the GPU
-    line can stay on all the time without touching frame pacing. The CPU parts
-    are opt-in because they walk the process table and shell out to ``ps``.
+    ``cpu=False`` keeps only the GPU counters: a single IOKit property read on
+    macOS or one PDH collection on Windows. CPU sampling is macOS-only and
+    opt-in because it walks the process table and shells out to ``ps``.
     """
 
     def __init__(self, interval: float = _DEFAULT_INTERVAL, *, cpu: bool = True) -> None:
@@ -104,6 +360,9 @@ class SystemLoadSampler:
         self._last_cpu: dict[str, float] = {}
         self._last_ticks: tuple[float, ...] | None = None
         self._gpu_samples: list[dict[str, int]] = []
+        self._windows_gpu_sampler: _WindowsPdhGpuSampler | None = None
+        self._windows_gpu_samples: list[dict[str, float | str]] = []
+        self._adapter_luid = 0
         # pid -> (group, name) for the processes worth sampling. Enumerating
         # every pid costs one syscall per process, and each call competes for
         # the interpreter lock with the render thread, so the mapping is
@@ -304,6 +563,14 @@ class SystemLoadSampler:
 
     # ----------------------------------------------------------------- GPU
     def _init_gpu(self) -> None:
+        if sys.platform == "win32":
+            sampler = _WindowsPdhGpuSampler()
+            if sampler.start():
+                with self._lock:
+                    sampler.set_adapter_luid(self._adapter_luid)
+                    self._windows_gpu_sampler = sampler
+                    self._gpu_ok = True
+            return
         if sys.platform != "darwin":
             return
         try:
@@ -345,7 +612,7 @@ class SystemLoadSampler:
         return self._cf.CFStringCreateWithCString(None, text.encode("utf-8"), 0x08000100)
 
     def _gpu_stats(self) -> dict[str, int]:
-        if not self._gpu_ok:
+        if sys.platform != "darwin" or not self._gpu_ok:
             return {}
         cf, iokit = self._cf, self._iokit
         matching = iokit.IOServiceMatching(b"AGXAccelerator")
@@ -383,18 +650,28 @@ class SystemLoadSampler:
     def _publish(self) -> None:
         snapshot: dict[str, float | str] = {}
 
-        samples = self._gpu_samples
-        self._gpu_samples = []
-        device = [s["Device Utilization %"] for s in samples if "Device Utilization %" in s]
-        if device:
-            snapshot["gpu"] = sum(device) / len(device)
-            snapshot["gpu_max"] = float(max(device))
+        if sys.platform == "win32":
+            samples = self._windows_gpu_samples
+            self._windows_gpu_samples = []
+            if samples:
+                snapshot.update(samples[-1])
+                peaks = [float(item["gpu"]) for item in samples if "gpu" in item]
+                if peaks:
+                    snapshot["gpu_max"] = max(peaks)
+        else:
+            samples = self._gpu_samples
+            self._gpu_samples = []
+            device = [s["Device Utilization %"] for s in samples if "Device Utilization %" in s]
+            if device:
+                snapshot["gpu"] = sum(device) / len(device)
+                snapshot["gpu_max"] = float(max(device))
 
-        system = self._system_cpu() if self._cpu_enabled else None
+        cpu_enabled = self._cpu_enabled and sys.platform == "darwin"
+        system = self._system_cpu() if cpu_enabled else None
         if system is not None:
             snapshot["sys_busy"] = system
 
-        if self._cpu_enabled:
+        if cpu_enabled:
             percents, browser_name = self._process_cpu()
             for group in ("app", "browser"):
                 value = percents.get(f"{group}_cpu")
@@ -410,32 +687,49 @@ class SystemLoadSampler:
         with self._lock:
             self._snapshot = snapshot
 
+    def set_adapter_luid(self, luid: int) -> None:
+        """Restrict Windows GPU counters to the presentation adapter."""
+        with self._lock:
+            self._adapter_luid = int(luid or 0)
+            if self._windows_gpu_sampler is not None:
+                self._windows_gpu_sampler.set_adapter_luid(self._adapter_luid)
+
     def _run(self) -> None:
         self._init_gpu()
         # Prime the CPU baselines so the first published window has deltas.
         try:
-            if self._cpu_enabled:
+            if self._cpu_enabled and sys.platform == "darwin":
                 self._system_cpu()
                 self._process_cpu()
             self._gpu_stats()
         except Exception:
             pass
         deadline = time.monotonic() + self._interval
-        while not self._stop.wait(_GPU_TICK):
-            try:
-                stats = self._gpu_stats()
-                if stats:
-                    self._gpu_samples.append(stats)
-                if time.monotonic() >= deadline:
+        try:
+            while not self._stop.wait(_GPU_TICK):
+                try:
+                    if sys.platform == "win32":
+                        sampler = self._windows_gpu_sampler
+                        stats = sampler.sample() if sampler is not None else {}
+                        if stats:
+                            self._windows_gpu_samples.append(stats)
+                    else:
+                        stats = self._gpu_stats()
+                        if stats:
+                            self._gpu_samples.append(stats)
+                    if time.monotonic() >= deadline:
+                        deadline = time.monotonic() + self._interval
+                        self._publish()
+                except Exception:
                     deadline = time.monotonic() + self._interval
-                    self._publish()
-            except Exception:
-                deadline = time.monotonic() + self._interval
-                continue
+                    continue
+        finally:
+            if self._windows_gpu_sampler is not None:
+                self._windows_gpu_sampler.close()
 
     # ---------------------------------------------------------------- public
     def start(self) -> bool:
-        if sys.platform != "darwin":
+        if sys.platform not in {"darwin", "win32"}:
             return False
         with self._lock:
             if self._thread is not None:
@@ -479,6 +773,13 @@ def format_load_fields(snapshot: dict | None) -> list[str]:
         ("sys_busy", "sys_busy", "{:.1f}"),
         ("gpu", "sys_gpu", "{:.0f}"),
         ("gpu_max", "sys_gpu_max", "{:.0f}"),
+        ("gpu_3d", "gpu_3d", "{:.0f}"),
+        ("gpu_copy", "gpu_copy", "{:.0f}"),
+        ("gpu_decode", "gpu_decode", "{:.0f}"),
+        ("gpu_encode", "gpu_encode", "{:.0f}"),
+        ("gpu_compute", "gpu_compute", "{:.0f}"),
+        ("gpu_vram_used_mb", "gpu_vram_used_mb", "{:.0f}"),
+        ("gpu_vram_total_mb", "gpu_vram_total_mb", "{:.0f}"),
         ("ws_busy", "ws_busy", "{:.1f}"),
         ("app_busy", "app_busy", "{:.1f}"),
         ("browser_busy", "browser_busy", "{:.1f}"),
@@ -486,6 +787,9 @@ def format_load_fields(snapshot: dict | None) -> list[str]:
         value = snapshot.get(key)
         if isinstance(value, (int, float)):
             fields.append(f"{label}=" + fmt.format(float(value)))
+    adapter = snapshot.get("gpu_adapter")
+    if adapter:
+        fields.append(f"gpu_adapter={adapter}")
     name = snapshot.get("browser_name")
     if name and "browser_busy" in snapshot:
         fields.append(f"browser={name}")

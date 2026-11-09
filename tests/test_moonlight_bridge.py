@@ -236,3 +236,55 @@ def test_moonlight_bridge_close_unblocks_a_backpressured_writer():
 
     assert not writer.is_alive()
     assert not closer.is_alive()
+
+
+
+def test_moonlight_bridge_acknowledges_before_a_concurrent_first_idr(monkeypatch):
+    from streaming import moonlight_bridge
+
+    building_reply = threading.Event()
+    writer_attempted = threading.Event()
+    writer_completed = threading.Event()
+    sent = []
+    original_dumps = json.dumps
+
+    def delayed_reply(value, *args, **kwargs):
+        if isinstance(value, dict) and value.get("ok") is True:
+            building_reply.set()
+            assert writer_attempted.wait(2.0)
+            writer_completed.wait(0.25)
+        return original_dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(moonlight_bridge.json, "dumps", delayed_reply)
+    bridge = MoonlightBridgeServer(
+        "d" * 64,
+        on_client_start=lambda config: {"accepted_width": config.width},
+        on_client_stop=lambda: None,
+        on_idr_request=lambda: None,
+    )
+    address = bridge.start()
+
+    def first_frame():
+        if building_reply.wait(2.0):
+            writer_attempted.set()
+            sent.append(bridge.send_access_unit(0, 123, b"first-idr", idr=True))
+            writer_completed.set()
+
+    writer = threading.Thread(target=first_frame)
+    writer.start()
+    try:
+        with socket.create_connection(address, timeout=3.0) as client:
+            client.sendall(_hello("d" * 64))
+            with client.makefile("rb") as reader:
+                assert json.loads(reader.readline()) == {"ok": True, "accepted_width": 3840}
+                header = reader.read(struct.calcsize("!4sQQII"))
+                marker, index, timestamp, flags, length = struct.unpack("!4sQQII", header)
+                assert (marker, index, timestamp, flags) == (b"D2SF", 0, 123, 1)
+                assert reader.read(length) == b"first-idr"
+        writer.join(timeout=1.0)
+        assert sent == [True]
+    finally:
+        writer_attempted.set()
+        bridge.close()
+        writer.join(timeout=2.0)
+    assert not writer.is_alive()

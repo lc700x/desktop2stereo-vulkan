@@ -7,6 +7,7 @@ to ensure identical letterbox/crop/stretch behavior between local and streaming 
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Tuple
 
 # Pure-math helpers from local viewer (no Vulkan deps)
@@ -493,3 +494,93 @@ def apply_aspect_on_gpu(
         output = torch.zeros((th, tw, 3), dtype=torch.uint8, device=frame.device)
         output[dy0:dy1, dx0:dx1] = src_crop
         return output.contiguous()
+
+
+@lru_cache(maxsize=1)
+def _packed_area_blit_kernel():
+    """Fuse the existing per-eye area filter and quantization without float planes."""
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def kernel(src, dst, sy: tl.constexpr, sx: tl.constexpr, sc: tl.constexpr,
+               ox: tl.constexpr, oy: tl.constexpr, sw: tl.constexpr, sh: tl.constexpr,
+               dx: tl.constexpr, dy: tl.constexpr, dw: tl.constexpr, dh: tl.constexpr,
+               tw: tl.constexpr, COPY: tl.constexpr, BLOCK: tl.constexpr):
+        p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        active = p < dw * dh * 3
+        channel = p % 3
+        x = (p // 3) % dw
+        y = p // (3 * dw)
+        x0 = x * sw // dw
+        y0 = y * sh // dh
+        x1 = ((x + 1) * sw + dw - 1) // dw
+        y1 = ((y + 1) * sh + dh - 1) // dh
+        total = tl.full((BLOCK,), 0.0, tl.float32)
+        for iy in range((sh + dh - 1) // dh + 1):
+            for ix in range((sw + dw - 1) // dw + 1):
+                valid = active & (x0 + ix < x1) & (y0 + iy < y1)
+                value = tl.load(src + (oy + y0 + iy) * sy + (ox + x0 + ix) * sx + channel * sc,
+                                mask=valid, other=0).to(tl.float32)
+                if not COPY:
+                    value = value * (1.0 / 255.0)
+                total += value
+        if not COPY:
+            # ATen area pooling divides height before width; the order affects byte rounding.
+            total = tl.div_rn(total, (y1 - y0).to(tl.float32))
+            total = tl.div_rn(total, (x1 - x0).to(tl.float32))
+            total = tl.minimum(1.0, tl.maximum(0.0, total)) * 255.0
+        offset = ((dy + y) * tw + dx + x) * 3 + channel
+        tl.store(dst + offset, total.to(tl.uint8), mask=active)
+
+    return kernel
+
+
+def try_packed_area_blit(
+    frame: "torch.Tensor",
+    target_size: Tuple[int, int],
+    fit_mode: str,
+    display_mode: str,
+    input_size: Tuple[int, int] | None = None,
+) -> "torch.Tensor | None":
+    """Optional byte-preserving GPU area fit; unsupported cases use the existing path."""
+    import torch
+    from stereo_runtime.triton_runtime import triton_runtime_available
+
+    if not frame.is_cuda or frame.dtype != torch.uint8:
+        return None
+    image = frame[0] if frame.ndim == 4 and frame.shape[0] == 1 else frame
+    if image.ndim != 3:
+        return None
+    if image.shape[0] in (3, 4) and image.shape[-1] not in (3, 4):
+        image = image.permute(1, 2, 0)
+    if image.shape[-1] != 3 or not triton_runtime_available(image.device):
+        return None
+    regions = presentation_blit_regions(
+        (int(image.shape[1]), int(image.shape[0])), target_size, fit_mode, display_mode, input_size,
+    )
+    if not regions:
+        return None
+    for (x0, y0, x1, y1), (dx0, dy0, dx1, dy1) in regions:
+        sw, sh, dw, dh = x1 - x0, y1 - y0, dx1 - dx0, dy1 - dy0
+        if min(sw, sh, dw, dh) <= 0 or (sw < dw and sh <= dh) or (sh < dh and sw <= dw):
+            return None  # Keep the established bilinear upscaling path.
+    try:
+        import triton
+
+        kernel = _packed_area_blit_kernel()
+        tw, th = target_size
+        fills_canvas = sum((r[1][2] - r[1][0]) * (r[1][3] - r[1][1]) for r in regions) == tw * th
+        allocate = torch.empty if fills_canvas else torch.zeros
+        output = allocate((th, tw, 3), dtype=torch.uint8, device=image.device)
+        for (x0, y0, x1, y1), (dx0, dy0, dx1, dy1) in regions:
+            sw, sh, dw, dh = x1 - x0, y1 - y0, dx1 - dx0, dy1 - dy0
+            kernel[((dw * dh * 3 + 255) // 256,)](
+                image, output, *image.stride(), x0, y0, sw, sh, dx0, dy0, dw, dh, tw,
+                (sw, sh) == (dw, dh), BLOCK=256, enable_fp_fusion=False,
+            )
+        return output
+    except (ImportError, RuntimeError):
+        return None
+    except triton.TritonError:
+        return None

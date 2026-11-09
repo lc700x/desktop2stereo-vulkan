@@ -1,3 +1,4 @@
+import importlib
 import os
 import sys
 from pathlib import Path
@@ -743,3 +744,60 @@ def test_quality_direct_sbs_uint8_preserves_packed_stereo_views(monkeypatch):
         actual.sbs[..., half_width:],
     )
     assert actual.debug_info["runtime_output_pack_backend"] == "triton_warp_composite2_half_sbs_uint8"
+
+
+@pytest.mark.parametrize("run_mode", ["Moonlight Streamer", "RTMP Streamer", "MJPEG Streamer"])
+@pytest.mark.parametrize("percent", ["100%", "85%", "75%", "50%"])
+def test_network_quality_scale_keeps_processing_eyes_at_current_capture_percentage(monkeypatch, run_mode, percent):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU required for actual packed synthesis")
+    from capture.preprocess import capture_frame_to_rgb, prepare_rgb_for_stereo_runtime
+    from stereo_runtime.adapter import runtime_config_from_d2s_settings
+    from stereo_runtime.pipeline import _resolve_pipeline_render_size
+    from stereo_runtime.render_size import RenderSizeConfig
+
+    config = runtime_config_from_d2s_settings({
+        "Depth Model": "Distill-Any-Depth-Small", "Run Mode": run_mode,
+        "Stereo Quality": "quality_4k", "Display Mode": "Half-SBS",
+        "Temporal": False, "Hole Fill Mode": "none", "Render Scale": percent,
+    }, device="cuda", depth_only=False)
+    assert config.output_quality_enabled is False
+    runtime = StereoRuntime(config, depth_provider=FakeDepthProvider(), collect_memory_stats=False)
+    raw = torch.zeros((180, 320, 4), dtype=torch.uint8, device="cuda")
+    raw[..., 2] = 255
+    size = _resolve_pipeline_render_size((320, 180), RenderSizeConfig(scale_factor=percent))
+    rgb = prepare_rgb_for_stereo_runtime(
+        capture_frame_to_rgb(raw, size, device="cuda", output="tensor"), device="cuda",
+    )
+    monkeypatch.setattr(torch.Tensor, "cpu", lambda *_a, **_k: pytest.fail("GPU image was read back"))
+    try:
+        result = runtime.process_rgb_frame(rgb)
+        assert result.output_eye_size == size
+        assert tuple(result.sbs.shape[-2:]) == (size[1], size[0])
+        assert result.sbs.is_cuda
+        assert result.debug_info["output_quality_mode"] != "upscale_easu"
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "stereo_runtime.runtime",
+        "stereo_runtime.synthesis",
+        "stereo_runtime.providers.nvidia.tensorrt_native",
+    ],
+)
+def test_cuda_stage_events_require_explicit_opt_in(monkeypatch, module_name):
+    module = importlib.import_module(module_name)
+    monkeypatch.delenv("D2S_CUDA_STAGE_EVENTS", raising=False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda **_kwargs: pytest.fail("stage event created without explicit opt-in"),
+    )
+    events = {}
+
+    module._record_cuda_event(events, "start", object())
+
+    assert events == {}

@@ -116,6 +116,7 @@ def _bgr_to_rgb_area_resize_norm_kernel(
     src_channel = 2 - channel
 
     value = tl.zeros((block,), dtype=tl.float32)
+    weight = tl.zeros((block,), dtype=tl.float32)
     for ky in tl.static_range(0, 3):
         sy = y0 + ky
         wy = tl.maximum(
@@ -131,14 +132,21 @@ def _bgr_to_rgb_area_resize_norm_kernel(
                 - tl.maximum(x_start, sx.to(tl.float32)),
             )
             src_offset = (sy * in_w + sx) * channels + src_channel
+            # fp32 subtraction of two ~4K coordinates loses precision, so the
+            # theoretical scale_x*scale_y is not the sum of the tap weights.
+            # Normalise by the weights actually used. This also keeps border
+            # pixels from being darkened when taps are clipped at the edge.
+            valid = active & (sy >= 0) & (sy < in_h) & (sx >= 0) & (sx < in_w)
+            tap_weight = tl.where(valid, wx * wy, 0.0)
             sample = tl.load(
                 src + src_offset,
-                mask=active & (sy < in_h) & (sx < in_w),
+                mask=valid,
                 other=0.0,
             ).to(tl.float32)
-            value += sample * wx * wy
+            value += sample * tap_weight
+            weight += tap_weight
 
-    value *= (1.0 / (scale_x * scale_y * 255.0))
+    value /= tl.maximum(weight * 255.0, 1.0e-6)
     tl.store(out + offsets, value, mask=active)
 
 

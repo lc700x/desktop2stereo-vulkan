@@ -272,7 +272,6 @@ class GUIConfigMixin:
         self.stream_protocol_key = cfg.get("Stream Protocol", DEFAULTS.get("Stream Protocol", "WebRTC"))
         self.stream_proto_dd.value = self.stream_protocol_key
         self.stream_port_tf.value = str(cfg.get("Streamer Port", DEFAULTS.get("Streamer Port", DEFAULT_PORT)))
-        self.stream_quality_dd.value = str(cfg.get("Stream Quality", DEFAULTS["Stream Quality"]))
         self.stream_calibration_mode_dd.value = (
             UI_MESSAGES[self.locale].get("Auto Calibration", "Auto Calibration")
             if bool(cfg.get("Use Stream Calibration", True))
@@ -460,7 +459,8 @@ class GUIConfigMixin:
             "Upscaler Sharpness": 0.0,
             "Stream Protocol": self.stream_proto_dd.value,
             "Streamer Port": self._parse_int(self.stream_port_tf.value, DEFAULTS["Streamer Port"]),
-            "Stream Quality": self._parse_int(self.stream_quality_dd.value, DEFAULTS["Stream Quality"]),
+            # Legacy JPEG compression is separate from Quality Scale geometry.
+            "Stream Quality": self._parse_int(self._config.get("Stream Quality"), DEFAULTS["Stream Quality"]),
             "Use Stream Calibration": self._stream_calibration_auto_enabled(),
             "Stream Target Bitrate Mbps": stream_target_bitrate,
             "Stream Peak Bitrate Mbps": stream_peak_bitrate,

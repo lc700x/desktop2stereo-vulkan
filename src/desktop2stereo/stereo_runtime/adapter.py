@@ -255,8 +255,10 @@ def runtime_config_from_d2s_settings(
     )
     if cuda_graph_setting is None:
         cuda_graph_setting = (
+            # Enable replay for local presentation without changing stereo
+            # parameters or the defaults of OpenXR and other stream outputs.
             str(settings.get("Run Mode", "")).strip().casefold()
-            == "moonlight streamer"
+            in {"local viewer", "3d monitor", "moonlight streamer"}
             and bool(settings.get("TensorRT", False))
             and parallel_workers == 1
         )
@@ -363,12 +365,18 @@ def _output_headset_tier_from_settings(settings: dict[str, Any]) -> int:
 
 
 def _output_quality_disabled(settings: dict[str, Any]) -> bool:
-    """Leave OpenXR source resolution native for runtime-owned projection sampling."""
+    """Leave processing native when the presenter/encoder owns the final canvas.
+
+    A headset-tier upscale here can undo Quality Scale and make an 85% 4K
+    source a 6528x3672 intermediate before the encoder shrinks it back to 4K.
+    """
     try:
         from utils.run_mode import normalize_run_mode
     except Exception:
         return False
-    return normalize_run_mode(str(settings.get("Run Mode", "") or "")) == "OpenXR Link"
+    return normalize_run_mode(str(settings.get("Run Mode", "") or "")) in {
+        "OpenXR Link", "Moonlight Streamer", "RTMP Streamer", "MJPEG Streamer",
+    }
 
 
 def _optional_int_setting(settings: dict[str, Any], *keys: str) -> int | None:

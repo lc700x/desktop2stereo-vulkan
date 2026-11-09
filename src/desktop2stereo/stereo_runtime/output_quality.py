@@ -16,6 +16,26 @@ from .output import (
 )
 
 
+def output_upscale_capped() -> bool:
+    """Keep fixed-canvas presenters on the source resolution.
+
+    A Quality-Scale source is bucketed into a lower input tier, so the headset
+    policy asks for a 2x EASU upscale. That does two expensive things: it
+    creates a >4K-per-eye intermediate that the Local Viewer/encoder shrinks
+    straight back to the display canvas, and it flips
+    ``output_quality_requires_eye_images`` on, which disables the fused Triton
+    direct-SBS warp. Capping to native_mip keeps the fast path and lets Quality
+    Scale actually reduce GPU work. Set ``D2S_CAP_OUTPUT_UPSCALE=0`` to keep
+    the legacy headset-tier EASU/RCAS chain (e.g. for headset projection).
+    """
+    return os.environ.get("D2S_CAP_OUTPUT_UPSCALE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
 def output_sampling_plan_for_config(
     config: Any,
     source_width: int,
@@ -28,13 +48,7 @@ def output_sampling_plan_for_config(
         source_height,
         headset_tier_k=int(getattr(config, "output_headset_tier_k", 4)),
     )
-    # Local Viewer presents to a physical display; inflating every frame to
-    # the headset tier before presenting wastes the whole GPU budget there.
-    # Consumers with output quality enabled still use the selected tier canvas.
-    if (
-        plan.mode == "upscale_easu"
-        and os.environ.get("D2S_CAP_OUTPUT_UPSCALE", "") == "1"
-    ):
+    if plan.mode == "upscale_easu" and output_upscale_capped():
         return OutputSamplingPlan(
             source_width=plan.source_width,
             source_height=plan.source_height,

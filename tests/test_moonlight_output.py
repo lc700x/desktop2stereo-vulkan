@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import ssl
 import threading
+from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from streaming import moonlight_output
 from streaming.moonlight_bridge import MoonlightClientConfig
@@ -745,6 +748,7 @@ def test_macos_sunshine_launch_uses_app_resources_and_shared_state(tmp_path):
         patch.object(output, "_ensure_service_files"),
         patch.object(output, "_ensure_sunshine_account"),
         patch.object(output, "_start_pairing_request_watcher"),
+        patch.object(output, "_sunshine_endpoint_in_use", return_value=False),
         patch("streaming.moonlight_output.MoonlightBridgeServer", _Bridge),
         patch("streaming.moonlight_output.subprocess.Popen", return_value=process) as popen,
         patch("streaming.moonlight_output.sys.platform", "darwin"),
@@ -756,6 +760,50 @@ def test_macos_sunshine_launch_uses_app_resources_and_shared_state(tmp_path):
     assert kwargs["cwd"] == str(app_resources)
     assert kwargs["env"]["D2S_MOONLIGHT_SOURCE_WIDTH"] == "1920"
     output.close()
+
+
+def test_moonlight_falls_back_when_another_sunshine_owns_default_port(
+    monkeypatch, tmp_path, capsys
+):
+    output = _sunshine_config_output(tmp_path)
+    sunshine_exe = tmp_path / "sunshine.exe"
+    sunshine_exe.touch()
+    output._sunshine_exe = sunshine_exe
+    monkeypatch.setattr(output, "_sunshine_endpoint_in_use", lambda: True)
+    monkeypatch.setattr(
+        MoonlightSbsOutput,
+        "_port_family_available",
+        classmethod(lambda _cls, port: port == 48089),
+    )
+    monkeypatch.setattr(output, "_ensure_sunshine_account", lambda: None)
+    monkeypatch.setattr(output, "_read_sunshine_log", lambda: None)
+    monkeypatch.setattr(output, "_start_pairing_request_watcher", lambda: None)
+
+    class FakeBridge:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def start():
+            return "127.0.0.1", 12345
+
+    monkeypatch.setattr(moonlight_output, "MoonlightBridgeServer", FakeBridge)
+    monkeypatch.setattr(
+        moonlight_output,
+        "sunshine_working_directory",
+        lambda _path: tmp_path,
+    )
+    monkeypatch.setattr(
+        moonlight_output.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=None),
+    )
+
+    output.start()
+
+    assert output._sunshine_port == 48089
+    assert read_sunshine_base_port(output._sunshine_config) == 48089
+    assert "selecting a compatible free port family" in capsys.readouterr().out
 
 
 def test_sunshine_service_config_keeps_custom_port_and_host_name(tmp_path):
@@ -1052,3 +1100,266 @@ def test_amd_encoder_wrapper_resizes_oversized_access_unit():
 
     assert encoder.read_packet() == payload
     assert encoder._dll.calls == 2
+
+
+@pytest.mark.parametrize("display_mode", ["Full-SBS", "Half-TAB", "Full-TAB"])
+@pytest.mark.parametrize("fit_mode", ["contain", "cover", "stretch"])
+@pytest.mark.parametrize("source_size", [(3840, 2160), (2560, 1080), (720, 1280), (1366, 768)])
+def test_moonlight_input_regions_follow_each_actual_eye(display_mode, fit_mode, source_size):
+    from streaming.aspect import presentation_blit_regions
+
+    width, height = source_size
+    output = MoonlightSbsOutput(
+        base_dir=".", fps=60, display_mode=display_mode, fit_mode=fit_mode,
+        input_size=source_size, input_bounds=None, device="cuda:0",
+    )
+    config = MoonlightClientConfig(3840, 2160, 60.0, 20_000, "hevc", width, height, 0, 0, width, height, 0)
+    response = output._client_ready_response(config)
+    mappings = response["input_regions"]
+    assert response["accepted_width"] == 3840 and response["accepted_height"] == 2160
+    assert len(mappings) == 2
+    packed = (width * 2, height) if display_mode == "Full-SBS" else (
+        (width, height * 2) if display_mode == "Full-TAB" else (width, height)
+    )
+    expected_regions = presentation_blit_regions(packed, (3840, 2160), fit_mode, display_mode, source_size)
+    centers = []
+    for mapping, (_crop, viewport) in zip(mappings, expected_regions):
+        assert mapping[:4] == list(viewport)
+        x0, y0, x1, y1 = mapping[4:]
+        assert 0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height
+        centers.append(((x0 + x1) / 2, (y0 + y1) / 2))
+        if fit_mode != "cover":
+            assert (x0, y0, x1, y1) == (0, 0, width, height)
+    assert centers[0] == centers[1]
+
+
+def test_moonlight_full_sbs_pointer_uses_visible_rect_not_letterbox():
+    output = MoonlightSbsOutput(
+        base_dir=".", fps=60, display_mode="Full-SBS", fit_mode="contain",
+        input_size=(1920, 1080), input_bounds=None, device="cuda:0",
+    )
+    config = MoonlightClientConfig(1920, 1080, 60.0, 20_000, "hevc", 1920, 1080, 0, 0, 1920, 1080, 0)
+    assert output._client_ready_response(config)["input_regions"] == [
+        [0, 270, 960, 810, 0, 0, 1920, 1080],
+        [960, 270, 1920, 810, 0, 0, 1920, 1080],
+    ]
+
+
+def test_moonlight_half_sbs_retains_legacy_input_contract():
+    output = MoonlightSbsOutput(
+        base_dir=".", fps=60, display_mode="Half-SBS", fit_mode="contain",
+        input_size=(1920, 1080), input_bounds=None, device="cuda:0",
+    )
+    config = MoonlightClientConfig(1920, 1080, 60.0, 20_000, "hevc", 1920, 1080, 0, 0, 1920, 1080, 0)
+    assert output._client_ready_response(config) == {"accepted_width": 1920, "accepted_height": 1080}
+
+
+@pytest.mark.parametrize("display_mode", ["Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB"])
+@pytest.mark.parametrize("fit_mode", ["contain", "cover", "stretch"])
+@pytest.mark.parametrize("percent", ["100%", "85%", "75%", "50%"])
+def test_moonlight_gpu_fit_preserves_existing_pixels(display_mode, fit_mode, percent):
+    import torch
+    from stereo_runtime.pipeline import _resolve_pipeline_render_size
+    from stereo_runtime.render_size import RenderSizeConfig
+    from streaming.aspect import apply_aspect_on_gpu
+
+    if not torch.cuda.is_available():
+        pytest.skip("GPU byte-parity check requires CUDA or ROCm")
+    original = (256, 144)
+    width, height = _resolve_pipeline_render_size(original, RenderSizeConfig(scale_factor=percent))
+    source = (width * (2 if display_mode == "Full-SBS" else 1),
+              height * (2 if display_mode == "Full-TAB" else 1))
+    frame = torch.randint(0, 256, (source[1], source[0], 3), device="cuda", dtype=torch.uint8)
+    output = MoonlightSbsOutput(
+        base_dir=".", fps=60, display_mode=display_mode, fit_mode=fit_mode,
+        input_size=original, input_bounds=None, device="cuda:0",
+    )
+    config = MoonlightClientConfig(256, 144, 60.0, 20_000, "hevc", *original, 0, 0, *original, 0)
+    expected = frame if source == original else apply_aspect_on_gpu(
+        frame, source, original, fit_mode, display_mode, original,
+    )
+    actual = output._fit_frame(frame, config)
+    assert torch.equal(actual, expected)
+    assert actual.is_cuda and actual.dtype == torch.uint8
+
+
+@pytest.mark.parametrize("has_event", [True, False])
+def test_moonlight_encoder_stream_waits_for_frame_producer(has_event):
+    from types import SimpleNamespace
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("GPU stream handoff requires CUDA or ROCm")
+    output = MoonlightSbsOutput(
+        base_dir=".", fps=60, display_mode="Half-SBS", fit_mode="contain",
+        input_size=(64, 32), input_bounds=None, device="cuda:0",
+    )
+    producer = torch.cuda.Stream() if has_event else torch.cuda.current_stream()
+    with torch.cuda.stream(producer):
+        frame = torch.full((32, 64, 3), 173, device="cuda", dtype=torch.uint8)
+        ready = torch.cuda.Event()
+        ready.record()
+    result = SimpleNamespace(sbs=frame, cuda_ready_event=ready if has_event else None)
+    with output._encoder_frame_context(result, frame):
+        assert torch.cuda.current_stream() == output._encode_stream
+        assert output._encode_stream != producer
+        copied = frame.clone()
+    torch.cuda.synchronize()
+    assert torch.equal(copied, frame)
+
+
+def test_moonlight_area_compiler_failure_uses_compatibility_path(monkeypatch):
+    import torch
+    import streaming.aspect as aspect
+
+    if not torch.cuda.is_available():
+        pytest.skip("GPU compiler fallback check requires CUDA or ROCm")
+    triton = pytest.importorskip("triton")
+
+    def unavailable():
+        raise triton.TritonError("optional compiler unsupported")
+
+    monkeypatch.setattr(aspect, "_packed_area_blit_kernel", unavailable)
+    output = MoonlightSbsOutput(
+        base_dir=".", fps=60, display_mode="Full-SBS", fit_mode="contain",
+        input_size=(128, 72), input_bounds=None, device="cuda:0",
+    )
+    frame = torch.randint(0, 256, (72, 256, 3), device="cuda", dtype=torch.uint8)
+    config = MoonlightClientConfig(128, 72, 60.0, 20_000, "hevc", 128, 72, 0, 0, 128, 72, 0)
+    expected = aspect.apply_aspect_on_gpu(frame, (256, 72), (128, 72), "contain", "Full-SBS", (128, 72))
+    assert torch.equal(output._fit_frame(frame, config), expected)
+
+
+def test_gpu_pixel_pack_retains_rounding_boundaries_and_nonfinite_values():
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("GPU packing check requires CUDA or ROCm")
+    pack = pytest.importorskip("stereo_runtime.fast_plus_fused_triton").try_pack_rgb_to_uint8
+    frame = torch.rand((1, 3, 108, 384), device="cuda") * 1.4 - 0.2
+    ties = (torch.arange(256, device="cuda", dtype=torch.float32) + 0.5) / 255.0
+    frame.reshape(-1)[:256] = ties
+    frame.reshape(-1)[256:259] = torch.tensor([float("nan"), float("inf"), float("-inf")], device="cuda")
+    expected = frame.clamp(0, 1).mul(255).round().to(torch.uint8)
+    actual = pack(frame)
+    if actual is None:
+        pytest.skip("optional GPU packing runtime is unavailable")
+    assert torch.equal(actual, expected)
+    assert actual.shape == frame.shape and actual.device == frame.device
+    assert pack(frame.transpose(-1, -2)) is None
+    assert pack(frame.half()) is None
+
+
+@pytest.mark.parametrize("backend,native_available", [("auto", True), ("auto", False), ("pynv", True)])
+def test_cuda_moonlight_prefers_zero_delay_nv12_and_preserves_explicit_or_missing_bridge_fallback(
+    monkeypatch, tmp_path, backend, native_available,
+):
+    import sys
+    from types import SimpleNamespace
+    from streaming import direct_sbs, nvidia_encoder, nvenc_cudaarray_bridge
+
+    calls = []
+    encoder = SimpleNamespace(close=lambda: None)
+    device = SimpleNamespace(type="cuda", index=0)
+    fake_torch = SimpleNamespace(
+        version=SimpleNamespace(hip=None), device=lambda _value: device,
+        cuda=SimpleNamespace(is_available=lambda: True, Stream=lambda **_kwargs: SimpleNamespace(cuda_stream=789)),
+    )
+
+    def native(width, height, **kwargs):
+        calls.append(("native", width, height, kwargs))
+        if not native_available:
+            raise RuntimeError("optional direct NV12 bridge unavailable")
+        return encoder
+
+    def legacy(codec, width, height, **kwargs):
+        calls.append(("pynv", width, height, kwargs))
+        assert codec == "codec"
+        return encoder
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(moonlight_output.sys, "platform", "win32")
+    monkeypatch.setattr(nvenc_cudaarray_bridge, "NvencCudaNv12Encoder", native)
+    monkeypatch.setattr(nvidia_encoder, "PyNvVideoCodecEncoder", legacy)
+    monkeypatch.setattr(direct_sbs, "_load_pynvvideo_codec", lambda: "codec")
+    output = _sunshine_config_output(tmp_path)
+    output.encoder_backend = backend
+    config = MoonlightClientConfig(3840, 2160, 60.0, 20000, "hevc", 1920, 1080, 0, 0, 1920, 1080, 0)
+    try:
+        assert output._configure_encoder(config) == {"accepted_width": 3840, "accepted_height": 2160}
+        assert output._encoder is encoder and output._encoder_config is config
+        assert output.current_network_bitrate_mbps == 20.0
+        expected = "native" if backend == "auto" and native_available else "pynv"
+        assert calls[-1][0] == expected
+        assert calls[-1][1:3] == (3840, 2160)
+        assert calls[-1][3]["bitrate"] == 20_000_000
+        assert calls[-1][3]["fps"] == 60 and calls[-1][3]["hevc"] is True
+        if expected == "pynv":
+            assert calls[-1][3]["cuda_stream"] == 789
+        if backend == "pynv":
+            assert len(calls) == 1
+    finally:
+        output._client_disconnected()
+
+
+def test_nvenc_direct_nv12_uses_the_active_encoder_stream(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from streaming import nvidia_encoder
+    from streaming.nvenc_cudaarray_bridge import NvencCudaNv12Encoder
+
+    calls = []
+    sequence = []
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            current_stream=lambda *, device: SimpleNamespace(
+                cuda_stream=456, synchronize=lambda: sequence.append("sync")
+            )
+        )
+    )
+
+    def convert(frame, **kwargs):
+        calls.append((frame, kwargs))
+        sequence.append("convert")
+        return None
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(nvidia_encoder, "rgb_cuda_to_nv12", convert)
+    encoder = object.__new__(NvencCudaNv12Encoder)
+    encoder._closed = False
+    encoder._handle = object()
+    encoder._nv12 = SimpleNamespace(device=object())
+    encoder._library = SimpleNamespace(
+        d2s_nvenc_nv12_submit=lambda *_args: sequence.append("submit") or 0
+    )
+    encoder._drain_timed_packets = lambda: []
+
+    assert encoder.encode_access_units(object(), frame_index=7) == []
+    assert calls[0][1]["encoder_stream"] == 456
+    assert sequence == ["convert", "sync", "submit"]
+
+
+def test_moonlight_encoder_target_uses_scaled_transport_size(tmp_path):
+    output = MoonlightSbsOutput(
+        base_dir=tmp_path,
+        fps=60,
+        display_mode="Half-SBS",
+        fit_mode="contain",
+        input_size=(3840, 2160),
+        input_bounds=None,
+        device="cuda:0",
+        target_size=(3264, 1836),
+    )
+    client_config = MoonlightClientConfig(
+        3840, 2160, 60.0, 20_000, "hevc", 3840, 2160, 0, 0, 3840, 2160, 0,
+    )
+
+    effective = output._encoder_config_for_target(client_config)
+    smaller_client = output._encoder_config_for_target(
+        MoonlightClientConfig(
+            1920, 1080, 60.0, 20_000, "hevc", 3840, 2160, 0, 0, 3840, 2160, 0,
+        )
+    )
+
+    assert (effective.width, effective.height) == (3264, 1836)
+    assert (smaller_client.width, smaller_client.height) == (1920, 1080)

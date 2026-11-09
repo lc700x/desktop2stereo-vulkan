@@ -296,7 +296,6 @@ class GUIBuilderMixin:
             self.stream_url_label, self.stream_port_label,
             self.stream_proto_label, self.audio_label, self.crf_label,
             self.stream_calibration_label,
-            self.stream_display_fit_label,
             self.color_brightness_label, self.color_saturation_label,
             self.color_temperature_label, self.projection_min_lod_label,
             self.projection_mip_lod_bias_label,
@@ -306,7 +305,7 @@ class GUIBuilderMixin:
             self.edge_threshold_label, self.anaglyph_label,
             self.render_scale_label, self.render_max_pixels_label, self.render_align_label,
             self.display_mode_label, self.environment_label,
-            self.theme_label, self.stream_quality_label, self.stream_key_label,
+            self.theme_label, self.stream_key_label, self.stream_display_fit_label,
             self.audio_delay_label, self.color_contrast_label,
             self.color_gamma_label, self.color_tint_label, self.projection_max_lod_label,
             self.projection_rcas_sharpness_label,
@@ -658,7 +657,7 @@ class GUIBuilderMixin:
             options=["Scaled"], value="Scaled", width=S(130),
             on_select=self.on_render_policy_change)
         self.render_policy_dd.visible = False
-        self.render_scale_label = ft.Text("Render Scale:", size=FONT_SIZE, width=S(130))
+        self.render_scale_label = ft.Text("Quality Scale:", size=FONT_SIZE, width=S(130))
         self.render_scale_dd = CompactDropdown(options=self._render_scale_options(),
             value=self._render_scale_to_display(DEFAULTS["Render Scale"]), width=S(130))
         self.render_align_label = ft.Text("Render Align:", size=FONT_SIZE, width=S(130))
@@ -1050,12 +1049,18 @@ class GUIBuilderMixin:
         self.stream_port_label = ft.Text("Streamer Port:", size=FONT_SIZE, width=S(150))
         self.stream_port_tf = CompactTextField(value=str(DEFAULT_PORT), width=S(130),
             on_change=self.update_stream_url, filter=r"[0-9]", max_length=5)
-        self.stream_quality_label = ft.Text("Stream Quality:", size=FONT_SIZE)
-        qual_vals = [str(i) for i in range(100, 49, -5)]
-        self.stream_quality_dd = CompactDropdown(width=S(130), options=[q for q in qual_vals], value="100")
+        fit_tooltip = UI_MESSAGES[self.locale]["tooltip_stream_fit"]
+        self.stream_display_fit_label = ft.Text("Stream Fit:", size=FONT_SIZE, width=S(130), tooltip=fit_tooltip)
+        self.stream_display_fit_dd = CompactDropdown(
+            options=self._display_fit_options(),
+            value=self._display_fit_to_display("contain"),
+            width=S(130),
+            on_select=self.on_stereo_hot_param_change,
+            tooltip=fit_tooltip,
+        )
         self.stream_port_quality_row = ft.Row(
             [self.stream_port_label, self.stream_port_tf, ft.Container(width=S(40)),
-             self.stream_quality_label, self.stream_quality_dd], spacing=1)
+             self.stream_display_fit_label, self.stream_display_fit_dd], spacing=1)
         self.stream_proto_label = ft.Text("Stream Protocol:", size=FONT_SIZE, width=S(150))
         self.stream_proto_dd = CompactDropdown(width=S(130),
             options=["RTMP", "RTSP", "HLS", "HLS M3U8", "WebRTC"],
@@ -1182,16 +1187,6 @@ class GUIBuilderMixin:
             on_change=self.on_audio_delay_change, filter=r"[0-9\-\.]", max_length=6)
         self.crf_row = ft.Row([self.crf_label, self.crf_tf, ft.Container(width=S(40)),
             self.audio_delay_label, self.audio_delay_tf], spacing=1)
-        fit_tooltip = UI_MESSAGES[self.locale]["tooltip_display_fit"]
-        self.stream_display_fit_label = ft.Text("Stream Fit:", size=FONT_SIZE, width=S(150), tooltip=fit_tooltip)
-        self.stream_display_fit_dd = CompactDropdown(
-            options=self._display_fit_options(),
-            value=self._display_fit_to_display("contain"),
-            width=S(130),
-            on_select=self.on_stereo_hot_param_change,
-            tooltip=fit_tooltip,
-        )
-        self.stream_fit_row = ft.Row([self.stream_display_fit_label, self.stream_display_fit_dd], spacing=1)
         self.moonlight_pairing_btn = ft.Button(
             content=ft.Text(
                 UI_MESSAGES[self.locale].get("Open Moonlight pairing", "Open Moonlight pairing"),
@@ -1254,7 +1249,6 @@ class GUIBuilderMixin:
         self._streamer_rows = [
             self.stream_port_quality_row, self.stream_proto_row,
             self.crf_row, self.audio_row,
-            self.stream_fit_row,
             self.stream_calibration_row,
             self.stream_calibration_warning_row,
             self.stream_calibration_result_row,
@@ -1282,8 +1276,8 @@ class GUIBuilderMixin:
     def _get_streamer_row_map():
         return {
             "Local Viewer": [], "OpenXR Link": [],
-            "MJPEG Streamer": [0, 4],
-            "RTMP Streamer": [0, 1, 2, 3, 4, 5, 6, 7, 9],
+            "MJPEG Streamer": [0],
+            "RTMP Streamer": [0, 1, 2, 3, 4, 5, 6, 8],
             "Moonlight Streamer": [],
         }
 

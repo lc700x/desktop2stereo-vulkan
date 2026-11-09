@@ -353,6 +353,27 @@ def runtime_sbs_to_rgb(frame_or_result: Any) -> np.ndarray:
     return np.ascontiguousarray(image)
 
 
+def stream_target_size_for_config(
+    input_size: Tuple[int, int], config: Any, fit_mode: str,
+) -> Tuple[int, int]:
+    """Resolve the encoder canvas from the actual processing input size."""
+    from stereo_runtime.output_quality import output_sampling_plan_for_config
+
+    width, height = input_size
+    plan = (
+        None if os.environ.get("D2S_OPENXR_NO_EYE_QUALITY")
+        else output_sampling_plan_for_config(config, width, height)
+    )
+    if plan is not None:
+        width, height = plan.target_width, plan.target_height
+    display_mode = str(getattr(config, "output_format", "half_sbs")).replace("_", "-")
+    packed_size = (
+        width * (2 if display_mode == "full-sbs" else 1),
+        height * (2 if display_mode == "full-tab" else 1),
+    )
+    return transport_canvas_size(packed_size, fit_mode, input_size=input_size, display_mode=display_mode)
+
+
 class RuntimeSbsRgbConverter:
     """Convert runtime SBS frames with a reusable pinned CUDA download buffer."""
 
@@ -363,7 +384,9 @@ class RuntimeSbsRgbConverter:
         display_mode: str = "Half-SBS",
         fit_mode: str = "contain",
         input_size: Tuple[int, int] | None = None,
+        target_size: Tuple[int, int] | None = None,
     ) -> None:
+        self.target_size = target_size
         self.copy_output = bool(copy_output)
         self.display_mode = str(display_mode or "Half-SBS").strip()
         self.fit_mode = str(fit_mode or "contain").strip()
@@ -400,13 +423,13 @@ class RuntimeSbsRgbConverter:
         # Transport canvas mirrors local viewer presentation / legacy
         # fill_16_9: contain pads each eye to a 16:9 canvas before packing;
         # cover/stretch keep the original input aspect.
-        tw, th = transport_canvas_size(
+        tw, th = self.target_size or transport_canvas_size(
             (w, h),
             self.fit_mode,
             input_size=self.input_size,
             display_mode=self.display_mode,
         )
-        process_aspect = normalize_display_fit_mode(self.fit_mode) == "contain"
+        process_aspect = (tw, th) != (w, h) or normalize_display_fit_mode(self.fit_mode) == "contain"
         # For GPU path, keep on GPU and apply per-eye aspect before download.
         # The 16:9 canvas processing is GPU-mandatory for CUDA frames: a
         # failure must surface, never silently degrade to a CPU download that
@@ -524,7 +547,9 @@ class DirectSbsOutputConsumer:
         fps_report_interval: float = 5.0,
         clock: Callable[[], float] = time.perf_counter,
         gpu_required: bool = False,
+        target_size: Tuple[int, int] | None = None,
     ) -> None:
+        self.target_size = target_size
         self.runtime_q = runtime_q
         self.shutdown_event = shutdown_event
         self.output = output
@@ -547,10 +572,11 @@ class DirectSbsOutputConsumer:
             display_mode=getattr(output, "display_mode", "Half-SBS"),
             fit_mode=getattr(output, "fit_mode", "contain"),
             input_size=getattr(output, "input_size", None),
+            target_size=target_size,
         )
 
     def _apply_cuda_aspect(self, frame: Any) -> Any:
-        """Pad a CUDA frame into the 16:9 transport canvas (contain only).
+        """Fit a CUDA frame into the unscaled transport canvas, entirely on GPU.
 
         The letterboxing runs entirely on the GPU (torch resize + blit into a
         device canvas), so CUDA paths stay zero-copy with respect to the host:
@@ -564,7 +590,7 @@ class DirectSbsOutputConsumer:
             h, w = int(frame.shape[-2]), int(frame.shape[-1])
         else:
             h, w = int(frame.shape[0]), int(frame.shape[1])
-        tw, th = transport_canvas_size(
+        tw, th = self.target_size or transport_canvas_size(
             (w, h),
             "contain",
             input_size=getattr(self.output, "input_size", None),
@@ -576,7 +602,7 @@ class DirectSbsOutputConsumer:
             frame,
             source_size=(w, h),
             target_size=(tw, th),
-            fit_mode="contain",
+            fit_mode=getattr(self.output, "fit_mode", "contain"),
             display_mode=getattr(self.output, "display_mode", "Half-SBS"),
             input_size=getattr(self.output, "input_size", None),
         )
@@ -724,6 +750,7 @@ class DirectSbsOutputConsumer:
             native_stream_frame = None
             try:
                 runtime_result, _capture_timestamp = item
+                target_kwargs = {"target_size": self.target_size} if self.target_size is not None else {}
                 self._fps_sbs_frames += 1
                 capture_timestamp = getattr(
                     runtime_result, "capture_timestamp", _capture_timestamp
@@ -753,6 +780,7 @@ class DirectSbsOutputConsumer:
                                 _capture_timestamp,
                             )
                         ),
+                        **target_kwargs,
                     )
                     self._fps_submit_seconds += self._clock() - submit_started
                     self._fps_submitted_frames += 1
@@ -764,7 +792,7 @@ class DirectSbsOutputConsumer:
                 prepare_calibration = getattr(
                     self.output, "prepare_calibration_source", None
                 )
-                if callable(prepare_calibration) and prepare_calibration(runtime_result):
+                if callable(prepare_calibration) and prepare_calibration(runtime_result, **target_kwargs):
                     if native_stream_frame is not None:
                         native_stream_frame.release()
                     self._fps_submitted_frames += 1
@@ -789,7 +817,7 @@ class DirectSbsOutputConsumer:
                     # native ring slot concurrently.
                     import numpy as np
 
-                    target_size = getattr(runtime_result, "output_display_size", None)
+                    target_size = self.target_size or getattr(runtime_result, "output_display_size", None)
                     if not isinstance(target_size, (tuple, list)) or len(target_size) != 2:
                         raise RuntimeError("native stream result has no output size")
                     target_width, target_height = (
@@ -844,7 +872,7 @@ class DirectSbsOutputConsumer:
                 # CUDA/CPU paths below. The CUDA path keeps the letterboxing on
                 # the GPU (zero host round trip) as the first priority.
                 letterbox_required = self._frame_letterbox_required(runtime_result)
-                if letterbox_required and not getattr(self, "_letterbox_notice", False):
+                if letterbox_required and self.target_size is None and not getattr(self, "_letterbox_notice", False):
                     self._letterbox_notice = True
                     print(
                         "[DirectSbsStream] Non-16:9 input: native GPU surface "
@@ -857,14 +885,14 @@ class DirectSbsOutputConsumer:
                     "submit_vulkan_stereo_frame",
                     None,
                 )
-                if letterbox_required:
+                if letterbox_required and self.target_size is None:
                     submit_vulkan_stereo = None
                 left_eye = getattr(runtime_result, "left_eye", None)
                 right_eye = getattr(runtime_result, "right_eye", None)
                 if callable(submit_vulkan_stereo) and getattr(
                     left_eye, "context", None
                 ) is not None and getattr(right_eye, "context", None) is not None:
-                    handled = submit_vulkan_stereo(runtime_result)
+                    handled = submit_vulkan_stereo(runtime_result, **target_kwargs)
                     if handled is False:
                         if self.gpu_required:
                             raise RuntimeError("GPU Vulkan stream submission failed")
@@ -879,7 +907,7 @@ class DirectSbsOutputConsumer:
                 if callable(submit_vulkan_stereo) and getattr(
                     runtime_result, "vulkan_compute_request", None
                 ) is not None:
-                    handled = submit_vulkan_stereo(runtime_result)
+                    handled = submit_vulkan_stereo(runtime_result, **target_kwargs)
                     if handled is False:
                         if self.gpu_required:
                             raise RuntimeError("deferred GPU Vulkan stream submission failed")
@@ -895,10 +923,10 @@ class DirectSbsOutputConsumer:
                 submit_native_surface = getattr(
                     self.output, "submit_native_d3d11_surface", None
                 )
-                if letterbox_required:
+                if letterbox_required and self.target_size is None:
                     submit_native_surface = None
                 if native_surface is not None and callable(submit_native_surface):
-                    handled = submit_native_surface(native_surface)
+                    handled = submit_native_surface(native_surface, **target_kwargs)
                     if handled is False:
                         if self.gpu_required:
                             raise RuntimeError("native GPU surface submission failed")
@@ -922,15 +950,12 @@ class DirectSbsOutputConsumer:
                     getattr(cuda_frame, "is_cuda", False)
                 ):
                     # GPU zerocopy paths skip RuntimeSbsRgbConverter, so apply the
-                    # same aspect rule here: contain letterboxes into a 16:9
-                    # transport canvas, cover/stretch pass the frame through.
-                    if (
-                        normalize_display_fit_mode(
-                            getattr(self.output, "fit_mode", "contain")
-                        )
-                        == "contain"
-                        # MJPEG applies aspect inside its encoder loop.
-                        and not isinstance(self.output, MjpegDirectSbsOutput)
+                    # same per-eye fit here, including restoring Quality Scale
+                    # frames to their unscaled encoder canvas. MJPEG owns this
+                    # operation in its existing encoder resize profile.
+                    if not isinstance(self.output, MjpegDirectSbsOutput) and (
+                        self.target_size is not None
+                        or normalize_display_fit_mode(getattr(self.output, "fit_mode", "contain")) == "contain"
                     ):
                         # GPU letterboxing is mandatory for CUDA frames (never a
                         # silent CPU fallback); a failure must surface.
@@ -1236,6 +1261,7 @@ class MjpegDirectSbsOutput:
         port: int,
         fps: int,
         quality: int,
+        target_size: Tuple[int, int] | None = None,
         display_mode: str = "Half-SBS",
         fit_mode: str = "contain",
         input_size: Tuple[int, int] | None = None,
@@ -1258,6 +1284,8 @@ class MjpegDirectSbsOutput:
             codec="mjpeg",
             quality=self.quality,
             target_fps=self.requested_fps,
+            resize_width=target_size[0] if target_size is not None else None,
+            resize_height=target_size[1] if target_size is not None else None,
             pixel_format="rgb",
         )
         self.streamer = MJPEGStreamer(
@@ -1484,11 +1512,11 @@ class FfmpegDirectSbsOutput:
             or 0.0
         )
 
-    def prepare_calibration_source(self, runtime_result: Any) -> bool:
+    def prepare_calibration_source(self, runtime_result: Any, *, target_size: Tuple[int, int] | None = None) -> bool:
         """Start or retune the independent probe without converting RGB frames."""
         if self._calibration_controller is None:
             return False
-        display_size = getattr(runtime_result, "output_display_size", None)
+        display_size = target_size or getattr(runtime_result, "output_display_size", None)
         if not display_size:
             frame = getattr(runtime_result, "sbs", runtime_result)
             shape = tuple(int(value) for value in getattr(frame, "shape", ()))
@@ -1770,8 +1798,12 @@ class FfmpegDirectSbsOutput:
         measured = max(1.0, float(measured_fps))
         if measured >= float(maximum):
             return maximum
-        safe_limit = min(float(maximum), measured * 0.90)
-        for candidate in (60, 50, 48, 40, 30, 25, 24, 20, 15, 12, 10):
+        safe_limit = min(float(maximum), measured * 0.95)
+        if maximum >= 42 and measured >= 42.0:
+            # Keep the 42 FPS tier so a 40 FPS minimum survives timer jitter
+            # and five-second rate windows.
+            safe_limit = max(safe_limit, 42.0)
+        for candidate in (60, 50, 48, 42, 40, 30, 25, 24, 20, 15, 12, 10):
             if candidate <= maximum and candidate <= safe_limit:
                 return candidate
         return max(5, min(maximum, int(safe_limit)))
@@ -4070,6 +4102,7 @@ class IntelD3D11DirectSbsOutput(IntelQsvDirectSbsOutput):
         self._native_onevpl_active = False
         self._vulkan_sbs_composer = None
         self._vulkan_runtime_bridge = None
+        self._native_resize_composer = None
 
     @staticmethod
     def _rgb_to_bgra(frame: np.ndarray) -> np.ndarray:
@@ -4173,6 +4206,10 @@ class IntelD3D11DirectSbsOutput(IntelQsvDirectSbsOutput):
             try: self._vulkan_runtime_bridge.close()
             except Exception: pass
             self._vulkan_runtime_bridge = None
+        resizer = getattr(self, "_native_resize_composer", None)
+        if resizer is not None:
+            resizer.close()
+            self._native_resize_composer = None
         self._stop_process(self._native_onevpl_mux)
         self._native_onevpl_mux = None
 
@@ -4208,11 +4245,30 @@ class IntelD3D11DirectSbsOutput(IntelQsvDirectSbsOutput):
             os.environ["D2S_INTEL_VULKAN_SBS"] = "0"
             self._stop_native_onevpl()
 
-    def submit_native_d3d11_surface(self, frame: Any) -> bool:
+    def submit_native_d3d11_surface(self, frame: Any, *, target_size: Tuple[int, int] | None = None) -> bool:
         """Encode a same-device final BGRA8 texture without CPU upload."""
         if self.stereo_mix_device:
             self._disable_native_onevpl_for_audio()
             return False
+        if target_size is not None and target_size != (frame.width, frame.height):
+            resource = getattr(frame, "vulkan_resource", None)
+            if resource is None:
+                # Preserve the requested canvas: compatibility callers can use
+                # the tensor path; strict GPU callers reject a missing GPU route.
+                return False
+            from desktop2stereo.stereo_runtime.intel_vulkan_sbs import IntelVulkanSbsComposer
+
+            resizer = getattr(self, "_native_resize_composer", None)
+            if resizer is None:
+                resizer = IntelVulkanSbsComposer(
+                    resource.context, frame.width // 2, frame.height, target_size=target_size,
+                )
+                self._native_resize_composer = resizer
+            frame = resizer.compose(
+                resource, resource, ready_timeline=frame.ready_timeline,
+                display_mode=self.display_mode, fit_mode=self.fit_mode,
+                input_size=self.input_size, packed_source=True,
+            )
         enabled = os.environ.get("D2S_ONEVPL_FINAL_SBS", "0").strip().casefold()
         if enabled not in {"1", "true", "yes", "on"}:
             raise RuntimeError("native final SBS surface path is disabled")
@@ -4287,7 +4343,9 @@ class IntelD3D11DirectSbsOutput(IntelQsvDirectSbsOutput):
             self._native_onevpl_mux.stdin.flush()
         return True
 
-    def submit_vulkan_stereo_frame(self, runtime_result: Any) -> bool:
+    def submit_vulkan_stereo_frame(
+        self, runtime_result: Any, *, target_size: Tuple[int, int] | None = None,
+    ) -> bool:
         """Compose Vulkan eye resources into the Intel D3D11 encoder surface."""
         if self.stereo_mix_device:
             self._disable_native_onevpl_for_audio()
@@ -4306,7 +4364,12 @@ class IntelD3D11DirectSbsOutput(IntelQsvDirectSbsOutput):
             height, width = shape[-2:]
             try:
                 if self._vulkan_runtime_bridge is None:
-                    self._vulkan_runtime_bridge = IntelVulkanSbsRuntimeBridge(width, height)
+                    bridge_kwargs = (
+                        dict(target_size=target_size, display_mode=self.display_mode,
+                             fit_mode=self.fit_mode, input_size=self.input_size)
+                        if target_size is not None else {}
+                    )
+                    self._vulkan_runtime_bridge = IntelVulkanSbsRuntimeBridge(width, height, **bridge_kwargs)
                 elif (
                     self._vulkan_runtime_bridge.eye_width != width
                     or self._vulkan_runtime_bridge.eye_height != height
@@ -4339,13 +4402,15 @@ class IntelD3D11DirectSbsOutput(IntelQsvDirectSbsOutput):
                 OneVPLD3D11SurfaceEncoder,
             )
 
-            self._vulkan_sbs_composer = IntelVulkanSbsComposer(context, width, height)
+            composer_kwargs = {"target_size": target_size} if target_size is not None else {}
+            self._vulkan_sbs_composer = IntelVulkanSbsComposer(context, width, height, **composer_kwargs)
             self._native_surface = self._vulkan_sbs_composer.surface
-            budget = self._dynamic_stream_rate_budget(width * 2, height)
+            output_width, output_height = self._native_surface.width, self._native_surface.height
+            budget = self._dynamic_stream_rate_budget(output_width, output_height)
             target_mbps = int(budget[0] if budget else 10)
             self._native_onevpl_encoder = OneVPLD3D11SurfaceEncoder(
-                width=width * 2,
-                height=height,
+                width=output_width,
+                height=output_height,
                 fps=self.fps,
                 bitrate=target_mbps * 1_000_000,
                 d3d11_device=self._native_surface.device,
@@ -4356,7 +4421,7 @@ class IntelD3D11DirectSbsOutput(IntelQsvDirectSbsOutput):
             self._start_native_onevpl_mux()
             self._native_onevpl_active = True
             self._native_onevpl_pts = 0
-            self._frame_size = (width * 2, height)
+            self._frame_size = (output_width, output_height)
             print(
                 "[IntelStream] Vulkan eyes -> D3D11 shared BGRA SBS -> "
                 "VideoProcessor NV12 -> oneVPL -> MediaMTX; gpu_to_cpu=False "
@@ -4375,10 +4440,15 @@ class IntelD3D11DirectSbsOutput(IntelQsvDirectSbsOutput):
             )
             or 0
         )
+        fit_kwargs = (
+            dict(display_mode=self.display_mode, fit_mode=self.fit_mode, input_size=self.input_size)
+            if target_size is not None else {}
+        )
         frame = self._vulkan_sbs_composer.compose(
             left_eye,
             right_eye,
             ready_timeline=ready_timeline or None,
+            **fit_kwargs,
         )
         self.submit_native_d3d11_surface(frame)
         return True

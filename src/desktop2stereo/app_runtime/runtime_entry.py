@@ -14,7 +14,7 @@ from typing import Any
 from capture import capture_frame_to_rgb, prepare_rgb_for_stereo_runtime
 from capture.adaptive_rate import AdaptiveCaptureRate, adaptive_capture_enabled_for_mode
 from capture.session import CaptureSessionLoop
-from stereo_runtime.pipeline import RuntimePipelineLoop
+from stereo_runtime.pipeline import RuntimePipelineLoop, _resolve_pipeline_render_size
 from stereo_runtime.render_size import RenderSizePolicy
 from utils import (
     CAPTURE_MODE,
@@ -596,21 +596,13 @@ def _wait_for_runtime_ready(
 
 
 def _resolve_local_viewer_render_size_config(settings, run_mode, device):
-    """Respect native processing for NVIDIA TensorRT; retain other source policies.
-
-    The optimized CUDA Half-SBS path keeps the requested 4K processing size.
-    Other GPU providers retain the v2.5 one-eye source size. The existing
-    D2S_LOCAL_VIEWER_NATIVE_4K override still controls either behavior.
-    """
+    """Honor Quality Scale unless the explicit legacy source override is set."""
     if platform.system() == "Darwin" or run_mode not in {"Local Viewer", "Viewer"}:
         return RENDER_SIZE_CONFIG
     if str(getattr(device, "type", device)).strip().lower() != "cuda":
         return RENDER_SIZE_CONFIG
-    if "D2S_LOCAL_VIEWER_NATIVE_4K" not in os.environ and settings.get("TensorRT") is True:
-        import torch
-
-        if not torch.version.hip:
-            return RENDER_SIZE_CONFIG
+    if "D2S_LOCAL_VIEWER_NATIVE_4K" not in os.environ:
+        return RENDER_SIZE_CONFIG
     if os.environ.get("D2S_LOCAL_VIEWER_NATIVE_4K", "0").strip().lower() in {
         "1", "true", "yes", "on"
     }:
@@ -621,7 +613,7 @@ def _resolve_local_viewer_render_size_config(settings, run_mode, device):
         return RENDER_SIZE_CONFIG
     if RENDER_SIZE_CONFIG.policy is not RenderSizePolicy.SCALED:
         return RENDER_SIZE_CONFIG
-    if RENDER_SIZE_CONFIG.scale_factor != "4K / 100%":
+    if RENDER_SIZE_CONFIG.scale_factor not in {"100%", "4K / 100%"}:
         return RENDER_SIZE_CONFIG
     if not isinstance(OUTPUT_RESOLUTION, (tuple, list)) or len(OUTPUT_RESOLUTION) != 2:
         return RENDER_SIZE_CONFIG
@@ -671,40 +663,26 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
     configured_run_mode = normalize_run_mode(
         settings.get("Run Mode", "Local Viewer")
     )
+    if configured_run_mode in {"Local Viewer", "Viewer"}:
+        # Local presentation already fits the processed eyes to the display.
+        # A headset-tier upscale here can undo Quality Scale and turn reduced
+        # Full-SBS into a 13K frame, exhausting device memory before present.
+        os.environ.setdefault("D2S_CAP_OUTPUT_UPSCALE", "1")
     if configured_run_mode in {"Local Viewer", "Viewer"} and platform.system() == "Darwin":
         if bool(settings.get("CoreML", False)):
             os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")
             os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")
-        # Local Viewer presents to a physical display; skip the headset-tier
-        # upscale chain (see output_sampling_plan_for_config).
-        os.environ.setdefault("D2S_CAP_OUTPUT_UPSCALE", "1")
         # Ship packed uint8 SBS so the viewer skips float32 transport
         # and re-quantization (pack once in the runtime, upload once in the
         # viewer). setdefault keeps an explicit user override authoritative.
         os.environ.setdefault("D2S_RUNTIME_OUTPUT_UINT8", "1")
-        # Deferred Metal shader warp is armed for the Metal viewer (the
-        # macOS default) and dropped if it falls back; see the Darwin viewer
-        # selection below.
-        # Vulkan fused warp-pack ships INPUT-RESOLUTION SBS (NVIDIA-path
-        # contract: 1080p in -> half_sbs 1920x1080). Quarter-res synth-scale
-        # preprocess would read as blur once packed at input res, so the
-        # fused path runs the pipeline at full render size. Explicit user
-        # overrides of either env stay authoritative.
-        _mac_viewer = os.environ.get("D2S_MAC_VIEWER") or "metal"
-        _vk_fused_on = os.environ.get("D2S_VK_FUSED_WARP", "1") not in {
-            "0", "false", "off",
-        }
-        if _mac_viewer == "vulkan" and _vk_fused_on:
-            os.environ.setdefault("D2S_HALF_RES_SYNTH", "0")
-            os.environ.setdefault("D2S_PREPROCESS_AT_SYNTH_SCALE", "0")
-        else:
-            # Halve synthesis resolution and upscale: warp cost scales with
-            # pixel count, so this cuts the dominant stage ~4x for the Metal
-            # viewer (its warp path skips synthesis; sampling upscales).
-            os.environ.setdefault("D2S_HALF_RES_SYNTH", "1")
-            # Preprocess directly at synthesis scale: skips a display-size
-            # upscale plus redundant downscale per frame.
-            os.environ.setdefault("D2S_PREPROCESS_AT_SYNTH_SCALE", "1")
+        # Local Viewer consumes the processed output at its actual Quality
+        # Scale. Do not add a hidden half-resolution synthesis pass and then
+        # sample it back to the drawable: the drawable is the only final
+        # display sample, while runtime/packing keep the selected size.
+        # setdefault keeps explicit performance experiments authoritative.
+        os.environ.setdefault("D2S_HALF_RES_SYNTH", "0")
+        os.environ.setdefault("D2S_PREPROCESS_AT_SYNTH_SCALE", "0")
         # Depth input scale is OPT-IN (e.g. D2S_DEPTH_INPUT_SCALE=0.75 buys
         # ~2x faster M1 MPS depth at corr 0.95); no default anymore. The
         # softened 0.75x depth made object-edge parallax flicker vs v2.5.0,
@@ -1190,6 +1168,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 MjpegDirectSbsOutput,
                 PyNvDirectSbsOutput,
                 VulkanDirectSbsOutput,
+                stream_target_size_for_config,
             )
             from streaming.stream_calibration import build_calibration_fingerprint
 
@@ -1210,12 +1189,37 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                         if title_stream and OS_NAME == "Windows":
                             try:
                                 import win32gui
+                                import ctypes
+                                from ctypes import wintypes
 
                                 hwnd_stream = win32gui.FindWindow(None, title_stream)
                                 if hwnd_stream:
-                                    client = win32gui.GetClientRect(hwnd_stream)
-                                    left, top = win32gui.ClientToScreen(hwnd_stream, (client[0], client[1]))
-                                    width, height = client[2] - client[0], client[3] - client[1]
+                                    bounds = wintypes.RECT()
+                                    dwm_result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                                        hwnd_stream,
+                                        9,  # DWMWA_EXTENDED_FRAME_BOUNDS
+                                        ctypes.byref(bounds),
+                                        ctypes.sizeof(bounds),
+                                    )
+                                    if dwm_result == 0:
+                                        left, top = int(bounds.left), int(bounds.top)
+                                        width = int(bounds.right - bounds.left)
+                                        height = int(bounds.bottom - bounds.top)
+                                    else:
+                                        client = win32gui.GetClientRect(hwnd_stream)
+                                        left, top = win32gui.ClientToScreen(
+                                            hwnd_stream, (client[0], client[1])
+                                        )
+                                        width = client[2] - client[0]
+                                        height = client[3] - client[1]
+                                        dpi = int(
+                                            ctypes.windll.user32.GetDpiForWindow(
+                                                hwnd_stream
+                                            )
+                                        )
+                                        if dpi > 0:
+                                            width = round(width * dpi / 96)
+                                            height = round(height * dpi / 96)
                                     if width > 0 and height > 0:
                                         source_rect = (left, top, width, height)
                             except Exception:
@@ -1246,6 +1250,18 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 stream_input_bounds = (
                     0, 0, stream_input_size[0], stream_input_size[1],
                     stream_input_size[0], stream_input_size[1],
+                )
+
+            stream_target_size = None
+            if stream_input_size is not None:
+                # A scaled render is packed and encoded at that size. Only an
+                # explicitly enabled output-quality plan may request a larger
+                # canvas; Render Scale itself never upscales back to capture size.
+                scaled_size = _resolve_pipeline_render_size(
+                    stream_input_size, effective_render_size_config
+                )
+                stream_target_size = stream_target_size_for_config(
+                    scaled_size, context.stereo_runtime.stereo_config, stream_fit_mode,
                 )
 
             if configured_run_mode in CALIBRATABLE_STREAM_MODES:
@@ -1398,6 +1414,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     display_mode=str(settings.get("Display Mode", "Half-SBS")),
                     fit_mode=stream_fit_mode,
                     input_size=stream_input_size,
+                    target_size=stream_target_size,
                     device=str(DEVICE),
                     encoder_backend=str(settings.get("Video Encoder Backend", "auto")),
                     bitrate_mbps=int(settings.get("Stream Target Bitrate Mbps", 0) or 0),
@@ -1408,6 +1425,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     port=int(settings.get("Streamer Port", 1122)),
                     fps=int(FPS),
                     quality=int(settings.get("Stream Quality", 90)),
+                    target_size=stream_target_size,
                     display_mode=str(settings.get("Display Mode", "Half-SBS")),
                     fit_mode=stream_fit_mode,
                     input_size=stream_input_size,
@@ -1420,6 +1438,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 runtime_q=presentation_q,
                 shutdown_event=shutdown_event,
                 output=network_output,
+                target_size=stream_target_size,
                 gpu_required=bool(context.capture_config.gpu_required),
                 source_stat_inc=callbacks.source_stat_inc,
                 show_fps_provider=callbacks.show_fps,

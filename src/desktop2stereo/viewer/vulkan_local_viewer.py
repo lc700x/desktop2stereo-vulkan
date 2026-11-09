@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from utils.display_info import resolve_glfw_monitor_index
 from utils.queue_utils import _release_item
+from utils.sys_load import format_load_fields
 from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
 from viewer.direct_sink import DIRECT_SINK, direct_staging_enabled
 from viewer.vulkan_fps_overlay import VulkanFpsOverlay, build_fps_panel_rgba
@@ -36,6 +37,7 @@ from viewer.window_control import (
     hide_window_from_capture,
     set_window_mouse_passthrough,
     show_window_in_capture,
+    update_native_cursor_suppression,
 )
 
 
@@ -333,6 +335,120 @@ def _cover_crop_rect(
         return (sw - width) // 2, 0, width, sh
     height = max(1, min(sh, round(sw * th / tw)))
     return 0, (sh - height) // 2, sw, height
+
+
+def local_viewer_fast_present_enabled() -> bool:
+    """Master switch for output-preserving Local Viewer present optimisations.
+
+    Set ``D2S_LOCAL_VIEWER_FAST_PRESENT=0`` to A/B against the original record
+    path on the same hardware. Nothing here changes depth, disparity, blend,
+    blit geometry or the swapchain present mode.
+    """
+    return os.environ.get("D2S_LOCAL_VIEWER_FAST_PRESENT", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def local_viewer_precise_barriers_enabled() -> bool:
+    """Switch for narrowing layout-transition barriers to TRANSFER stages.
+
+    Set ``D2S_LOCAL_VIEWER_PRECISE_BARRIERS=0`` if a driver shows flicker or
+    device loss with the narrower stage masks. Independent of the fast-present
+    switch so the two can be isolated during A/B runs.
+    """
+    return os.environ.get("D2S_LOCAL_VIEWER_PRECISE_BARRIERS", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def blit_destinations_cover_target(
+    blit_regions: tuple[tuple[tuple[int, int, int, int], tuple[int, int, int, int]], ...],
+    target_extent: tuple[int, int],
+) -> bool:
+    """Return True when the blits overwrite every swapchain destination pixel.
+
+    A full-coverage blit makes ``vkCmdClearColorImage`` redundant: every pixel
+    is written by ``vkCmdBlitImage`` afterwards. Letterboxed/cropped layouts
+    keep the clear so the untouched bars stay black. This is an exact rectangle
+    coverage test; it never changes the blit rectangles themselves.
+    """
+    width, height = int(target_extent[0]), int(target_extent[1])
+    if width <= 0 or height <= 0 or not blit_regions:
+        return False
+    rects: list[tuple[int, int, int, int]] = []
+    for _source_rect, destination_rect in blit_regions:
+        x0, y0, x1, y1 = (int(value) for value in destination_rect)
+        if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0 or x1 > width or y1 > height:
+            return False
+        rects.append((x0, y0, x1, y1))
+    edges = sorted({0, height, *(y for _x0, y0, _x1, y1 in rects for y in (y0, y1))})
+    for top, bottom in zip(edges, edges[1:]):
+        if bottom <= top:
+            continue
+        spans = sorted((x0, x1) for x0, y0, x1, y1 in rects if y0 <= top and y1 >= bottom)
+        covered = 0
+        for x0, x1 in spans:
+            if x0 > covered:
+                break
+            covered = max(covered, x1)
+        if covered < width:
+            return False
+    return True
+
+
+def image_layout_barrier_sync(vk: Any, old: int, new: int) -> tuple[int, int, int, int]:
+    """Return (src_stage, src_access, dst_stage, dst_access) for a transition.
+
+    Local Viewer presentation only issues transfer operations between these
+    layouts, so ALL_COMMANDS on both sides drains every GPU stage four times
+    per frame. GENERAL is kept conservative because an external CUDA/HIP
+    producer owns that layout. Presentation-engine reads are already ordered
+    by the acquire semaphore, which is waited at the TRANSFER stage.
+    """
+    all_commands = int(vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)
+    transfer = int(vk.VK_PIPELINE_STAGE_TRANSFER_BIT)
+    top = int(getattr(vk, "VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT", 0))
+    memory_access = int(getattr(vk, "VK_ACCESS_MEMORY_READ_BIT", 0)) | int(
+        getattr(vk, "VK_ACCESS_MEMORY_WRITE_BIT", 0)
+    )
+    transfer_read = int(getattr(vk, "VK_ACCESS_TRANSFER_READ_BIT", 0))
+    transfer_write = int(getattr(vk, "VK_ACCESS_TRANSFER_WRITE_BIT", 0))
+    undefined = int(vk.VK_IMAGE_LAYOUT_UNDEFINED)
+    general = int(vk.VK_IMAGE_LAYOUT_GENERAL)
+    transfer_dst = int(vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+    transfer_src = int(vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+    present_src = int(vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+
+    if old == undefined:
+        src_stage, src_access = top, 0
+    elif old == general:
+        src_stage, src_access = all_commands, memory_access
+    elif old == transfer_dst:
+        src_stage, src_access = transfer, transfer_write
+    elif old == transfer_src:
+        src_stage, src_access = transfer, transfer_read
+    elif old == present_src:
+        src_stage, src_access = transfer, 0
+    else:
+        src_stage, src_access = all_commands, memory_access
+
+    if new == general:
+        dst_stage, dst_access = all_commands, memory_access
+    elif new == transfer_dst:
+        dst_stage, dst_access = transfer, transfer_write
+    elif new == transfer_src:
+        dst_stage, dst_access = transfer, transfer_read
+    elif new == present_src:
+        dst_stage, dst_access = transfer, 0
+    else:
+        dst_stage, dst_access = all_commands, memory_access
+    return src_stage, src_access, dst_stage, dst_access
 
 
 def presentation_blit_regions(
@@ -857,8 +973,9 @@ class VulkanLocalViewer:
         self._cursor_texture_overlay: VulkanFpsOverlay | None = None
         self._cursor_snapshot = None
         self._cursor_snapshot_key = None
-        # Latency is capture start -> present submission, using the same
-        # perf_counter clock as the runtime queue timestamp.
+        # Frame-available -> successful present, on the capture perf_counter
+        # clock. Missing availability stamps retain the legacy poll anchor.
+        self._latency_anchor = "poll"
         self._last_latency_ms = 0.0
         self._latency_history: list[float] = []
         self._latency_history_max = 300
@@ -877,6 +994,7 @@ class VulkanLocalViewer:
         self.upstream_fps_provider = None
         self._upstream_fps = 0.0
         self.sys_load_provider = None
+        self._load_snapshot: dict[str, Any] = {}
         self._gpu_util = None
         self._gpu_util_max = None
         self._reuse_ratio = 0.0
@@ -1144,6 +1262,8 @@ class VulkanLocalViewer:
         if self.glfw.window_should_close(self.window):
             raise StopIteration
         self._keep_fullscreen_visible()
+        if self.config.cursor_passthrough and self.config.hide_cursor_overlay:
+            update_native_cursor_suppression()
 
     def _configure_persistent_fullscreen(self) -> None:
         if sys.platform != "win32" or self.window is None:
@@ -1377,9 +1497,11 @@ class VulkanLocalViewer:
         if callable(load_provider):
             try:
                 load = load_provider()
+                self._load_snapshot = dict(load) if load else {}
                 self._gpu_util = load.get("gpu")
                 self._gpu_util_max = load.get("gpu_max")
             except (AttributeError, RuntimeError, TypeError, ValueError):
+                self._load_snapshot = {}
                 self._gpu_util = None
                 self._gpu_util_max = None
         benchmark_fps = os.environ.get("D2S_BENCHMARK", "0").strip().lower() in {
@@ -1420,14 +1542,12 @@ class VulkanLocalViewer:
             f"latency_ms={self.latency_ms():.2f}",
             f"avg_latency_ms={self.avg_latency_ms():.2f}",
             f"latency_samples={len(self._latency_history)}",
+            f"latency_anchor={self._latency_anchor}",
             f"display_hz={int(self._output_refresh_hz)}",
         ]
         if self._upstream_fps > 0.0:
             parts.append(f"upstream_fps={self._upstream_fps:.2f}")
-        if isinstance(self._gpu_util, (int, float)):
-            parts.append(f"sys_gpu={float(self._gpu_util):.0f}")
-            if isinstance(self._gpu_util_max, (int, float)):
-                parts.append(f"sys_gpu_max={float(self._gpu_util_max):.0f}")
+        parts.extend(format_load_fields(self._load_snapshot))
         if latency:
             parts.extend(
                 (
@@ -1477,6 +1597,8 @@ class VulkanLocalViewer:
             "capture_wait_ms",
             "sck_callback_to_runtime_ms",
             "runtime_execution_ms",
+            "runtime_gpu_wait_ms",
+            "runtime_completion_ms",
             "depth_preprocess_ms",
             "depth_model_ms",
             "depth_postprocess_ms",
@@ -1484,6 +1606,19 @@ class VulkanLocalViewer:
             "metal_handoff_copy_ms",
             "viewer_queue_ms",
             "present_call_ms",
+            "viewer_ready_wait_ms",
+            "vk_fence_wait_ms",
+            "vk_acquire_ms",
+            "vk_upload_ms",
+            "vk_record_ms",
+            "vk_record_cpu_ms",
+            "vk_monitor_size_ms",
+            "vk_overlay_ms",
+            "vk_overlay_upload_ms",
+            "vk_submit_ms",
+            "vk_submit_cpu_ms",
+            "vk_present_ms",
+            "vk_total_ms",
         ):
             samples = sorted(
                 item[name]
@@ -1519,8 +1654,15 @@ class VulkanLocalViewer:
         capture_start_time: float | None,
         *,
         stage_timing: dict[str, float] | None = None,
+        anchor_time: float | None = None,
     ) -> None:
-        """Record capture-start through successful present submission."""
+        """Record frame availability through successful present submission.
+
+        Callback/return stamps must share capture's perf_counter clock and lie
+        within the capture-start/present interval. D2S_LATENCY_ANCHOR=poll (or
+        start/legacy) keeps the old start anchor for comparable A/B samples.
+        Changing the metric anchor does not establish a performance improvement.
+        """
         if capture_start_time is None:
             return
         try:
@@ -1530,11 +1672,36 @@ class VulkanLocalViewer:
         if not (started > 0.0) or started != started or started == float("inf"):
             return
         now = time.perf_counter()
+        timing = stage_timing or {}
+        try:
+            presented_at = float(timing.get("presented_at", now))
+        except (TypeError, ValueError):
+            presented_at = now
+        if math.isfinite(presented_at) and started <= presented_at <= now:
+            now = presented_at
         if now < started:
             return
+        label = "poll"
+        if os.environ.get("D2S_LATENCY_ANCHOR", "callback").strip().lower() not in {"poll", "start", "legacy"}:
+            for candidate_label, value in (
+                ("sck_callback", timing.get("sck_callback_time")),
+                ("capture_return", timing.get("capture_poll_returned_at")),
+                ("callback", anchor_time),
+            ):
+                try:
+                    candidate = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(candidate) and started <= candidate <= now:
+                    started, label = candidate, candidate_label
+                    break
         latency_ms = (now - started) * 1000.0
         if not (latency_ms > 0.0) or latency_ms > 10_000.0:
             return
+        if label != self._latency_anchor:
+            # Never label percentiles from a previous clock anchor as new data.
+            self._latency_history.clear()
+        self._latency_anchor = label
         self._last_latency_ms = latency_ms
         self._latency_history.append(latency_ms)
         if len(self._latency_history) > self._latency_history_max:
@@ -1547,6 +1714,8 @@ class VulkanLocalViewer:
                 "capture_wait_ms",
                 "sck_callback_to_runtime_ms",
                 "runtime_execution_ms",
+                "runtime_gpu_wait_ms",
+                "runtime_completion_ms",
                 "depth_preprocess_ms",
                 "depth_model_ms",
                 "depth_postprocess_ms",
@@ -1560,6 +1729,19 @@ class VulkanLocalViewer:
                 "sck_presentation_time",
                 "viewer_queue_ms",
                 "present_call_ms",
+                "viewer_ready_wait_ms",
+                "vk_fence_wait_ms",
+                "vk_acquire_ms",
+                "vk_upload_ms",
+                "vk_record_ms",
+                "vk_record_cpu_ms",
+                "vk_monitor_size_ms",
+                "vk_overlay_ms",
+                "vk_overlay_upload_ms",
+                "vk_submit_ms",
+                "vk_submit_cpu_ms",
+                "vk_present_ms",
+                "vk_total_ms",
             ):
                 try:
                     value = float(stage_timing[key])
@@ -2022,10 +2204,18 @@ class VulkanLocalViewer:
         modes = vk.ffi.new("VkPresentModeKHR[]", int(mode_count[0]))
         get_modes(self.physical_device, self.surface, mode_count, modes)
         fmt, is_srgb = choose_srgb_surface_format(formats, vk)
+        self.swapchain_format = int(fmt.format)
         self.source_format = getattr(
             vk,
             LOCAL_VIEWER_SOURCE_FORMAT if is_srgb else "VK_FORMAT_R8G8B8A8_UNORM",
         )
+        if int(self.source_format) != self.swapchain_format:
+            print(
+                "[VulkanLocalViewer] Source/swapchain formats differ; using "
+                "format-converting blit "
+                f"(source={int(self.source_format)}, swapchain={self.swapchain_format})",
+                flush=True,
+            )
         if not is_srgb:
             print(
                 "[VulkanLocalViewer] Surface has no sRGB format; using UNORM "
@@ -2179,6 +2369,11 @@ class VulkanLocalViewer:
             self._full_screen_exclusive_acquired = False
 
     def _destroy_swapchain(self) -> None:
+        # Cached submit/present structs hold swapchain image indices and
+        # render-finished semaphore handles, both of which are rebuilt here.
+        for source in [self._source, *self._direct_sources]:
+            if source is not None and hasattr(source, "invalidate_present_caches"):
+                source.invalidate_present_caches()
         self._destroy_render_finished_semaphores()
         if self.swapchain is not None:
             if self._fps_overlay is not None:
@@ -2255,6 +2450,28 @@ class VulkanLocalViewer:
             self.vk.vkDestroySemaphore(self.device, semaphore, None)
         self.render_finished = []
 
+    def wait_for_present_ready(self) -> bool:
+        """Keep events responsive and leave queued frames replaceable until the GPU is ready."""
+        self.poll_events()
+        if self.fence is None:
+            return True
+        vk = self.vk
+        try:
+            value = vk.vkWaitForFences(self.device, 1, [self.fence], True, 1_000_000)
+        except vk.VkTimeout:
+            return False
+        result = int(vk.VK_SUCCESS if value is None else value)
+        if result == int(vk.VK_TIMEOUT):
+            return False
+        if result != int(vk.VK_SUCCESS):
+            raise RuntimeError(f"Vulkan local-viewer fence failed ({result})")
+        # Retire only completed submissions. This also makes direct-staging
+        # slots available to the packer before waiting for its next result.
+        for source in [self._source, *self._direct_sources]:
+            if source is not None:
+                source._complete_direct()
+        return True
+
     def present(self, frame: Any) -> bool:
         if self.window is None:
             raise RuntimeError("Vulkan local viewer has not been initialized")
@@ -2280,9 +2497,9 @@ class VulkanLocalViewer:
                 output_format = str(
                     getattr(frame, "output_format", "half_sbs") or "half_sbs"
                 )
-                source_size = getattr(native_frame, "source_size", None)
+                source_size = getattr(frame, "output_eye_size", None)
                 if source_size is None:
-                    source_size = getattr(frame, "output_eye_size", None)
+                    source_size = getattr(native_frame, "source_size", None)
                 if not isinstance(source_size, (tuple, list)) or len(source_size) != 2:
                     raise RuntimeError("native CoreML result has no source dimensions")
                 target_size = pack_target(
@@ -2585,7 +2802,86 @@ class _TransferSource:
         self._metal_buffer_capacity = 0
         self._direct_lock = threading.Lock()
         self._direct_state = "available"
+        self._static_cache: dict[str, Any] | None = None
+        # Keyed rather than single-slot: reuse frames and fresh GPU-buffer
+        # frames alternate, and each needs its own packed-blit geometry.
+        self._geometry_cache: dict[Any, tuple[Any, ...]] | None = None
+        self._submit_cache: dict[tuple[bool, int], Any] | None = None
+        self._present_info_cache: dict[int, tuple[Any, Any]] | None = None
+        self._barrier_cache: dict[tuple[int, int, int, bool], Any] | None = None
+        self._fast_present = False
+        self._precise_barriers = False
         self._create()
+
+    def _static(self, name: str, factory: Callable[[], Any]) -> Any:
+        """Return a process-lifetime cffi/device object, built at most once."""
+        cache = getattr(self, "_static_cache", None)
+        if cache is None:
+            cache = {}
+            self._static_cache = cache
+        value = cache.get(name)
+        if value is None:
+            value = factory()
+            cache[name] = value
+        return value
+
+    def invalidate_present_caches(self) -> None:
+        """Drop cached structs bound to the previous swapchain or geometry."""
+        self._static_cache = None
+        self._geometry_cache = None
+        self._submit_cache = None
+        self._present_info_cache = None
+        self._barrier_cache = None
+
+    def _input_size_for_presentation(self, owner: Any) -> tuple[Any, float]:
+        """Resolve the live capture size used to derive per-eye blit geometry."""
+        dyn_input_size = owner.config.input_size
+        monitor_size_ms = 0.0
+        try:
+            cap_mode = str(getattr(owner.config, "capture_mode", "") or "").strip()
+            if cap_mode.casefold() == "window":
+                title = str(getattr(owner.config, "window_title", "") or "").strip()
+                if title and sys.platform == "win32":
+                    try:
+                        import win32gui
+
+                        hwnd = win32gui.FindWindow(None, title)
+                        if hwnd:
+                            _, _, w, h = win32gui.GetClientRect(hwnd)
+                            if w > 0 and h > 0:
+                                dyn_input_size = (int(w), int(h))
+                    except Exception:
+                        pass
+            elif cap_mode:
+                try:
+                    inp_idx = int(getattr(owner.config, "preview_monitor_index", 0) or 0)
+                    if inp_idx <= 0:
+                        inp_idx = int(getattr(owner.config, "monitor_index", 0) or 0)
+                    if inp_idx > 0:
+                        now = time.monotonic()
+                        cached_size = getattr(self, "_input_monitor_size_cache", None)
+                        if (
+                            cached_size is not None
+                            and cached_size[0] == inp_idx
+                            and now - cached_size[1] < 2.0
+                        ):
+                            dyn_input_size = cached_size[2]
+                        else:
+                            from utils.display import get_monitor_size
+
+                            monitor_started = time.perf_counter()
+                            dyn_input_size = get_monitor_size(inp_idx)
+                            monitor_size_ms = (time.perf_counter() - monitor_started) * 1000.0
+                            self._input_monitor_size_cache = (
+                                inp_idx,
+                                now,
+                                dyn_input_size,
+                            )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return dyn_input_size, monitor_size_ms
 
     @property
     def direct_view(self):
@@ -2834,17 +3130,91 @@ class _TransferSource:
         self._rocm_interop = False
 
     @staticmethod
-    def transition_image(vk: Any, cmd: Any, image: Any, old: int, new: int) -> None:
-        barrier = vk.VkImageMemoryBarrier(sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, oldLayout=old, newLayout=new, srcAccessMask=0, dstAccessMask=0, image=image, subresourceRange=vk.VkImageSubresourceRange(aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, baseMipLevel=0, levelCount=1, baseArrayLayer=0, layerCount=1))
-        vk.vkCmdPipelineBarrier(cmd, vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, None, 0, None, 1, [barrier])
+    def _barrier_sync(vk: Any, old: int, new: int, precise: bool) -> tuple[int, int, int, int]:
+        if precise:
+            return image_layout_barrier_sync(vk, old, new)
+        all_commands = vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+        return all_commands, 0, all_commands, 0
+
+    @staticmethod
+    def _make_barrier(
+        vk: Any, image: Any, old: int, new: int, sync: tuple[int, int, int, int]
+    ) -> Any:
+        _src_stage, src_access, _dst_stage, dst_access = sync
+        return vk.VkImageMemoryBarrier(
+            sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            oldLayout=old,
+            newLayout=new,
+            srcAccessMask=src_access,
+            dstAccessMask=dst_access,
+            image=image,
+            subresourceRange=vk.VkImageSubresourceRange(
+                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                baseMipLevel=0,
+                levelCount=1,
+                baseArrayLayer=0,
+                layerCount=1,
+            ),
+        )
+
+    @staticmethod
+    def transition_image(
+        vk: Any,
+        cmd: Any,
+        image: Any,
+        old: int,
+        new: int,
+        *,
+        precise: bool = False,
+        sync: tuple[int, int, int, int] | None = None,
+        barrier: Any = None,
+    ) -> None:
+        if sync is None:
+            sync = _TransferSource._barrier_sync(vk, old, new, precise)
+        if barrier is None:
+            barrier = _TransferSource._make_barrier(vk, image, old, new, sync)
+        src_stage, _src_access, dst_stage, _dst_access = sync
+        vk.vkCmdPipelineBarrier(
+            cmd, src_stage, dst_stage, 0, 0, None, 0, None, 1, [barrier]
+        )
 
     def _transition(self, cmd: Any, image: Any, old: int, new: int) -> None:
-        self.transition_image(self.owner.vk, cmd, image, old, new)
+        vk = self.owner.vk
+        precise = bool(getattr(self, "_precise_barriers", False))
+        sync = None
+        barrier = None
+        if getattr(self, "_fast_present", False):
+            # Layout transitions repeat with the same image/layout pairs. Keep
+            # the derived stage masks and the cffi barrier alive across frames;
+            # the image reference in the entry keeps its id stable.
+            cache = getattr(self, "_barrier_cache", None)
+            if cache is None:
+                cache = {}
+                self._barrier_cache = cache
+            key = (id(image), int(old), int(new), precise)
+            entry = cache.get(key)
+            if entry is None:
+                sync = self._barrier_sync(vk, old, new, precise)
+                barrier = self._make_barrier(vk, image, old, new, sync)
+                entry = (barrier, image, sync)
+                cache[key] = entry
+            barrier, _image_ref, sync = entry
+        self.transition_image(
+            vk, cmd, image, old, new, precise=precise, sync=sync, barrier=barrier
+        )
 
     def present(self, pixels: Any, *, direct: bool = False, reuse: bool = False) -> bool:
         vk, o = self.owner.vk, self.owner
         frame_started = time.perf_counter()
+        self._last_present_metrics = {}
         stage_started = frame_started
+        fast = local_viewer_fast_present_enabled()
+        self._fast_present = fast
+        self._precise_barriers = local_viewer_precise_barriers_enabled()
+
+        def cached(name: str, factory: Callable[[], Any]) -> Any:
+            """Reuse invariant cffi/device objects; build fresh in legacy mode."""
+            return self._static(name, factory) if fast else factory()
         # Keep the macOS event loop responsive if a drawable/GPU completion
         # is late. Never reset a command buffer whose submission is pending.
         # Under FIFO, MoltenVK's CAMetalLayer drawable acquisition waits for
@@ -2868,8 +3238,14 @@ class _TransferSource:
         for source in [o._source, *o._direct_sources]:
             if source is not None:
                 source._complete_direct()
-        index_output = vk.ffi.new("uint32_t *")
-        acquire = o._device_function(b"vkAcquireNextImageKHR", "VkResult(*)(VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t *)")
+        index_output = cached("index_output", lambda: vk.ffi.new("uint32_t *"))
+        acquire = cached(
+            "acquire_fn",
+            lambda: o._device_function(
+                b"vkAcquireNextImageKHR",
+                "VkResult(*)(VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t *)",
+            ),
+        )
         stage_started = time.perf_counter()
         acquire_result = int(acquire(o.device, o.swapchain, wait_ns, o.image_available, vk.ffi.NULL, index_output))
         acquire_ms = (time.perf_counter() - stage_started) * 1000.0
@@ -2939,7 +3315,41 @@ class _TransferSource:
         record_cpu_started = time.thread_time()
         cmd = o.command_buffer
         vk.vkResetCommandBuffer(cmd, 0)
-        vk.vkBeginCommandBuffer(cmd, vk.VkCommandBufferBeginInfo(sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO))
+        vk.vkBeginCommandBuffer(
+            cmd,
+            cached(
+                "begin_info",
+                lambda: vk.VkCommandBufferBeginInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+                ),
+            ),
+        )
+        subresource_layers = cached(
+            "subresource_layers",
+            lambda: vk.VkImageSubresourceLayers(
+                aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                mipLevel=0,
+                baseArrayLayer=0,
+                layerCount=1,
+            ),
+        )
+        # Both CUDA and host staging uploads use the same copy region; the
+        # source buffer handle is a separate vkCmdCopyBufferToImage argument.
+        buffer_image_copy = cached(
+            "buffer_image_copy",
+            lambda: [
+                vk.VkBufferImageCopy(
+                    bufferOffset=0,
+                    bufferRowLength=0,
+                    bufferImageHeight=0,
+                    imageSubresource=subresource_layers,
+                    imageOffset=vk.VkOffset3D(x=0, y=0, z=0),
+                    imageExtent=vk.VkExtent3D(
+                        width=self.size[0], height=self.size[1], depth=1
+                    ),
+                )
+            ],
+        )
         source_image = self.image
         if reuse:
             # The previous fence has completed. Its image is already in
@@ -2960,21 +3370,7 @@ class _TransferSource:
                 self.image,
                 vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 1,
-                [vk.VkBufferImageCopy(
-                    bufferOffset=0,
-                    bufferRowLength=0,
-                    bufferImageHeight=0,
-                    imageSubresource=vk.VkImageSubresourceLayers(
-                        aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
-                        mipLevel=0,
-                        baseArrayLayer=0,
-                        layerCount=1,
-                    ),
-                    imageOffset=vk.VkOffset3D(x=0, y=0, z=0),
-                    imageExtent=vk.VkExtent3D(
-                        width=self.size[0], height=self.size[1], depth=1
-                    ),
-                )],
+                buffer_image_copy,
             )
             self._transition(
                 cmd,
@@ -2984,7 +3380,14 @@ class _TransferSource:
             )
         else:
             self._transition(cmd, self.image, vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL if self._image_initialized else vk.VK_IMAGE_LAYOUT_UNDEFINED, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-            vk.vkCmdCopyBufferToImage(cmd, self.buffer, self.image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, [vk.VkBufferImageCopy(bufferOffset=0, bufferRowLength=0, bufferImageHeight=0, imageSubresource=vk.VkImageSubresourceLayers(aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, mipLevel=0, baseArrayLayer=0, layerCount=1), imageOffset=vk.VkOffset3D(x=0, y=0, z=0), imageExtent=vk.VkExtent3D(width=self.size[0], height=self.size[1], depth=1))])
+            vk.vkCmdCopyBufferToImage(
+                cmd,
+                self.buffer,
+                self.image,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                buffer_image_copy,
+            )
             self._transition(cmd, self.image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
         if not reuse and o.config.on_breakdown_inc is not None:
             o.config.on_breakdown_inc("local_buffer_to_image_copy", 1)
@@ -2995,8 +3398,6 @@ class _TransferSource:
             else vk.VK_IMAGE_LAYOUT_UNDEFINED
         )
         self._transition(cmd, target, target_old_layout, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-        clear = vk.VkClearColorValue(float32=[0.0, 0.0, 0.0, 1.0])
-        vk.vkCmdClearColorImage(cmd, target, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, clear, 1, [vk.VkImageSubresourceRange(aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, baseMipLevel=0, levelCount=1, baseArrayLayer=0, layerCount=1)])
         fit_mode = "contain"
         if o.config.display_fit_enabled and o.config.display_fit_mode_provider is not None:
             try:
@@ -3007,60 +3408,114 @@ class _TransferSource:
             fit_mode = o.config.display_fit_mode
         fit_mode = normalize_display_fit_mode(fit_mode)
         # Refresh source geometry so monitor/window size changes are reflected.
-        dyn_input_size = o.config.input_size
-        monitor_size_ms = 0.0
-        try:
-            cap_mode = str(getattr(o.config, "capture_mode", "") or "").strip()
-            if cap_mode.casefold() == "window":
-                title = str(getattr(o.config, "window_title", "") or "").strip()
-                if title and sys.platform == "win32":
-                    try:
-                        import win32gui
-
-                        hwnd = win32gui.FindWindow(None, title)
-                        if hwnd:
-                            _, _, w, h = win32gui.GetClientRect(hwnd)
-                            if w > 0 and h > 0:
-                                dyn_input_size = (int(w), int(h))
-                    except Exception:
-                        pass
-            elif cap_mode:
-                # Monitor mode: use current monitor size (may change with resolution)
-                try:
-                    # o.config.monitor_index is the stereo output monitor; input monitor
-                    # is preview_monitor_index or monitor_index depending on config
-                    inp_idx = int(getattr(o.config, "preview_monitor_index", 0) or 0)
-                    if inp_idx <= 0:
-                        inp_idx = int(getattr(o.config, "monitor_index", 0) or 0)
-                    if inp_idx > 0:
-                        now = time.monotonic()
-                        cached_size = self._input_monitor_size_cache
-                        if (
-                            cached_size is not None
-                            and cached_size[0] == inp_idx
-                            and now - cached_size[1] < 2.0
-                        ):
-                            dyn_input_size = cached_size[2]
-                        else:
-                            from utils.display import get_monitor_size
-
-                            monitor_started = time.perf_counter()
-                            dyn_input_size = get_monitor_size(inp_idx)
-                            monitor_size_ms = (time.perf_counter() - monitor_started) * 1000.0
-                            self._input_monitor_size_cache = (
-                                inp_idx, now, dyn_input_size
-                            )
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        regions = presentation_blit_regions(
-            self.size,
-            o.extent,
+        dyn_input_size, monitor_size_ms = self._input_size_for_presentation(o)
+        geometry_key = (
             fit_mode,
             o.config.display_mode,
-            input_size=dyn_input_size,
+            self.size,
+            o.extent,
+            dyn_input_size,
+            bool(o.config.display_fit_enabled),
+            bool(gpu_buffer_source),
         )
+        geometry_cache = getattr(self, "_geometry_cache", None) if fast else None
+        if geometry_cache is None:
+            geometry_cache = {}
+            self._geometry_cache = geometry_cache
+        cached_geometry = geometry_cache.get(geometry_key) if fast else None
+        if cached_geometry is not None:
+            (
+                regions,
+                eye_rects,
+                blit_regions,
+                clear_target,
+                blit_commands,
+                copy_command,
+            ) = cached_geometry
+        else:
+            regions = presentation_blit_regions(
+                self.size,
+                o.extent,
+                fit_mode,
+                o.config.display_mode,
+                input_size=dyn_input_size,
+            )
+            eye_rects = tuple(
+                destination_rect for _source_rect, destination_rect in regions
+            )
+            # For the GPU buffer path, an exact-aspect Half-SBS frame can be
+            # scaled as one packed image. It is equivalent to two eye blits and
+            # avoids a second 4K filtering pass/command on the local viewer.
+            single_packed_blit = (
+                gpu_buffer_source
+                and len(regions) == 2
+                and regions[0]
+                == (
+                    (0, 0, self.size[0] // 2, self.size[1]),
+                    (0, 0, o.extent[0] // 2, o.extent[1]),
+                )
+                and regions[1]
+                == (
+                    (self.size[0] // 2, 0, self.size[0], self.size[1]),
+                    (o.extent[0] // 2, 0, o.extent[0], o.extent[1]),
+                )
+            )
+            blit_regions = (
+                (((0, 0, self.size[0], self.size[1]), (0, 0, o.extent[0], o.extent[1])),)
+                if single_packed_blit
+                else regions
+            )
+            # A full-coverage blit already writes every target pixel, so the
+            # full-screen clear is redundant. Letterboxed/cropped layouts keep
+            # the clear so the untouched bars remain black.
+            clear_target = not blit_destinations_cover_target(blit_regions, o.extent)
+            # Image copy preserves stored channel order. Use it only when the
+            # source and swapchain formats match; otherwise blit performs the
+            # required RGBA/BGRA component conversion.
+            copy_command = None
+            if (
+                fast
+                and not clear_target
+                and self.size == o.extent
+                and self.format == int(getattr(o, "swapchain_format", -1))
+                and len(blit_regions) == 1
+                and blit_regions[0]
+                == (
+                    (0, 0, self.size[0], self.size[1]),
+                    (0, 0, o.extent[0], o.extent[1]),
+                )
+            ):
+                copy_command = vk.VkImageCopy(
+                    srcSubresource=subresource_layers,
+                    srcOffset=vk.VkOffset3D(x=0, y=0, z=0),
+                    dstSubresource=subresource_layers,
+                    dstOffset=vk.VkOffset3D(x=0, y=0, z=0),
+                    extent=vk.VkExtent3D(width=o.extent[0], height=o.extent[1], depth=1),
+                )
+            blit_commands = () if copy_command is not None else tuple(
+                vk.VkImageBlit(
+                    srcSubresource=subresource_layers,
+                    srcOffsets=[
+                        vk.VkOffset3D(x=source_rect[0], y=source_rect[1], z=0),
+                        vk.VkOffset3D(x=source_rect[2], y=source_rect[3], z=1),
+                    ],
+                    dstSubresource=subresource_layers,
+                    dstOffsets=[
+                        vk.VkOffset3D(x=destination_rect[0], y=destination_rect[1], z=0),
+                        vk.VkOffset3D(x=destination_rect[2], y=destination_rect[3], z=1),
+                    ],
+                )
+                for source_rect, destination_rect in blit_regions
+            )
+            if fast:
+                geometry_cache[geometry_key] = (
+                    regions,
+                    eye_rects,
+                    blit_regions,
+                    clear_target,
+                    blit_commands,
+                    copy_command,
+                )
         geometry = (fit_mode, o.config.display_mode, self.size, o.extent, regions)
         if geometry != o._last_presentation_geometry:
             prefix = "First-frame" if o._last_presentation_geometry is None else "Updated"
@@ -3074,54 +3529,58 @@ class _TransferSource:
                 f"blit_regions={regions}",
                 flush=True,
             )
-        # For the GPU buffer path, an exact-aspect Half-SBS frame can be
-        # scaled as one packed image. It is equivalent to two eye blits and
-        # avoids a second 4K filtering pass/command on the local viewer.
-        single_packed_blit = (
-            gpu_buffer_source
-            and len(regions) == 2
-            and regions[0]
-            == (
-                (0, 0, self.size[0] // 2, self.size[1]),
-                (0, 0, o.extent[0] // 2, o.extent[1]),
+        if not fast or clear_target:
+            clear = cached(
+                "clear_value",
+                lambda: vk.VkClearColorValue(float32=[0.0, 0.0, 0.0, 1.0]),
             )
-            and regions[1]
-            == (
-                (self.size[0] // 2, 0, self.size[0], self.size[1]),
-                (o.extent[0] // 2, 0, o.extent[0], o.extent[1]),
+            clear_ranges = cached(
+                "clear_ranges",
+                lambda: [
+                    vk.VkImageSubresourceRange(
+                        aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                        baseMipLevel=0,
+                        levelCount=1,
+                        baseArrayLayer=0,
+                        layerCount=1,
+                    )
+                ],
             )
-        )
-        blit_regions = (
-            (((0, 0, self.size[0], self.size[1]), (0, 0, o.extent[0], o.extent[1])),)
-            if single_packed_blit
-            else regions
-        )
+            vk.vkCmdClearColorImage(
+                cmd,
+                target,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                clear,
+                1,
+                clear_ranges,
+            )
         # Keep the common buffer path to one region. Separate commands remain
         # the safe crop fallback when the packed frame is not exact-aspect.
-        for source_rect, destination_rect in blit_regions:
-            sx0, sy0, sx1, sy1 = source_rect
-            dx0, dy0, dx1, dy1 = destination_rect
-            vk.vkCmdBlitImage(
+        if copy_command is not None:
+            vk.vkCmdCopyImage(
                 cmd,
                 source_image,
                 vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 target,
                 vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 1,
-                [vk.VkImageBlit(
-                    srcSubresource=vk.VkImageSubresourceLayers(aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, mipLevel=0, baseArrayLayer=0, layerCount=1),
-                    srcOffsets=[vk.VkOffset3D(x=sx0, y=sy0, z=0), vk.VkOffset3D(x=sx1, y=sy1, z=1)],
-                    dstSubresource=vk.VkImageSubresourceLayers(aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, mipLevel=0, baseArrayLayer=0, layerCount=1),
-                    dstOffsets=[vk.VkOffset3D(x=dx0, y=dy0, z=0), vk.VkOffset3D(x=dx1, y=dy1, z=1)],
-                )],
-                vk.VK_FILTER_LINEAR,
+                [copy_command],
             )
+        else:
+            for blit in blit_commands:
+                vk.vkCmdBlitImage(
+                    cmd,
+                    source_image,
+                    vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    target,
+                    vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    1,
+                    [blit],
+                    vk.VK_FILTER_LINEAR,
+                )
         overlay_drawn = False
         overlay_ms = 0.0
         overlay_upload_ms = 0.0
-        eye_rects = tuple(
-            destination_rect for _source_rect, destination_rect in regions
-        )
         target_layout = vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
         cursor_rects = ()
         if o._cursor_texture_overlay is not None:
@@ -3187,7 +3646,31 @@ class _TransferSource:
             waits.append(self._cuda_ready.semaphore)
             stages.append(vk.VK_PIPELINE_STAGE_TRANSFER_BIT)
         render_finished = o.render_finished[index]
-        submit = vk.VkSubmitInfo(sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO, waitSemaphoreCount=len(waits), pWaitSemaphores=waits, pWaitDstStageMask=stages, commandBufferCount=1, pCommandBuffers=[cmd], signalSemaphoreCount=1, pSignalSemaphores=[render_finished])
+        submit_cache = getattr(self, "_submit_cache", None)
+        if submit_cache is None:
+            submit_cache = {}
+            self._submit_cache = submit_cache
+        # The CUDA wait semaphore belongs to the interop session; include its
+        # identity so a re-registered semaphore can never reuse a stale struct.
+        submit_key = (
+            bool(gpu_source),
+            index,
+            id(self._cuda_ready) if gpu_source else 0,
+        )
+        submit = submit_cache.get(submit_key) if fast else None
+        if submit is None:
+            submit = vk.VkSubmitInfo(
+                sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                waitSemaphoreCount=len(waits),
+                pWaitSemaphores=waits,
+                pWaitDstStageMask=stages,
+                commandBufferCount=1,
+                pCommandBuffers=[cmd],
+                signalSemaphoreCount=1,
+                pSignalSemaphores=[render_finished],
+            )
+            if fast:
+                submit_cache[submit_key] = submit
         stage_started = time.perf_counter()
         submit_cpu_started = time.thread_time()
         submit_value = vk.vkQueueSubmit(o.queue, 1, [submit], o.fence)
@@ -3198,12 +3681,48 @@ class _TransferSource:
         submit_cpu_ms = (time.thread_time() - submit_cpu_started) * 1000.0
         if direct and submit_result == int(vk.VK_SUCCESS):
             self._mark_direct_submitted()
-        present_info = vk.VkPresentInfoKHR(sType=vk.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, waitSemaphoreCount=1, pWaitSemaphores=[render_finished], swapchainCount=1, pSwapchains=[o.swapchain], pImageIndices=[index])
-        present = o._device_function(b"vkQueuePresentKHR", "VkResult(*)(VkQueue, const VkPresentInfoKHR *)")
+        present_cache = getattr(self, "_present_info_cache", None)
+        if present_cache is None:
+            present_cache = {}
+            self._present_info_cache = present_cache
+        present_entry = present_cache.get(index) if fast else None
+        if present_entry is None:
+            present_info = vk.VkPresentInfoKHR(
+                sType=vk.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                waitSemaphoreCount=1,
+                pWaitSemaphores=[render_finished],
+                swapchainCount=1,
+                pSwapchains=[o.swapchain],
+                pImageIndices=[index],
+            )
+            present_entry = (present_info, vk.ffi.addressof(present_info))
+            if fast:
+                present_cache[index] = present_entry
+        present = cached(
+            "present_fn",
+            lambda: o._device_function(
+                b"vkQueuePresentKHR",
+                "VkResult(*)(VkQueue, const VkPresentInfoKHR *)",
+            ),
+        )
         stage_started = time.perf_counter()
-        result = int(present(o.queue, vk.ffi.addressof(present_info)))
+        result = int(present(o.queue, present_entry[1]))
         present_ms = (time.perf_counter() - stage_started) * 1000.0
         total_ms = (time.perf_counter() - frame_started) * 1000.0
+        self._last_present_metrics = {
+            "vk_fence_wait_ms": fence_ms,
+            "vk_acquire_ms": acquire_ms,
+            "vk_upload_ms": upload_ms,
+            "vk_record_ms": record_ms,
+            "vk_record_cpu_ms": record_cpu_ms,
+            "vk_monitor_size_ms": monitor_size_ms,
+            "vk_overlay_ms": overlay_ms,
+            "vk_overlay_upload_ms": overlay_upload_ms,
+            "vk_submit_ms": submit_ms,
+            "vk_submit_cpu_ms": submit_cpu_ms,
+            "vk_present_ms": present_ms,
+            "vk_total_ms": total_ms,
+        }
         if total_ms >= 100.0:
             self._slow_present_count += 1
             if self._slow_present_count <= 5 or self._slow_present_count % 30 == 0:
@@ -3262,6 +3781,7 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
     cached_frame = None
     cached_path = "host"
     next_present_at = 0.0
+    ready_wait_seconds = 0.0
     last_presented_at = 0.0
     vsync_handoff_stalled = False
     vsync_handoff_wait_logged = False
@@ -3296,6 +3816,10 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             if system_load is not None:
                 viewer.sys_load_provider = system_load.snapshot
             viewer.initialize()
+            adapter_luid = int(getattr(viewer, "_adapter_luid", 0) or 0)
+            set_luid = getattr(system_load, "set_adapter_luid", None)
+            if adapter_luid and callable(set_luid):
+                set_luid(adapter_luid)
             print("[VulkanLocalViewer] Vulkan local window initialized", flush=True)
         except Exception as vulkan_exc:
             if os.environ.get("D2S_GPU_IMAGE_PIPELINE_REQUIRED", "0") == "1":
@@ -3376,6 +3900,7 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             direct_staging=False,
             manage_glfw_lifecycle=False,
             exclude_from_capture=False,
+            hide_cursor_overlay=False,
         )
         try:
             preview_viewer = VulkanLocalViewer(preview_config)
@@ -3421,6 +3946,23 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             config.on_capture_windows_initialized()
 
         while not shutdown_event.is_set():
+            wait_ready = getattr(viewer, "wait_for_present_ready", None)
+            if not bool(getattr(runtime_q, "_d2s_ordered", False)) and callable(wait_ready):
+                # Waiting after dequeue makes the selected frame grow stale
+                # during GPU contention. Keep latest-wins ownership upstream
+                # until the previous submission has actually finished.
+                ready_started = time.perf_counter()
+                ready = wait_ready()
+                ready_wait_seconds += time.perf_counter() - ready_started
+                if not ready:
+                    if preview_viewer is not None:
+                        try:
+                            preview_viewer.poll_events()
+                        except StopIteration:
+                            preview_viewer.close()
+                            preview_viewer = None
+                            preview_disabled = True
+                    continue
             paced = (
                 cached_frame is not None
                 and not config.vsync
@@ -3447,6 +3989,11 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     queue_timeout = max(
                         0.0, scheduled_deadline - time.perf_counter()
                     )
+                elif cached_frame is not None and not config.vsync and present_asap:
+                    # Wait only for a reusable-frame deadline. A fresh result
+                    # wakes get() immediately; after a timeout keep waiting on
+                    # the next refresh instead of spinning on cached presents.
+                    queue_timeout = min(0.05, max(0.0, next_present_at - time.perf_counter()))
                 elif cached_frame is not None:
                     # Present already paces the VSync loop. Briefly wait for a
                     # freshly prepared frame so a publication just after the
@@ -3562,9 +4109,19 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             if presented is not False and callable(show_capture_window):
                 show_capture_window()
             presented_at = time.perf_counter()
+            frame_ready_wait_seconds = ready_wait_seconds
+            ready_wait_seconds = 0.0
+            if frame_ready_wait_seconds > 0.0 and config.on_breakdown_add_time is not None:
+                config.on_breakdown_add_time("local_present_ready_wait", frame_ready_wait_seconds)
             if presented is not False and not reused:
                 debug_info = getattr(result, "debug_info", None)
+                source = getattr(viewer, "_last_present_source", None)
+                present_metrics = getattr(source, "_last_present_metrics", None)
+                if isinstance(debug_info, dict) and isinstance(present_metrics, dict):
+                    debug_info.update(present_metrics)
                 stage_timing: dict[str, float] = {}
+                if frame_ready_wait_seconds > 0.0:
+                    stage_timing["viewer_ready_wait_ms"] = frame_ready_wait_seconds * 1000.0
                 if isinstance(debug_info, dict):
                     for key in (
                         "capture_to_runtime_start_ms",
@@ -3572,6 +4129,8 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                         "capture_wait_ms",
                         "sck_callback_to_runtime_ms",
                         "runtime_execution_ms",
+                        "runtime_gpu_wait_ms",
+                        "runtime_completion_ms",
                         "depth_preprocess_ms",
                         "depth_model_ms",
                         "depth_postprocess_ms",
@@ -3583,6 +4142,20 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                         "native_coreml_host_handoff_copy_count",
                         "native_coreml_gpu_copy_count",
                         "sck_presentation_time",
+                        "sck_callback_time",
+                        "capture_poll_returned_at",
+                        "vk_fence_wait_ms",
+                        "vk_acquire_ms",
+                        "vk_upload_ms",
+                        "vk_record_ms",
+                        "vk_record_cpu_ms",
+                        "vk_monitor_size_ms",
+                        "vk_overlay_ms",
+                        "vk_overlay_upload_ms",
+                        "vk_submit_ms",
+                        "vk_submit_cpu_ms",
+                        "vk_present_ms",
+                        "vk_total_ms",
                     ):
                         try:
                             stage_timing[key] = float(debug_info[key])
@@ -3601,9 +4174,16 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                 stage_timing["present_call_ms"] = max(
                     0.0, (presented_at - present_started) * 1000.0
                 )
+                stage_timing["presented_at"] = presented_at
                 record_latency = getattr(viewer, "record_frame_latency", None)
                 if callable(record_latency):
-                    record_latency(_started, stage_timing=stage_timing)
+                    record_latency(
+                        _started,
+                        stage_timing=stage_timing,
+                        anchor_time=(
+                            stage_timing.get("sck_callback_time") or stage_timing.get("capture_poll_returned_at")
+                        ),
+                    )
             # Preserve the clock: relative waits accumulate scheduler oversleep
             # and turn 60 Hz into roughly 57 FPS on macOS.
             if next_present_at == 0.0:
@@ -3697,9 +4277,10 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     )
             if presented is not False:
                 last_presented_at = presented_at
-                if reused or not present_asap:
-                    # Pace reused frames to the refresh grid. Fresh ASAP frames
-                    # submit immediately and are paced by the WSI present mode.
+                if config.vsync and (reused or not present_asap):
+                    # VSync reuse stays on the refresh grid. With VSync off,
+                    # queue hand-off already waits for content; do not add a
+                    # second refresh delay after presenting it.
                     interval = 1.0 / _vsync_refresh_hz()
                     if presented_at - present_started < interval * 0.5:
                         remaining = next_present_at - time.perf_counter()

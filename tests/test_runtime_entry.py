@@ -1,6 +1,7 @@
 import ast
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -365,11 +366,15 @@ def test_stream_compute_units_are_not_changed_by_local_viewer_default() -> None:
     assert "D2S_COREML_COMPUTE_UNITS" not in stream_branch
 
 
-def test_local_viewer_uses_v25_source_size_without_changing_4k_io(monkeypatch) -> None:
+def test_local_viewer_legacy_source_size_requires_explicit_override(monkeypatch) -> None:
     import app_runtime.runtime_entry as runtime_entry
 
     monkeypatch.setattr(runtime_entry.platform, "system", lambda: "Windows")
     monkeypatch.setattr(runtime_entry, "OUTPUT_RESOLUTION", (3840, 2160))
+    from stereo_runtime.render_size import RenderSizeConfig
+
+    monkeypatch.setattr(runtime_entry, "RENDER_SIZE_CONFIG", RenderSizeConfig(scale_factor="100%"))
+    monkeypatch.setenv("D2S_LOCAL_VIEWER_NATIVE_4K", "0")
     config = runtime_entry._resolve_local_viewer_render_size_config(
         {
             "Processing Resolution": "Auto",
@@ -388,6 +393,9 @@ def test_local_viewer_tensorrt_respects_native_processing_by_default(monkeypatch
     import torch
     import app_runtime.runtime_entry as runtime_entry
 
+    from stereo_runtime.render_size import RenderSizeConfig
+
+    monkeypatch.setattr(runtime_entry, "RENDER_SIZE_CONFIG", RenderSizeConfig(scale_factor="100%"))
     settings = {"Processing Resolution": "Auto", "Display Mode": "Half-SBS", "TensorRT": True}
     device = type("CudaDevice", (), {"type": "cuda"})()
     monkeypatch.delenv("D2S_LOCAL_VIEWER_NATIVE_4K", raising=False)
@@ -655,3 +663,94 @@ def test_openxr_environment_resolves_hdr_panorama_image(tmp_path: Path) -> None:
     assert glb_path is None
     assert profile_path == room / "profile.json"
     assert panorama_path == room / "room.hdr"
+
+
+@pytest.mark.parametrize("is_rocm", [False, True])
+@pytest.mark.parametrize("percent", ["100%", "85%", "75%", "50%"])
+def test_local_quality_scale_is_not_implicitly_replaced(monkeypatch, is_rocm, percent):
+    import torch
+    import app_runtime.runtime_entry as runtime_entry
+    from stereo_runtime.render_size import RenderSizeConfig
+
+    monkeypatch.setattr(runtime_entry.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(torch.version, "hip", "7.0" if is_rocm else None)
+    monkeypatch.delenv("D2S_LOCAL_VIEWER_NATIVE_4K", raising=False)
+    original = RenderSizeConfig(scale_factor=percent)
+    monkeypatch.setattr(runtime_entry, "RENDER_SIZE_CONFIG", original)
+    result = runtime_entry._resolve_local_viewer_render_size_config(
+        {"Processing Resolution": "Auto", "Display Mode": "Half-SBS"},
+        "Local Viewer", SimpleNamespace(type="cuda"),
+    )
+    assert result is original
+
+
+@pytest.mark.parametrize("platform_name", ["Windows", "Darwin"])
+@pytest.mark.parametrize("run_mode", ["Local Viewer", "Viewer", "Moonlight Streamer"])
+@pytest.mark.parametrize("explicit_override", [None, "0"])
+def test_local_output_upscale_cap_preserves_moonlight_and_explicit_overrides(
+    monkeypatch, platform_name, run_mode, explicit_override,
+):
+    import ast
+    import os
+
+    module = ast.parse(RUNTIME_ENTRY.read_text(encoding="utf-8"))
+    run = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "run_processing_runtime")
+    branch = next(node for node in run.body if isinstance(node, ast.If)
+                  and any(isinstance(child, ast.Constant) and child.value == "D2S_CAP_OUTPUT_UPSCALE"
+                          for child in ast.walk(node)))
+    monkeypatch.delenv("D2S_CAP_OUTPUT_UPSCALE", raising=False)
+    if explicit_override is not None:
+        monkeypatch.setenv("D2S_CAP_OUTPUT_UPSCALE", explicit_override)
+    exec(compile(ast.Module(body=[branch], type_ignores=[]), str(RUNTIME_ENTRY), "exec"), {
+        "configured_run_mode": run_mode, "os": os,
+        "platform": SimpleNamespace(system=lambda: platform_name),
+    })
+    expected = explicit_override if explicit_override is not None else (
+        "1" if run_mode in {"Local Viewer", "Viewer"} else None
+    )
+    assert os.environ.get("D2S_CAP_OUTPUT_UPSCALE") == expected
+
+
+@pytest.mark.parametrize("explicit_values", [None, {"D2S_HALF_RES_SYNTH": "1", "D2S_PREPROCESS_AT_SYNTH_SCALE": "1"}])
+def test_macos_local_viewer_keeps_processing_size_without_hidden_upscale(monkeypatch, explicit_values):
+    import ast
+    import os
+
+    module = ast.parse(RUNTIME_ENTRY.read_text(encoding="utf-8"))
+    run = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_processing_runtime"
+    )
+    branch = next(
+        node
+        for node in run.body
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(child, ast.Constant) and child.value == "D2S_HALF_RES_SYNTH"
+            for child in ast.walk(node)
+        )
+    )
+    monkeypatch.setattr(os, "environ", os.environ)
+    monkeypatch.delenv("D2S_HALF_RES_SYNTH", raising=False)
+    monkeypatch.delenv("D2S_PREPROCESS_AT_SYNTH_SCALE", raising=False)
+    if explicit_values:
+        for key, value in explicit_values.items():
+            monkeypatch.setenv(key, value)
+
+    exec(
+        compile(ast.Module(body=[branch], type_ignores=[]), str(RUNTIME_ENTRY), "exec"),
+        {
+            "configured_run_mode": "Local Viewer",
+            "os": os,
+            "platform": SimpleNamespace(system=lambda: "Darwin"),
+            "settings": {},
+        },
+    )
+
+    expected = explicit_values or {
+        "D2S_HALF_RES_SYNTH": "0",
+        "D2S_PREPROCESS_AT_SYNTH_SCALE": "0",
+    }
+    for key, value in expected.items():
+        assert os.environ.get(key) == value

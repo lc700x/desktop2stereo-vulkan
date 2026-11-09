@@ -506,6 +506,13 @@ def _merge_openxr_rgba_pack_backend(left_backend: str, right_backend: str) -> st
 
 
 def _record_cuda_event(events: dict[str, Any], name: str, frame: torch.Tensor | None) -> None:
+    if os.environ.get("D2S_CUDA_STAGE_EVENTS", "0").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
     if not isinstance(frame, torch.Tensor) or not frame.is_cuda:
         return
     try:
@@ -1880,8 +1887,20 @@ class StereoRuntime:
             # The packed SBS is authoritative. Direct quality_4k synthesis can
             # intentionally retain source RGB placeholders in left_eye/right_eye;
             # rebuilding from those placeholders duplicates the same eye.
-            sbs = sbs.detach().clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
-            debug["runtime_output_pack_backend"] = "torch_packed_sbs_to_uint8"
+            packed = None
+            if bool(getattr(sbs, "is_cuda", False)):
+                try:
+                    from .fast_plus_fused_triton import try_pack_rgb_to_uint8
+                except ImportError:
+                    pass
+                else:
+                    packed = try_pack_rgb_to_uint8(sbs)
+            if packed is None:
+                sbs = sbs.detach().clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
+                debug["runtime_output_pack_backend"] = "torch_packed_sbs_to_uint8"
+            else:
+                sbs = packed
+                debug["runtime_output_pack_backend"] = "triton_packed_sbs_to_uint8"
             debug["runtime_output_dtype"] = "uint8"
         else:
             if sbs.dtype == torch.uint8:
@@ -3453,10 +3472,11 @@ def _native_output_size(width: int, height: int, output_format: str) -> tuple[in
 
 
 def _half_res_synth_enabled() -> bool:
-    """Viewer fast path: warp at half eye resolution, upscale the SBS.
+    """Return whether an explicit low-resolution synthesis experiment is on.
 
-    Default-on for the Darwin Local Viewer (runtime_entry setdefaults "1");
-    synthesis is the dominant stage and scales with pixel count.
+    Local Viewer defaults keep the selected processing size end to end. The
+    flag remains available for controlled A/B runs, but it must not silently
+    introduce a synthesis downscale followed by a display upsample.
     """
     return _env_flag("D2S_HALF_RES_SYNTH", "0")
 

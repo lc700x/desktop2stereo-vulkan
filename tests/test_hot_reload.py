@@ -219,7 +219,9 @@ def test_hot_reload_hole_fill_off_disables_fill_and_ignores_stale_strength() -> 
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="NVIDIA CUDA is required for native TensorRT hot-reload backend mapping")
-def test_hot_reload_depth_provider_rebuild_fields_only_when_changed():
+def test_hot_reload_depth_provider_rebuild_fields_only_when_changed(monkeypatch):
+    # Exercise NVIDIA config mapping without depending on the installed Torch backend.
+    monkeypatch.setattr(torch.version, "hip", None)
     config = make_config(
         model_id="Distill-Any-Depth-Base",
         depth_backend="pytorch_cuda",

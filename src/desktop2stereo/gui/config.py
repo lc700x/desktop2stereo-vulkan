@@ -179,7 +179,7 @@ DEFAULTS = {
     "Target FPS": 0,
     "Processing Resolution": "Auto",
     "Render Size Policy": "scaled",
-    "Render Scale": "4K / 100%",
+    "Render Scale": "100%",
     # OpenXR projection target multiplier. This is independent from the
     # capture/inference Render Scale above.
     "XR Render": 1.0,

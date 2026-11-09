@@ -33,11 +33,26 @@ def test_stream_output_quality_uses_selected_headset_and_pico4_default() -> None
     )
 
     assert DEFAULT_XR_HEADSET_MODEL == "Pico 4 / 4 Ultra"
-    assert config.output_quality_enabled is True
+    # The encoder owns the final canvas. Leaving headset-tier output quality
+    # enabled here can inflate a Quality-Scale 4K source to 6528x3672 before
+    # the encoder shrinks it back, undoing the whole render-scale saving.
+    assert config.output_quality_enabled is False
+    # The selected headset tier and LOD settings are still carried through.
     assert config.output_headset_tier_k == 4
     assert config.output_min_lod == 0.5
     assert config.output_max_lod == 1.5
     assert config.output_mip_lod_bias == -0.7
+
+
+def test_local_viewer_keeps_output_quality_enabled() -> None:
+    config = runtime_config_from_d2s_settings(
+        {"Depth Model": "Distill-Any-Depth-Base", "Run Mode": "Local Viewer"},
+        cache_dir="models",
+        device="cpu",
+        depth_only=False,
+    )
+    assert config.output_quality_enabled is True
+    assert config.output_headset_tier_k == 4
 
 
 def test_local_output_quality_uses_the_same_selected_headset_target() -> None:

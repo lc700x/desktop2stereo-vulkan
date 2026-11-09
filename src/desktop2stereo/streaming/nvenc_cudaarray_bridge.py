@@ -297,3 +297,68 @@ class NvencCudaArrayEncoder:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+class NvencCudaNv12Encoder(NvencCudaArrayEncoder):
+    """Encode a persistent GPU NV12 buffer without a multi-frame output delay."""
+
+    def __init__(self, width: int, height: int, *, fps: int, bitrate: int, hevc: bool, device: Any) -> None:
+        import torch
+
+        self._library = load_nvenc_cudaarray_bridge()
+        create = self._library.d2s_nvenc_nv12_create
+        create.restype = ctypes.c_void_p
+        create.argtypes = [
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_int32, ctypes.c_uint64, ctypes.c_uint32,
+        ]
+        submit = self._library.d2s_nvenc_nv12_submit
+        submit.restype = ctypes.c_int32
+        submit.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int32]
+        self._closed = True
+        self._handle = None
+        if width < 2 or height < 2 or width % 2 or height % 2:
+            raise ValueError("NV12 encoder requires positive even dimensions")
+        self._nv12 = torch.empty((height * 3 // 2, width, 1), device=device, dtype=torch.uint8)
+        with torch.cuda.device(device):
+            # A cached torch allocation need not bind a CUDA context on a new
+            # handshake thread. Make one runtime call before native NVENC opens
+            # its session; this setup-only wait is not in the frame hot path.
+            torch.cuda.current_stream(device=device).synchronize()
+            self._handle = create(width, height, max(1, fps), max(1, bitrate), int(hevc), self._nv12.data_ptr(), width)
+        if not self._handle:
+            raise RuntimeError(_last_error(self._library))
+        self._closed = False
+
+    def encode_access_units(self, rgb_cuda: Any, *, frame_index: int, force_idr: bool = False) -> list[dict[str, Any]]:
+        from streaming.nvidia_encoder import rgb_cuda_to_nv12
+        import torch
+
+        if self._closed:
+            raise RuntimeError("native NVENC NV12 encoder is closed")
+        # Reuse the exact existing RGB/NV12 coefficients. NVENC submits on a
+        # separate queue and has no implicit dependency on the PyTorch stream.
+        encode_stream = torch.cuda.current_stream(device=self._nv12.device)
+        rgb_cuda_to_nv12(
+            rgb_cuda,
+            encoder_stream=int(encode_stream.cuda_stream),
+            destination=self._nv12,
+        )
+        encode_stream.synchronize()
+        status = self._library.d2s_nvenc_nv12_submit(self._handle, max(0, int(frame_index)), int(force_idr))
+        if status != 0:
+            raise RuntimeError(_last_error(self._library))
+        return [
+            {"data": packet.data, "frame_index": packet.pts, "idr": bool(force_idr)}
+            for packet in self._drain_timed_packets()
+        ]
+
+    def flush_access_units(self) -> list[dict[str, Any]]:
+        return [
+            {"data": packet.data, "frame_index": packet.pts, "idr": False}
+            for packet in self.flush_timed()
+        ]
+
+    def close(self) -> None:
+        super().close()
+        self._nv12 = None

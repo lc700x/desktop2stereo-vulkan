@@ -146,20 +146,23 @@ class MoonlightBridgeServer:
                         reservation = object()
                         owner._client_reserved = reservation
                     response = owner.on_client_start(config)
-                    with owner._socket_lock:
-                        if owner._client_reserved is not reservation:
+                    # Publish and acknowledge under the frame writer's lock:
+                    # the first IDR must never precede the JSON handshake.
+                    with owner._send_lock:
+                        with owner._socket_lock:
+                            if owner._client_reserved is not reservation:
+                                return
+                            owner._client_reserved = None
+                            reservation = None
+                            if response is not None:
+                                owner._client_socket = self.connection
+                                owner._client_config = config
+                                owner._client_generation += 1
+                        if response is None:
+                            self.wfile.write(b'{"ok":false,"error":"encoder configuration rejected"}\n')
                             return
-                        owner._client_reserved = None
-                        reservation = None
-                        if response is not None:
-                            owner._client_socket = self.connection
-                            owner._client_config = config
-                            owner._client_generation += 1
-                    if response is None:
-                        self.wfile.write(b'{"ok":false,"error":"encoder configuration rejected"}\n')
-                        return
-                    self.wfile.write((json.dumps({"ok": True, **response}) + "\n").encode("utf-8"))
-                    self.wfile.flush()
+                        self.wfile.write((json.dumps({"ok": True, **response}) + "\n").encode("utf-8"))
+                        self.wfile.flush()
                     while True:
                         commands = self.connection.recv(256)
                         if not commands:

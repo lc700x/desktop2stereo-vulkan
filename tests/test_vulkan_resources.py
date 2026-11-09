@@ -140,3 +140,39 @@ def test_d3d11_vulkan_import_requires_a_verified_vulkan_adapter_luid():
             123,
             adapter_luid=456,
         )
+
+
+def test_vulkan_stereo_blit_restores_canvas_and_tracks_shared_source_once(monkeypatch):
+    from types import SimpleNamespace
+    import vulkan as vk
+    from viewer.vulkan_context import VulkanContext, ImageStateTracker
+
+    context = object.__new__(VulkanContext)
+    context.vk = vk
+    context.physical_device = object()
+    context.queue_family_index = 0
+    context._image_states = ImageStateTracker(default_queue_family_index=0)
+    context._ensure_open = lambda: None
+    recorded, barriers, clears = [], [], []
+    monkeypatch.setattr(
+        vk, "vkGetPhysicalDeviceFormatProperties", lambda *_: SimpleNamespace(optimalTilingFeatures=0xFFFFFFFF),
+    )
+    monkeypatch.setattr(vk, "vkCmdPipelineBarrier", lambda *_args: barriers.append(_args))
+    monkeypatch.setattr(vk, "vkCmdClearColorImage", lambda *_args: clears.append(_args))
+    monkeypatch.setattr(vk, "vkCmdBlitImage", lambda *_args: recorded.append(_args))
+    context.submit_on = lambda queue, record, **kwargs: record(object()) or 7
+    source = SimpleNamespace(context=context, image=vk.ffi.cast("VkImage", 1), width=160, height=50, format=37)
+    destination = SimpleNamespace(context=context, image=vk.ffi.cast("VkImage", 2), width=160, height=100, format=37)
+    regions = (((0, 0, 80, 50), (0, 0, 80, 100)), ((80, 0, 160, 50), (80, 0, 160, 100)))
+    assert context.compose_sbs_images(source, source, destination, blit_regions=regions) == 7
+    assert len(clears) == 1
+    assert len(recorded) == 2
+    assert recorded[0][-1] == vk.VK_FILTER_LINEAR
+    assert recorded[1][-2][0].srcOffsets[0].x == 80
+    assert recorded[1][-2][0].dstOffsets[1].x == 160
+    assert len(context._image_states._states) == 2
+    assert len(barriers) == 5  # Two transitions, clear-to-blit ordering, two restorations.
+    with pytest.raises(ValueError, match="outside"):
+        context.compose_sbs_images(source, source, destination, blit_regions=(
+            ((0, 0, 161, 50), (0, 0, 80, 100)), regions[1],
+        ))

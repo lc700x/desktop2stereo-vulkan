@@ -76,6 +76,7 @@ if OS_NAME == "Windows":
     _cursor_originals: dict[int, int] = {}
     _cursor_clones: dict[int, int] = {}
     _cursor_handle_map: dict[int, int] = {}
+    _cursor_suppression_windows: set[int] = set()
 
     class CursorInfo(ctypes.Structure):
         _fields_ = [
@@ -135,6 +136,10 @@ if OS_NAME == "Windows":
     user32.GetCursorInfo.restype = wintypes.BOOL
     user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
     user32.GetCursorPos.restype = wintypes.BOOL
+    user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+    user32.MonitorFromPoint.restype = wintypes.HANDLE
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.MonitorFromWindow.restype = wintypes.HANDLE
     user32.GetIconInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(IconInfo)]
     user32.GetIconInfo.restype = wintypes.BOOL
     user32.DrawIconEx.argtypes = [
@@ -474,6 +479,23 @@ if OS_NAME == "Windows":
     def native_cursor_suppressed() -> bool:
         return _cursor_hidden
 
+    def update_native_cursor_suppression() -> None:
+        """Hide the system cursor only while it is on a stereo-output monitor."""
+        if not _cursor_suppression_windows:
+            _set_native_cursor_suppressed(False)
+            return
+        position = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(position)):
+            return
+        monitor = user32.MonitorFromPoint(position, 0)
+        hidden = bool(monitor) and any(
+            user32.MonitorFromWindow(hwnd, 0) == monitor
+            for hwnd in _cursor_suppression_windows
+        )
+        # The cursor scheme changes only when crossing an involved monitor's
+        # boundary. Keep the existing cursor resource and two-eye overlay handling.
+        _set_native_cursor_suppressed(hidden)
+
     def _set_window_capture_affinity(glfw_window, affinity):
         hwnd = glfw.get_win32_window(glfw_window)
         if not hwnd:
@@ -546,7 +568,11 @@ if OS_NAME == "Windows":
                 glfw.set_input_mode(window, attr, mode)
         except Exception:
             pass
-        _set_native_cursor_suppressed(hidden)
+        if hidden:
+            _cursor_suppression_windows.add(int(hwnd))
+        else:
+            _cursor_suppression_windows.discard(int(hwnd))
+        update_native_cursor_suppression()
         return True
 
     class StereoCursorOverlay:
@@ -724,6 +750,9 @@ else:
 
     def native_cursor_suppressed():
         return False
+
+    def update_native_cursor_suppression():
+        return None
 
     class StereoCursorOverlay:
         def __init__(self, *args, **kwargs):

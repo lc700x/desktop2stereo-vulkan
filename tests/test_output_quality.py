@@ -28,7 +28,10 @@ def _headset_config(**overrides):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for EASU")
-def test_triton_easu_and_rcas_preserve_a_constant_eye_image() -> None:
+def test_triton_easu_and_rcas_preserve_a_constant_eye_image(monkeypatch) -> None:
+    # Fixed-canvas presenters cap the headset upscale by default. Exercise the
+    # legacy EASU/RCAS chain explicitly here so this kernel stays covered.
+    monkeypatch.setenv("D2S_CAP_OUTPUT_UPSCALE", "0")
     image = torch.full((1, 3, 8, 12), 0.25, device="cuda")
 
     left, right, debug = apply_output_quality(image, image, _headset_config())
@@ -56,7 +59,8 @@ def test_triton_quality_matches_the_device_independent_reference() -> None:
     assert torch.allclose(actual_rcas, expected_rcas, atol=1e-4, rtol=1e-4)
 
 
-def test_common_quality_runs_before_half_sbs_packing() -> None:
+def test_common_quality_runs_before_half_sbs_packing(monkeypatch) -> None:
+    monkeypatch.setenv("D2S_CAP_OUTPUT_UPSCALE", "0")
     rgb = torch.rand(1, 3, 8, 12)
     depth = torch.linspace(0.0, 1.0, 12).view(1, 1, 1, 12).expand(1, 1, 8, 12)
     config = StereoConfig(
@@ -76,7 +80,8 @@ def test_common_quality_runs_before_half_sbs_packing() -> None:
     assert result.debug_info["output_quality_backend"] == "torch_easu_reference"
 
 
-def test_forced_mip_lod_filters_native_headset_output_before_packing() -> None:
+def test_forced_mip_lod_filters_native_headset_output_before_packing(monkeypatch) -> None:
+    monkeypatch.setenv("D2S_CAP_OUTPUT_UPSCALE", "0")
     checker = (torch.arange(16).view(1, 1, 1, 16) % 2).float().expand(1, 3, 8, 16)
     baseline, _, _ = apply_output_quality(
         checker,
@@ -98,6 +103,48 @@ def test_forced_mip_lod_filters_native_headset_output_before_packing() -> None:
     assert debug["output_quality_applied"] == 1
     assert debug["output_quality_backend"].startswith("torch_trilinear_mip+")
     assert output_quality_requires_eye_images(config, 16, 8) is True
+
+
+@pytest.mark.parametrize("scale", ["100%", "85%", "75%", "50%"])
+def test_cap_keeps_quality_scale_sources_eligible_for_fused_direct_sbs(monkeypatch, scale) -> None:
+    """Quality Scale must reduce GPU work, not disable the fused warp path."""
+    from stereo_runtime.output_quality import (
+        output_quality_requires_eye_images,
+        output_sampling_plan_for_config,
+        output_upscale_capped,
+    )
+    from stereo_runtime.render_size import RenderSizeConfig, resolve_render_size
+
+    monkeypatch.delenv("D2S_CAP_OUTPUT_UPSCALE", raising=False)
+    assert output_upscale_capped() is True
+    size = resolve_render_size((3840, 2160), RenderSizeConfig(scale_factor=scale))
+    config = _headset_config(
+        output_min_lod=0.0,
+        output_max_lod=0.35,
+        output_mip_lod_bias=-0.35,
+    )
+    plan = output_sampling_plan_for_config(config, *size)
+    assert plan is not None
+    assert plan.mode == "native_mip"
+    assert (plan.target_width, plan.target_height) == size
+    assert output_quality_requires_eye_images(config, *size) is False
+
+
+def test_legacy_headset_upscale_would_disable_the_fused_path(monkeypatch) -> None:
+    from stereo_runtime.output_quality import (
+        output_quality_requires_eye_images,
+        output_sampling_plan_for_config,
+    )
+    from stereo_runtime.render_size import RenderSizeConfig, resolve_render_size
+
+    monkeypatch.setenv("D2S_CAP_OUTPUT_UPSCALE", "0")
+    size = resolve_render_size((3840, 2160), RenderSizeConfig(scale_factor="85%"))
+    config = _headset_config()
+    plan = output_sampling_plan_for_config(config, *size)
+    assert plan is not None
+    assert plan.mode == "upscale_easu"
+    assert (plan.target_width, plan.target_height) == (6528, 3672)
+    assert output_quality_requires_eye_images(config, *size) is True
 
 
 def test_pixel_coverage_downsample_avoids_ringing_and_sharpens_at_final_size(monkeypatch) -> None:

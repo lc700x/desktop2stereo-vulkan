@@ -26,6 +26,38 @@ class IntelVulkanSbsFrame:
     gpu_copy_count: int = 1
     producer_ready: bool = False
     ready_timeline: int = 0
+    vulkan_resource: Any = None
+
+
+def _eye_blit_regions(
+    eye_size: tuple[int, int], target_size: tuple[int, int], display_mode: str,
+    fit_mode: str, input_size: tuple[int, int] | None, *, packed_source: bool = False,
+) -> tuple:
+    """Map the stream's per-eye fit rectangles back to full-resolution source eyes."""
+    from streaming.aspect import presentation_blit_regions
+
+    width, height = eye_size
+    mode = str(display_mode).casefold().replace("_", "-")
+    is_tab = mode.endswith("tab")
+    is_half = mode.startswith("half-")
+    encoded_width = width // 2 if is_half and not is_tab else width
+    encoded_height = height // 2 if is_half and is_tab else height
+    encoded_width, encoded_height = max(1, encoded_width), max(1, encoded_height)
+    source_size = (encoded_width, encoded_height * 2) if is_tab else (encoded_width * 2, encoded_height)
+    regions = presentation_blit_regions(source_size, target_size, fit_mode, display_mode, input_size)
+    mapped = []
+    for index, (source, destination) in enumerate(regions):
+        origin_x, origin_y = (0, index * encoded_height) if is_tab else (index * encoded_width, 0)
+        crop = tuple(int(round(value)) for value in (
+            (source[0] - origin_x) * width / encoded_width,
+            (source[1] - origin_y) * height / encoded_height,
+            (source[2] - origin_x) * width / encoded_width,
+            (source[3] - origin_y) * height / encoded_height,
+        ))
+        if packed_source:
+            crop = (crop[0] + index * width, crop[1], crop[2] + index * width, crop[3])
+        mapped.append((crop, destination))
+    return tuple(mapped)
 
 
 class IntelVulkanSbsComposer:
@@ -36,7 +68,9 @@ class IntelVulkanSbsComposer:
     this is explicitly a GPU-only copy path, not strict zero-copy yet.
     """
 
-    def __init__(self, context: Any, eye_width: int, eye_height: int) -> None:
+    def __init__(
+        self, context: Any, eye_width: int, eye_height: int, *, target_size: tuple[int, int] | None = None,
+    ) -> None:
         self.context = context
         self.eye_width = int(eye_width)
         self.eye_height = int(eye_height)
@@ -46,9 +80,11 @@ class IntelVulkanSbsComposer:
         if adapter_luid == 0:
             raise RuntimeError("Vulkan Adapter LUID is unavailable for Intel SBS composition")
         self.adapter_luid = adapter_luid
+        self.target_size = target_size
+        output_width, output_height = target_size or (self.eye_width * 2, self.eye_height)
         self.surface = D3D11SbsSurface(
-            width=self.eye_width * 2,
-            height=self.eye_height,
+            width=output_width,
+            height=output_height,
             adapter_luid=adapter_luid,
         )
         if self.surface.adapter_luid != adapter_luid:
@@ -67,6 +103,10 @@ class IntelVulkanSbsComposer:
         right_resource: Any,
         *,
         ready_timeline: int | None = None,
+        display_mode: str = "Full-SBS",
+        fit_mode: str = "stretch",
+        input_size: tuple[int, int] | None = None,
+        packed_source: bool = False,
     ) -> IntelVulkanSbsFrame:
         if self.imported is None or self.imported.resource is None:
             raise RuntimeError("Intel Vulkan SBS imported destination is unavailable")
@@ -74,11 +114,25 @@ class IntelVulkanSbsComposer:
             right_resource, "context", None
         ) is not self.context:
             raise RuntimeError("Vulkan SBS eye resources belong to a different context")
+        kwargs = {}
+        if self.target_size is not None:
+            regions = _eye_blit_regions(
+                (self.eye_width, self.eye_height), self.target_size,
+                display_mode, fit_mode, input_size, packed_source=packed_source,
+            )
+            native_regions = (
+                ((0, 0, self.eye_width, self.eye_height), (0, 0, self.eye_width, self.eye_height)),
+                ((0, 0, self.eye_width, self.eye_height),
+                 (self.eye_width, 0, self.eye_width * 2, self.eye_height)),
+            )
+            if regions != native_regions:
+                kwargs["blit_regions"] = regions
         timeline = self.context.compose_sbs_images(
             left_resource,
             right_resource,
             self.imported.resource,
             wait_for_timeline=ready_timeline,
+            **kwargs,
         )
         # D3D11 has no Vulkan semaphore object in this bridge yet. Waiting for
         # the submitted Vulkan timeline is still GPU synchronization; it does
@@ -93,6 +147,7 @@ class IntelVulkanSbsComposer:
             adapter_luid=self.adapter_luid,
             producer_ready=True,
             ready_timeline=int(timeline),
+            vulkan_resource=self.imported.resource,
         )
 
     def frame_after_vulkan_submit(self, timeline: int) -> IntelVulkanSbsFrame:
@@ -109,6 +164,7 @@ class IntelVulkanSbsComposer:
             producer_ready=True,
             ready_timeline=int(timeline),
             gpu_copy_count=1,
+            vulkan_resource=self.imported.resource,
         )
 
     def close(self) -> None:
@@ -129,7 +185,11 @@ class IntelVulkanSbsRuntimeBridge:
     opt-in and does not perform an intermediate eye-image blit.
     """
 
-    def __init__(self, eye_width: int, eye_height: int, *, ring_size: int = 3) -> None:
+    def __init__(
+        self, eye_width: int, eye_height: int, *, ring_size: int = 3,
+        target_size: tuple[int, int] | None = None, display_mode: str = "Full-SBS",
+        fit_mode: str = "stretch", input_size: tuple[int, int] | None = None,
+    ) -> None:
         from viewer.vulkan_context import VulkanContext, VulkanContextConfig
         from stereo_runtime.vulkan_backend import VulkanStereoImageComputeBackend
 
@@ -147,6 +207,14 @@ class IntelVulkanSbsRuntimeBridge:
         if destination is None:
             raise RuntimeError("Intel Vulkan SBS imported destination is unavailable")
         self.context.prepare_external_image_for_producer(destination)
+        self.output_composer = (
+            IntelVulkanSbsComposer(self.context, self.eye_width, self.eye_height, target_size=target_size)
+            if target_size is not None and (
+                target_size != (self.eye_width * 2, self.eye_height)
+                or str(display_mode).casefold().endswith("tab")
+            ) else None
+        )
+        self.display_mode, self.fit_mode, self.input_size = display_mode, fit_mode, input_size
         self._frame_id = 0
 
     def submit(self, request: Any) -> IntelVulkanSbsFrame:
@@ -173,7 +241,15 @@ class IntelVulkanSbsRuntimeBridge:
             params=params,
             packed_output=True,
         )
-        frame = self.composer.frame_after_vulkan_submit(timeline)
+        frame = (
+            self.output_composer.compose(
+                destination, destination, ready_timeline=timeline,
+                display_mode=self.display_mode, fit_mode=self.fit_mode,
+                input_size=self.input_size, packed_source=True,
+            )
+            if self.output_composer is not None
+            else self.composer.frame_after_vulkan_submit(timeline)
+        )
         self._frame_id += 1
         return frame
 
@@ -185,6 +261,10 @@ class IntelVulkanSbsRuntimeBridge:
             except Exception:
                 pass
             self.backend = None
+        output_composer = getattr(self, "output_composer", None)
+        if output_composer is not None:
+            output_composer.close()
+            self.output_composer = None
         composer = getattr(self, "composer", None)
         if composer is not None:
             try:

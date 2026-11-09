@@ -30,6 +30,7 @@ def test_migraphx_factory_preserves_profile_sync(monkeypatch, profile_sync):
 def test_migraphx_profile_does_not_synchronize_normal_inference(monkeypatch, tmp_path, device):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("GPU timing requires a CUDA/ROCm device")
+    monkeypatch.setenv("D2S_CUDA_STAGE_EVENTS", "1")
     provider = MIGraphXDepthProvider(device=device, onnx_path=tmp_path / "model_fp16_2x3.onnx")
     predicted = torch.arange(6, dtype=torch.float32, device=device).reshape(1, 2, 3)
 

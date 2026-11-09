@@ -155,7 +155,9 @@ git -C "$temp_dir/sunshine/third-party/moonlight-common-c" \
   submodule update --init --depth 1 -- enet nanors
 git -C "$temp_dir/sunshine/third-party/build-deps" \
   submodule update --init --depth 1 -- third-party/FFmpeg/FFmpeg
-git -C "$temp_dir/sunshine" apply --include=src/video.cpp --include=src/nvhttp.cpp "$patch_file"
+git -C "$temp_dir/sunshine" apply \
+  --include=src/video.cpp --include=src/nvhttp.cpp \
+  --include=src/input.h --include=src/input.cpp "$patch_file"
 git -C "$temp_dir/sunshine" apply "$macos_compat_patch"
 source_commit="$(git -C "$temp_dir/sunshine" rev-parse HEAD)"
 

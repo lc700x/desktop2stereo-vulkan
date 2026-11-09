@@ -838,8 +838,9 @@ class VulkanContext:
         destination_resource: Any,
         *,
         wait_for_timeline: int | None = None,
+        blit_regions: tuple | None = None,
     ) -> int:
-        """Blit two Vulkan eye images into a D3D11-imported SBS image.
+        """Blit two Vulkan eye images into a D3D11-imported stereo image.
 
         This is the compatibility bridge for the current two-eye Vulkan
         producer. It performs GPU-only composition and records two GPU blits;
@@ -847,7 +848,11 @@ class VulkanContext:
         A later fused shader can write the imported SBS image directly.
         """
         self._ensure_open()
-        resources = (left_resource, right_resource, destination_resource)
+        resources = (
+            (left_resource, destination_resource)
+            if left_resource is right_resource
+            else (left_resource, right_resource, destination_resource)
+        )
         for resource in resources:
             if getattr(resource, "context", self) is not self:
                 raise VulkanCapabilityError("SBS composition resource belongs to a different context")
@@ -861,9 +866,35 @@ class VulkanContext:
             raise ValueError("SBS source image dimensions must be positive")
         if (right_width, right_height) != (left_width, left_height):
             raise ValueError("SBS source eye dimensions must match")
-        if (destination_width, destination_height) != (left_width * 2, left_height):
+        custom_regions = blit_regions is not None
+        if not custom_regions and (destination_width, destination_height) != (left_width * 2, left_height):
             raise ValueError("D3D11 SBS destination dimensions must be two eye widths")
+        if min(destination_width, destination_height) < 1:
+            raise ValueError("stereo destination dimensions must be positive")
+        if blit_regions is None:
+            blit_regions = (
+                ((0, 0, left_width, left_height), (0, 0, left_width, left_height)),
+                ((0, 0, right_width, right_height), (left_width, 0, destination_width, destination_height)),
+            )
+        if len(blit_regions) != 2:
+            raise ValueError("stereo composition requires exactly two eye blits")
+        for resource, (source, destination) in zip((left_resource, right_resource), blit_regions):
+            if not (
+                0 <= source[0] < source[2] <= resource.width
+                and 0 <= source[1] < source[3] <= resource.height
+                and 0 <= destination[0] < destination[2] <= destination_width
+                and 0 <= destination[1] < destination[3] <= destination_height
+            ):
+                raise ValueError("stereo blit rectangle lies outside its image")
         vk = self.vk
+        filter_mode = vk.VK_FILTER_NEAREST
+        linear_feature = int(getattr(vk, "VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT", 0))
+        if custom_regions and linear_feature and all(
+            int(vk.vkGetPhysicalDeviceFormatProperties(
+                self.physical_device, int(resource.format),
+            ).optimalTilingFeatures) & linear_feature for resource in (left_resource, right_resource)
+        ):
+            filter_mode = vk.VK_FILTER_LINEAR
         blit_src = int(getattr(vk, "VK_FORMAT_FEATURE_BLIT_SRC_BIT", 0))
         blit_dst = int(getattr(vk, "VK_FORMAT_FEATURE_BLIT_DST_BIT", 0))
         if blit_src and blit_dst:
@@ -920,7 +951,21 @@ class VulkanContext:
                     [barrier],
                 )
 
-            def region(source: Any, destination_x: int) -> Any:
+            if custom_regions:
+                vk.vkCmdClearColorImage(
+                    command_buffer, destination_resource.image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    vk.VkClearColorValue(float32=[0.0, 0.0, 0.0, 1.0]),
+                    1, [_color_subresource_range(vk)],
+                )
+                vk.vkCmdPipelineBarrier(
+                    command_buffer, vk.VK_PIPELINE_STAGE_TRANSFER_BIT, vk.VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                    1, [vk.VkMemoryBarrier(
+                        sType=vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT, dstAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                    )], 0, None, 0, None,
+                )
+
+            def region(source_rect: tuple, destination_rect: tuple) -> Any:
                 return vk.VkImageBlit(
                     srcSubresource=vk.VkImageSubresourceLayers(
                         aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
@@ -929,8 +974,8 @@ class VulkanContext:
                         layerCount=1,
                     ),
                     srcOffsets=[
-                        vk.VkOffset3D(x=0, y=0, z=0),
-                        vk.VkOffset3D(x=int(source.width), y=int(source.height), z=1),
+                        vk.VkOffset3D(x=source_rect[0], y=source_rect[1], z=0),
+                        vk.VkOffset3D(x=source_rect[2], y=source_rect[3], z=1),
                     ],
                     dstSubresource=vk.VkImageSubresourceLayers(
                         aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
@@ -939,12 +984,8 @@ class VulkanContext:
                         layerCount=1,
                     ),
                     dstOffsets=[
-                        vk.VkOffset3D(x=destination_x, y=0, z=0),
-                        vk.VkOffset3D(
-                            x=destination_x + int(source.width),
-                            y=int(source.height),
-                            z=1,
-                        ),
+                        vk.VkOffset3D(x=destination_rect[0], y=destination_rect[1], z=0),
+                        vk.VkOffset3D(x=destination_rect[2], y=destination_rect[3], z=1),
                     ],
                 )
 
@@ -955,8 +996,8 @@ class VulkanContext:
                 destination_resource.image,
                 vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 1,
-                [region(left_resource, 0)],
-                vk.VK_FILTER_NEAREST,
+                [region(*blit_regions[0])],
+                filter_mode,
             )
             vk.vkCmdBlitImage(
                 command_buffer,
@@ -965,8 +1006,8 @@ class VulkanContext:
                 destination_resource.image,
                 vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 1,
-                [region(right_resource, left_width)],
-                vk.VK_FILTER_NEAREST,
+                [region(*blit_regions[1])],
+                filter_mode,
             )
 
             for resource, _image_key, state in image_states:

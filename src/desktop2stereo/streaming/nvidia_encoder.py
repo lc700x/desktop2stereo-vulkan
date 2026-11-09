@@ -2,12 +2,59 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 import subprocess
 import threading
 from typing import Any
 
 
-def rgb_cuda_to_nv12(frame: Any) -> tuple[Any, Any]:
+@lru_cache(maxsize=1)
+def _nv12_kernel():
+    """Compile the existing BT.601 conversion as one CUDA pass when Triton exists."""
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def color(src, x, y, sy: tl.constexpr, sx: tl.constexpr, sc: tl.constexpr,
+              FLOAT: tl.constexpr, mask):
+        offset = y * sy + x * sx
+        r = tl.load(src + offset, mask=mask, other=0).to(tl.float32)
+        g = tl.load(src + offset + sc, mask=mask, other=0).to(tl.float32)
+        b = tl.load(src + offset + 2 * sc, mask=mask, other=0).to(tl.float32)
+        if FLOAT:
+            r = tl.minimum(1.0, tl.maximum(0.0, r)) * 255.0
+            g = tl.minimum(1.0, tl.maximum(0.0, g)) * 255.0
+            b = tl.minimum(1.0, tl.maximum(0.0, b)) * 255.0
+        yy = tl.minimum(255.0, tl.maximum(0.0, 0.257 * r + 0.504 * g + 0.098 * b + 16.0))
+        u = tl.minimum(255.0, tl.maximum(0.0, -0.148 * r - 0.291 * g + 0.439 * b + 128.0))
+        v = tl.minimum(255.0, tl.maximum(0.0, 0.439 * r - 0.368 * g - 0.071 * b + 128.0))
+        return yy, u, v
+
+    @triton.jit
+    def kernel(src, dst, width: tl.constexpr, height: tl.constexpr,
+               sy: tl.constexpr, sx: tl.constexpr, sc: tl.constexpr,
+               FLOAT: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        active = i < (width // 2) * (height // 2)
+        x = (i % (width // 2)) * 2
+        y = (i // (width // 2)) * 2
+        y00, u00, v00 = color(src, x, y, sy, sx, sc, FLOAT, active)
+        y01, u01, v01 = color(src, x + 1, y, sy, sx, sc, FLOAT, active)
+        y10, u10, v10 = color(src, x, y + 1, sy, sx, sc, FLOAT, active)
+        y11, u11, v11 = color(src, x + 1, y + 1, sy, sx, sc, FLOAT, active)
+        base = y * width + x
+        tl.store(dst + base, y00.to(tl.uint8), mask=active)
+        tl.store(dst + base + 1, y01.to(tl.uint8), mask=active)
+        tl.store(dst + base + width, y10.to(tl.uint8), mask=active)
+        tl.store(dst + base + width + 1, y11.to(tl.uint8), mask=active)
+        chroma = height * width + (y // 2) * width + x
+        tl.store(dst + chroma, (((u00 + u10) + (u01 + u11)) * 0.25).to(tl.uint8), mask=active)
+        tl.store(dst + chroma + 1, (((v00 + v10) + (v01 + v11)) * 0.25).to(tl.uint8), mask=active)
+
+    return kernel
+
+
+def rgb_cuda_to_nv12(frame: Any, *, encoder_stream: int = 0, destination: Any = None) -> tuple[Any, Any]:
     """Convert a CUDA RGB tensor to NV12 planes without downloading to CPU."""
     import torch
 
@@ -29,6 +76,43 @@ def rgb_cuda_to_nv12(frame: Any) -> tuple[Any, Any]:
     height, width = (int(image.shape[0]), int(image.shape[1]))
     if height % 2 or width % 2:
         raise ValueError("NV12 requires even width and height")
+    if destination is not None and (
+        destination.device != image.device or destination.dtype != torch.uint8
+        or tuple(destination.shape) != (height * 3 // 2, width, 1) or not destination.is_contiguous()
+    ):
+        raise ValueError("NV12 destination must be contiguous uint8 on the input device with matching dimensions")
+    producer_stream = torch.cuda.current_stream(device=image.device)
+    # An explicitly shared stream already orders conversion before NVENC's
+    # device copy. Unknown/default or different encoder streams still need
+    # the legacy host hand-off wait to prevent reading unfinished planes.
+    needs_handoff_wait = not encoder_stream or producer_stream.cuda_stream != encoder_stream
+    # Keep the exact coefficients, rounding and 2x2 chroma footprint. The
+    # single pass avoids full-resolution float planes and many kernel launches.
+    if image.dtype in {torch.uint8, torch.float32} and image.shape[-1] == 3:
+        try:
+            from stereo_runtime.triton_runtime import triton_runtime_available
+
+            if triton_runtime_available(image.device):
+                nv12 = destination if destination is not None else torch.empty(
+                    (height * 3 // 2, width, 1), dtype=torch.uint8, device=image.device,
+                )
+                import triton
+
+                try:
+                    kernel = _nv12_kernel()
+                    kernel[(((height // 2) * (width // 2) + 255) // 256,)](
+                        image, nv12, width, height, *image.stride(),
+                        image.dtype == torch.float32, BLOCK=256, enable_fp_fusion=False,
+                    )
+                except triton.TritonError:
+                    pass
+                else:
+                    if needs_handoff_wait:
+                        producer_stream.synchronize()
+                    return nv12[:height], nv12[height:].reshape(height // 2, width // 2, 2)
+        except (ImportError, RuntimeError):
+            # Retain the proven conversion on installations without Triton.
+            pass
     if image.dtype == torch.uint8:
         rgb = image.float()
     else:
@@ -41,16 +125,15 @@ def rgb_cuda_to_nv12(frame: Any) -> tuple[Any, Any]:
     u = u.reshape(height // 2, 2, width // 2, 2).mean(dim=(1, 3))
     v = v.reshape(height // 2, 2, width // 2, 2).mean(dim=(1, 3))
     uv = torch.stack((u, v), dim=-1).reshape(height // 2, width).to(torch.uint8)
-    nv12 = torch.empty((height * 3 // 2, width, 1), dtype=torch.uint8, device=image.device)
+    nv12 = destination if destination is not None else torch.empty(
+        (height * 3 // 2, width, 1), dtype=torch.uint8, device=image.device,
+    )
     y_plane = nv12[:height]
     uv_plane = nv12[height:].reshape(height // 2, width // 2, 2)
     y_plane.copy_(y.unsqueeze(-1))
     uv_plane.copy_(uv.reshape(height // 2, width // 2, 2))
-    # PyNvVideoCodec owns a separate CUDA/NVENC submission queue and cannot
-    # infer a dependency on PyTorch's current stream. Without this hand-off
-    # wait it may read the NV12 planes while conversion is still in flight,
-    # producing an initialized encoder with corrupted frames.
-    torch.cuda.current_stream(device=image.device).synchronize()
+    if needs_handoff_wait:
+        producer_stream.synchronize()
     return y_plane, uv_plane
 
 
@@ -78,8 +161,10 @@ class PyNvVideoCodecEncoder:
         fps: int,
         bitrate: int,
         gpu_id: int = 0,
+        cuda_stream: int = 0,
     ):
         self._nvc = nvc
+        self._cuda_stream = int(cuda_stream)
         codec = "hevc" if hevc else "h264"
         frame_rate = max(1, int(fps))
         target_bitrate = max(1, int(bitrate))
@@ -93,6 +178,7 @@ class PyNvVideoCodecEncoder:
             bitrate=target_bitrate,
             maxbitrate=max(target_bitrate, int(target_bitrate * 1.2)),
             gpu_id=max(0, int(gpu_id)),
+            cudastream=int(cuda_stream),
             tuning_info="ultra_low_latency",
             preset="P1",
             rc="cbr",
@@ -107,7 +193,7 @@ class PyNvVideoCodecEncoder:
         self._pending_nv12_frames: dict[int, tuple[Any, Any]] = {}
 
     def encode(self, rgb_cuda: Any) -> bytes:
-        y, uv = rgb_cuda_to_nv12(rgb_cuda)
+        y, uv = rgb_cuda_to_nv12(rgb_cuda, encoder_stream=self._cuda_stream)
         packet = self._encoder.Encode(Nv12CudaFrame(y, uv))
         return self._packet_bytes(packet)
 
@@ -119,7 +205,7 @@ class PyNvVideoCodecEncoder:
         force_idr: bool = False,
     ) -> list[dict[str, Any]]:
         """Encode a CUDA frame and preserve packet timestamps for GameStream."""
-        y, uv = rgb_cuda_to_nv12(rgb_cuda)
+        y, uv = rgb_cuda_to_nv12(rgb_cuda, encoder_stream=self._cuda_stream)
         frame_index = max(0, int(frame_index))
         # NVENC can return an access unit several Encode() calls after the
         # corresponding input was submitted. Keep its CUDA planes alive until

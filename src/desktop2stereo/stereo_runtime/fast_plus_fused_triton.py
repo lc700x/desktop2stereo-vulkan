@@ -715,3 +715,31 @@ def make_fast_plus_fused_half_sbs_uint8(
         block,
     )
     return out
+
+
+@triton.jit
+def _pack_rgb_uint8_kernel(src, dst, count: tl.constexpr, BLOCK: tl.constexpr):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = index < count
+    value = tl.load(src + index, mask=active, other=0)
+    value = tl.where(value == value, value, 0.0)
+    value = tl.minimum(1.0, tl.maximum(0.0, value)) * 255.0
+    floor = tl.floor(value)
+    fraction = value - floor
+    rounded = floor + ((fraction > 0.5) | ((fraction == 0.5) & ((floor.to(tl.int32) & 1) != 0)))
+    tl.store(dst + index, rounded.to(tl.uint8), mask=active)
+
+
+def try_pack_rgb_to_uint8(frame: torch.Tensor) -> torch.Tensor | None:
+    """Pack contiguous float32 pixels with the exact existing clamp/mul/round values."""
+    if (not isinstance(frame, torch.Tensor) or not frame.is_cuda or frame.dtype != torch.float32
+            or not frame.is_contiguous() or not triton_runtime_available(frame.device)):
+        return None
+    try:
+        packed = torch.empty_like(frame, dtype=torch.uint8)
+        _pack_rgb_uint8_kernel[(triton.cdiv(frame.numel(), 1024),)](
+            frame, packed, frame.numel(), BLOCK=1024, enable_fp_fusion=False,
+        )
+        return packed
+    except (RuntimeError, triton.TritonError):
+        return None

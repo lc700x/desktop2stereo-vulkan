@@ -57,18 +57,23 @@ public:
         uint32_t fps,
         uint32_t bitrate,
         bool hevc,
-        void* cuda_array
+        void* cuda_array,
+        uint32_t nv12_pitch = 0
     ) : width_(width),
         height_(height),
         fps_(std::max<uint32_t>(1, fps)),
         bitrate_(std::max<uint32_t>(1, bitrate)),
         hevc_(hevc),
-        cuda_array_(cuda_array) {
+        cuda_array_(cuda_array),
+        nv12_pitch_(nv12_pitch) {
         if (width_ < 2 || height_ < 2 || (width_ & 1U) || (height_ & 1U)) {
             throw NvencError("NVENC CUDAARRAY requires positive even dimensions");
         }
         if (!cuda_array_) {
             throw NvencError("CUDA array pointer is null");
+        }
+        if (nv12_pitch_ != 0 && nv12_pitch_ < width_) {
+            throw NvencError("NV12 pitch must cover the encoded width");
         }
         try {
             open();
@@ -82,7 +87,7 @@ public:
         close_noexcept();
     }
 
-    void submit(int64_t timestamp) {
+    void submit(int64_t timestamp, bool force_idr = false) {
         if (!encoder_ || !registered_ || !bitstream_) {
             throw NvencError("NVENC CUDAARRAY encoder is not initialized");
         }
@@ -100,13 +105,17 @@ public:
             NV_ENC_PIC_PARAMS picture{};
             picture.version = NV_ENC_PIC_PARAMS_VER;
             picture.inputBuffer = map.mappedResource;
-            picture.bufferFmt = NV_ENC_BUFFER_FORMAT_ABGR;
+            picture.bufferFmt = nv12_pitch_ ? NV_ENC_BUFFER_FORMAT_NV12 : NV_ENC_BUFFER_FORMAT_ABGR;
+            picture.encodePicFlags = force_idr ? NV_ENC_PIC_FLAG_FORCEIDR : 0;
             picture.inputWidth = width_;
             picture.inputHeight = height_;
             picture.outputBitstream = bitstream_;
             picture.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
             picture.inputTimeStamp = static_cast<uint64_t>(timestamp);
             encode_status = api_.nvEncEncodePicture(encoder_, &picture);
+            if (nv12_pitch_ && encode_status == NV_ENC_ERR_NEED_MORE_INPUT) {
+                throw NvencError("Zero-delay NV12 encoder unexpectedly buffered an input frame");
+            }
             if (
                 encode_status != NV_ENC_SUCCESS &&
                 encode_status != NV_ENC_ERR_NEED_MORE_INPUT
@@ -360,12 +369,13 @@ private:
 
         NV_ENC_REGISTER_RESOURCE resource{};
         resource.version = NV_ENC_REGISTER_RESOURCE_VER;
-        resource.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY;
+        resource.resourceType = nv12_pitch_
+            ? NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR : NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY;
         resource.width = width_;
         resource.height = height_;
-        resource.pitch = 0;
+        resource.pitch = nv12_pitch_;
         resource.resourceToRegister = cuda_array_;
-        resource.bufferFormat = NV_ENC_BUFFER_FORMAT_ABGR;
+        resource.bufferFormat = nv12_pitch_ ? NV_ENC_BUFFER_FORMAT_NV12 : NV_ENC_BUFFER_FORMAT_ABGR;
         resource.bufferUsage = NV_ENC_INPUT_IMAGE;
         require_status(
             api_.nvEncRegisterResource(encoder_, &resource),
@@ -438,6 +448,7 @@ private:
     uint32_t bitrate_;
     bool hevc_;
     void* cuda_array_;
+    uint32_t nv12_pitch_;
     HMODULE nvenc_module_ = nullptr;
     HMODULE cuda_module_ = nullptr;
     NV_ENCODE_API_FUNCTION_LIST api_{};
@@ -519,6 +530,47 @@ d2s_nvenc_cudaarray_handle d2s_nvenc_cudaarray_create(
         g_last_error = "unknown native NVENC CUDAARRAY create error";
         return nullptr;
     }
+}
+
+d2s_nvenc_cudaarray_handle d2s_nvenc_nv12_create(
+    uint32_t width,
+    uint32_t height,
+    uint32_t fps,
+    uint32_t bitrate,
+    int32_t hevc,
+    uint64_t device_pointer,
+    uint32_t pitch
+) {
+    try {
+        if (pitch == 0) {
+            throw NvencError("NV12 pitch must be positive");
+        }
+        auto encoder = std::make_unique<NvencCudaArrayEncoder>(
+            width, height, fps, bitrate, hevc != 0,
+            reinterpret_cast<void*>(static_cast<uintptr_t>(device_pointer)), pitch
+        );
+        g_last_error.clear();
+        return encoder.release();
+    } catch (const std::exception& exc) {
+        g_last_error = exc.what();
+        return nullptr;
+    } catch (...) {
+        g_last_error = "unknown native NVENC NV12 create error";
+        return nullptr;
+    }
+}
+
+int32_t d2s_nvenc_nv12_submit(
+    d2s_nvenc_cudaarray_handle handle,
+    int64_t timestamp,
+    int32_t force_idr
+) {
+    return protect([&] {
+        if (!handle) {
+            throw NvencError("NVENC NV12 handle is null");
+        }
+        static_cast<NvencCudaArrayEncoder*>(handle)->submit(timestamp, force_idr != 0);
+    });
 }
 
 int32_t d2s_nvenc_cudaarray_submit(

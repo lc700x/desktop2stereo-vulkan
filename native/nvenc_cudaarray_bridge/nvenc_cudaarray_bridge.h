@@ -38,6 +38,24 @@ D2S_NVENC_API d2s_nvenc_cudaarray_handle d2s_nvenc_cudaarray_create(
     uint64_t cuda_array
 );
 
+/* Additional NV12 device-pointer entry points; existing ABI 3 array calls are unchanged. */
+D2S_NVENC_API d2s_nvenc_cudaarray_handle d2s_nvenc_nv12_create(
+    uint32_t width,
+    uint32_t height,
+    uint32_t fps,
+    uint32_t bitrate,
+    int32_t hevc,
+    uint64_t device_pointer,
+    uint32_t pitch
+);
+
+/* The caller must finish GPU writes before submission and keep the buffer registered until destroy. */
+D2S_NVENC_API int32_t d2s_nvenc_nv12_submit(
+    d2s_nvenc_cudaarray_handle handle,
+    int64_t timestamp,
+    int32_t force_idr
+);
+
 D2S_NVENC_API int32_t d2s_nvenc_cudaarray_submit(
     d2s_nvenc_cudaarray_handle handle,
     int64_t timestamp

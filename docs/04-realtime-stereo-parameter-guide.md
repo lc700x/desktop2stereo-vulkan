@@ -25,7 +25,7 @@ right_shift_px = -disparity_px / 2
 | `Convergence` | 零视差/汇聚平面 | 默认 0.0 |
 | `Dynamic Convergence Strength` | 动态会聚强度；0.00 表示关闭，使用静态 `Convergence` | 默认 0.00 |
 | `Depth Separation Preset` | 前景/中景/背景视差倍率的组合预设 | default / standard / strong / weak |
-| `Render Scale` | 4K 级输入的稳定缩放档位，影响 `render_size`，进而影响预算解析 | 4K / 100%, 3K / 85%, 2K / 75%, 1K / 50% |
+| `Render Scale` | 画质缩放：所有输入尺寸按宽高百分比缩放处理尺寸，影响 `render_size` 与预算解析；编码画布不随之降低 | 100%, 85%, 75%, 50% |
 
 不得再把以下旧字段作为当前测试变量：
 
@@ -86,7 +86,7 @@ per_eye_shift_px = actual_disparity_px / 2
 | Convergence | `Convergence` | -0.50 到 1.00，0.05 步进 | 0.00 | 零视差/汇聚平面，改变哪些深度落在屏幕平面附近 | 不是强度滑杆；近景太顶眼可适当提高，整体太靠后可降低 |
 | Dynamic Convergence | `Dynamic Convergence Strength` | 0.00-1.00，0.10 步进 | 0.00 | 按当前深度图自动微调零视差平面；0.00 关闭，静态 `Convergence` 生效；大于 0.00 时动态会聚生效 | 默认保持 0.00；视频前后景变化很大时再试 0.30-0.50；游戏/低延迟优先关闭 |
 | Depth Separation | `Depth Separation Preset` | Default, Standard, Strong, Weak | Cinema=Standard, Game=Weak, Image=Strong | 一键设置 `Foreground Pop` / `Midground Pop` / `Background Pop` | 先用模式默认；人物太顶眼或背景过强时再切 Weak；图片需要层次可用 Strong |
-| Render Scale | `Render Scale` | 4K / 100%, 3K / 85%, 2K / 75%, 1K / 50% | 4K / 100% | 对 4K 级输入按比例缩放并保持输入宽高比；影响 `render_size` 与预算解析 | 不每帧动态改变；只在用户切档、OpenXR scale 或输入尺寸稳定跨档时重算 |
+| Quality Scale / 画质缩放 | `Render Scale` | 100%, 85%, 75%, 50% | 100% | 所有输入尺寸按宽、高百分比缩放，仅取整与对齐；推流编码画布仍由未缩放输入及原输出策略决定，Moonlight 保持客户端协商尺寸 | 高级选项中可用于所有输出模式；停止后重新运行生效；旧 4K/3K/2K/1K 文本档位读取时映射为百分比 |
 
 ### 预算解析参考
 

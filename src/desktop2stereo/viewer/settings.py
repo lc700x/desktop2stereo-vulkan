@@ -42,6 +42,7 @@ class ViewerSettings:
     openxr_screen_width: float
     openxr_screen_distance: float
     xr_preview_window: bool
+    _is_4k_default_applied: bool = False
 
 
 def _resolve_available_display_index(
@@ -151,7 +152,17 @@ def resolve_viewer_settings(settings: dict) -> ViewerSettings:
     render_size_config = render_size_config_from_settings(settings)
     window_title = settings["Window Title"] if capture_mode == "Window" else None
     target_fps = target_fps_for_run_mode(settings)
-    fps = target_fps if 1 <= target_fps <= 240 else get_fps(window_title, monitor_index)
+    # Auto-configured 4K streams follow the target display's actual refresh
+    # rate instead of imposing a fixed cap. Explicit Target FPS still wins.
+    is_4k = bool(output_resolution)
+    if isinstance(output_resolution, (tuple, list)):
+        is_4k = int(output_resolution[0]) >= 3840 and int(output_resolution[1]) >= 2160
+    elif isinstance(output_resolution, int):
+        is_4k = output_resolution >= 2160
+    detected_fps = get_fps(window_title, monitor_index)
+    if target_fps < 1 and is_4k:
+        target_fps = detected_fps
+    fps = target_fps if 1 <= target_fps <= 240 else detected_fps
     language = settings["Language"]
     controller_help_rows, environment_help_rows = get_controller_help_rows(language)
     xr_headset_model = settings.get("XR Headset Model", DEFAULT_XR_HEADSET_MODEL)
@@ -171,6 +182,7 @@ def resolve_viewer_settings(settings: dict) -> ViewerSettings:
         window_title=window_title,
         target_fps=target_fps,
         fps=fps,
+        _is_4k_default_applied=bool(is_4k and target_fps >= 40),
         fill_16_9=settings["Fill 16:9"],
         local_vsync=settings["VSync"],
         upscaler=normalize_upscaler(settings.get("Upscaler", "Off")),

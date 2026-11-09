@@ -5,6 +5,8 @@ import queue
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from viewer.direct_sink import DirectSinkRegistry
 from viewer.host_frame_packer import maybe_install_local_viewer_packer
 from viewer.host_frame_packer import HostFramePacker
@@ -290,3 +292,99 @@ def test_packer_reports_ready_frame_rate_without_warmup_dilution(monkeypatch) ->
     assert packer.take_published_fps() == 0.0
     packer._published = 60
     assert packer.take_published_fps() == 60.0
+
+
+@pytest.mark.parametrize(("output_format", "expected"), [
+    ("half_sbs", (4, 2)), ("full_sbs", (8, 2)),
+    ("half_tab", (4, 2)), ("full_tab", (4, 4)),
+])
+def test_native_packer_uses_processing_eye_size_not_original_source(monkeypatch, output_format, expected):
+    from viewer.direct_sink import DIRECT_SINK
+
+    source = _DirectSource()
+    source.size = expected
+    calls = []
+    native = SimpleNamespace(source_size=(40, 20), release=lambda: calls.append("release"))
+    result = SimpleNamespace(viewer_native=native, output_eye_size=(4, 2), output_format=output_format)
+
+    def pack(frame, size, fmt):
+        calls.append((size, fmt))
+        assert frame.source_size == (40, 20)
+        return source
+
+    monkeypatch.setattr(DIRECT_SINK, "pack_native", pack)
+    in_q, out_q = queue.Queue(), queue.Queue()
+    in_q.put((result, 1.0))
+    packer = HostFramePacker(in_q, out_q)
+    packer.start()
+    try:
+        completed, _ = out_q.get(timeout=2.0)
+    finally:
+        packer.stop()
+    assert completed is result
+    assert calls == [(expected, output_format), "release"]
+    assert result.viewer_native is None
+    assert result.viewer_frame_direct is source
+
+
+@pytest.mark.parametrize(("output_format", "expected"), [
+    ("half_sbs", (4, 2)), ("full_sbs", (8, 2)),
+    ("half_tab", (4, 2)), ("full_tab", (4, 4)),
+])
+@pytest.mark.parametrize("processing", [(4, 2), None])
+def test_vulkan_native_present_sizes_staging_from_runtime_eyes(monkeypatch, output_format, expected, processing):
+    from viewer import vulkan_local_viewer as module
+
+    monkeypatch.delenv("D2S_GPU_IMAGE_PIPELINE_REQUIRED", raising=False)
+    viewer = module.VulkanLocalViewer(module.VulkanLocalViewerConfig())
+    viewer.window = object()
+    viewer.poll_events = lambda: None
+    calls = []
+    source_size = (40, 20) if processing is not None else (4, 2)
+    native = SimpleNamespace(source_size=source_size, last_pack_metrics={}, release=lambda: calls.append("release"))
+    result = SimpleNamespace(viewer_native=native, output_eye_size=processing, output_format=output_format)
+
+    def reset(width, height):
+        viewer._source = SimpleNamespace(size=(width, height), format=viewer.source_format,
+                                         present=lambda *_a, **_k: True)
+        calls.append((width, height))
+
+    def pack(frame, size, fmt, **kwargs):
+        calls.append((size, fmt))
+        return viewer._source
+
+    monkeypatch.setattr(viewer, "_reset_sources", reset)
+    monkeypatch.setattr(module.DIRECT_SINK, "pack_native", pack)
+    assert viewer.present(result) is True
+    assert calls[:2] == [expected, (expected, output_format)]
+    assert result.viewer_native is None
+    assert calls.count("release") == 1
+
+
+@pytest.mark.parametrize(("output_format", "expected"), [
+    ("half_sbs", (4, 2)), ("full_sbs", (8, 2)),
+    ("half_tab", (4, 2)), ("full_tab", (4, 4)),
+])
+@pytest.mark.parametrize("processing", [(4, 2), None])
+def test_metal_native_present_sizes_gpu_pack_from_runtime_eyes(monkeypatch, output_format, expected, processing):
+    from viewer import macos_metal_viewer as module
+
+    monkeypatch.setitem(sys.modules, "objc", SimpleNamespace(pyobjc_id=lambda value: 123))
+    monkeypatch.setattr(module, "Metal", SimpleNamespace(MTLResourceStorageModeShared=0), raising=False)
+    viewer = object.__new__(module.MetalLocalViewer)
+    viewer._native_pack_size = expected
+    viewer._native_pack_cursor = 0
+    texture = object()
+    viewer._native_pack_slots = [{"buffer": object(), "texture": texture, "busy": False}]
+    calls = []
+    native = SimpleNamespace(
+        source_size=(40, 20) if processing is not None else (4, 2),
+        pack_metal=lambda *args: calls.append(args),
+        release=lambda: calls.append("release"),
+    )
+    result = SimpleNamespace(viewer_native=native, output_eye_size=processing, output_format=output_format)
+    slot, packed_texture, width, height = viewer._pack_native_coreml_frame(result)
+    assert (width, height) == expected
+    assert calls == [(123, expected[0] * expected[1] * 4, expected, output_format), "release"]
+    assert packed_texture is texture and slot["busy"]
+    assert result.viewer_native is None

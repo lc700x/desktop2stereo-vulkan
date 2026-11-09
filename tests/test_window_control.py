@@ -12,6 +12,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_cursor_suppression_owners(monkeypatch):
+    monkeypatch.setattr(window_control, "_cursor_suppression_windows", set(), raising=False)
+
+
+@pytest.fixture
+def same_cursor_monitor(monkeypatch):
+    monkeypatch.setattr(window_control.user32, "GetCursorPos", lambda _point: True)
+    monkeypatch.setattr(window_control.user32, "MonitorFromPoint", lambda _point, _flags: 1)
+    monkeypatch.setattr(window_control.user32, "MonitorFromWindow", lambda _hwnd, _flags: 1)
+
+
 def test_hide_window_from_capture_uses_full_native_hwnd(monkeypatch):
     hwnd = 0x123456789ABC
     calls = []
@@ -112,6 +124,7 @@ def test_mouse_passthrough_hides_and_restores_the_window_cursor(
     monkeypatch,
     hide_cursor_overlay,
     expected_cursor_mode,
+    same_cursor_monitor,
 ):
     window = object()
     calls = []
@@ -149,7 +162,7 @@ def test_mouse_passthrough_hides_and_restores_the_window_cursor(
     assert calls == expected
 
 
-def test_mouse_passthrough_hides_and_restores_the_system_cursor_scheme(monkeypatch):
+def test_mouse_passthrough_hides_and_restores_the_system_cursor_scheme(monkeypatch, same_cursor_monitor):
     window = object()
     calls = []
     monkeypatch.setattr(window_control.glfw, "get_win32_window", lambda _window: 123)
@@ -211,6 +224,8 @@ def test_cursor_suppression_replaces_system_cursor_images_for_overlay(monkeypatc
     assert window_control.native_cursor_suppressed() is True
     assert sum(call[0] == "set" for call in calls) == len(window_control.SYSTEM_CURSOR_IDS)
     assert all(call[1] == 999 for call in calls if call[0] == "set")
+    window_control._set_native_cursor_suppressed(True)
+    assert sum(call[0] == "set" for call in calls) == len(window_control.SYSTEM_CURSOR_IDS)
     window_control._set_native_cursor_suppressed(False)
     assert window_control.native_cursor_suppressed() is False
     assert sum(call[0] == "set" for call in calls) == 2 * len(window_control.SYSTEM_CURSOR_IDS)
@@ -229,3 +244,80 @@ def test_overlay_registers_only_its_two_capture_excluded_windows(monkeypatch):
     overlay.update_capture_policy()
 
     assert calls == []
+
+
+@pytest.mark.parametrize("monitor", [1, 2, 0])
+def test_native_cursor_is_hidden_only_on_registered_output_monitors(monkeypatch, monitor):
+    calls = []
+    monkeypatch.setattr(window_control, "_cursor_suppression_windows", {123}, raising=False)
+    monkeypatch.setattr(window_control.user32, "GetCursorPos", lambda _point: True)
+    monkeypatch.setattr(window_control.user32, "MonitorFromPoint", lambda _point, _flags: monitor)
+    monkeypatch.setattr(window_control.user32, "MonitorFromWindow", lambda _hwnd, _flags: 1)
+    monkeypatch.setattr(window_control, "_set_native_cursor_suppressed", calls.append)
+
+    window_control.update_native_cursor_suppression()
+
+    assert calls == [monitor == 1]
+
+
+def test_native_cursor_monitor_detection_preserves_negative_desktop_coordinates(monkeypatch):
+    from ctypes import wintypes
+
+    def position(point):
+        value = ctypes.cast(point, ctypes.POINTER(wintypes.POINT)).contents
+        value.x, value.y = -1920, -100
+        return True
+
+    def monitor(point, flags):
+        assert (point.x, point.y, flags) == (-1920, -100, 0)
+        return 7
+
+    calls = []
+    monkeypatch.setattr(window_control, "_cursor_suppression_windows", {123}, raising=False)
+    monkeypatch.setattr(window_control.user32, "GetCursorPos", position)
+    monkeypatch.setattr(window_control.user32, "MonitorFromPoint", monitor)
+    monkeypatch.setattr(window_control.user32, "MonitorFromWindow", lambda _hwnd, _flags: 7)
+    monkeypatch.setattr(window_control, "_set_native_cursor_suppressed", calls.append)
+
+    window_control.update_native_cursor_suppression()
+
+    assert calls == [True]
+
+
+def test_failed_cursor_position_query_does_not_change_visibility(monkeypatch):
+    monkeypatch.setattr(window_control, "_cursor_suppression_windows", {123}, raising=False)
+    monkeypatch.setattr(window_control.user32, "GetCursorPos", lambda _point: False)
+    monkeypatch.setattr(
+        window_control, "_set_native_cursor_suppressed",
+        lambda _hidden: pytest.fail("visibility changed without a cursor position"),
+    )
+
+    window_control.update_native_cursor_suppression()
+
+
+def test_cursor_suppression_tracks_each_window_without_restoring_another_owner(monkeypatch):
+    window = object()
+    hwnd = [123]
+    calls = []
+    owners = set()
+    monkeypatch.setattr(window_control, "_cursor_suppression_windows", owners, raising=False)
+    monkeypatch.setattr(window_control.glfw, "get_win32_window", lambda _window: hwnd[0])
+    monkeypatch.setattr(window_control.glfw, "MOUSE_PASSTHROUGH", 7, raising=False)
+    monkeypatch.setattr(window_control.glfw, "set_input_mode", lambda *_args: None)
+    monkeypatch.setattr(window_control.glfw, "set_window_attrib", lambda *_args: None)
+    monkeypatch.setattr(window_control.user32, "GetCursorPos", lambda _point: True)
+    monkeypatch.setattr(window_control.user32, "MonitorFromPoint", lambda _point, _flags: 1)
+    monkeypatch.setattr(window_control.user32, "MonitorFromWindow", lambda _hwnd, _flags: 1)
+    monkeypatch.setattr(window_control, "_set_native_cursor_suppressed", calls.append)
+
+    assert window_control.set_window_mouse_passthrough(window, True, hide_cursor_overlay=True)
+    hwnd[0] = 456
+    assert window_control.set_window_mouse_passthrough(window, True, hide_cursor_overlay=True)
+    assert owners == {123, 456}
+    assert window_control.set_window_mouse_passthrough(window, False)
+    assert owners == {123}
+    hwnd[0] = 123
+    assert window_control.set_window_mouse_passthrough(window, False)
+
+    assert owners == set()
+    assert calls == [True, True, True, False]

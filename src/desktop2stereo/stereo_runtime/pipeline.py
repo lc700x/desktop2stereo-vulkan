@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import queue
@@ -344,6 +345,20 @@ class GPURequiredError(RuntimeError):
     """The active runtime could not preserve a GPU-resident image path."""
 
 
+def _runtime_output_device(runtime_result):
+    """Return the device of the first output image the runtime produced.
+
+    ``StereoRuntimeResult`` presents a packed ``sbs`` frame, while
+    ``OpenXRRuntimeResult`` presents ``left_eye``/``right_eye`` and has no
+    ``sbs`` field at all, so the guard must probe every presentation surface.
+    """
+    for name in ("sbs", "left_eye", "right_eye", "source_rgb", "depth"):
+        device = getattr(getattr(runtime_result, name, None), "device", None)
+        if getattr(device, "type", None) is not None:
+            return device
+    return None
+
+
 def _drain_latest_nowait(q: object | None):
     if q is None:
         return None
@@ -439,7 +454,7 @@ def _prewarm_gpu_runtime_before_capture(ctx, render_config: RenderSizeConfig | N
         device = torch.device(device)
         if device.type != "cuda" or not torch.cuda.is_available():
             return
-        width, height = resolve_render_size(capture_hint, render_config)
+        width, height = _resolve_pipeline_render_size(capture_hint, render_config)
         if width <= 0 or height <= 0:
             return
         rgb = torch.zeros((1, 3, height, width), device=device, dtype=torch.float32)
@@ -556,9 +571,11 @@ def _prepare_frame_input(ctx, captured_frame, frame_raw):
 
 
 def _resolve_pipeline_render_size(size, config: RenderSizeConfig | None):
-    if config is None:
-        return size
     if isinstance(size, (tuple, list)) and len(size) == 2:
+        config = config or RenderSizeConfig()
+        # Capture preprocessing requires even dimensions. Resolve that constraint
+        # together with the user's alignment, before preflight and diagnostics.
+        config = replace(config, align=math.lcm(2, max(1, int(config.align))))
         return resolve_render_size((int(size[0]), int(size[1])), config)
     return size
 
@@ -711,6 +728,13 @@ def _attach_capture_debug(
                 0.0, (time.perf_counter() - capture_timestamp) * 1000.0
             )
     if isinstance(debug_info, dict):
+        for key in ("sck_callback_time", "capture_poll_returned_at"):
+            try:
+                value = float(metadata[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                debug_info[key] = value
         debug_info["replayed_static_frame"] = int(bool(metadata.get("replayed_static_frame")))
     capture_frame_id = metadata.get("capture_frame_id")
     if capture_frame_id is None:
@@ -788,8 +812,7 @@ def _attach_pipeline_debug(
             eye_size = (width, height)
     if isinstance(eye_size, (tuple, list)) and len(eye_size) == 2:
         debug_info["output_eye_size"] = _size_debug_text(eye_size)
-    runtime_image = getattr(runtime_result, "sbs", None)
-    runtime_device = getattr(runtime_image, "device", None)
+    runtime_device = _runtime_output_device(runtime_result)
     if runtime_device is not None:
         debug_info["stereo_output_device"] = str(runtime_device)
     debug_info["application_runtime_target"] = _application_target_debug_label(
@@ -886,24 +909,25 @@ def _attach_cuda_ready_event(runtime_result):
     return runtime_result
 
 
-def _cuda_event_ready(event) -> bool:
+def _cuda_event_ready(event, *, ctx: RuntimePipelineContext | None = None) -> bool:
     if event is None:
         return True
-    # A NVIDIA torch CUDA event can be waited on by the consumer stream without
-    # a host-side poll. ``query()`` is unreliable here: the runtime producer
-    # and presenter run on different Python threads/streams, and keeping the
-    # result in ``_pending_runtime_items`` can leave XR displaying one frame
-    # forever. The CUDA output adapter enqueues the GPU wait before it reads
-    # the tensors, so treat wait-capable NVIDIA events as ready to publish.
-    # HIP events also expose ``wait``; keep ROCm on its original query/pending
-    # path because its adapter has a different Vulkan staging handoff.
+    # Local Viewer packs and copies on the producer's CUDA stream. Publishing
+    # unfinished work also bypasses its in-flight bound, so new inference can
+    # queue ahead of presentation and leave the Vulkan fence waiting >100 ms.
+    # Query completion before publishing/refilling that bounded local pipeline.
+    # XR's CUDA adapter instead enqueues an event wait on its consumer stream;
+    # retain its GPU-wait handoff and ROCm's existing query/pending behavior.
+    local_viewer = str(getattr(ctx, "run_mode", "")).strip().casefold() in {
+        "viewer", "local viewer"
+    }
     try:
         import torch
 
         is_rocm = bool(getattr(torch.version, "hip", None))
     except Exception:
         is_rocm = False
-    if not is_rocm and callable(getattr(event, "wait", None)):
+    if not local_viewer and not is_rocm and callable(getattr(event, "wait", None)):
         return True
     query = getattr(event, "query", None)
     if not callable(query):
@@ -1818,7 +1842,7 @@ class RuntimePipelineLoop:
         ):
             capture_hint = getattr(ctx, "capture_size_hint", None)
             try:
-                native_preflight_key = resolve_render_size(capture_hint, render_config)
+                native_preflight_key = _resolve_pipeline_render_size(capture_hint, render_config)
             except (TypeError, ValueError):
                 native_preflight_key = None
             if native_preflight_key is not None and min(native_preflight_key) > 0:
@@ -1857,7 +1881,22 @@ class RuntimePipelineLoop:
         if not _add_cuda_event_timings(ctx, runtime_result):
             self._pending_cuda_timing_results.append(runtime_result)
         if isinstance(debug_info, dict):
-            debug_info["viewer_ready_at"] = time.perf_counter()
+            published_at = time.perf_counter()
+            debug_info["viewer_ready_at"] = published_at
+            if str(getattr(ctx, "run_mode", "")).strip().casefold() in {"viewer", "local viewer"}:
+                # Dispatch time alone excludes asynchronous CUDA execution. The
+                # local completion gate has now observed the ready event, so
+                # record that wait separately and stamp actual availability.
+                gpu_wait_ms = (
+                    max(0.0, (published_at - pending_since) * 1000.0)
+                    if pending_since is not None else 0.0
+                )
+                debug_info["runtime_gpu_wait_ms"] = gpu_wait_ms
+                debug_info["runtime_completion_ms"] = max(0.0, runtime_latency * 1000.0) + gpu_wait_ms
+                debug_info["capture_to_runtime_ready_ms"] = max(
+                    0.0, (published_at - capture_start_time) * 1000.0
+                )
+                debug_info["runtime_ready_at"] = published_at
         try:
             runtime_q_was_full = ctx.runtime_q.full()
         except Exception:
@@ -1905,7 +1944,7 @@ class RuntimePipelineLoop:
         ready_index = None
         for index in range(len(self._pending_runtime_items) - 1, -1, -1):
             pending_result = self._pending_runtime_items[index][0]
-            if _cuda_event_ready(getattr(pending_result, "cuda_ready_event", None)):
+            if _cuda_event_ready(getattr(pending_result, "cuda_ready_event", None), ctx=self.context):
                 ready_index = index
                 break
         if ready_index is None:
@@ -2022,7 +2061,10 @@ class RuntimePipelineLoop:
                     ctx.breakdown_inc("runtime_diag_raw")
                     continue
 
-                if len(self._pending_runtime_items) >= self._pending_depth_limit() and not _cuda_event_ready(self._last_cuda_ready_event):
+                if (
+                    len(self._pending_runtime_items) >= self._pending_depth_limit()
+                    and not _cuda_event_ready(self._last_cuda_ready_event, ctx=ctx)
+                ):
                     ctx.source_stat_inc("runtime_drop_cuda_inflight")
                     ctx.breakdown_inc("runtime_drop_cuda_inflight")
                     continue
@@ -2473,14 +2515,14 @@ class RuntimePipelineLoop:
                         )
                 ctx.breakdown_add_time("rt_call", time.perf_counter() - runtime_call_start_time)
                 if ctx.gpu_required:
-                    runtime_image = getattr(runtime_result, "sbs", None)
-                    output_device = getattr(getattr(runtime_image, "device", None), "type", None)
+                    output_device = getattr(_runtime_output_device(runtime_result), "type", None)
                     native_output = any(
                         getattr(runtime_result, name, None) is not None
                         for name in (
                             "native_stream_frame",
                             "viewer_native",
                             "native_resource_handle",
+                            "native_final_sbs_surface",
                             "vulkan_compute_request",
                         )
                     )
@@ -2655,7 +2697,7 @@ class RuntimePipelineLoop:
                         except (TypeError, ValueError):
                             pass
 
-                if not _cuda_event_ready(self._last_cuda_ready_event):
+                if not _cuda_event_ready(self._last_cuda_ready_event, ctx=ctx):
                     self._pending_runtime_items.append(
                         (runtime_result, capture_start_time, process_latency, runtime_latency, time.perf_counter())
                     )

@@ -34,7 +34,9 @@ from stereo_runtime.pipeline import (
     _runtime_parallel_adaptive_backoff_enabled,
     _cuda_event_ready,
     _attach_capture_debug,
+    _attach_pipeline_debug,
     _native_coreml_capture_enabled,
+    _runtime_output_device,
 )
 
 
@@ -542,6 +544,44 @@ def test_publish_runtime_item_marks_inference_pipeline_ready():
     assert loop._pending_cuda_poll_interval_s == 0.001
 
 
+@pytest.mark.parametrize("run_mode", ["Viewer", "Local Viewer", "OpenXR"])
+@pytest.mark.parametrize("pending_since", [None, 1.03])
+def test_local_publication_reports_gpu_completion_time(monkeypatch, run_mode, pending_since):
+    monkeypatch.setattr(pipeline_module.time, "perf_counter", lambda: 1.08)
+    runtime_q = queue.Queue(maxsize=1)
+    loop = object.__new__(RuntimePipelineLoop)
+    loop.context = SimpleNamespace(
+        run_mode=run_mode,
+        runtime_q=runtime_q,
+        queue_put_latest=lambda q, item: q.put_nowait(item),
+        breakdown_inc=lambda *args, **kwargs: None,
+        breakdown_add_time=lambda *args, **kwargs: None,
+        source_stat_inc=lambda *args, **kwargs: None,
+    )
+    result = SimpleNamespace(debug_info={
+        "runtime_ready_at": 1.03,
+        "capture_to_runtime_ready_ms": 30.0,
+        "runtime_execution_ms": 20.0,
+    })
+
+    loop._publish_runtime_item((result, 1.0, 0.01, 0.02, pending_since))
+
+    assert runtime_q.get_nowait()[0] is result
+    assert result.debug_info["viewer_ready_at"] == 1.08
+    assert result.debug_info["runtime_execution_ms"] == 20.0
+    if run_mode == "OpenXR":
+        assert result.debug_info["runtime_ready_at"] == 1.03
+        assert result.debug_info["capture_to_runtime_ready_ms"] == 30.0
+        assert "runtime_gpu_wait_ms" not in result.debug_info
+        assert "runtime_completion_ms" not in result.debug_info
+    else:
+        wait_ms = 0.0 if pending_since is None else 50.0
+        assert result.debug_info["runtime_ready_at"] == 1.08
+        assert result.debug_info["capture_to_runtime_ready_ms"] == pytest.approx(80.0)
+        assert result.debug_info["runtime_gpu_wait_ms"] == pytest.approx(wait_ms)
+        assert result.debug_info["runtime_completion_ms"] == pytest.approx(20.0 + wait_ms)
+
+
 def test_cuda_timing_events_are_recorded_after_gpu_completion():
     class FakeCudaEvent:
         def __init__(self, ready, elapsed_ms=0.0):
@@ -627,6 +667,57 @@ def test_cuda_ready_event_uses_gpu_waitable_event(monkeypatch):
     event = SimpleNamespace(wait=lambda: None, query=lambda: False)
 
     assert _cuda_event_ready(event) is True
+
+
+@pytest.mark.parametrize("run_mode", ["Viewer", "Local Viewer"])
+@pytest.mark.parametrize("complete", [False, True])
+def test_local_viewer_waits_for_cuda_completion(monkeypatch, run_mode, complete):
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    event = SimpleNamespace(wait=lambda: None, query=lambda: complete)
+    ctx = SimpleNamespace(run_mode=run_mode)
+
+    assert _cuda_event_ready(event, ctx=ctx) is complete
+    assert _cuda_event_ready(None, ctx=ctx) is True
+
+
+def test_openxr_retains_cuda_event_gpu_wait_handoff(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    event = SimpleNamespace(wait=lambda: None, query=lambda: False)
+
+    assert _cuda_event_ready(event, ctx=SimpleNamespace(run_mode="OpenXR")) is True
+
+
+@pytest.mark.parametrize("older_complete", [False, True])
+def test_local_viewer_pending_queue_publishes_completed_frames_only(monkeypatch, older_complete):
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    newest_complete = False
+    older = SimpleNamespace(
+        cuda_ready_event=SimpleNamespace(wait=lambda: None, query=lambda: older_complete)
+    )
+    newest = SimpleNamespace(
+        cuda_ready_event=SimpleNamespace(wait=lambda: None, query=lambda: newest_complete)
+    )
+    loop = RuntimePipelineLoop.__new__(RuntimePipelineLoop)
+    loop.context = SimpleNamespace(run_mode="Viewer")
+    loop._pending_runtime_items = [(older,), (newest,)]
+    loop._pending_depth_limit = lambda: 2
+    published = []
+    loop._publish_runtime_item = published.append
+
+    assert loop._publish_ready_pending_items() == int(older_complete)
+    assert published == ([(older,)] if older_complete else [])
+    assert loop._pending_runtime_items[-1] == (newest,)
+
+    newest_complete = True
+    assert loop._publish_ready_pending_items() == 1
+    assert published[-1] == (newest,)
+    assert loop._pending_runtime_items == []
 
 
 def test_rocm_ready_event_keeps_query_pending_path(monkeypatch):
@@ -1048,3 +1139,194 @@ def test_gpu_runtime_warms_depth_and_stereo_before_capture(monkeypatch):
         "stereo",
         "sync",
     ]
+
+
+def test_runtime_output_device_prefers_packed_sbs_then_eyes():
+    cuda = SimpleNamespace(type="cuda")
+    cpu = SimpleNamespace(type="cpu")
+
+    # Local Viewer / stream results present the packed SBS frame, so its
+    # device is the one the guard must judge; host SBS stays a violation.
+    sbs_result = SimpleNamespace(
+        sbs=SimpleNamespace(device=cpu),
+        left_eye=SimpleNamespace(device=cuda),
+        right_eye=SimpleNamespace(device=cuda),
+        source_rgb=None,
+        depth=None,
+    )
+    assert _runtime_output_device(sbs_result) is cpu
+
+    sbs_result = SimpleNamespace(
+        sbs=SimpleNamespace(device=cuda),
+        left_eye=None,
+        right_eye=None,
+        source_rgb=None,
+        depth=None,
+    )
+    assert _runtime_output_device(sbs_result) is cuda
+
+    # OpenXRRuntimeResult has no sbs field at all; the eyes are the output.
+    openxr_result = SimpleNamespace(
+        left_eye=SimpleNamespace(device=cuda),
+        right_eye=SimpleNamespace(device=cuda),
+        source_rgb=None,
+        depth=None,
+    )
+    assert _runtime_output_device(openxr_result).type == "cuda"
+
+    # A host-resident result stays reported as host so the guard can reject it.
+    host_result = SimpleNamespace(
+        left_eye=SimpleNamespace(device=cpu),
+        right_eye=SimpleNamespace(device=cpu),
+        source_rgb=None,
+        depth=None,
+    )
+    assert _runtime_output_device(host_result).type == "cpu"
+
+    assert _runtime_output_device(SimpleNamespace()) is None
+
+
+def test_gpu_required_guard_accepts_openxr_eye_only_result():
+    cuda = SimpleNamespace(type="cuda")
+    runtime_result = SimpleNamespace(
+        left_eye=SimpleNamespace(device=cuda),
+        right_eye=SimpleNamespace(device=cuda),
+        source_rgb=None,
+        depth=None,
+        native_stream_frame=None,
+        viewer_native=None,
+        native_resource_handle=None,
+        native_final_sbs_surface=None,
+        vulkan_compute_request=None,
+        debug_info={},
+    )
+
+    output_device = getattr(_runtime_output_device(runtime_result), "type", None)
+    native_output = any(
+        getattr(runtime_result, name, None) is not None
+        for name in (
+            "native_stream_frame",
+            "viewer_native",
+            "native_resource_handle",
+            "native_final_sbs_surface",
+            "vulkan_compute_request",
+        )
+    )
+
+    assert output_device in {"cuda", "mps", "meta"} or native_output
+
+
+def test_attach_pipeline_debug_reports_openxr_eye_device():
+    cuda = SimpleNamespace(type="cuda")
+    runtime_result = SimpleNamespace(
+        left_eye=SimpleNamespace(device=cuda),
+        right_eye=SimpleNamespace(device=cuda),
+        source_rgb=None,
+        depth=None,
+        output_eye_size=(1920, 1080),
+        debug_info={},
+    )
+
+    _attach_pipeline_debug(
+        runtime_result,
+        capture_size=(3840, 2160),
+        render_size=(3840, 2160),
+        run_mode="OpenXR",
+        render_size_config=RenderSizeConfig(),
+        application_runtime_target="openxr",
+        gpu_required=True,
+    )
+
+    assert runtime_result.debug_info["stereo_output_device"] == str(cuda)
+    assert runtime_result.debug_info["output_eye_size"] == "1920x1080"
+
+
+@pytest.mark.parametrize("capture_size", [
+    (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160),
+    (3440, 1440), (1080, 1920), (320, 200), (1366, 768),
+])
+@pytest.mark.parametrize("percent", ["100%", "85%", "75%", "50%"])
+@pytest.mark.parametrize("align", [1, 3, 8])
+def test_pipeline_quality_scale_matches_backend_even_size(capture_size, percent, align):
+    import math
+
+    config = RenderSizeConfig(scale_factor=percent, align=align)
+    alignment = math.lcm(align, 2)
+    factor = int(percent[:-1]) / 100.0
+    expected = tuple(max(alignment, (round(side * factor) // alignment) * alignment) for side in capture_size)
+    assert _resolve_pipeline_render_size(capture_size, config) == expected
+    assert config.align == align
+
+
+@pytest.mark.parametrize("percent", ["100%", "85%", "75%", "50%"])
+def test_window_resize_uses_current_capture_size_for_rgb_and_metadata(percent):
+    from capture.preprocess import capture_frame_to_rgb
+
+    config = RenderSizeConfig(scale_factor=percent)
+    for width, height in [(1366, 768), (1280, 720), (960, 540), (320, 200)]:
+        raw = np.zeros((height, width, 4), dtype=np.uint8)
+        captured = CapturedFrame(frame=raw, target_height=2160, timestamp=1.0, capture_size=(width, height))
+        _, size, _, _ = _unpack_raw_queue_item(captured)
+        processing_size = _resolve_pipeline_render_size(size, config)
+        rgb = capture_frame_to_rgb(raw, processing_size, use_torch=False)
+        assert (rgb.shape[1], rgb.shape[0]) == processing_size
+        result = SimpleNamespace(debug_info={}, output_eye_size=processing_size)
+        _attach_pipeline_debug(result, capture_size=size, render_size=processing_size,
+                               run_mode="Local Viewer", render_size_config=config)
+        assert result.debug_info["render_size"] == f"{rgb.shape[1]}x{rgb.shape[0]}"
+        assert result.debug_info["capture_size"] == f"{width}x{height}"
+
+
+def test_attach_capture_debug_keeps_frame_available_time_without_frame_id():
+    captured = CapturedFrame(frame=None, target_height=720, timestamp=1.0,
+                             metadata={"capture_poll_returned_at": 1.016})
+    result = SimpleNamespace(debug_info={})
+    _attach_capture_debug(result, captured, SimpleNamespace())
+    assert result.debug_info["capture_poll_returned_at"] == 1.016
+
+
+def test_gpu_prewarm_uses_final_even_processing_size(monkeypatch):
+    import torch
+
+    shapes = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
+    monkeypatch.setattr(torch, "zeros", lambda shape, **_kwargs: shapes.append(shape) or SimpleNamespace(shape=shape))
+    config = RenderSizeConfig(scale_factor="85%")
+    context = SimpleNamespace(
+        device="cuda", capture_size_hint=(1366, 768),
+        stereo_runtime=SimpleNamespace(_predict_depth_profile=lambda rgb: None),
+        warmup_stereo_once_for_frame=lambda rgb: None,
+    )
+    _prewarm_gpu_runtime_before_capture(context, config)
+    assert shapes == [(1, 3, 652, 1160)]
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(), reason="CUDA/ROCm device required for GPU preprocessing",
+)
+@pytest.mark.parametrize("capture_size", [
+    (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160),
+    (3440, 1440), (1080, 1920), (320, 200), (1366, 768),
+])
+@pytest.mark.parametrize("percent", ["100%", "85%", "75%", "50%"])
+def test_quality_scale_gpu_preprocess_matches_final_pipeline_size(monkeypatch, capture_size, percent):
+    import torch
+    from capture.preprocess import capture_frame_to_rgb
+
+    def no_readback(*_args, **_kwargs):
+        pytest.fail("GPU preprocessing must not read back image pixels")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", no_readback)
+    width, height = capture_size
+    raw = torch.empty((height, width, 4), dtype=torch.uint8, device="cuda")
+    raw[:] = torch.tensor([8, 64, 240, 255], dtype=torch.uint8, device="cuda")
+    target = _resolve_pipeline_render_size(capture_size, RenderSizeConfig(scale_factor=percent))
+    rgb = capture_frame_to_rgb(raw, target, device="cuda", output="tensor")
+    assert rgb.is_cuda and tuple(rgb.shape) == (3, target[1], target[0])
+    from capture.preprocess import prepare_rgb_for_stereo_runtime
+
+    runtime_rgb = prepare_rgb_for_stereo_runtime(rgb, device="cuda")
+    assert runtime_rgb.is_cuda and tuple(runtime_rgb.shape) == (1, 3, target[1], target[0])
+    expected_rgb = torch.tensor([240, 64, 8], dtype=torch.float32, device="cuda").view(1, 3, 1, 1) / 255.0
+    assert torch.allclose(runtime_rgb, expected_rgb.expand_as(runtime_rgb), atol=1e-6, rtol=0.0)
