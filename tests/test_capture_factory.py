@@ -2,7 +2,7 @@ import sys
 import types
 
 from capture import CaptureConfig, create_capture_runner
-from capture.factory import get_desktop_grabber_class
+from capture.factory import get_desktop_grabber_class, normalize_config
 from capture.factory import DesktopDuplicationFallbackRunner
 from capture.runners import PollingCaptureRunner
 
@@ -130,3 +130,149 @@ def test_desktop_duplication_tries_windows_capture_when_native_bridge_is_missing
     )
 
     assert isinstance(runner, DesktopDuplicationFallbackRunner)
+
+
+def test_normalize_config_preserves_media_runtime_fields():
+    render_size_config = object()
+    config = CaptureConfig(
+        media_path="D:/media/movie.mkv",
+        media_control_path="D:/runtime/control.json",
+        media_gui_control_path="D:/runtime/control.json",
+        media_state_path="D:/runtime/state.json",
+        media_session_id="session-123",
+        media_resume_position=12.5,
+        media_audio_enabled=False,
+        render_size_config=render_size_config,
+    )
+
+    normalized = normalize_config(config)
+
+    assert (
+        normalized.media_path,
+        normalized.media_control_path,
+        normalized.media_gui_control_path,
+        normalized.media_state_path,
+        normalized.media_session_id,
+        normalized.media_resume_position,
+        normalized.media_audio_enabled,
+        normalized.render_size_config,
+    ) == (
+        config.media_path,
+        config.media_control_path,
+        config.media_gui_control_path,
+        config.media_state_path,
+        config.media_session_id,
+        config.media_resume_position,
+        config.media_audio_enabled,
+        render_size_config,
+    )
+
+
+
+def test_polling_runner_stops_source_once_after_normal_exit():
+    import threading
+
+    shutdown = threading.Event()
+    stop_calls = []
+
+    class Source:
+        def grab(self):
+            shutdown.set()
+            return None, (1, 1)
+
+        def stop(self):
+            stop_calls.append("stop")
+
+    runner = PollingCaptureRunner(CaptureConfig(), lambda: Source())
+    runner.run(shutdown_event=shutdown, on_frame=lambda _frame: None)
+    runner.stop()
+
+    assert stop_calls == ["stop"]
+
+
+def test_polling_runner_stops_source_when_grab_raises():
+    import threading
+
+    stop_calls = []
+
+    class Source:
+        def grab(self):
+            raise RuntimeError("capture failed")
+
+        def stop(self):
+            stop_calls.append("stop")
+
+    runner = PollingCaptureRunner(CaptureConfig(), lambda: Source())
+    try:
+        runner.run(shutdown_event=threading.Event(), on_frame=lambda _frame: None)
+    except RuntimeError as exc:
+        assert str(exc) == "capture failed"
+    else:
+        raise AssertionError("capture error was not propagated")
+
+    assert stop_calls == ["stop"]
+
+
+def test_polling_runner_marks_host_video_frames_as_media_for_gpu_preprocessing():
+    import threading
+
+    import numpy as np
+
+    from stereo_runtime.pipeline import _gpu_capture_input_requires_device_residency
+
+    shutdown = threading.Event()
+    captured = []
+
+    class Source:
+        mode = "video"
+        frame_format = "bgr24"
+
+        def grab(self):
+            return np.zeros((2, 2, 3), dtype=np.uint8), (2, 2)
+
+        def stop(self):
+            pass
+
+    def on_frame(frame):
+        captured.append(frame)
+        shutdown.set()
+
+    runner = PollingCaptureRunner(
+        CaptureConfig(capture_mode="Video", gpu_required=True), lambda: Source()
+    )
+    runner.run(shutdown_event=shutdown, on_frame=on_frame)
+
+    assert captured[0].capture_mode == "Video"
+    assert not _gpu_capture_input_requires_device_residency(
+        types.SimpleNamespace(gpu_required=True), captured[0]
+    )
+
+
+def test_polling_runner_uses_current_media_mode_after_source_switch():
+    import threading
+
+    import numpy as np
+
+    shutdown = threading.Event()
+    captured = []
+
+    class Source:
+        mode = "image"
+        frame_format = "bgr24"
+
+        def grab(self):
+            return np.zeros((2, 2, 3), dtype=np.uint8), (2, 2)
+
+        def stop(self):
+            pass
+
+    def on_frame(frame):
+        captured.append(frame)
+        shutdown.set()
+
+    runner = PollingCaptureRunner(
+        CaptureConfig(capture_mode="Video"), lambda: Source()
+    )
+    runner.run(shutdown_event=shutdown, on_frame=on_frame)
+
+    assert captured[0].capture_mode == "Image"

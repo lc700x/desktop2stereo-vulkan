@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass, replace
+import json
 import math
 from pathlib import Path
 import os
@@ -22,12 +23,28 @@ from utils.queue_utils import _release_item
 from utils.sys_load import format_load_fields
 from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
 from viewer.direct_sink import DIRECT_SINK, direct_staging_enabled
+from media_ui import (
+    build_media_bar_rgba,
+    build_media_browser_rgba,
+    build_pointer_rgba,
+    media_bar_hit,
+    media_bar_value_fraction,
+    media_browser_hit,
+    media_control_enabled,
+)
 from viewer.vulkan_fps_overlay import VulkanFpsOverlay, build_fps_panel_rgba
 from viewer.vulkan_context import _query_adapter_luid
 from viewer.vulkan_resources import (
     VulkanExportableBuffer,
     VulkanExportableImage,
     VulkanExportableSemaphore,
+)
+from viewer.source_pointer import (
+    send_screen_pointer_click,
+    send_screen_pointer_move,
+    send_window_pointer_click,
+    send_window_pointer_move,
+    source_pointer_point,
 )
 from viewer.window_control import (
     capture_cursor_snapshot,
@@ -835,6 +852,12 @@ class VulkanLocalViewerConfig:
     input_size: tuple[int, int] | None = None
     capture_mode: str = "Monitor"
     window_title: str | None = None
+    window_handle: int | None = None
+    media_state_path: str | None = None
+    media_session_id: str | None = None
+    media_action_callback: Callable[[str, object], bool] | None = None
+    pointer_mapping_enabled: bool = False
+    locale: str = "EN"
     vsync: bool = True
     show_fps: bool = False
     show_fps_provider: Callable[[], bool] | None = None
@@ -971,6 +994,29 @@ class VulkanLocalViewer:
         self._fps_overlay_reported = False
         self._fps_overlay_swapchain_supported = False
         self._cursor_texture_overlay: VulkanFpsOverlay | None = None
+        self._media_bar_overlay: VulkanFpsOverlay | None = None
+        self._media_browser_overlay: VulkanFpsOverlay | None = None
+        self._media_state: dict[str, Any] = {}
+        self._media_state_read_at = 0.0
+        self._media_last_activity = 0.0
+        self._media_last_cursor_position: tuple[float, float] | None = None
+        self._media_bar_hover: str | None = None
+        self._media_bar_rects: tuple[tuple[int, int, int, int], ...] = ()
+        self._media_browser_rects: tuple[tuple[int, int, int, int], ...] = ()
+        self._media_eye_rects: tuple[tuple[int, int, int, int], ...] = ()
+        self._media_bar_texture_key: tuple[Any, ...] | None = None
+        self._media_browser_texture_key: tuple[Any, ...] | None = None
+        self._media_browser_scroll = 0
+        self._media_pointer_uv: tuple[float, float] | None = None
+        self._media_hit_uv: tuple[float, float] | None = None
+        self._media_pointer_overlay: VulkanFpsOverlay | None = None
+        self._media_pointer_texture_key: tuple[Any, ...] | None = None
+        self._media_interactive_passthrough = False
+        self._media_panel_hovered = False
+        self._media_drag_action: str | None = None
+        self._media_drag_last_sent_at = 0.0
+        self._media_last_click_at = 0.0
+        self._media_last_click_hit: str | None = None
         self._cursor_snapshot = None
         self._cursor_snapshot_key = None
         # Frame-available -> successful present, on the capture perf_counter
@@ -987,6 +1033,7 @@ class VulkanLocalViewer:
         self._present_phase_target_ms: float | None = None
         self._present_total = 0
         self._present_reused = 0
+        self._content_frame_count = 0
         self._present_cumulative_total = 0
         self._reuse_cumulative_total = 0
         self._present_window_start = time.perf_counter()
@@ -1140,9 +1187,13 @@ class VulkanLocalViewer:
         elif self.config.exclude_from_capture:
             hide_window_from_capture(self.window)
         glfw.set_key_callback(self.window, self._on_key)
+        glfw.set_cursor_pos_callback(self.window, self._on_cursor_pos)
+        glfw.set_mouse_button_callback(self.window, self._on_mouse_button)
+        glfw.set_scroll_callback(self.window, self._on_scroll)
         self._create_device()
         self._init_fps_overlay()
         self._init_cursor_texture_overlay()
+        self._init_media_overlays()
         self._create_swapchain()
         self._create_sync()
         if self._capture_window_registered:
@@ -1224,6 +1275,611 @@ class VulkanLocalViewer:
             cursor_screen_position(),
         )
 
+    def _init_media_overlays(self) -> None:
+        for attr, label in (
+            ("_media_bar_overlay", "media bar"),
+            ("_media_browser_overlay", "media browser"),
+        ):
+            try:
+                overlay = VulkanFpsOverlay(self)
+            except Exception as exc:
+                print(
+                    f"[VulkanLocalViewer] {label} overlay unavailable: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                continue
+            if not overlay.available:
+                overlay.close()
+                print(
+                    f"[VulkanLocalViewer] {label} overlay unavailable: {overlay.reason}",
+                    flush=True,
+                )
+                continue
+            setattr(self, attr, overlay)
+        if self.config.pointer_mapping_enabled:
+            try:
+                pointer = VulkanFpsOverlay(self)
+                if pointer.available:
+                    rgba = build_pointer_rgba(48)
+                    pointer.set_rgba(rgba.tobytes(), (48, 48))
+                    self._media_pointer_overlay = pointer
+                    self._media_pointer_texture_key = ("pointer",)
+                else:
+                    pointer.close()
+            except Exception as exc:
+                print(
+                    "[VulkanLocalViewer] media pointer overlay unavailable: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+    def _read_media_state(self, *, force: bool = False) -> dict[str, Any]:
+        path = str(getattr(self.config, "media_state_path", "") or "").strip()
+        session = str(getattr(self.config, "media_session_id", "") or "")
+        now = time.monotonic()
+        if not path or (not force and now - self._media_state_read_at < 0.25):
+            return self._media_state
+        self._media_state_read_at = now
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                state = json.load(stream)
+        except (OSError, ValueError):
+            return self._media_state
+        if not isinstance(state, dict) or (session and state.get("session") != session):
+            return self._media_state
+        if self._media_drag_action == "seek":
+            state = {**state, "position": self._media_state.get("position", state.get("position"))}
+        elif self._media_drag_action == "volume":
+            state = {**state, "volume": self._media_state.get("volume", state.get("volume"))}
+        if state != self._media_state:
+            had_state = bool(self._media_state)
+            was_browser_visible = self._media_browser_visible()
+            self._media_state = state
+            if (
+                not had_state
+                or (
+                    bool(state.get("browser_visible"))
+                    and not was_browser_visible
+                )
+            ):
+                self._media_last_activity = now
+        return self._media_state
+
+    def _media_browser_visible(self) -> bool:
+        return bool(self._media_state.get("browser_visible"))
+
+    def _media_bar_visible(self) -> bool:
+        return bool(self._media_state)
+
+    def _media_bar_expanded(self) -> bool:
+        last_activity = float(getattr(self, "_media_last_activity", 0.0) or 0.0)
+        return (
+            self._media_browser_visible()
+            or time.monotonic() - last_activity <= 3.0
+        )
+
+    def _media_rect_for_eye(
+        self,
+        eye_rect: tuple[int, int, int, int],
+        *,
+        browser: bool = False,
+    ) -> tuple[int, int, int, int]:
+        left, top, right, bottom = (int(value) for value in eye_rect)
+        eye_w = max(1, right - left)
+        eye_h = max(1, bottom - top)
+        if browser:
+            panel_w = min(int(eye_w * 0.86), 1200)
+            panel_h = min(int(eye_h * 0.78), int(panel_w * 900 / 1400))
+        else:
+            panel_w = min(int(eye_w * 0.92), 1024)
+            panel_h = max(70, int(panel_w * 160 / 1024))
+        if panel_w <= 0 or panel_h <= 0:
+            return (left, top, left + 1, top + 1)
+        x = left + (eye_w - panel_w) // 2
+        y = top + eye_h - panel_h - max(10, int(eye_h * 0.035)) if not browser else top + (eye_h - panel_h) // 2
+        return (x, y, x + panel_w, y + panel_h)
+
+    def _media_bar_texture_key_value(self) -> tuple[Any, ...]:
+        state = self._media_state
+        return (
+            self._media_bar_expanded(),
+            state.get("mode"),
+            state.get("ready"),
+            state.get("playing"),
+            state.get("muted"),
+            int(float(state.get("position", 0.0) or 0.0)),
+            int(float(state.get("duration", 0.0) or 0.0)),
+            round(float(state.get("volume", 1.0) or 0.0), 2),
+            state.get("audio_enabled"),
+            self._media_bar_hover,
+            getattr(self.config, "locale", "EN"),
+        )
+
+    def _media_browser_texture_key_value(self) -> tuple[Any, ...]:
+        state = self._media_state
+        return (
+            state.get("browser_revision"),
+            state.get("browser_visible"),
+            state.get("browser_path"),
+            state.get("browser_parent"),
+            state.get("browser_selection"),
+            self._media_bar_hover,
+            self._media_browser_scroll,
+            tuple(
+                (entry.get("path"), entry.get("kind"))
+                for entry in (state.get("browser_entries") or [])
+            ),
+            tuple(
+                (entry.get("path"), entry.get("kind"))
+                for entry in (state.get("browser_mounts") or [])
+            ),
+            tuple(
+                (entry.get("path"), entry.get("kind"))
+                for entry in (state.get("playlist_entries") or [])
+            ),
+            tuple(
+                (entry.get("path"), entry.get("kind"))
+                for entry in (state.get("recent_entries") or [])
+            ),
+            state.get("playlist_index"),
+            state.get("browser_error"),
+            getattr(self.config, "locale", "EN"),
+        )
+
+    def _refresh_media_textures(self) -> None:
+        language = "CN" if getattr(self.config, "locale", "EN") == "CN" else "EN"
+        if self._media_bar_overlay is not None and self._media_bar_visible():
+            key = self._media_bar_texture_key_value()
+            if key != self._media_bar_texture_key:
+                rgba = build_media_bar_rgba(
+                    self._media_state,
+                    width=1024,
+                    height=160,
+                    hover=self._media_bar_hover,
+                    lang=language,
+                    collapsed=not self._media_bar_expanded(),
+                )
+                self._media_bar_overlay.set_rgba(rgba.tobytes(), (1024, 160))
+                self._media_bar_texture_key = key
+        if self._media_browser_overlay is not None and self._media_browser_visible():
+            key = self._media_browser_texture_key_value()
+            if key != self._media_browser_texture_key:
+                rgba = build_media_browser_rgba(
+                    self._media_state,
+                    width=1400,
+                    height=900,
+                    hover=self._media_bar_hover,
+                    scroll_offset=self._media_browser_scroll,
+                    lang=language,
+                )
+                self._media_browser_overlay.set_rgba(rgba.tobytes(), (1400, 900))
+                self._media_browser_texture_key = key
+
+    def _media_hit(self, u: float, v: float) -> str | None:
+        if not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+            return None
+        if self._media_browser_visible():
+            hit = media_browser_hit(
+                u, v, self._media_state, scroll_offset=self._media_browser_scroll
+            )
+            if hit is not None:
+                return f"{hit[0]}:{hit[1]}" if hit[1] is not None else hit[0]
+            return "browser"
+        return media_bar_hit(
+            u,
+            v,
+            self._media_state,
+            collapsed=not self._media_bar_expanded(),
+        )
+
+    def _media_action(self, action: str, value=None) -> bool:
+        callback = getattr(self.config, "media_action_callback", None)
+        if not callable(callback):
+            return False
+        return bool(callback(action, value))
+
+    def _dispatch_media_hit(self, hit: str | None, *, double_click: bool = False) -> None:
+        if not hit:
+            return
+        if hit.startswith("entry:"):
+            path = hit.split(":", 1)[1]
+            self._media_action("browse_open" if double_click else "browse_select", {"path": path})
+            return
+        if hit.startswith("mount:"):
+            self._media_action("browse", hit.split(":", 1)[1])
+            return
+        if hit.startswith("playlist_select:"):
+            self._media_action("playlist_select", {"path": hit.split(":", 1)[1]})
+            return
+        if hit.startswith("seek:"):
+            try:
+                fraction = max(0.0, min(1.0, float(hit.split(":", 1)[1])))
+            except (TypeError, ValueError):
+                return
+            duration = float(self._media_state.get("duration", 0.0) or 0.0)
+            if duration > 0.0 and media_control_enabled("seek", self._media_state):
+                self._media_state = {**self._media_state, "position": fraction * duration}
+                self._media_action("seek", fraction * duration)
+            return
+        if hit.startswith("volume:"):
+            try:
+                volume = max(0.0, min(1.0, float(hit.split(":", 1)[1])))
+            except (TypeError, ValueError):
+                return
+            if media_control_enabled("volume", self._media_state):
+                self._media_state = {**self._media_state, "volume": volume}
+                self._media_action("volume", volume)
+            return
+        if hit == "wake":
+            self._media_last_activity = time.monotonic()
+            return
+        if hit.startswith("browse_open:"):
+            self._media_action("browse_open", {"path": hit.split(":", 1)[1]})
+            return
+        if hit.startswith("recent_remove:"):
+            self._media_action("recent_remove", {"path": hit.split(":", 1)[1]})
+            return
+        if hit.startswith("recent:"):
+            self._media_action("browse_open", {"path": hit.split(":", 1)[1]})
+            return
+        if hit == "browse":
+            self._media_action("browse", None)
+        elif hit == "browse_disc":
+            self._media_action("browse", {"mode": "disc"})
+        elif hit == "browser_up":
+            self._media_action("browse_up")
+        elif hit == "browser_refresh":
+            self._media_action("browse_refresh")
+        elif hit == "playlist_previous":
+            self._media_action("playlist_previous")
+        elif hit == "playlist_next":
+            self._media_action("playlist_next")
+        elif hit == "playlist_clear":
+            self._media_action("playlist_clear")
+        elif hit == "mute":
+            if media_control_enabled("mute", self._media_state):
+                self._media_action("mute", not bool(self._media_state.get("muted", False)))
+        elif hit == "play":
+            if media_control_enabled("play", self._media_state):
+                was_playing = bool(self._media_state.get("playing", False))
+                action = "pause" if was_playing else "play"
+                if self._media_action(action):
+                    # Keep the in-viewer control responsive while the media
+                    # publisher round-trips through media.state.json. The next
+                    # state poll will replace this optimistic value with the
+                    # decoder's authoritative state.
+                    self._media_state = {
+                        **self._media_state,
+                        "playing": not was_playing,
+                    }
+                    self._media_bar_texture_key = None
+            return
+        elif hit.startswith("seek_relative:"):
+            try:
+                value = float(hit.split(":", 1)[1])
+            except (TypeError, ValueError):
+                return
+            if media_control_enabled(hit.split(":", 1)[0], self._media_state):
+                self._media_action("seek_relative", value)
+        elif hit == "browser_close":
+            self._media_action("browse_close")
+
+    def _update_media_drag(self, u: float) -> None:
+        now = time.monotonic()
+        if now - self._media_drag_last_sent_at < 0.05:
+            return
+        action = str(self._media_drag_action or "")
+        fraction = media_bar_value_fraction(u, action=action)
+        if fraction is None:
+            return
+        if action == "seek":
+            duration = float(self._media_state.get("duration", 0.0) or 0.0)
+            if duration <= 0.0 or not media_control_enabled("seek", self._media_state):
+                return
+            position = fraction * duration
+            self._media_state = {**self._media_state, "position": position}
+            self._media_action("seek", position)
+        elif action == "volume":
+            if not media_control_enabled("volume", self._media_state):
+                return
+            self._media_state = {**self._media_state, "volume": fraction}
+            self._media_action("volume", fraction)
+        else:
+            return
+        self._media_drag_last_sent_at = now
+        self._refresh_media_textures()
+
+    def _poll_media_pointer(self) -> None:
+        """Poll GLFW coordinates so click-through windows still reveal controls."""
+        try:
+            xpos, ypos = self.glfw.get_cursor_pos(self.window)
+        except Exception:
+            return
+        position = (float(xpos), float(ypos))
+        if position == self._media_last_cursor_position:
+            return
+        self._media_last_cursor_position = position
+        client_w, client_h = self.glfw.get_window_size(self.window)
+        if 0.0 <= position[0] < client_w and 0.0 <= position[1] < client_h:
+            self._on_cursor_pos(self.window, position[0], position[1])
+
+    def _on_cursor_pos(self, _window: Any, xpos: float, ypos: float) -> None:
+        self._media_last_cursor_position = (float(xpos), float(ypos))
+        self._media_last_activity = time.monotonic()
+        self._media_panel_hovered = False
+        eye_rects = self._media_eye_rects
+        if not eye_rects:
+            self._media_pointer_uv = None
+            self._media_hit_uv = None
+            return
+        client_w, client_h = self.glfw.get_window_size(self.window)
+        extent_w, extent_h = self.extent
+        x = float(xpos) * extent_w / max(1, client_w)
+        y = float(ypos) * extent_h / max(1, client_h)
+        expanded = self._media_bar_expanded()
+        panels = (
+            self._media_browser_rects
+            if self._media_browser_visible()
+            else self._media_bar_rects
+        )
+        for index, rect in enumerate(eye_rects):
+            left, top, right, bottom = rect
+            if not (left <= x < right and top <= y < bottom):
+                continue
+            u = (x - left) / max(1, right - left)
+            v = (y - top) / max(1, bottom - top)
+            self._media_pointer_uv = (u, v)
+            panel = panels[min(index, len(panels) - 1)] if panels else None
+            if panel is None:
+                self._media_hit_uv = None
+                self._media_bar_hover = None
+                if self.config.pointer_mapping_enabled:
+                    self._map_pointer_move(u, v)
+                return
+            p_left, p_top, p_right, p_bottom = panel
+            hit_u = (x - p_left) / max(1, p_right - p_left)
+            hit_v = (y - p_top) / max(1, p_bottom - p_top)
+            self._media_hit_uv = (hit_u, hit_v)
+            hit = self._media_hit(hit_u, hit_v)
+            self._media_panel_hovered = expanded and 0.0 <= hit_u <= 1.0 and 0.0 <= hit_v <= 1.0
+            if not expanded and hit == "wake":
+                self._media_last_activity = time.monotonic()
+                self._media_panel_hovered = True
+            self._media_bar_hover = hit
+            if self._media_drag_action is not None and self._media_panel_hovered:
+                self._update_media_drag(hit_u)
+            if not self._media_panel_hovered and self.config.pointer_mapping_enabled:
+                self._map_pointer_move(u, v)
+            self._refresh_media_textures()
+            return
+        self._media_pointer_uv = None
+        self._media_hit_uv = None
+        self._media_bar_hover = None
+
+    def _on_mouse_button(self, _window: Any, button: int, action: int, _mods: int) -> None:
+        left_button = int(getattr(self.glfw, "MOUSE_BUTTON_LEFT", 0))
+        right_button = int(getattr(self.glfw, "MOUSE_BUTTON_RIGHT", 1))
+        release = int(getattr(self.glfw, "RELEASE", 0))
+        if action == release:
+            if self._media_drag_action is not None and self._media_hit_uv is not None:
+                self._media_drag_last_sent_at = 0.0
+                self._update_media_drag(self._media_hit_uv[0])
+            self._media_drag_action = None
+            return
+        if action != self.glfw.PRESS or button not in {left_button, right_button}:
+            return
+        if button != left_button:
+            if (
+                not self._media_panel_hovered
+                and self.config.pointer_mapping_enabled
+                and self._media_pointer_uv is not None
+            ):
+                self._map_pointer_click(*self._media_pointer_uv, button=1)
+            return
+        hit = self._media_bar_hover
+        if hit == "browser":
+            self._media_action("browse_close")
+            self._media_last_activity = time.monotonic()
+            return
+        if hit and self._media_hit_uv is not None:
+            now = time.monotonic()
+            double_click = (
+                hit.startswith("entry:")
+                and hit == self._media_last_click_hit
+                and now - self._media_last_click_at <= 0.45
+            )
+            self._dispatch_media_hit(hit, double_click=double_click)
+            if hit.startswith(("seek:", "volume:")):
+                self._media_drag_action = hit.split(":", 1)[0]
+                self._media_drag_last_sent_at = now
+            self._media_last_click_hit = hit
+            self._media_last_click_at = now
+            self._media_last_activity = now
+            return
+        if not self._media_panel_hovered and self.config.pointer_mapping_enabled and self._media_pointer_uv is not None:
+            self._map_pointer_click(*self._media_pointer_uv, button=button)
+
+    def _on_scroll(self, _window: Any, _xoffset: float, yoffset: float) -> None:
+        if not self._media_browser_visible() or not self._media_panel_hovered:
+            return
+        entries = self._media_state.get("browser_entries") or []
+        self._media_browser_scroll = max(
+            0,
+            min(
+                max(0, len(entries) - 12),
+                self._media_browser_scroll + (-3 if yoffset > 0 else 3),
+            ),
+        )
+        self._media_last_activity = time.monotonic()
+        self._refresh_media_textures()
+
+    def _sync_media_passthrough(self) -> None:
+        if not self.config.cursor_passthrough:
+            return
+        want = self._media_panel_hovered or self._media_drag_action is not None
+        if want == self._media_interactive_passthrough:
+            return
+        self._media_interactive_passthrough = want
+        set_window_mouse_passthrough(
+            self.window,
+            not want,
+            hide_cursor_overlay=not want,
+        )
+
+    def _pointer_window_handle(self) -> int:
+        hwnd = int(self.config.window_handle or 0)
+        if not hwnd and self.config.window_title and sys.platform == "win32":
+            try:
+                import win32gui
+
+                hwnd = int(win32gui.FindWindow(None, self.config.window_title))
+            except Exception:
+                hwnd = 0
+        return hwnd
+
+    def _pointer_monitor_point(self, u: float, v: float) -> tuple[int, int] | None:
+        try:
+            from utils.display_info import enumerate_displays
+
+            index = int(
+                self.config.preview_monitor_index
+                if self.config.preview_monitor_index is not None
+                else self.config.monitor_index
+            )
+            display = next(
+                item for item in enumerate_displays()
+                if int(item.capture_index) == index
+            )
+            return source_pointer_point(
+                u,
+                v,
+                monitor_rect=(
+                    int(display.left), int(display.top),
+                    int(display.width), int(display.height),
+                ),
+            )
+        except Exception:
+            return None
+
+    def _map_pointer_move(self, u: float, v: float) -> None:
+        capture_mode = str(self.config.capture_mode or "").strip().casefold()
+        if capture_mode == "window":
+            send_window_pointer_move(self._pointer_window_handle(), u, v)
+        elif capture_mode == "monitor":
+            send_screen_pointer_move(self._pointer_monitor_point(u, v))
+
+    def _map_pointer_click(self, u: float, v: float, *, button: int) -> None:
+        """Forward a click from either SBS eye to the captured source."""
+        capture_mode = str(self.config.capture_mode or "").strip().casefold()
+        if capture_mode == "window":
+            send_window_pointer_click(
+                self._pointer_window_handle(), u, v, button=button
+            )
+        elif capture_mode == "monitor":
+            send_screen_pointer_click(
+                self._pointer_monitor_point(u, v), button=button
+            )
+
+    def _media_overlay_instances(self):
+        items = (
+            getattr(self, "_media_bar_overlay", None),
+            getattr(self, "_media_browser_overlay", None),
+            getattr(self, "_media_pointer_overlay", None),
+        )
+        return tuple(item for item in items if item is not None)
+
+    def _record_media_overlays(
+        self,
+        cmd: Any,
+        swapchain_image: Any,
+        swap_image_index: int,
+        eye_rects,
+        *,
+        source_layout: int,
+    ) -> tuple[bool, int]:
+        self._media_eye_rects = tuple(
+            tuple(int(value) for value in rect) for rect in eye_rects
+        )
+        self._media_bar_rects = tuple(
+            self._media_rect_for_eye(rect) for rect in self._media_eye_rects
+        )
+        self._media_browser_rects = tuple(
+            self._media_rect_for_eye(rect, browser=True)
+            for rect in self._media_eye_rects
+        )
+        # _media_rect_for_eye returns absolute (left, top, right, bottom)
+        # bounds for hit testing. VulkanFpsOverlay.record_rects consumes
+        # viewport rectangles (x, y, width, height), so convert explicitly.
+        # Passing absolute bounds here makes the viewport extend past the
+        # bottom/right edge and clips most of the controls on 16:10 displays.
+        media_bar_viewports = self._media_overlay_viewport_rects(
+            self._media_bar_rects
+        )
+        media_browser_viewports = self._media_overlay_viewport_rects(
+            self._media_browser_rects
+        )
+        layout = int(source_layout)
+        drawn = False
+        if self._media_browser_overlay is not None and self._media_browser_visible():
+            if self._media_browser_overlay.record_rects(
+                cmd,
+                swapchain_image,
+                swap_image_index,
+                media_browser_viewports,
+                source_layout=layout,
+            ):
+                drawn = True
+                layout = self.vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+        elif self._media_bar_overlay is not None and self._media_bar_visible():
+            if self._media_bar_overlay.record_rects(
+                cmd,
+                swapchain_image,
+                swap_image_index,
+                media_bar_viewports,
+                source_layout=layout,
+            ):
+                drawn = True
+                layout = self.vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+        if (
+            self._media_pointer_overlay is not None
+            and self.config.pointer_mapping_enabled
+            and self._media_pointer_uv is not None
+            and self._media_eye_rects
+        ):
+            u, v = self._media_pointer_uv
+            pointer_rects = []
+            for left, top, right, bottom in self._media_eye_rects:
+                x = int(left + u * (right - left)) - 24
+                y = int(top + v * (bottom - top)) - 24
+                pointer_rects.append((x, y, 48, 48))
+            if self._media_pointer_overlay.record_rects(
+                cmd,
+                swapchain_image,
+                swap_image_index,
+                tuple(pointer_rects),
+                source_layout=layout,
+            ):
+                drawn = True
+                layout = self.vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+        return drawn, layout
+
+    @staticmethod
+    def _media_overlay_viewport_rects(
+        rects: tuple[tuple[int, int, int, int], ...]
+        | list[tuple[int, int, int, int]],
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        """Convert absolute media rectangles to Vulkan viewport rectangles."""
+        return tuple(
+            (
+                int(left),
+                int(top),
+                max(1, int(right) - int(left)),
+                max(1, int(bottom) - int(top)),
+            )
+            for left, top, right, bottom in rects
+        )
+
     def _init_fps_overlay(self) -> None:
         """Prepare an optional panel without making Vulkan setup fatal."""
         if self._fps_overlay is not None:
@@ -1258,10 +1914,14 @@ class VulkanLocalViewer:
             self._set_exclusive_fullscreen(not self._exclusive_fullscreen)
 
     def poll_events(self) -> None:
+        self._read_media_state()
+        self._refresh_media_textures()
         self.glfw.poll_events()
+        self._poll_media_pointer()
         if self.glfw.window_should_close(self.window):
             raise StopIteration
         self._keep_fullscreen_visible()
+        self._sync_media_passthrough()
         if self.config.cursor_passthrough and self.config.hide_cursor_overlay:
             update_native_cursor_suppression()
 
@@ -1453,8 +2113,11 @@ class VulkanLocalViewer:
         )
 
     def _report_present_fps(self, fps: float, frame_count: int) -> int | None:
+        self._refresh_content_rate()
         capture_target = (
-            self.config.on_sbs_fps(fps, frame_count)
+            self.config.on_sbs_fps(
+                self._content_fps, self._content_frame_count
+            )
             if self.config.on_sbs_fps is not None
             else None
         )
@@ -1511,7 +2174,6 @@ class VulkanLocalViewer:
             "on",
         }
         if not show_fps and not benchmark_fps:
-            self._refresh_content_rate()
             return capture_target
         target_text = (
             f" capture_target={capture_target}" if capture_target is not None else ""
@@ -1520,7 +2182,6 @@ class VulkanLocalViewer:
             f"[VulkanLocalViewer] Present FPS: {fps:.1f}{target_text}",
             flush=True,
         )
-        self._refresh_content_rate()
         if show_fps:
             self._refresh_fps_overlay(fps, capture_target)
             self._log_present_metrics(fps, capture_target)
@@ -1832,6 +2493,7 @@ class VulkanLocalViewer:
         total = self._present_total
         fresh = total - self._present_reused
         self._content_fps = fresh / elapsed
+        self._content_frame_count = fresh
         self._reuse_ratio = self._present_reused / total if total else 0.0
         self._present_total = 0
         self._present_reused = 0
@@ -2245,7 +2907,7 @@ class VulkanLocalViewer:
         cursor_overlay = self._cursor_texture_overlay
         available_overlays = tuple(
             item
-            for item in (overlay, cursor_overlay)
+            for item in (overlay, cursor_overlay, *self._media_overlay_instances())
             if item is not None and item.available
         )
         if available_overlays:
@@ -2380,6 +3042,8 @@ class VulkanLocalViewer:
                 self._fps_overlay.on_swapchain_destroyed()
             if self._cursor_texture_overlay is not None:
                 self._cursor_texture_overlay.on_swapchain_destroyed()
+            for media_overlay in self._media_overlay_instances():
+                media_overlay.on_swapchain_destroyed()
             self._release_full_screen_exclusive()
             self._device_function(
                 b"vkDestroySwapchainKHR",
@@ -2727,6 +3391,15 @@ class VulkanLocalViewer:
                 if self._cursor_texture_overlay is not None:
                     self._cursor_texture_overlay.close()
                     self._cursor_texture_overlay = None
+                for name in (
+                    "_media_bar_overlay",
+                    "_media_browser_overlay",
+                    "_media_pointer_overlay",
+                ):
+                    overlay = getattr(self, name, None)
+                    if overlay is not None:
+                        overlay.close()
+                        setattr(self, name, None)
                 for source in [self._source, *self._direct_sources]:
                     if source is not None:
                         source.close()
@@ -3582,6 +4255,21 @@ class _TransferSource:
         overlay_ms = 0.0
         overlay_upload_ms = 0.0
         target_layout = vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        media_started = time.perf_counter()
+        media_drawn, target_layout = o._record_media_overlays(
+            cmd,
+            target,
+            index,
+            eye_rects,
+            source_layout=target_layout,
+        )
+        media_ms = (time.perf_counter() - media_started) * 1000.0
+        overlay_ms += media_ms
+        for overlay in (o._media_bar_overlay, o._media_browser_overlay, o._media_pointer_overlay):
+            if overlay is not None:
+                overlay_upload_ms += float(getattr(overlay, "last_upload_ms", 0.0) or 0.0)
+        if media_drawn:
+            overlay_drawn = True
         cursor_rects = ()
         if o._cursor_texture_overlay is not None:
             try:

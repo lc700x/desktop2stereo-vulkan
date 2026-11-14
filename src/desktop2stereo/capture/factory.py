@@ -81,6 +81,20 @@ def normalize_config(config: CaptureConfig | None = None) -> CaptureConfig:
         on_window_exclusion_ready=config.on_window_exclusion_ready,
         on_window_exclusion_fallback=config.on_window_exclusion_fallback,
         gpu_required=bool(config.gpu_required),
+        media_path=config.media_path,
+        media_control_path=config.media_control_path,
+        media_gui_control_path=config.media_gui_control_path,
+        media_viewer_control_path=getattr(config, "media_viewer_control_path", None),
+        media_state_path=config.media_state_path,
+        media_session_id=config.media_session_id,
+        media_resume_position=float(config.media_resume_position or 0.0),
+        media_volume=float(getattr(config, "media_volume", 1.0) or 1.0),
+        media_muted=bool(getattr(config, "media_muted", False)),
+        media_browser_directory=getattr(config, "media_browser_directory", None),
+        media_audio_enabled=bool(config.media_audio_enabled),
+        render_size_config=getattr(config, "render_size_config", None),
+        window_handle=getattr(config, "window_handle", None),
+        window_rect=getattr(config, "window_rect", None),
     )
 
 
@@ -115,8 +129,18 @@ class DesktopGrabber:
         return backend_cls(*args, **kwargs)
 
 
+def _is_media_mode(config: CaptureConfig) -> bool:
+    return str(config.capture_mode or "").strip().casefold() in {
+        "file", "video", "image",
+    }
+
+
 def create_capture_source(config: CaptureConfig | None = None):
     config = normalize_config(config)
+    if _is_media_mode(config):
+        from .media import MediaCaptureSource
+
+        return MediaCaptureSource(config)
     source_cls = get_desktop_grabber_class(config)
     kwargs = {
         "output_resolution": config.output_resolution,
@@ -133,6 +157,8 @@ def create_capture_source(config: CaptureConfig | None = None):
 
 def create_capture_runner(config: CaptureConfig | None = None):
     config = normalize_config(config)
+    if _is_media_mode(config):
+        return PollingCaptureRunner(config, lambda: create_capture_source(config))
     if config.gpu_required and config.os_name == "Windows":
         try:
             import torch

@@ -15,6 +15,8 @@ from .output import ensure_b1hw, ensure_bchw
 _LOGGER = logging.getLogger(__name__)
 _TRITON_GAUSSIAN_FAILURE_LOCK = threading.Lock()
 _TRITON_GAUSSIAN_FAILURE_RECORDED = False
+_TRITON_MODEL_GAUSSIAN_FAILURE_LOCK = threading.Lock()
+_TRITON_MODEL_GAUSSIAN_FAILURE_RECORDED = False
 _MODEL_DEPTH_AA_APPLIED: ContextVar[bool] = ContextVar(
     "d2s_model_depth_aa_applied", default=False
 )
@@ -286,6 +288,24 @@ def anti_alias_depth(
         kernel_2d = (kernel[:, None] * kernel[None, :]).view(
             1, 1, kernel_size, kernel_size
         )
+        if depth.device.type == "cuda":
+            try:
+                from ._depth_gaussian_triton import gaussian_model
+
+                return gaussian_model(
+                    depth,
+                    kernel.contiguous(),
+                    edge_threshold=float(edge_threshold),
+                )
+            except Exception as exc:
+                global _TRITON_MODEL_GAUSSIAN_FAILURE_RECORDED
+                with _TRITON_MODEL_GAUSSIAN_FAILURE_LOCK:
+                    if not _TRITON_MODEL_GAUSSIAN_FAILURE_RECORDED:
+                        _LOGGER.warning(
+                            "Triton model depth Gaussian failed; falling back to Torch: %s",
+                            exc,
+                        )
+                        _TRITON_MODEL_GAUSSIAN_FAILURE_RECORDED = True
         return _edge_aware_gaussian_torch(depth, kernel_2d, float(edge_threshold))
     radius = kernel_size // 2
     horizontal = F.conv2d(

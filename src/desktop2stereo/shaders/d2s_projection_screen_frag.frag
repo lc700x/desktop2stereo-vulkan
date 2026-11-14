@@ -47,6 +47,34 @@ vec4 sample_pixel_area(vec2 uv) {
         return textureLod(screen_texture, source_uv, 0.0);
     }
 
+    // Strong minification needs a denser integration grid. The screen covers
+    // proportionally fewer output pixels in this branch, so 8x8 keeps total
+    // texture work bounded while removing the structured aliasing (moire)
+    // produced by a 4x4 grid on fine patterns.
+    if (max(footprint_x, footprint_y) > 2.0) {
+        const float offsets[8] = float[](
+            -0.4801449283, -0.3983332387, -0.2627662050, -0.0917173213,
+             0.0917173213,  0.2627662050,  0.3983332387,  0.4801449283
+        );
+        const float weights[8] = float[](
+            0.0506142681, 0.1111905172, 0.1568533230, 0.1813418917,
+            0.1813418917, 0.1568533230, 0.1111905172, 0.0506142681
+        );
+        vec4 total = vec4(0.0);
+        for (int y = 0; y < 8; ++y) {
+            for (int x = 0; x < 8; ++x) {
+                vec2 sample_uv = clamp(
+                    source_uv + source_dx * offsets[x] + source_dy * offsets[y],
+                    source_min_uv,
+                    source_max_uv
+                );
+                total += textureLod(screen_texture, sample_uv, 0.0)
+                    * weights[x] * weights[y];
+            }
+        }
+        return total;
+    }
+
     // Four-point Gauss-Legendre quadrature integrates the projected pixel's
     // footprint instead of sampling sparsely across neighboring pixels.
     const float offsets[4] = float[](

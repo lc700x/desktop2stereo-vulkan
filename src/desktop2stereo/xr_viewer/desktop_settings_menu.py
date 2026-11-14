@@ -882,7 +882,13 @@ def _run_flet_desktop_settings_app(
             nonlocal visible, drawer_expanded
             async with window_mode_lock:
                 cancel_drawer_hide()
+                was_visible = visible
                 visible = show_panel
+                if was_visible and not show_panel:
+                    try:
+                        actions.put_nowait(("__settings_menu_closed__", None, True))
+                    except Exception:
+                        pass
                 drawer_expanded = False
                 drawer_body.visible = False
                 drawer_handle.visible = True

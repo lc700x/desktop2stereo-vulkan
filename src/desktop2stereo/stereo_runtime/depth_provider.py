@@ -202,7 +202,10 @@ def _model_input_size_for_model(
 
 def _normalize_depth(depth: torch.Tensor, subsample_cap: int = 6_144) -> torch.Tensor:
     depth = ensure_b1hw(depth).float()
-    depth = torch.nan_to_num(depth, nan=0.0)
+    # Sanitise every non-finite value before percentile selection. Replacing
+    # +Inf after normalisation is too late: Inf wins the 98th-percentile bound
+    # and collapses the otherwise valid frame to near-black.
+    depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
     flat = depth.flatten(start_dim=2)
     count = flat.shape[-1]
     if count <= 1:

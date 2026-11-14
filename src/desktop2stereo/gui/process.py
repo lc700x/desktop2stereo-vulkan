@@ -9,10 +9,12 @@ import ctypes
 import datetime
 import json
 import logging
+import math
 import platform
 import queue
 import subprocess
 import traceback
+import uuid
 import flet as ft
 from utils import OS_NAME, DEFAULT_PORT, shutdown_event, read_yaml
 from . import devices as devices_module
@@ -662,6 +664,10 @@ class GUIProcessMixin:
         if stop_content is not None and stop_content.value != stop_text:
             stop_content.value = stop_text
             changed_controls.append(self.stop_btn)
+        capture_mode_control = getattr(self, "capture_mode_dd", None)
+        if capture_mode_control is not None and capture_mode_control.disabled != running:
+            capture_mode_control.disabled = running
+            changed_controls.append(capture_mode_control)
         calibration_button = getattr(self, "stream_calibration_btn", None)
         if (
             calibration_button is not None
@@ -669,8 +675,56 @@ class GUIProcessMixin:
         ):
             calibration_button.disabled = running
             changed_controls.append(calibration_button)
+        self._set_media_transport_enabled(running=running)
         self._safe_update(*changed_controls)
         self._refresh_openxr_controls_button()
+
+    def _set_media_transport_enabled(self, *, running: bool | None = None) -> None:
+        if running is None:
+            running = bool(getattr(self, "_starting", False)) or (
+                getattr(self, "process", None) is not None
+                and getattr(self.process, "returncode", None) is None
+            )
+        state = getattr(self, "_media_runtime_state", None)
+        state = state if isinstance(state, dict) else {}
+        ready = bool(state.get("ready", False)) if state else bool(running)
+        mode = str(state.get("mode", "")).strip().casefold()
+        video = ready and mode not in {"image", "browser"}
+        audio = video and bool(state.get("audio_enabled", True))
+        active = (
+            bool(running)
+            and str(getattr(self, "capture_mode_key", "")) in {"File", "Video", "Image"}
+            and bool(getattr(self, "_media_session_id", None))
+        )
+        controls = []
+        for name in ("media_rewind_btn", "media_play_btn", "media_forward_btn"):
+            control = getattr(self, name, None)
+            if control is not None:
+                desired = not (active and video)
+                if bool(getattr(control, "disabled", False)) != desired:
+                    control.disabled = desired
+                    controls.append(control)
+        seek = getattr(self, "media_seek_slider", None)
+        if seek is not None:
+            if bool(getattr(seek, "disabled", False)) != (not (active and video)):
+                seek.disabled = not (active and video)
+                controls.append(seek)
+        for name in ("media_mute_btn", "media_volume_slider"):
+            control = getattr(self, name, None)
+            if control is not None:
+                desired = not (active and audio)
+                if bool(getattr(control, "disabled", False)) != desired:
+                    control.disabled = desired
+                    controls.append(control)
+        for name in ("media_open_file_btn", "media_open_folder_btn"):
+            control = getattr(self, name, None)
+            if control is not None:
+                desired = not (active and (not state or ready))
+                if bool(getattr(control, "disabled", False)) != desired:
+                    control.disabled = desired
+                    controls.append(control)
+        if controls:
+            self._safe_update(*controls)
 
     def _set_openxr_controls_window_state(self, visible: bool) -> None:
         self._openxr_controls_visible = bool(visible)
@@ -1472,10 +1526,12 @@ class GUIProcessMixin:
             input_monitor_index=input_monitor_index,
             output_monitor_index=output_monitor_index,
         )
+        file_mode = self.capture_mode_key == "File"
         if (
             self.run_mode_key == "Local Viewer"
             and monitor_count <= 1
             and not same_monitor_local_3d
+            and not file_mode
         ):
             return False, UI_MESSAGES[self.locale]["Local Viewer requires a second display"]
         if self.capture_mode_key == "Monitor" and (
@@ -1486,6 +1542,7 @@ class GUIProcessMixin:
         if (
             self.run_mode_key == "Local Viewer"
             and not same_monitor_local_3d
+            and not (file_mode and monitor_count <= 1)
             and (
                 getattr(self, "_missing_stereo_output_identity", False)
                 or not self.stereo_monitor_dd.value
@@ -1592,6 +1649,104 @@ class GUIProcessMixin:
         self.page.update()
         asyncio.create_task(self._countdown_and_run(0.5))
 
+    def _configure_media_runtime(self, child_env):
+        inherited_media_env = {
+            key: child_env.get(key)
+            for key in (
+                "D2S_MEDIA_PATH",
+                "D2S_MEDIA_CONTROL_PATH",
+                "D2S_MEDIA_STATE_PATH",
+                "D2S_MEDIA_HISTORY_PATH",
+                "D2S_MEDIA_SESSION_ID",
+                "D2S_MEDIA_RESUME_POSITION",
+                "D2S_MEDIA_VOLUME",
+                "D2S_MEDIA_MUTED",
+                "D2S_MEDIA_BROWSER_DIRECTORY",
+            )
+        }
+        for key in inherited_media_env:
+            child_env.pop(key, None)
+        child_env.pop("D2S_WINDOW_HANDLE", None)
+        if str(getattr(self, "capture_mode_key", "")) == "Window":
+            handle = getattr(self, "selected_window_handle", None)
+            if handle:
+                child_env["D2S_WINDOW_HANDLE"] = str(int(handle))
+
+        self._media_session_id = None
+        self._media_control_path = None
+        self._media_state_path = None
+        self._media_path = ""
+        self._media_resume_position = 0.0
+        self._media_runtime_state = None
+
+        capture_mode = str(
+            getattr(self, "capture_mode_key", "") or ""
+        ).strip().casefold()
+        if capture_mode not in {"file", "video", "image"}:
+            return
+
+        config = getattr(self, "_config", {})
+        if not isinstance(config, dict):
+            config = {}
+        media_path = str(
+            config.get("Media Path")
+            or inherited_media_env.get("D2S_MEDIA_PATH")
+            or ""
+        ).strip()
+        resume_value = config.get("Media Playback Position")
+        if resume_value in (None, ""):
+            resume_value = inherited_media_env.get(
+                "D2S_MEDIA_RESUME_POSITION", "0"
+            )
+        try:
+            resume_position = float(resume_value or 0.0)
+        except (TypeError, ValueError):
+            resume_position = 0.0
+        if not math.isfinite(resume_position):
+            resume_position = 0.0
+        resume_position = max(0.0, resume_position)
+        if capture_mode == "image":
+            resume_position = 0.0
+
+        os.makedirs(LOG_DIR, exist_ok=True)
+        session_id = f"{os.getpid()}-{time.time_ns()}-{uuid.uuid4().hex}"
+        control_path = os.path.abspath(
+            os.path.join(LOG_DIR, f"media-{session_id}.control.json")
+        )
+        state_path = os.path.abspath(
+            os.path.join(LOG_DIR, f"media-{session_id}.state.json")
+        )
+        history_path = os.path.abspath(
+            os.path.join(LOG_DIR, "media-recent.json")
+        )
+        browser_directory = str(
+            config.get("Media Browser Directory")
+            or (os.path.dirname(media_path) if media_path else "")
+            or ""
+        )
+        child_env.update({
+            "D2S_MEDIA_PATH": media_path,
+            "D2S_MEDIA_CONTROL_PATH": control_path,
+            "D2S_MEDIA_STATE_PATH": state_path,
+            "D2S_MEDIA_HISTORY_PATH": history_path,
+            "D2S_MEDIA_SESSION_ID": session_id,
+            "D2S_MEDIA_RESUME_POSITION": str(resume_position),
+            "D2S_MEDIA_VOLUME": str(config.get("Media Volume", 1.0)),
+            "D2S_MEDIA_MUTED": "1" if config.get("Media Muted", False) else "0",
+            "D2S_MEDIA_BROWSER_DIRECTORY": browser_directory,
+        })
+        self._media_session_id = session_id
+        self._media_control_path = control_path
+        self._media_state_path = state_path
+        self._media_path = media_path
+        self._media_resume_position = resume_position
+        self.media_path = media_path
+        self.media_resume_position = resume_position
+        if isinstance(getattr(self, "_config", None), dict):
+            if media_path:
+                self._config["Media Path"] = media_path
+            self._config["Media Playback Position"] = resume_position
+
     async def _countdown_and_run(self, seconds):
         self._diag("_countdown_and_run scheduled")
         try:
@@ -1623,6 +1778,7 @@ class GUIProcessMixin:
             child_env = os.environ.copy()
             child_env["DESKTOP2STEREO_LOCALE"] = self.locale
             child_env["PYTHONIOENCODING"] = "utf-8"
+            self._configure_media_runtime(child_env)
             runtime_override = _set_alvr_openxr_runtime_override(
                 child_env, self.run_mode_key
             )
@@ -1736,6 +1892,181 @@ class GUIProcessMixin:
             logger.exception("_pump_child_output exception: %s", e)
             self._diag(f"_pump_child_output exception: {e}\n{traceback.format_exc()}", error=True)
 
+    def _poll_media_state(self):
+        state_path = getattr(self, "_media_state_path", None)
+        session_id = getattr(self, "_media_session_id", None)
+        if not state_path or not session_id:
+            return False
+        try:
+            with open(state_path, "r", encoding="utf-8") as stream:
+                state = json.load(stream)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(state, dict) or state.get("session") != session_id:
+            return False
+
+        media_path = str(state.get("path") or self._media_path or "").strip()
+        position = self._media_resume_position
+        try:
+            candidate_position = float(state.get("position", position))
+            if math.isfinite(candidate_position) and candidate_position >= 0.0:
+                position = candidate_position
+        except (TypeError, ValueError):
+            pass
+        duration = 0.0
+        try:
+            candidate_duration = float(state.get("duration", 0.0))
+            if math.isfinite(candidate_duration) and candidate_duration >= 0.0:
+                duration = candidate_duration
+        except (TypeError, ValueError):
+            pass
+
+        state = dict(state)
+        state["path"] = media_path
+        state["position"] = position
+        state["duration"] = duration
+        state["playing"] = bool(state.get("playing", False))
+        state["status"] = str(
+            state.get("error")
+            or (
+                "Playing"
+                if state["playing"]
+                else "Ready"
+                if str(state.get("mode", "")).casefold() in {"image", "browser"}
+                else "Paused"
+            )
+        )
+        state["decode_error"] = str(
+            state.get("error") or state.get("decode_fallback_reason") or ""
+        )
+        state["audio_error"] = str(state.get("audio_error") or "")
+        self._media_runtime_state = state
+        self._media_path = media_path
+        self._media_resume_position = position
+        self.media_path = media_path
+        self.media_resume_position = position
+        config = getattr(self, "_config", None)
+        if isinstance(config, dict):
+            if media_path:
+                config["Media Path"] = media_path
+            config["Media Playback Position"] = position
+            if state.get("volume") is not None:
+                config["Media Volume"] = state.get("volume")
+            config["Media Muted"] = bool(state.get("muted", False))
+            if state.get("browser_path"):
+                config["Media Browser Directory"] = state.get("browser_path")
+
+        messages = UI_MESSAGES.get(
+            getattr(self, "locale", "EN"), UI_MESSAGES["EN"]
+        )
+        error_messages = []
+        if state.get("error"):
+            error_messages.append(
+                f"{messages.get('Media error', 'Media error')}: {state['error']}"
+            )
+        if state.get("decode_fallback_reason"):
+            error_messages.append(f"Decode: {state['decode_fallback_reason']}")
+        if state["audio_error"]:
+            error_messages.append(f"Audio: {state['audio_error']}")
+        status_text = " | ".join(error_messages) or messages.get(
+            state["status"], state["status"]
+        )
+
+        def format_time(value):
+            total_seconds = max(0, int(value))
+            hours, remainder = divmod(total_seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            if hours:
+                return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            return f"{minutes:02d}:{seconds:02d}"
+
+        changed_controls = []
+        status_control = getattr(self, "media_status_text", None)
+        if status_control is not None:
+            status_control.value = status_text
+            changed_controls.append(status_control)
+        position_control = getattr(self, "media_position_text", None)
+        if position_control is not None:
+            position_control.value = (
+                f"{format_time(position)} / {format_time(duration)}"
+            )
+            changed_controls.append(position_control)
+        seek_slider = getattr(self, "media_seek_slider", None)
+        if seek_slider is not None:
+            seek_slider.max = max(duration, 1.0)
+            seek_slider.value = min(position, duration) if duration > 0.0 else 0.0
+            changed_controls.append(seek_slider)
+        play_button = getattr(self, "media_play_btn", None)
+        if play_button is not None:
+            play_button.icon = (
+                ft.Icons.PAUSE if state["playing"] else ft.Icons.PLAY_ARROW
+            )
+            play_button.tooltip = messages.get(
+                "Pause" if state["playing"] else "Play",
+                "Pause" if state["playing"] else "Play",
+            )
+            changed_controls.append(play_button)
+        path_control = getattr(self, "media_path_text", None)
+        if path_control is not None:
+            path_control.value = media_path
+            changed_controls.append(path_control)
+        safe_update = getattr(self, "_safe_update", None)
+        if changed_controls and callable(safe_update):
+            safe_update(*changed_controls)
+        set_transport_enabled = getattr(self, "_set_media_transport_enabled", None)
+        if callable(set_transport_enabled):
+            set_transport_enabled(running=True)
+        return True
+
+    def _persist_media_state(self, *, media_path=None, position=None):
+        if not getattr(self, "_media_session_id", None) and media_path is None:
+            return
+        state = getattr(self, "_media_runtime_state", None) or {}
+        if media_path is None:
+            media_path = state.get("path") or getattr(self, "_media_path", "") or ""
+        media_path = str(media_path).strip()
+        if position is None:
+            position = getattr(self, "_media_resume_position", 0.0)
+        try:
+            position = float(position)
+            if not math.isfinite(position) or position < 0.0:
+                position = 0.0
+        except (TypeError, ValueError):
+            position = 0.0
+
+        settings_path = os.path.join(BASE_DIR, "settings.yaml")
+        try:
+            settings = read_yaml(settings_path) or {}
+        except FileNotFoundError:
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        if media_path:
+            settings["Media Path"] = media_path
+        settings["Media Playback Position"] = position
+        if state.get("volume") is not None:
+            settings["Media Volume"] = state.get("volume")
+        settings["Media Muted"] = bool(state.get("muted", False))
+        if state.get("browser_path"):
+            settings["Media Browser Directory"] = state.get("browser_path")
+        config = getattr(self, "_config", None)
+        if isinstance(config, dict):
+            if media_path:
+                config["Media Path"] = media_path
+            config["Media Playback Position"] = position
+            if state.get("volume") is not None:
+                config["Media Volume"] = state.get("volume")
+            config["Media Muted"] = bool(state.get("muted", False))
+            if state.get("browser_path"):
+                config["Media Browser Directory"] = state.get("browser_path")
+        self.media_path = media_path
+        self._media_path = media_path
+        self.media_resume_position = position
+        self._media_resume_position = position
+        ok, error = save_yaml(settings_path, settings)
+        if not ok:
+            logger.warning("Failed to persist media playback state: %s", error)
+
     def _log_child_line(self, line):
         text = str(line or "").strip()
         if not text:
@@ -1840,11 +2171,34 @@ class GUIProcessMixin:
             return
         self._diag(f"monitor_task started, pid={proc.pid}")
         try:
-            await proc.wait()
+            if getattr(self, "_media_state_path", None):
+                last_media_persist_at = time.monotonic()
+                wait_task = asyncio.create_task(proc.wait())
+                while not wait_task.done():
+                    if self._poll_media_state():
+                        now = time.monotonic()
+                        if now - last_media_persist_at >= 5.0:
+                            self._persist_media_state()
+                            last_media_persist_at = now
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(wait_task), timeout=1.0
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                await wait_task
+            else:
+                await proc.wait()
             self._diag(f"proc.wait returned, rc={proc.returncode}")
         except Exception as e:
             self._diag(f"proc.wait() exception: {e}", error=True)
         finally:
+            if getattr(self, "_media_session_id", None):
+                self._poll_media_state()
+                self._persist_media_state()
+                self._media_session_id = None
+                self._media_control_path = None
+                self._media_state_path = None
             self._diag(f"finally: process is proc={self.process is proc}, returncode={proc.returncode}")
             if self.process is proc:
                 self.process = None

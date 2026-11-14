@@ -24,6 +24,21 @@ class CaptureConfig:
     excluded_window_handles_provider: Callable[[], tuple[int, ...]] | None = None
     on_window_exclusion_ready: Callable[[], None] | None = None
     on_window_exclusion_fallback: Callable[[str], None] | None = None
+    media_path: str | None = None
+    media_control_path: str | None = None
+    media_gui_control_path: str | None = None
+    media_viewer_control_path: str | None = None
+    media_state_path: str | None = None
+    media_history_path: str | None = None
+    media_session_id: str | None = None
+    media_resume_position: float = 0.0
+    media_volume: float = 1.0
+    media_muted: bool = False
+    media_browser_directory: str | None = None
+    media_audio_enabled: bool = True
+    render_size_config: Any | None = None
+    window_handle: int | None = None
+    window_rect: tuple[int, int, int, int] | None = None
 
 
 class FrameCopyMode(Enum):

@@ -1,12 +1,12 @@
-Capture Mode: Monitor
-Monitor Index: 1
+Capture Mode: File
+Monitor Index: 3
 Monitor Identity:
-  stable_id: DISPLAY\TUP0270\7&314d3634&4&UID61700
+  stable_id: DISPLAY\TUP0270\7&34414894&e&UID1536
   name: D270H
   manufacturer: TUP
   model: D270H
   serial: '808728147'
-  left: -3840
+  left: 0
   top: 0
   width: 3840
   height: 2160
@@ -382,29 +382,29 @@ Vulkan Projection MIP LOD Bias: -0.35
 Vulkan Projection RCAS Sharpness: 0.5
 Display Mode: Half-SBS
 FP16: true
-torch.compile: true
-TensorRT: true
+torch.compile: false
+TensorRT: null
 Parallel Inference: false
 Parallel Inference Workers: 1
 Recompile TensorRT: false
 CoreML: null
 Recompile CoreML: false
-MIGraphX: null
+MIGraphX: true
 Recompile MIGraphX: false
 Recompile OpenVINO: false
 Computing Device: 0
-Language: EN
-Run Mode: Local Viewer
+Language: CN
+Run Mode: OpenXR Link
 XR Headset Model: Pico 4 / 4 Ultra
-XR Preview Window: false
+XR Preview Window: true
 VSync: false
 Window Preview: false
 Target FPS: 0
 Processing Resolution: Auto
 Render Size Policy: scaled
 Render Scale: 100%
-XR Render: 1.0
-XR Render Mode: auto
+XR Render: 2.0
+XR Render Mode: manual
 Render Fixed Width: 1920
 Render Fixed Height: 1080
 Render Max Pixels: 8294400
@@ -429,24 +429,48 @@ Environment Model: Default
 NVIDIA Frame Generation: false
 Lossless Scaling Support: false
 LSFG Support: false
-Capture Tool: WindowsCaptureCUDA
+Capture Tool: WindowsCaptureROCm
 Display Fit Mode: contain
 Stream Display Fit Mode: contain
 Fill 16:9: true
 Fix Viewer Aspect: true
-Stereo Output: 1
+Stereo Output: 2
 Stereo Output Identity:
-  stable_id: DISPLAY\TUP0270\7&314d3634&4&UID61700
-  name: D270H
-  manufacturer: TUP
-  model: D270H
-  serial: '808728147'
-  left: -3840
+  stable_id: DISPLAY\DELF015\7&314d3634&4&UID61696
+  name: Dell U2410(Digital)
+  manufacturer: DEL
+  model: DELL U2410
+  serial: J257M0CR0TUL
+  left: 7680
   top: 0
-  width: 3840
-  height: 2160
+  width: 1920
+  height: 1200
 Show Log Panel: true
+Stream Target FPS: 0
 Input Display Resolution Tier: 4K
 Synthetic View: quality_4k
 OpenVINO: null
-Stream Target FPS: 0
+Media Path: F:\Videos\【顶级画质】B站首支4K 120FPS HDR10影片《文字大战》\P1-【4K 120FPS HDR10】文字大战.mp4
+Media Playback Position: 346.366
+OpenXR Screen States:
+  Default:
+    position:
+    - 0.0
+    - 0.0
+    - -20.0
+    width: 23.09
+    height: 12.988125
+    rotation_deg:
+    - 0.0
+    - 0.0
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+OpenXR Glow Modes:
+  Default: 'off'
+Media Volume: 1.0
+Media Muted: false
+Media Browser Directory: F:\Videos

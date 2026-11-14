@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 import os
 import queue
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from capture import CaptureConfig
 from capture.session import CaptureSessionCallbacks
@@ -73,6 +75,86 @@ def env_flag(name, default="0"):
     )
 
 
+def _env_int(name: str) -> int | None:
+    try:
+        value = int(str(os.environ.get(name, "")).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _configure_rocm_attention(device, device_info) -> None:
+    """Enable the measured ROCm attention path before the depth model loads."""
+    if not env_flag("D2S_ROCM_AOTRITON", "1"):
+        return
+    if os.environ.get("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL") is not None:
+        return
+    if str(getattr(device, "type", "")).casefold() != "cuda":
+        return
+    vendor_text = str(device_info or "").upper()
+    if "AMD" in vendor_text or "RADEON" in vendor_text:
+        os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+
+
+def _media_capture_options_from_environment(
+    run_mode: str, settings: dict | None = None
+) -> dict[str, object]:
+    settings = settings or {}
+    control_path = os.environ.get("D2S_MEDIA_CONTROL_PATH") or None
+    state_path = os.environ.get("D2S_MEDIA_STATE_PATH") or None
+    history_path = os.environ.get("D2S_MEDIA_HISTORY_PATH") or None
+    if not history_path and state_path:
+        history_path = str(Path(state_path).with_name("media-recent.json"))
+    if not history_path:
+        history_path = str(
+            Path(__file__).resolve().parents[1] / "logs" / "media-recent.json"
+        )
+    resume_default = settings.get("Media Playback Position", 0.0)
+    try:
+        resume_position = float(
+            os.environ.get("D2S_MEDIA_RESUME_POSITION", resume_default) or 0.0
+        )
+    except (TypeError, ValueError):
+        resume_position = 0.0
+    if not math.isfinite(resume_position):
+        resume_position = 0.0
+    volume_default = settings.get("Media Volume", 1.0)
+    try:
+        volume = float(os.environ.get("D2S_MEDIA_VOLUME", volume_default) or volume_default)
+    except (TypeError, ValueError):
+        volume = 1.0
+    if not math.isfinite(volume):
+        volume = 1.0
+    if "D2S_MEDIA_MUTED" in os.environ:
+        muted = env_flag("D2S_MEDIA_MUTED")
+    else:
+        muted = bool(settings.get("Media Muted", False))
+
+    return {
+        "media_path": (
+            os.environ.get("D2S_MEDIA_PATH")
+            or str(settings.get("Media Path") or "").strip()
+            or None
+        ),
+        "media_control_path": f"{control_path}.openxr" if control_path else None,
+        "media_gui_control_path": control_path,
+        "media_viewer_control_path": f"{control_path}.viewer" if control_path else None,
+        "media_state_path": state_path,
+        "media_history_path": history_path,
+        "media_session_id": os.environ.get("D2S_MEDIA_SESSION_ID") or None,
+        "media_resume_position": max(0.0, resume_position),
+        "media_volume": max(0.0, min(1.0, volume)),
+        "media_muted": muted,
+        "media_browser_directory": (
+            os.environ.get("D2S_MEDIA_BROWSER_DIRECTORY")
+            or str(settings.get("Media Browser Directory") or "").strip()
+            or None
+        ),
+        "media_audio_enabled": str(run_mode or "").strip().casefold() != "mjpeg streamer",
+        "window_handle": _env_int("D2S_WINDOW_HANDLE"),
+    }
+
+
 def _runtime_contract_from_settings(settings: dict, *, os_name: str):
     run_mode_config = resolve_run_mode(
         settings.get("Run Mode", "Local Viewer"),
@@ -118,6 +200,7 @@ def create_runtime_context(
     convergence,
     capture_fps_provider=None,
 ):
+    render_size_config = render_size_config or RenderSizeConfig()
     base_dir = os.path.dirname(os.path.abspath(file_path))
     nvfruc_frame_generation = bool(
         settings.get(
@@ -143,6 +226,7 @@ def create_runtime_context(
         device=str(device),
         depth_only=False,
     )
+    _configure_rocm_attention(device, device_info)
     stereo_runtime = StereoRuntime(runtime_config)
     stereo_auto_enabled, stereo_active_preset = initial_stereo_preset_state(runtime_config)
     stereo_runtime.configure_stereo(stereo_config_from_runtime(runtime_config), reset_temporal=True)
@@ -229,6 +313,8 @@ def create_runtime_context(
                     and any(token in str(device_info).upper() for token in ("NVIDIA", "AMD", "RADEON"))
                 )
             ),
+            render_size_config=render_size_config,
+            **_media_capture_options_from_environment(run_mode, settings),
         ),
         render_size_config=render_size_config or RenderSizeConfig(),
         application_runtime_target=application_runtime_target,

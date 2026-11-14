@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 import os
 import threading
 import time
@@ -44,6 +46,8 @@ class RuntimeCallbacks:
         self._display_fit_mode = str(display_fit_mode or "contain")
         self.stream_output = None
         self._screen_state_save_error_logged = False
+        self._media_command_revisions: dict[str, int] = {}
+        self._media_command_revision = -1
 
     def set_stream_output(self, output) -> None:
         self.stream_output = output
@@ -266,6 +270,52 @@ class RuntimeCallbacks:
             except Exception as exc:
                 print(f"[OpenXRViewer] auto render scale save failed: {exc}", flush=True)
                 return False
+        if action == "persist_openxr_room_settings":
+            state = values.get("state")
+            if not isinstance(state, dict):
+                return False
+            try:
+                environment = str(
+                    values.get("environment", "Default") or "Default"
+                ).strip() or "Default"
+                seat_index = state.get("seat_index")
+                if type(seat_index) is not int or not 0 <= seat_index <= 2:
+                    return False
+                room_state = {"seat_index": seat_index}
+                for name, minimum, maximum in (
+                    ("seat_height", -3.0, 3.0),
+                    ("exposure", -8.0, 8.0),
+                ):
+                    value = state.get(name)
+                    if isinstance(value, bool):
+                        return False
+                    numeric = float(value)
+                    if not math.isfinite(numeric):
+                        return False
+                    room_state[name] = max(minimum, min(maximum, numeric))
+                reflection = state.get("screen_reflection_enabled")
+                if not isinstance(reflection, bool):
+                    return False
+                room_state["screen_reflection_enabled"] = reflection
+
+                from gui.config import save_yaml
+                from stereo_runtime.hot_reload import read_yaml
+
+                settings_path = os.path.join(self.context.base_dir, "settings.yaml")
+                settings = read_yaml(settings_path)
+                states = settings.get("OpenXR Room Settings", {})
+                states = dict(states) if isinstance(states, dict) else {}
+                states[environment] = room_state
+                settings["OpenXR Room Settings"] = states
+                ok, error = save_yaml(settings_path, settings)
+                if not ok:
+                    raise OSError(error)
+                return True
+            except (TypeError, ValueError, OverflowError):
+                return False
+            except Exception as exc:
+                print(f"[OpenXRViewer] room settings save failed: {exc}", flush=True)
+                return False
         if action in {"persist_openxr_screen_state", "reset_openxr_screen_state"}:
             try:
                 environment = str(values.get("environment", "Default") or "Default").strip()
@@ -358,6 +408,10 @@ class RuntimeCallbacks:
             except Exception as exc:
                 print(f"[OpenXRViewer] glow transparency save failed: {exc}", flush=True)
                 return False
+        if action == "media_control":
+            return self._write_openxr_media_command(
+                values.get("media_action"), values.get("value")
+            )
         if action == "set_runtime_setting":
             return self._set_openxr_runtime_setting(
                 str(values.get("name", "")), values.get("value"),
@@ -411,6 +465,104 @@ class RuntimeCallbacks:
             f"[OpenXRViewer] controller shortcut {action}: depth_strength={target:.3f}",
             flush=True,
         )
+        return True
+
+    def _write_openxr_media_command(self, media_action, value=None) -> bool:
+        capture_config = getattr(self.context, "capture_config", None)
+        return self._write_media_command(
+            getattr(capture_config, "media_control_path", None),
+            media_action,
+            value,
+            label="OpenXRViewer",
+        )
+
+    def write_viewer_media_command(self, media_action, value=None) -> bool:
+        capture_config = getattr(self.context, "capture_config", None)
+        return self._write_media_command(
+            getattr(capture_config, "media_viewer_control_path", None),
+            media_action,
+            value,
+            label="VulkanLocalViewer",
+        )
+
+    def _write_media_command(
+        self, control_path, media_action, value=None, *, label: str
+    ) -> bool:
+        capture_config = getattr(self.context, "capture_config", None)
+        control_path = str(control_path or "").strip()
+        session_id = str(
+            getattr(capture_config, "media_session_id", "") or ""
+        ).strip()
+        media_action = str(media_action or "").casefold()
+        allowed_actions = {
+            "play", "pause", "seek", "seek_relative", "volume", "mute",
+            "browse", "browse_up", "browse_refresh", "browse_close", "browse_select",
+            "browse_open", "recent_remove", "playlist_next", "playlist_previous", "playlist_select",
+            "playlist_clear", "playlist_remove",
+        }
+        if not control_path or not session_id or media_action not in allowed_actions:
+            return False
+
+        if media_action in {"seek", "seek_relative"}:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(value):
+                return False
+            if media_action == "seek":
+                value = max(0.0, value)
+        elif media_action == "volume":
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(value):
+                return False
+            value = max(0.0, min(1.0, value))
+        elif media_action == "mute":
+            if not isinstance(value, bool):
+                return False
+        elif media_action in {"browse_select", "browse_open", "recent_remove", "playlist_select", "playlist_remove"}:
+            if isinstance(value, dict):
+                path = value.get("path")
+            else:
+                path = value
+            if not isinstance(path, str) or not path.strip():
+                return False
+            value = {"path": path.strip()}
+
+        revisions = getattr(self, "_media_command_revisions", None)
+        if revisions is None:
+            revisions = {}
+            self._media_command_revisions = revisions
+        revision = revisions.get(control_path, -1) + 1
+        command = {
+            "session": session_id,
+            "revision": revision,
+            "action": media_action,
+        }
+        if media_action in {
+            "seek", "seek_relative", "volume", "mute", "browse", "browse_select",
+            "browse_open", "recent_remove", "playlist_select", "playlist_remove",
+        }:
+            command["value"] = value
+        control_path = os.path.abspath(os.path.expanduser(control_path))
+        temporary_path = f"{control_path}.{os.getpid()}.tmp"
+        try:
+            os.makedirs(os.path.dirname(control_path), exist_ok=True)
+            with open(temporary_path, "w", encoding="utf-8") as stream:
+                json.dump(command, stream, ensure_ascii=False)
+            os.replace(temporary_path, control_path)
+        except OSError as exc:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+            print(f"[{label}] media command write failed: {exc}", flush=True)
+            return False
+        revisions[control_path] = revision
+        self._media_command_revision = revision
         return True
 
     def _set_openxr_runtime_setting(self, name: str, value, *, persist: bool) -> bool:

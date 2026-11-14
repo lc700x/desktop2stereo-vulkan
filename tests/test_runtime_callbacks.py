@@ -408,3 +408,53 @@ def test_settings_menu_persists_default_environment_glow_transparency(tmp_path) 
         "Cinema": 0.4,
         "Default": 0.65,
     }
+
+
+
+def test_settings_menu_persists_per_environment_room_settings(tmp_path) -> None:
+    callbacks = _callbacks(0.6)
+    callbacks.context.base_dir = str(tmp_path)
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(
+        "OpenXR Room Settings:\n  Cinema:\n    seat_index: 1\n",
+        encoding="utf-8",
+    )
+    state = {
+        "seat_index": 2,
+        "seat_height": 0.75,
+        "exposure": -1.25,
+        "screen_reflection_enabled": True,
+    }
+
+    assert callbacks.on_openxr_controller_shortcut(
+        "persist_openxr_room_settings",
+        environment="Default",
+        state=state,
+    ) is True
+
+    from stereo_runtime.hot_reload import read_yaml
+
+    settings = read_yaml(str(settings_path))
+    assert settings["OpenXR Room Settings"] == {
+        "Cinema": {"seat_index": 1},
+        "Default": state,
+    }
+
+
+def test_settings_menu_rejects_invalid_room_settings(tmp_path) -> None:
+    callbacks = _callbacks(0.6)
+    callbacks.context.base_dir = str(tmp_path)
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text("Environment Model: Default\n", encoding="utf-8")
+
+    assert callbacks.on_openxr_controller_shortcut(
+        "persist_openxr_room_settings",
+        environment="Default",
+        state={
+            "seat_index": 8,
+            "seat_height": 0.0,
+            "exposure": 0.0,
+            "screen_reflection_enabled": False,
+        },
+    ) is False
+    assert "OpenXR Room Settings" not in settings_path.read_text(encoding="utf-8")

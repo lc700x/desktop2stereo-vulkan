@@ -444,6 +444,11 @@ def _openxr_filament_config(
             if isinstance(settings.get("OpenXR Screen States", {}), dict)
             else {}
         ),
+        "filament_room_states": (
+            dict(settings.get("OpenXR Room Settings", {}))
+            if isinstance(settings.get("OpenXR Room Settings", {}), dict)
+            else {}
+        ),
         "filament_glow_modes": _openxr_glow_modes(settings),
         "filament_glow_transparencies": dict(saved_transparency),
     }
@@ -1600,6 +1605,15 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 input_size=input_size,
                 capture_mode=str(settings.get("Capture Mode", "Monitor")),
                 window_title=str(settings.get("Window Title", "") or "") if str(settings.get("Capture Mode", "")).casefold() == "window" else None,
+                window_handle=getattr(context.capture_config, "window_handle", None),
+                media_state_path=getattr(context.capture_config, "media_state_path", None),
+                media_session_id=getattr(context.capture_config, "media_session_id", None),
+                media_action_callback=callbacks.write_viewer_media_command,
+                pointer_mapping_enabled=(
+                    str(settings.get("Capture Mode", "")).casefold() in {"monitor", "window"}
+                    and int(input_monitor_index) != int(effective_output_monitor_index)
+                ),
+                locale=str(os.environ.get("DESKTOP2STEREO_LOCALE", "EN")),
                 vsync=bool(LOCAL_VSYNC),
                 show_fps=bool(SHOW_FPS),
                 show_fps_provider=callbacks.show_fps,

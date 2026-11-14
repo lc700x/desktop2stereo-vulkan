@@ -24,6 +24,20 @@ def test_normalize_depth_sanitizes_non_finite() -> None:
     assert bool((out >= 0.0).all() and (out <= 1.0).all())
 
 
+def test_normalize_depth_inf_does_not_collapse_percentile_range() -> None:
+    values = torch.full((1, 1, 10, 10), 0.5)
+    values[0, 0, 0, 0] = 0.0
+    values[0, 0, 0, 1] = 1.0
+    values[0, 0, 0, 2] = float("inf")
+    values[0, 0, 0, 3] = float("-inf")
+    values[0, 0, 0, 4] = float("nan")
+
+    out = _normalize_depth(values)
+
+    assert torch.isfinite(out).all()
+    assert float(out.max() - out.min()) > 0.5
+
+
 def test_quantize_depth_for_warp_sanitizes_non_finite(monkeypatch) -> None:
     monkeypatch.setattr("stereo_runtime.runtime.sys.platform", "darwin")
     q = _quantize_depth_for_warp(_poisoned_depth())

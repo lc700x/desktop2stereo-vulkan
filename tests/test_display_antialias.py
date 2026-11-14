@@ -6,7 +6,9 @@ import pytest
 from stereo_runtime.depth_postprocess import anti_alias_depth
 from stereo_runtime.depth_postprocess import anti_alias_depth_global_gaussian
 from stereo_runtime.depth_postprocess import _depth_gaussian_spacing
+from stereo_runtime.depth_postprocess import _edge_aware_gaussian_torch
 from stereo_runtime.depth_postprocess import _global_gaussian_kernel
+from stereo_runtime.depth_postprocess import _model_gaussian_kernel
 from stereo_runtime.depth_postprocess import model_depth_aa_applied, postprocess_depth
 from stereo_runtime.display_antialias import antialias_depth_map
 
@@ -132,6 +134,29 @@ def test_model_scale_edge_aware_gaussian_preserves_step_and_smooths_flat_region(
     assert torch.equal(filtered_step, depth)
     assert torch.isfinite(filtered_flat).all()
     assert filtered_flat.var() < smooth_input.var()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm device unavailable")
+def test_model_edge_aware_gaussian_gpu_matches_torch_reference() -> None:
+    depth = torch.rand((1, 1, 48, 80), dtype=torch.float32)
+    depth[..., 40:] = (depth[..., 40:] > 0.5).float()
+    strength = 2.0
+    edge_threshold = 0.04
+    kernel = _model_gaussian_kernel("cpu", None, torch.float32, strength)
+    reference = _edge_aware_gaussian_torch(
+        depth,
+        (kernel[:, None] * kernel[None, :]).view(1, 1, 7, 7),
+        edge_threshold,
+    )
+
+    actual = anti_alias_depth(
+        depth.cuda(),
+        strength,
+        edge_threshold=edge_threshold,
+    ).cpu()
+
+    assert torch.isfinite(actual).all()
+    assert torch.allclose(actual, reference, atol=2e-5, rtol=2e-5)
 
 
 def test_depth_map_uses_shared_display_aa_switch(monkeypatch) -> None:

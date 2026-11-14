@@ -4,7 +4,7 @@
     "CN": "默认"
   },
   "glb": null,
-  "dark_room_background": false,
+  "dark_room_background": true,
   "xr_render_scale": 1.0,
   "env_render_quality": "fast",
   "env_shading_mode": "preview",

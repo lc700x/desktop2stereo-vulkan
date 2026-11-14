@@ -26,6 +26,25 @@ class GUIConfigMixin:
 
     def apply_config(self, cfg, keep_optional=True):
         cfg = cfg.copy()
+        capture_mode = cfg.get("Capture Mode", DEFAULTS["Capture Mode"])
+        if capture_mode in {"Video", "Image"}:
+            capture_mode = "File"
+        if capture_mode not in {"Monitor", "Window", "File"}:
+            capture_mode = DEFAULTS["Capture Mode"]
+        self.capture_mode_key = capture_mode
+        self.media_path = str(cfg.get("Media Path") or "")
+        self._media_path = self.media_path
+        media_position = self._parse_float(
+            cfg.get("Media Playback Position", cfg.get("Media Resume Position", 0.0)),
+            0.0,
+        )
+        self.media_resume_position = (
+            0.0 if capture_mode == "Image" else max(0.0, media_position)
+        )
+        self._media_resume_position = self.media_resume_position
+        cfg["Capture Mode"] = capture_mode
+        cfg["Media Path"] = self.media_path
+        cfg["Media Playback Position"] = self.media_resume_position
         cfg["Run Mode"] = normalize_run_mode(
             cfg.get("Run Mode", DEFAULTS.get("Run Mode", "Local Viewer"))
         )
@@ -304,9 +323,16 @@ class GUIConfigMixin:
         }.get(str(cfg.get("Video Encoder Backend", "auto")).casefold(), "Auto")
         self.crf_tf.value = str(cfg.get("CRF", DEFAULTS["CRF"]))
         self.audio_delay_tf.value = str(cfg.get("Audio Delay", DEFAULTS["Audio Delay"]))
-        self.capture_mode_key = cfg.get("Capture Mode", DEFAULTS["Capture Mode"])
         cm_t = UI_MESSAGES[self.locale]
-        self.capture_mode_dd.value = cm_t["Monitor"] if self.capture_mode_key == "Monitor" else cm_t["Window"]
+        capture_mode_label = cm_t.get(
+            {
+                "Monitor": "Input Screen",
+                "Window": "Input Window",
+                "File": "Media Player",
+            }.get(self.capture_mode_key, self.capture_mode_key),
+            self.capture_mode_key,
+        )
+        self.capture_mode_dd.value = capture_mode_label
         self._sync_capture_mode_visibility()
         self._apply_stereo_output(cfg)
         self.update_tensorrt_visibility_based_on_model(selected_model)
@@ -314,6 +340,7 @@ class GUIConfigMixin:
         self.update_coreml_visibility_based_on_model(selected_model)
         self.update_openvino_visibility_based_on_model(selected_model)
         self.update_ui_texts()
+        self.capture_mode_dd.value = capture_mode_label
         self._sync_visibility()
         self.update_stream_url()
         self.on_device_change(None)
@@ -361,6 +388,20 @@ class GUIConfigMixin:
         parallel_workers = self._display_to_parallel_inference_workers(
             self.parallel_inference_dd.value
         )
+        media_path = str(
+            getattr(self, "_media_path", "") or getattr(self, "media_path", "") or ""
+        )
+        media_position = (
+            0.0 if self.capture_mode_key == "Image"
+            else self._parse_float(
+                getattr(self, "_media_resume_position", getattr(self, "media_resume_position", 0.0)),
+                0.0,
+            )
+        )
+        self.media_path = media_path
+        self._media_path = media_path
+        self.media_resume_position = media_position
+        self._media_resume_position = media_position
         self._config.pop("Debug Mode", None)
         fps_key = target_fps_setting_key(self.run_mode_key)
         self._config[fps_key] = self._target_fps_from_display(self.target_fps_dd.value)
@@ -383,6 +424,8 @@ class GUIConfigMixin:
 
         self._config.update({
             "Capture Mode": self.capture_mode_key,
+            "Media Path": media_path,
+            "Media Playback Position": media_position,
             "Monitor Index": monitor_idx,
             "Input Display Resolution Tier": monitor_resolution_tier(monitor_idx),
             "Window Title": self.selected_window_name if self.capture_mode_key == "Window" else "",

@@ -162,6 +162,11 @@ class _Harness:
             self.device_lookups[name] += 1
             return self.functions[name]
 
+        def record_media_overlays(
+            _cmd, _image, _index, _eye_rects, *, source_layout
+        ):
+            return False, source_layout
+
         self.owner = SimpleNamespace(
             vk=self.vk,
             device=object(),
@@ -183,6 +188,10 @@ class _Harness:
             _direct_sources=[],
             _cursor_texture_overlay=None,
             _fps_overlay=None,
+            _media_bar_overlay=None,
+            _media_browser_overlay=None,
+            _media_pointer_overlay=None,
+            _record_media_overlays=record_media_overlays,
             _device_function=device_function,
             is_swapchain_out_of_date=lambda _result: False,
             is_swapchain_recreate_result=lambda _result: False,

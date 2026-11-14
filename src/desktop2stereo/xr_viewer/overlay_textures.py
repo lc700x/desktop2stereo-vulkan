@@ -409,6 +409,15 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
                 (left + 10, top + 15, left + 14, bottom - 2),
                 outline=color, width=1,
             )
+        elif tab == "media":
+            target.rounded_rectangle(
+                (left + 2, top + 3, right - 2, bottom - 3),
+                radius=3, outline=color, width=2,
+            )
+            target.polygon(
+                ((left + 9, top + 7), (left + 9, bottom - 7), (right - 6, (top + bottom) // 2)),
+                fill=color,
+            )
         else:
             target.rounded_rectangle(
                 (left + 2, top + 3, right - 2, bottom - 3),
@@ -479,13 +488,24 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
                     fill=glyph_color, width=3,
                 )
         label = translate(control.label)
-        value_text = (
-            f"{round(current * 100):.0f}%"
-            if control.key == "openxr_render_scale"
-            else f"{current:.0f}% each"
-            if control.key in {"screen:crop_width", "screen:crop_height"}
-            else f"{current:.2f}"
-        )
+        if control.key == "media_seek":
+            total_seconds = max(0, int(current))
+            hours, remainder = divmod(total_seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            value_text = (
+                f"{hours}:{minutes:02d}:{seconds:02d}"
+                if hours else f"{minutes:02d}:{seconds:02d}"
+            )
+        elif control.key == "media_volume":
+            value_text = f"{round(current * 100):.0f}%"
+        else:
+            value_text = (
+                f"{round(current * 100):.0f}%"
+                if control.key == "openxr_render_scale"
+                else f"{current:.0f}% each"
+                if control.key in {"screen:crop_width", "screen:crop_height"}
+                else f"{current:.2f}"
+            )
         row_left = int(minus.rect[0] * width)
         row_right = int(plus.rect[2] * width)
         value_column = min(80, max(64, row_right - row_left - 128))
@@ -521,6 +541,10 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
         pressed = control.key == getattr(menu, "active_key", None)
         active = selected_for(control)
         label = translate(control.label)
+        if control.key == "media:play_pause":
+            label = translate("Pause" if values.get("media_playing") else "Play")
+        elif control.key == "media:toggle_mute":
+            label = translate("Unmute" if values.get("media_muted") else "Mute")
         if control.kind == "slider":
             draw_slider(target, control)
             return

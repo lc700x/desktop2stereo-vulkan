@@ -526,3 +526,44 @@ def test_saved_stereo_output_can_match_the_captured_display():
     GUIBuilderMixin._apply_stereo_output(gui, {"Stereo Output": 1})
 
     assert gui.stereo_monitor_dd.value == "Input"
+
+
+def test_media_timeline_has_its_own_row_and_volume_shares_transport_row():
+    builders = BUILDERS_SOURCE.read_text(encoding="utf-8")
+    handlers = HANDLERS_SOURCE.read_text(encoding="utf-8")
+
+    slider_start = builders.index("self.media_seek_slider = ft.Slider(")
+    position_start = builders.index("self.media_position_text = ft.Text(", slider_start)
+    seek_slider = builders[slider_start:position_start]
+    seek_start = builders.index("self.media_seek_row = ft.Row(")
+    transport_start = builders.index("self.media_transport_row = ft.Row(", seek_start)
+    controls_start = builders.index("self.media_controls_row = ft.Container(", transport_start)
+    row10_start = builders.index("# Row 10:", controls_start)
+    seek = builders[seek_start:transport_start]
+    transport = builders[transport_start:controls_start]
+    controls = builders[controls_start:row10_start]
+
+    assert "media_position_text" in seek and "media_seek_slider" in seek
+    assert "media_seek_slider" not in transport
+    assert "media_status_text" in transport and "media_play_btn" in transport
+    assert "media_mute_btn" in transport and "media_volume_slider" in transport
+    assert "expand=1" in seek_slider and "width=" not in seek_slider
+    assert "width=S(110)" in builders[builders.index("self.media_position_text = ft.Text("):seek_start]
+    assert "text_align=ft.TextAlign.LEFT" in builders[builders.index("self.media_position_text = ft.Text("):seek_start]
+    open_group = builders[
+        builders.index("self.media_open_file_btn = ft.Button("):
+        builders.index("self.media_open_group = ft.Row(")
+    ]
+    assert "width=S(170)" in open_group
+    assert "self.media_open_folder_btn = ft.Button(" in open_group
+    assert "width=S(145)" in open_group
+    assert "media_volume_slider" in transport
+    assert "bgcolor=ft.Colors.SURFACE_CONTAINER_LOW" in controls
+    assert controls.index("self.media_seek_row") < controls.index("self.media_transport_row")
+    assert "media_volume_row" not in builders
+
+    visibility_start = handlers.index("def _sync_capture_mode_visibility(self):")
+    visibility_end = handlers.index("def on_capture_mode_change", visibility_start)
+    visibility = handlers[visibility_start:visibility_end]
+    assert '("media_seek_row", video_controls_visible)' in visibility
+    assert '("media_volume_row", video_controls_visible)' not in visibility

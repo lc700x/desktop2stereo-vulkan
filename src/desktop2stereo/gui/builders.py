@@ -792,15 +792,189 @@ class GUIBuilderMixin:
             self.environment_label, self.env_model_dd], spacing=1)
 
         # Row 9: Input monitor/window + Refresh
-        self.capture_mode_dd = CompactDropdown(options=["Monitor", "Window"],
-            value="Monitor", on_select=self.on_capture_mode_change, width=S(100))
+        capture_mode_messages = UI_MESSAGES[self.locale]
+        self.capture_mode_dd = CompactDropdown(
+            options=[
+                capture_mode_messages.get("Input Screen", "Input Screen"),
+                capture_mode_messages.get("Input Window", "Input Window"),
+                capture_mode_messages.get("Media Player", "Media Player"),
+            ],
+            value=capture_mode_messages.get("Input Screen", "Input Screen"),
+            on_select=self.on_capture_mode_change,
+            width=S(126),
+        )
         self.monitor_dd = CompactDropdown(on_select=self._on_monitor_change, max_width=S(300))
         self.window_dd = CompactDropdown(on_select=self.on_window_selected, max_width=S(300))
         self.refresh_btn = ft.Button(content=ft.Text("Refresh", size=FONT_SIZE),
             width=S(130), on_click=self.refresh_monitor_and_window)
         self._row8_spacer = ft.Container(width=S(60))
-        row8 = ft.Row([self.capture_mode_dd, self._row8_spacer, self.monitor_dd, self.window_dd,
-            ft.Container(width=S(8)), self.refresh_btn], spacing=1)
+
+        media_messages = UI_MESSAGES[self.locale]
+        self.media_open_file_label = ft.Text(
+            media_messages.get("Open File", "Open File"),
+            size=FONT_SIZE,
+            no_wrap=True,
+        )
+        self.media_open_file_btn = ft.Button(
+            content=ft.Row(
+                [
+                    ft.Icon(ft.Icons.INSERT_DRIVE_FILE, size=S(16)),
+                    self.media_open_file_label,
+                ],
+                spacing=S(6),
+                tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            width=S(170),
+            disabled=True,
+            on_click=self.on_media_open_file,
+        )
+        self.media_open_disc_label = ft.Text(
+            media_messages.get("Open Disc", "Open Disc"),
+            size=FONT_SIZE,
+            no_wrap=True,
+        )
+        self.media_open_folder_btn = ft.Button(
+            content=ft.Row(
+                [
+                    ft.Icon(ft.Icons.DISC_FULL, size=S(16)),
+                    self.media_open_disc_label,
+                ],
+                spacing=S(6),
+                tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            width=S(145),
+            tooltip=media_messages.get("Open Disc Folder", "Open Disc Folder"),
+            disabled=True,
+            on_click=self.on_media_open_folder,
+        )
+        self.media_path_text = ft.Text(
+            "",
+            size=max(10, FONT_SIZE - 1),
+            width=S(220),
+            no_wrap=True,
+            overflow=ft.TextOverflow.ELLIPSIS,
+        )
+        row8 = ft.Row(
+            [
+                self.capture_mode_dd,
+                self._row8_spacer,
+                self.monitor_dd,
+                self.window_dd,
+                self.media_path_text,
+                self.refresh_btn,
+            ],
+            spacing=1,
+        )
+        self.media_rewind_btn = ft.IconButton(
+            icon=ft.Icons.REPLAY_10,
+            icon_size=S(18),
+            tooltip=media_messages.get("Rewind 10 seconds", "Rewind 10 seconds"),
+            on_click=self.on_media_rewind,
+            disabled=True,
+        )
+        self.media_play_btn = ft.IconButton(
+            icon=ft.Icons.PLAY_ARROW,
+            icon_size=S(18),
+            tooltip=media_messages.get("Play/Pause", "Play/Pause"),
+            on_click=self.on_media_play_pause,
+            disabled=True,
+        )
+        self.media_forward_btn = ft.IconButton(
+            icon=ft.Icons.FORWARD_10,
+            icon_size=S(18),
+            tooltip=media_messages.get("Forward 10 seconds", "Forward 10 seconds"),
+            on_click=self.on_media_forward,
+            disabled=True,
+        )
+        self.media_seek_slider = ft.Slider(
+            min=0,
+            max=1,
+            value=0,
+            height=S(34),
+            expand=1,
+            on_change_end=self.on_media_seek,
+        )
+        self.media_position_text = ft.Text(
+            "00:00 / 00:00",
+            size=FONT_SIZE,
+            width=S(110),
+            no_wrap=True,
+            text_align=ft.TextAlign.LEFT,
+        )
+        self.media_mute_btn = ft.IconButton(
+            icon=ft.Icons.VOLUME_UP,
+            icon_size=S(18),
+            tooltip=media_messages.get("Mute", "Mute"),
+            on_click=self.on_media_mute,
+        )
+        self.media_volume_label = ft.Text(
+            media_messages.get("Volume", "Volume"),
+            size=max(10, FONT_SIZE - 1),
+            width=S(48),
+            no_wrap=True,
+        )
+        self.media_volume_slider = ft.Slider(
+            min=0,
+            max=1,
+            value=1,
+            height=S(34),
+            width=S(125),
+            on_change=self.on_media_volume,
+        )
+        self.media_status_text = ft.Text(
+            media_messages.get("No media loaded", "No media loaded"),
+            size=max(10, FONT_SIZE - 1),
+            width=S(150),
+            color=ft.Colors.GREY,
+            no_wrap=True,
+            overflow=ft.TextOverflow.ELLIPSIS,
+        )
+        self.media_open_group = ft.Row(
+            [self.media_open_file_btn, self.media_open_folder_btn],
+            spacing=S(6),
+            tight=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        self.media_seek_row = ft.Row(
+            [
+                self.media_position_text,
+                self.media_seek_slider,
+            ],
+            spacing=S(12),
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        self.media_transport_row = ft.Row(
+            [
+                self.media_open_group,
+                ft.Container(width=S(12)),
+                self.media_rewind_btn,
+                self.media_play_btn,
+                self.media_forward_btn,
+                ft.Container(width=S(12)),
+                self.media_status_text,
+                self.media_mute_btn,
+                self.media_volume_label,
+                self.media_volume_slider,
+            ],
+            spacing=S(8),
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        self.media_controls_row = ft.Container(
+            content=ft.Column(
+                [
+                    self.media_seek_row,
+                    self.media_transport_row,
+                ],
+                spacing=S(8),
+                tight=True,
+            ),
+            padding=ft.Padding(S(12), S(8), S(12), S(8)),
+            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
+            border_radius=S(10),
+            visible=False,
+        )
 
         # Row 10: Stereo output + display fitting
         self.stereo_output_label = ft.Text("Stereo Output:", size=FONT_SIZE, width=S(130))
@@ -867,7 +1041,8 @@ class GUIBuilderMixin:
         # leftover height (like the log panel). Its own content scrolls when the
         # window is shorter than the rows.
         device_content = ft.Column([row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, self.row6b, self.row6d, self.row6g, self.row6e, self.row6f,
-                       self.row7a, self.xr_headset_row, self.row7b, row8, self.row6c, self.row9,
+                       self.row7a, self.xr_headset_row, self.row7b, row8, self.media_controls_row,
+                       self.row6c, self.row9,
                        self.moonlight_controls_row,
                        self.stream_url_row], spacing=S(6), scroll=ft.ScrollMode.AUTO,
                        tight=True)

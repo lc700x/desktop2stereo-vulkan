@@ -417,18 +417,23 @@ def test_running_ui_does_not_redraw_enabled_stop_button():
     gui = Harness()
     gui.run_btn = SimpleNamespace(disabled=False)
     gui.stop_btn = SimpleNamespace(disabled=False)
+    gui.capture_mode_dd = SimpleNamespace(disabled=False)
     gui.stream_calibration_btn = SimpleNamespace(disabled=False)
 
     gui._set_running_ui(True)
 
     assert gui.run_btn.disabled is True
     assert gui.stop_btn.disabled is False
+    assert gui.capture_mode_dd.disabled is True
     assert gui.stream_calibration_btn.disabled is True
     assert gui.stop_btn not in updates
 
     updates.clear()
     gui._set_running_ui(True)
     assert updates == []
+
+    gui._set_running_ui(False)
+    assert gui.capture_mode_dd.disabled is False
 
 
 def test_startup_restores_profile_values_after_shutdown_race(monkeypatch, tmp_path):
@@ -810,3 +815,75 @@ def test_openxr_child_reports_broken_alvr_install(monkeypatch):
     with pytest.raises(RuntimeError, match="Missing runtime manifest"):
         gui_process._set_alvr_openxr_runtime_override(child_env, "OpenXR Link")
     assert child_env["XR_RUNTIME_JSON"] == "C:/VirtualDesktop/OpenXR/vdxr.json"
+
+
+
+def test_media_state_is_persisted_every_five_seconds_and_on_exit(monkeypatch):
+    clock = [100.0]
+    persist_calls = []
+    poll_calls = []
+    wait_calls = [0]
+
+    class FakeProcess:
+        pid = 4321
+        returncode = None
+
+        def __init__(self):
+            self.finished = asyncio.Event()
+
+        async def wait(self):
+            await self.finished.wait()
+            self.returncode = 0
+            return 0
+
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            return clock[0]
+
+    class Harness(gui_process.GUIProcessMixin):
+        def _diag(self, *_args, **_kwargs):
+            pass
+
+        def _refresh_openxr_controls_button(self):
+            pass
+
+        def _sync_moonlight_button_state(self):
+            pass
+
+        def _set_running_ui(self, _running):
+            pass
+
+        def set_status(self, *_args, **_kwargs):
+            pass
+
+    proc = FakeProcess()
+    gui = Harness()
+    gui.process = proc
+    gui._starting = True
+    gui._user_stop_requested = True
+    gui._calibration_active = False
+    gui._media_state_path = "media-state.json"
+    gui._media_session_id = "media-session"
+    gui._media_control_path = "media-control.json"
+    gui.locale = "EN"
+    gui._poll_media_state = lambda: poll_calls.append("poll") or True
+    gui._persist_media_state = lambda: persist_calls.append(clock[0])
+    monkeypatch.setattr(gui_process, "time", FakeTime())
+    real_wait_for = gui_process.asyncio.wait_for
+
+    async def stepping_wait_for(awaitable, timeout):
+        wait_calls[0] += 1
+        clock[0] += 1.0
+        if wait_calls[0] == 6:
+            proc.finished.set()
+            await asyncio.sleep(0)
+            return await awaitable
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(gui_process.asyncio, "wait_for", stepping_wait_for)
+    asyncio.run(gui._monitor_process_task())
+
+    assert persist_calls == [105.0, 106.0]
+    assert len(poll_calls) == 7
+    assert gui.process is None

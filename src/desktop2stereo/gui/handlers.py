@@ -1,6 +1,7 @@
 """GUI Handler Mixin — event handlers, visibility sync, i18n, audio, refresh."""
 import os
 import asyncio
+import json
 import logging
 import re
 import subprocess
@@ -41,6 +42,14 @@ from .paths import BASE_DIR
 from .devices import DEVICES
 
 logger = logging.getLogger(__name__)
+
+_MEDIA_VIDEO_EXTENSIONS = (
+    ".avi", ".m2ts", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".mts",
+    ".ts", ".vob", ".webm", ".iso",
+)
+_MEDIA_IMAGE_EXTENSIONS = (
+    ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
+)
 
 
 class GUIHandlerMixin:
@@ -263,8 +272,12 @@ class GUIHandlerMixin:
         self.fp16_cb.visible = not (dml or mps)
         self.acceleration_label.visible = not (dml or other)
         is_windows_or_mac = OS_NAME in ("Windows", "Darwin")
-        self.capture_tool_label.visible = is_windows_or_mac
-        self.capture_tool_dd.visible = is_windows_or_mac
+        capture_tool_visible = (
+            is_windows_or_mac
+            and str(getattr(self, "capture_mode_key", "")) != "File"
+        )
+        self.capture_tool_label.visible = capture_tool_visible
+        self.capture_tool_dd.visible = capture_tool_visible
         if dml or other:
             self.torch_compile_cb.visible = False
             self.tensorrt_cb.visible = False
@@ -455,30 +468,339 @@ class GUIHandlerMixin:
     # ── capture tool / mode handlers ──
 
     def on_capture_tool_change(self, e):
-        self.capture_mode_dd.disabled = False
+        process = getattr(self, "process", None)
+        self.capture_mode_dd.disabled = bool(
+            process is not None and getattr(process, "returncode", None) is None
+        )
         self.set_status("", key="")
         self.capture_mode_dd.update()
         self._sync_capture_mode_visibility()
 
     def _sync_capture_mode_visibility(self):
-        if self.capture_mode_key == "Monitor":
-            self.monitor_dd.visible = True
-            self.window_dd.visible = False
-        else:
-            self.monitor_dd.visible = False
-            self.window_dd.visible = True
-        self._safe_update(self.monitor_dd, self.window_dd)
+        mode = getattr(self, "capture_mode_key", "Monitor")
+        is_media_player = mode == "File"
+        # Media-player controls live in the output overlay (Local Viewer and
+        # OpenXR) so the input-file selector stays a compact source selector.
+        gui_media_controls_visible = False
+        video_controls_visible = False
+        self.monitor_dd.visible = mode == "Monitor"
+        self.window_dd.visible = mode == "Window"
+        capture_tool_visible = OS_NAME in {"Windows", "Darwin"}
+        process = getattr(self, "process", None)
+        process_running = bool(
+            process is not None and getattr(process, "returncode", None) is None
+        )
+        self.capture_tool_label.visible = capture_tool_visible
+        self.capture_tool_dd.visible = capture_tool_visible
+        self.capture_tool_dd.disabled = is_media_player or process_running
+        controls = [
+            self.monitor_dd,
+            self.window_dd,
+            self.capture_tool_label,
+            self.capture_tool_dd,
+        ]
+        spacer = getattr(self, "_row8_spacer", None)
+        if spacer is not None:
+            spacer.visible = not is_media_player
+            controls.append(spacer)
+        for attr, visible in (
+            ("media_controls_row", gui_media_controls_visible),
+            ("media_transport_row", gui_media_controls_visible),
+            ("media_seek_row", video_controls_visible),
+            ("media_path_text", gui_media_controls_visible),
+            ("media_open_group", gui_media_controls_visible),
+            ("media_open_file_label", gui_media_controls_visible),
+            ("media_open_file_btn", gui_media_controls_visible),
+            ("media_open_disc_label", gui_media_controls_visible),
+            ("media_open_folder_btn", gui_media_controls_visible),
+            ("refresh_btn", not is_media_player),
+            ("media_rewind_btn", video_controls_visible),
+            ("media_play_btn", video_controls_visible),
+            ("media_forward_btn", video_controls_visible),
+            ("media_seek_slider", video_controls_visible),
+            ("media_position_text", video_controls_visible),
+            ("media_mute_btn", video_controls_visible),
+            ("media_volume_label", video_controls_visible),
+            ("media_volume_slider", video_controls_visible),
+            ("media_status_text", gui_media_controls_visible),
+        ):
+            control = getattr(self, attr, None)
+            if control is not None:
+                control.visible = visible
+                controls.append(control)
+        path_control = getattr(self, "media_path_text", None)
+        if path_control is not None:
+            path_control.value = str(getattr(self, "media_path", "") or "")
+        self._safe_update(*controls)
         self._fit_window_to_content()
 
     def on_capture_mode_change(self, e):
-        mode = e.control.value
         texts = UI_MESSAGES[self.locale]
-        reverse_map = {texts["Monitor"]: "Monitor", texts["Window"]: "Window"}
+        mode = getattr(getattr(e, "control", None), "value", self.capture_mode_dd.value)
+        source_modes = ("Monitor", "Window", "File")
+        label_keys = {
+            "Monitor": "Input Screen",
+            "Window": "Input Window",
+            "File": "Media Player",
+        }
+        reverse_map = {texts[label_keys[key]]: key for key in source_modes}
+        reverse_map.update({key: key for key in source_modes})
+        reverse_map.update({
+            "Monitor": "Monitor",
+            "Window": "Window",
+            "Video": "File",
+            "Image": "File",
+            "Input File": "File",
+            "输入文件": "File",
+        })
         self.capture_mode_key = reverse_map.get(mode, "Monitor")
+        self.capture_mode_dd.value = texts[label_keys[self.capture_mode_key]]
+        if getattr(self, "_config", None) is not None:
+            self._config["Capture Mode"] = self.capture_mode_key
         self._sync_capture_mode_visibility()
         if self.capture_mode_key == "Window":
             self.refresh_window_list()
         self._sync_visibility()
+
+    # Builder controls are optional; media_seek_slider uses seconds and volume uses 0..1.
+    # The process mixin owns _media_state_path polling and exposes _media_runtime_state;
+    # this mixin only writes revisioned commands to _media_control_path.
+    def _media_initial_directory(self):
+        media_path = str(getattr(self, "media_path", "") or "").strip()
+        if media_path and os.path.isdir(media_path):
+            return media_path
+        if media_path:
+            return os.path.dirname(os.path.abspath(media_path))
+        return None
+
+    def _set_media_source(self, path):
+        selected_path = os.path.abspath(os.path.expanduser(str(path or "").strip()))
+        texts = UI_MESSAGES[self.locale]
+        if not os.path.exists(selected_path):
+            self.set_status(texts["Media source does not exist: {}"].format(selected_path))
+            return False
+
+        is_directory = os.path.isdir(selected_path)
+        extension = os.path.splitext(selected_path)[1].casefold()
+        if self.capture_mode_key not in {"File", "Video", "Image"}:
+            return False
+        media_extensions = (
+            set(_MEDIA_VIDEO_EXTENSIONS)
+            | set(_MEDIA_IMAGE_EXTENSIONS)
+            | {".iso"}
+        )
+        if not is_directory and extension not in media_extensions:
+            self.set_status(
+                texts["Could not open media: {}"].format("Unsupported media type")
+            )
+            return False
+
+        current_path = str(getattr(self, "media_path", "") or "").strip()
+        same_video = (
+            current_path
+            and not is_directory
+            and extension in _MEDIA_VIDEO_EXTENSIONS
+            and os.path.normcase(os.path.abspath(os.path.expanduser(current_path)))
+            == os.path.normcase(selected_path)
+        )
+        try:
+            position = max(
+                0.0,
+                float(getattr(self, "media_resume_position", 0.0))
+                if same_video else 0.0,
+            )
+        except (TypeError, ValueError):
+            position = 0.0
+
+        self.media_path = selected_path
+        self._media_path = selected_path
+        self.media_resume_position = position
+        self._media_resume_position = position
+        if getattr(self, "_config", None) is not None:
+            self._config["Media Path"] = selected_path
+            self._config["Media Playback Position"] = position
+        path_control = getattr(self, "media_path_text", None)
+        if path_control is not None:
+            path_control.value = selected_path
+            self._safe_update(path_control)
+        self._persist_media_state(media_path=selected_path, position=position)
+        if getattr(self, "_media_session_id", None):
+            self._write_media_command(
+                "open",
+                {
+                    "path": selected_path,
+                    "mode": "File",
+                    "position": position,
+                },
+            )
+        self._fit_window_to_content()
+        return True
+
+    async def on_media_open_file(self, e=None):
+        if self.capture_mode_key not in {"File", "Video", "Image"}:
+            return
+        texts = UI_MESSAGES[self.locale]
+        if not getattr(self, "_media_session_id", None):
+            self.set_status(
+                texts.get(
+                    "Start the player before browsing files",
+                    "Start the player before browsing files",
+                )
+            )
+            return
+        state = self._read_media_state()
+        self._write_media_command(
+            "browse",
+            {"mode": "file", "path": self._media_initial_directory() or ""},
+            state=state,
+        )
+
+    async def on_media_open_folder(self, e=None):
+        if self.capture_mode_key not in {"File", "Video", "Image"}:
+            return
+        state = self._read_media_state()
+        self._write_media_command("browse", {"mode": "disc"}, state=state)
+
+    def _media_state_matches_selected_path(self, state):
+        state_path = str(state.get("path") or "").strip()
+        selected_path = str(getattr(self, "media_path", "") or "").strip()
+        if not state_path or not selected_path:
+            return False
+        state_path = os.path.normcase(os.path.abspath(os.path.expanduser(state_path)))
+        selected_path = os.path.normcase(os.path.abspath(os.path.expanduser(selected_path)))
+        return state_path == selected_path
+
+    def _read_media_state(self):
+        state = getattr(self, "_media_runtime_state", None)
+        return state if isinstance(state, dict) else {}
+
+    def _write_media_command(self, action, value=None, state=None):
+        state = self._read_media_state() if state is None else state
+        browse_actions = {
+            "browse", "browse_up", "browse_refresh", "browse_close", "browse_open",
+            "playlist_next", "playlist_previous", "playlist_select",
+            "playlist_clear", "playlist_remove",
+        }
+        if action == "open" or action in browse_actions:
+            session = str(getattr(self, "_media_session_id", "") or "")
+            if not session:
+                return False
+        else:
+            if not self._media_state_matches_selected_path(state):
+                return False
+            session = str(
+                getattr(self, "_media_session_id", "") or state.get("session") or ""
+            )
+        control_path = str(getattr(self, "_media_control_path", "") or "").strip()
+        if not control_path:
+            return False
+        previous_session = getattr(self, "_media_command_session", None)
+        if previous_session == session:
+            revision = int(getattr(self, "_media_command_revision", -1)) + 1
+        else:
+            revision = 0
+        command = {"session": session, "revision": revision, "action": action}
+        if value is not None:
+            command["value"] = value
+
+        control_path = os.path.abspath(os.path.expanduser(control_path))
+        temporary_path = f"{control_path}.{os.getpid()}.{revision}.tmp"
+        try:
+            os.makedirs(os.path.dirname(control_path), exist_ok=True)
+            with open(temporary_path, "w", encoding="utf-8") as stream:
+                json.dump(command, stream, ensure_ascii=False)
+            os.replace(temporary_path, control_path)
+        except OSError as exc:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+            logger.warning("Could not write media command: %s", exc)
+            self.set_status(UI_MESSAGES[self.locale]["Could not open media: {}"].format(exc))
+            return False
+        self._media_command_session = session
+        self._media_command_revision = revision
+        if action in {"pause", "seek"}:
+            self._persist_media_state(position=value if action == "seek" else None)
+        return True
+
+    def on_media_rewind(self, e=None):
+        if self.capture_mode_key not in {"File", "Video", "Image"}:
+            return
+        state = self._read_media_state()
+        return self._write_media_command("seek_relative", -10.0, state=state)
+
+    def on_media_forward(self, e=None):
+        if self.capture_mode_key not in {"File", "Video", "Image"}:
+            return
+        state = self._read_media_state()
+        return self._write_media_command("seek_relative", 10.0, state=state)
+
+    def on_media_play_pause(self, e=None):
+        if self.capture_mode_key not in {"File", "Video", "Image"}:
+            return
+        self._poll_media_state()
+        state = self._read_media_state()
+        if (
+            str(state.get("mode", "Video")).casefold() in {"image", "browser"}
+            or not self._media_state_matches_selected_path(state)
+        ):
+            return
+        action = "pause" if bool(state.get("playing", False)) else "play"
+        return self._write_media_command(action, state=state)
+
+    def on_media_seek(self, e=None):
+        if self.capture_mode_key not in {"File", "Video", "Image"}:
+            return
+        control = getattr(e, "control", None) if e is not None else None
+        if control is None:
+            control = getattr(self, "media_seek_slider", None)
+        try:
+            position = float(getattr(control, "value", None))
+        except (TypeError, ValueError):
+            return
+        state = self._read_media_state()
+        if not self._media_state_matches_selected_path(state):
+            return
+        try:
+            duration = max(0.0, float(state.get("duration", 0.0)))
+        except (TypeError, ValueError):
+            duration = 0.0
+        position = max(0.0, min(position, duration)) if duration > 0.0 else max(0.0, position)
+        self.media_resume_position = position
+        self._media_resume_position = position
+        if getattr(self, "_config", None) is not None:
+            self._config["Media Playback Position"] = position
+        return self._write_media_command("seek", position, state=state)
+
+    def on_media_volume(self, e=None):
+        if self.capture_mode_key not in {"File", "Video", "Image"}:
+            return
+        control = getattr(e, "control", None) if e is not None else None
+        if control is None:
+            control = getattr(self, "media_volume_slider", None)
+        try:
+            volume = float(getattr(control, "value", None))
+        except (TypeError, ValueError):
+            return
+        volume = max(0.0, min(1.0, volume))
+        state = self._read_media_state()
+        return self._write_media_command("volume", volume, state=state)
+
+    def on_media_mute(self, e=None):
+        if self.capture_mode_key not in {"File", "Video", "Image"}:
+            return
+        state = self._read_media_state()
+        if not self._media_state_matches_selected_path(state):
+            return
+        control = getattr(e, "control", None) if e is not None else None
+        requested_value = getattr(control, "value", None)
+        muted = (
+            bool(requested_value)
+            if isinstance(requested_value, bool)
+            else not bool(state.get("muted", False))
+        )
+        return self._write_media_command("mute", muted, state=state)
 
     def on_window_selected(self, e):
         label = e.control.value if e else self.window_dd.value
@@ -1517,8 +1839,64 @@ class GUIHandlerMixin:
 
     # ── i18n text update ──
 
+    def _update_media_control_texts(self):
+        messages = UI_MESSAGES[self.locale]
+        open_file_label = getattr(self, "media_open_file_label", None)
+        if open_file_label is not None:
+            open_file_label.value = messages.get("Open File", "Open File")
+
+        open_disc_label = getattr(self, "media_open_disc_label", None)
+        if open_disc_label is not None:
+            open_disc_label.value = messages.get("Open Disc", "Open Disc")
+        open_disc_button = getattr(self, "media_open_folder_btn", None)
+        if open_disc_button is not None:
+            open_disc_button.tooltip = messages.get(
+                "Open Disc Folder", "Open Disc Folder"
+            )
+
+        for name, key in (
+            ("media_rewind_btn", "Rewind 10 seconds"),
+            ("media_forward_btn", "Forward 10 seconds"),
+        ):
+            control = getattr(self, name, None)
+            if control is not None:
+                control.tooltip = messages.get(key, key)
+
+        runtime_state = getattr(self, "_media_runtime_state", None)
+        if isinstance(runtime_state, dict) and runtime_state:
+            has_error = any(
+                runtime_state.get(key)
+                for key in ("error", "decode_fallback_reason", "audio_error")
+            )
+            status_key = None if has_error else str(
+                runtime_state.get("status") or "No media loaded"
+            )
+            play_key = "Pause" if runtime_state.get("playing") else "Play"
+            mute_key = "Unmute" if runtime_state.get("muted") else "Mute"
+        else:
+            status_key = "No media loaded"
+            play_key = "Play/Pause"
+            mute_key = "Mute"
+
+        status_text = getattr(self, "media_status_text", None)
+        if status_text is not None and status_key is not None:
+            status_text.value = messages.get(status_key, status_key)
+
+        play_button = getattr(self, "media_play_btn", None)
+        if play_button is not None:
+            play_button.tooltip = messages.get(play_key, play_key)
+
+        mute_button = getattr(self, "media_mute_btn", None)
+        if mute_button is not None:
+            mute_button.tooltip = messages.get(mute_key, mute_key)
+
+        volume_label = getattr(self, "media_volume_label", None)
+        if volume_label is not None:
+            volume_label.value = messages.get("Volume", "Volume")
+
     def update_ui_texts(self):
         t = UI_MESSAGES[self.locale]
+        self._update_media_control_texts()
         self.video_backend_label.value = t["Video Encoder:"]
         self.video_backend_label.width = S(110 if self.locale == "CN" else 130)
         self.depth_model_label.value = t["Depth Model:"]
@@ -1693,8 +2071,16 @@ class GUIHandlerMixin:
                 "RTMP Streamer": t["RTMP Streamer"], "MJPEG Streamer": t["MJPEG Streamer"],
             }
         self.run_mode_dd.options = [v for v in run_mode_texts.values()]
-        self.capture_mode_dd.options = [t["Monitor"], t["Window"]]
-        self.capture_mode_dd.value = t["Monitor"] if self.capture_mode_key == "Monitor" else t["Window"]
+        source_modes = ("Monitor", "Window", "File")
+        label_keys = {
+            "Monitor": "Input Screen",
+            "Window": "Input Window",
+            "File": "Media Player",
+        }
+        self.capture_mode_dd.options = [t[label_keys[mode]] for mode in source_modes]
+        if self.capture_mode_key not in source_modes:
+            self.capture_mode_key = "Monitor"
+        self.capture_mode_dd.value = t[label_keys[self.capture_mode_key]]
         self.capture_mode_dd.reapply_width()
         self.stream_url_label.value = t["Streamer URL"]
         self.stream_port_label.value = t["Streamer Port:"]

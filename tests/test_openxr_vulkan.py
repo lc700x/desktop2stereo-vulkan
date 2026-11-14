@@ -63,7 +63,10 @@ from xr_viewer.msdf_font_atlas import MsdfFontAtlas
 from viewer.controller_help import get_controller_help_rows
 from viewer.vulkan_msdf_quad import VulkanMsdfQuadRequest
 from xr_viewer.xr_math import _xr_quat_to_mat4, euler_to_mat4, mat4_to_xr_posef
-from utils.screen_resolution_policy import build_screen_sampling_plan
+from utils.screen_resolution_policy import (
+    build_projection_screen_sampling_plan,
+    build_screen_sampling_plan,
+)
 
 
 def test_vulkan_version_round_trip() -> None:
@@ -1630,6 +1633,18 @@ def test_filament_multiview_is_opt_in(monkeypatch) -> None:
     assert presenter._filament_multiview_requested is True
 
 
+def test_auto_render_scale_keeps_headset_panel_sampling_ratio() -> None:
+    presenter = OpenXrVulkanPresenter(
+        OpenXrVulkanConfig(
+            headset_model="Pico 4 / 4 Ultra",
+            render_scale=1.0,
+            render_scale_auto=True,
+        )
+    )
+
+    assert presenter._recommended_openxr_render_scale() == pytest.approx(1.44)
+
+
 def test_projection_quality_chain_defaults_to_direct_gpu_and_can_be_enabled(monkeypatch) -> None:
     monkeypatch.delenv("D2S_VULKAN_PROJECTION_QUALITY_CHAIN", raising=False)
     presenter = OpenXrVulkanPresenter()
@@ -1928,6 +1943,39 @@ def test_projection_composer_final_pass_samples_completed_quality_mips() -> None
     assert values.tolist() == pytest.approx((1.0 / 3840.0, 1.0 / 2160.0, 1.0, 0.0))
 
 
+def test_direct_projection_uses_easu_only_for_magnification() -> None:
+    presenter = OpenXrVulkanPresenter()
+    source = SimpleNamespace(width=960, height=960)
+    target = SimpleNamespace(width=1920, height=2000)
+
+    presenter._active_screen_sampling_plan = build_projection_screen_sampling_plan(
+        960, 960, 1200, 1200
+    )
+    upscale = np.frombuffer(
+        presenter._projection_screen_sampling_constants(
+            source, target, use_lanczos=True
+        ),
+        dtype="<f4",
+    )
+    assert upscale[0] < 0.0
+    assert upscale[2] == pytest.approx(1200)
+    assert upscale[3] == pytest.approx(1200)
+
+    presenter._active_screen_sampling_plan = build_projection_screen_sampling_plan(
+        1920, 1080, 960, 540
+    )
+    downscale = np.frombuffer(
+        presenter._projection_screen_sampling_constants(
+            SimpleNamespace(width=1920, height=1080),
+            target,
+            use_lanczos=True,
+        ),
+        dtype="<f4",
+    )
+    assert downscale[0] > 0.0
+    assert downscale[3] == pytest.approx(1.0)
+
+
 def test_projection_composer_routes_sampling_policy_to_quality_chain() -> None:
     source = inspect.getsource(OpenXrVulkanPresenter._render_vulkan_projection_composer)
 
@@ -2083,6 +2131,35 @@ def test_empty_filament_background_skip_preserves_nonempty_and_legacy_paths(guar
     assert presenter._can_skip_filament_background() is (guard is None)
 
 
+@pytest.mark.parametrize(
+    ("dark_background", "glb_path", "panorama_path", "expected"),
+    [
+        (True, None, None, True),
+        (False, None, None, False),
+        (True, "room.glb", None, False),
+        (True, None, "sky.hdr", False),
+    ],
+)
+def test_profile_dark_background_skip_preserves_explicit_environments(
+    dark_background, glb_path, panorama_path, expected
+) -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter.filament_bridge = SimpleNamespace(controller_overlay_abi_available=True)
+    presenter._filament_background_frame_count = 8
+    presenter._filament_glow_mode = "off"
+    presenter._filament_profile_data = {
+        "dark_room_background": dark_background,
+    }
+    presenter.config = replace(
+        presenter.config,
+        filament_profile_path="Default/profile.json",
+        filament_glb_path=glb_path,
+        filament_panorama_path=panorama_path,
+    )
+
+    assert presenter._can_skip_filament_background() is expected
+
+
 def test_controller_only_warmup_counts_rendered_backgrounds_not_xr_ticks(monkeypatch) -> None:
     monkeypatch.setattr(
         "xr_viewer.core_openxr_vulkan._update_filament_camera", lambda *_args, **_kwargs: None
@@ -2105,7 +2182,10 @@ def test_controller_only_warmup_counts_rendered_backgrounds_not_xr_ticks(monkeyp
     assert presenter._can_skip_filament_background()
 
 
-@pytest.mark.parametrize("guard", [None, "rocm", "glow", "panorama", "quality", "clear", "hidden"])
+@pytest.mark.parametrize(
+    "guard",
+    [None, "rocm", "glow", "panorama", "quality", "clear", "transparent", "hidden"],
+)
 def test_controller_precomposition_preserves_other_rendering_paths(guard) -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._rocm_backend = False
@@ -2123,9 +2203,11 @@ def test_controller_precomposition_preserves_other_rendering_paths(guard) -> Non
         presenter._vulkan_projection_quality_chain_requested = True
     elif guard == "clear":
         presenter.config = replace(presenter.config, clear_color=(0.1, 0.0, 0.0, 1.0))
+    elif guard == "transparent":
+        presenter.config = replace(presenter.config, clear_color=(0.0, 0.0, 0.0, 0.0))
     elif guard == "hidden":
         presenter._filament_controller_overlay_empty = True
-    assert presenter._can_precompose_filament_controllers() is (guard is None)
+    assert presenter._can_precompose_filament_controllers() is (guard == "transparent")
 
 
 @pytest.mark.parametrize(
@@ -4530,6 +4612,46 @@ def test_glb_room_exposure_always_starts_at_zero_for_new_session(tmp_path) -> No
     presenter._load_filament_profile()
 
     assert presenter._filament_scene_exposure == pytest.approx(0.0)
+
+
+def test_filament_profile_restores_saved_room_settings_after_profile_defaults(tmp_path) -> None:
+    environment = tmp_path / "Cinema"
+    environment.mkdir()
+    profile_path = environment / "profile.json"
+    profile_path.write_text(json.dumps({
+        "glb": "room.glb",
+        "view_pose_index": 0,
+        "view_poses": [
+            {"name": "Front", "x": 0.0, "y": 1.0, "z": 0.0, "pose_space": "scene"},
+            {"name": "Middle", "x": 0.0, "y": 2.0, "z": 0.0, "pose_space": "scene"},
+            {"name": "Back", "x": 0.0, "y": 3.0, "z": 0.0, "pose_space": "scene"},
+        ],
+        "preview_exposure": 2.0,
+        "environment_screen_light_enabled": True,
+    }), encoding="utf-8")
+    state = {
+        "seat_index": 2,
+        "seat_height": 0.4,
+        "exposure": 1.25,
+        "screen_reflection_enabled": False,
+    }
+    presenter = OpenXrVulkanPresenter(OpenXrVulkanConfig(
+        filament_profile_path=str(profile_path),
+        filament_glb_path=str(environment / "room.glb"),
+        filament_room_states={"Cinema": state},
+    ))
+
+    presenter._load_filament_profile()
+
+    assert presenter._filament_view_pose_index == 2
+    assert presenter._profile_view_name == "Back"
+    assert presenter._profile_head_transform[1, 3] == pytest.approx(3.4)
+    assert presenter._room_seat_height_offset == pytest.approx(0.4)
+    assert presenter._filament_scene_exposure == pytest.approx(1.25)
+    assert presenter._environment_screen_light_enabled is False
+    assert presenter._settings_menu_reset_defaults["room:seat_index"] == 0
+    assert presenter._settings_menu_reset_defaults["room:exposure"] == pytest.approx(0.0)
+    assert presenter._settings_menu_reset_defaults["room:screen_reflection_enabled"] is True
 
 
 def test_filament_profile_view_pose_is_converted_to_glb_local_space(tmp_path) -> None:
@@ -7096,7 +7218,7 @@ def test_settings_menu_grip_drag_resets_on_tracking_loss_and_requires_release():
     assert presenter._settings_menu_grab_filtered_pose is not None
 
 
-def test_settings_menu_render_scale_defers_rebuild_until_slider_release() -> None:
+def test_settings_menu_render_scale_updates_runtime_immediately() -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._settings_menu.set_tab("picture")
     control = next(
@@ -7107,7 +7229,7 @@ def test_settings_menu_render_scale_defers_rebuild_until_slider_release() -> Non
     presenter._apply_settings_menu_control(control, (control.rect[2], 0.5))
 
     assert presenter._settings_menu_values["openxr_render_scale"] == 4.0
-    assert presenter._pending_openxr_render_scale is None
+    assert presenter._pending_openxr_render_scale == pytest.approx(4.0)
 
 
 def test_settings_menu_plus_button_applies_exact_slider_step() -> None:
@@ -7127,10 +7249,190 @@ def test_settings_menu_plus_button_applies_exact_slider_step() -> None:
     presenter._apply_settings_menu_control(plus, (0.0, 0.0))
 
     assert presenter._settings_menu_values["color_brightness"] == pytest.approx(1.1)
-    assert calls[-1] == (
+    assert calls[0] == (
         "set_runtime_setting",
-        {"name": "color_brightness", "value": pytest.approx(1.1), "persist": True},
+        {"name": "color_brightness", "value": pytest.approx(1.1), "persist": False},
     )
+    assert calls[-1] == (
+        "set_runtime_settings",
+        {"settings": {"color_brightness": pytest.approx(1.1)}, "persist": True},
+    )
+
+
+def test_openxr_media_overlay_dispatches_shared_player_actions():
+    class Callback:
+        def __init__(self):
+            self.actions = []
+
+        def dispatch(self, action, **values):
+            self.actions.append((action, values))
+            return True
+
+    callback = Callback()
+    presenter = OpenXrVulkanPresenter(on_controller_shortcut=callback.dispatch)
+    presenter._media_overlay_state = {
+        "ready": True,
+        "mode": "Video",
+        "playing": True,
+        "muted": False,
+        "duration": 120.0,
+        "audio_enabled": True,
+        "browser_entries": [],
+        "playlist_entries": [
+            {"path": "F:/Videos/a.mp4"},
+            {"path": "F:/Videos/b.mp4"},
+        ],
+    }
+
+    presenter._dispatch_media_overlay_hit("browse")
+    presenter._dispatch_media_overlay_hit("browse_disc")
+    presenter._dispatch_media_overlay_hit("browse_open", "F:/Videos/a.mp4")
+    presenter._dispatch_media_overlay_hit("recent", "F:/Videos/recent.mp4")
+    presenter._dispatch_media_overlay_hit("recent_remove", "F:/Videos/recent.mp4")
+    presenter._dispatch_media_overlay_hit("seek_relative:-10")
+    presenter._dispatch_media_overlay_hit("seek_relative:10")
+    presenter._dispatch_media_overlay_hit("play")
+    presenter._dispatch_media_overlay_hit("mute")
+    presenter._dispatch_media_overlay_hit("playlist_next")
+    presenter._dispatch_media_overlay_hit("entry:F:/Videos/a.mp4")
+    presenter._dispatch_media_overlay_hit("entry:F:/Videos/a.mp4")
+    presenter._dispatch_media_overlay_hit("playlist_select", "F:/Videos/a.mp4")
+
+    assert callback.actions == [
+        ("media_control", {"media_action": "browse"}),
+        (
+            "media_control",
+            {"media_action": "browse", "value": {"mode": "disc"}},
+        ),
+        (
+            "media_control",
+            {"media_action": "browse_open", "value": {"path": "F:/Videos/a.mp4"}},
+        ),
+        (
+            "media_control",
+            {"media_action": "browse_open", "value": {"path": "F:/Videos/recent.mp4"}},
+        ),
+        (
+            "media_control",
+            {"media_action": "recent_remove", "value": {"path": "F:/Videos/recent.mp4"}},
+        ),
+        ("media_control", {"media_action": "seek_relative", "value": -10.0}),
+        ("media_control", {"media_action": "seek_relative", "value": 10.0}),
+        ("media_control", {"media_action": "pause"}),
+        ("media_control", {"media_action": "mute", "value": True}),
+        ("media_control", {"media_action": "playlist_next"}),
+        (
+            "media_control",
+            {"media_action": "browse_select", "value": {"path": "F:/Videos/a.mp4"}},
+        ),
+        (
+            "media_control",
+            {"media_action": "browse_open", "value": {"path": "F:/Videos/a.mp4"}},
+        ),
+        (
+            "media_control",
+            {"media_action": "playlist_select", "value": {"path": "F:/Videos/a.mp4"}},
+        ),
+    ]
+
+
+def test_openxr_media_state_and_controls_use_the_active_capture_session(tmp_path):
+    class Callback:
+        def __init__(self):
+            self.actions = []
+            self.context = SimpleNamespace(capture_config=SimpleNamespace(
+                media_state_path=str(tmp_path / "state.json"),
+                media_session_id="session-123",
+            ))
+
+        def dispatch(self, action, **values):
+            self.actions.append((action, values))
+            return True
+
+    callback = Callback()
+    state_path = Path(callback.context.capture_config.media_state_path)
+    state_path.write_text(json.dumps({
+        "session": "session-123",
+        "path": "F:/Videos/movie.mkv",
+        "mode": "Video",
+        "ready": True,
+        "position": 24.0,
+        "duration": 120.0,
+        "playing": True,
+        "volume": 0.65,
+        "muted": False,
+        "hdr": True,
+        "audio_enabled": True,
+        "error": "",
+        "audio_error": "",
+    }), encoding="utf-8")
+
+    presenter = OpenXrVulkanPresenter(on_controller_shortcut=callback.dispatch)
+    presenter._refresh_openxr_media_state(force=True)
+
+    assert presenter._settings_menu_values["media_available"] is True
+    assert presenter._settings_menu_values["media_position"] == 24.0
+    assert presenter._settings_menu_values["media_seek"] == 24.0
+    assert presenter._settings_menu_values["media_duration"] == 120.0
+    assert presenter._settings_menu_values["media_volume"] == 0.65
+    assert presenter._settings_menu_values["media_audio_enabled"] is True
+    assert presenter._settings_menu_values["media_hdr"] is True
+
+    presenter._settings_menu.set_tab("media")
+    controls = {
+        control.key: control
+        for control in presenter._settings_menu.controls(
+            values=presenter._settings_menu_values
+        )
+    }
+    presenter._apply_settings_menu_control(controls["media:play_pause"], None)
+    presenter._apply_settings_menu_control(controls["media:toggle_mute"], None)
+    seek = controls["media_seek"]
+    presenter._apply_settings_menu_control(
+        seek, (seek.rect[2], 0.0), persist=True
+    )
+    volume = controls["media_volume"]
+    volume_u = volume.rect[0] + (volume.rect[2] - volume.rect[0]) * 0.25
+    presenter._apply_settings_menu_control(
+        volume, (volume_u, 0.0), persist=True
+    )
+
+    assert callback.actions[:2] == [
+        ("media_control", {"media_action": "pause"}),
+        ("media_control", {"media_action": "mute", "value": True}),
+    ]
+    assert callback.actions[2][1]["media_action"] == "seek"
+    assert callback.actions[2][1]["value"] == pytest.approx(120.0)
+    assert callback.actions[3][1]["media_action"] == "volume"
+    assert callback.actions[3][1]["value"] == pytest.approx(0.25)
+
+    state_path.write_text(json.dumps({
+        "session": "session-123",
+        "path": "F:/Videos/movie.mkv",
+        "mode": "Video",
+        "ready": True,
+        "position": 24.0,
+        "duration": 120.0,
+        "playing": True,
+        "error": "FileNotFoundError: replacement file is unavailable",
+    }), encoding="utf-8")
+    presenter._refresh_openxr_media_state(force=True)
+    assert presenter._settings_menu_values["media_available"] is True
+    assert (
+        "replacement file is unavailable"
+        in presenter._settings_menu_values["media_error"]
+    )
+    controls = {
+        control.key: control
+        for control in presenter._settings_menu.controls(
+            values=presenter._settings_menu_values
+        )
+    }
+    assert controls["media:play_pause"].enabled is True
+
+    state_path.write_text(json.dumps({"session": "stale-session"}), encoding="utf-8")
+    presenter._refresh_openxr_media_state(force=True)
+    assert presenter._settings_menu_values["media_available"] is False
 
 
 def test_settings_menu_depth_toggle_and_cross_eyed_are_dispatched() -> None:
@@ -7250,7 +7552,9 @@ def test_persisted_default_glow_mode_wins_after_lighting_preset() -> None:
     assert presenter._filament_glow_shell_intensity_multiplier == 0.0
 
 
-def test_glow_transparency_slider_updates_gpu_parameters_and_persists() -> None:
+def test_glow_transparency_slider_updates_gpu_parameters_and_persists(monkeypatch) -> None:
+    now = [10.0]
+    monkeypatch.setattr(core_openxr_vulkan.time, "monotonic", lambda: now[0])
     calls = []
     presenter = OpenXrVulkanPresenter(
         on_controller_shortcut=lambda action, **values: (
@@ -7273,6 +7577,9 @@ def test_glow_transparency_slider_updates_gpu_parameters_and_persists() -> None:
     presenter._apply_settings_menu_control(transparency, (u, 0.0))
 
     assert presenter._veil_alpha == pytest.approx(0.65)
+    assert calls == []
+    now[0] += 0.251
+    presenter._persist_openxr_settings_if_due()
     assert calls[-1] == (
         "persist_openxr_glow_transparency",
         {"environment": "Default", "transparency": pytest.approx(0.35)},
@@ -7315,7 +7622,18 @@ def test_settings_menu_room_exposure_updates_filament_immediately() -> None:
     )
     assert presenter._filament_scene_exposure == pytest.approx(8.0)
     assert calls == [pytest.approx(8.0)]
-    assert persisted == []
+    assert persisted == [(
+        "persist_openxr_room_settings",
+        {
+            "environment": "Default",
+            "state": {
+                "seat_index": 0,
+                "seat_height": 0.0,
+                "exposure": 8.0,
+                "screen_reflection_enabled": True,
+            },
+        },
+    )]
 
 
 def test_settings_menu_room_exposure_uses_only_vulkan_resolve_in_multiview() -> None:
@@ -7860,11 +8178,90 @@ def test_settings_menu_render_scale_step_schedules_one_rebuild() -> None:
 
     assert presenter._settings_menu_values["openxr_render_scale"] == pytest.approx(0.95)
     assert presenter._pending_openxr_render_scale == pytest.approx(0.95)
-    assert calls[-1][0] == "persist_openxr_render_scale"
+    assert [action for action, _values in calls].count(
+        "persist_openxr_render_scale"
+    ) == 1
+
+
+def test_openxr_slider_saves_are_debounced_and_final_value_flushes(monkeypatch) -> None:
+    now = [10.0]
+    monkeypatch.setattr(core_openxr_vulkan.time, "monotonic", lambda: now[0])
+    calls = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda action, **values: calls.append((action, values)) or True
+    )
+    control = MenuControl(
+        "depth_strength", "Depth", (0.0, 0.0, 1.0, 1.0),
+        kind="slider", minimum=0.0, maximum=1.0, step=0.1,
+    )
+
+    presenter._apply_settings_menu_control(control, (0.2, 0.5))
+    now[0] = 10.1
+    presenter._apply_settings_menu_control(control, (0.8, 0.5))
+
+    assert [action for action, _values in calls] == [
+        "set_runtime_setting", "set_runtime_setting",
+    ]
+    assert calls[0][1]["persist"] is False
+    assert calls[1][1]["value"] == pytest.approx(0.8)
+    now[0] = 10.349
+    presenter._persist_openxr_settings_if_due()
+    assert len(calls) == 2
+
+    now[0] = 10.351
+    presenter._persist_openxr_settings_if_due()
+    assert calls[-1] == (
+        "set_runtime_settings",
+        {"settings": {"depth_strength": pytest.approx(0.8)}, "persist": True},
+    )
+
+    now[0] = 11.0
+    presenter._apply_settings_menu_control(control, (0.4, 0.5), persist=True)
+    assert calls[-2][0] == "set_runtime_setting"
+    assert calls[-1] == (
+        "set_runtime_settings",
+        {"settings": {"depth_strength": pytest.approx(0.4)}, "persist": True},
+    )
+
+
+def test_openxr_settings_menu_close_flushes_pending_slider_value() -> None:
+    calls = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda action, **values: calls.append((action, values)) or True
+    )
+    presenter._queue_openxr_setting_persistence("depth_strength", 0.65)
+    close = MenuControl("close", "Close", (0.0, 0.0, 1.0, 1.0))
+
+    presenter._apply_settings_menu_control(close, (0.5, 0.5))
+
+    assert calls[0] == (
+        "set_runtime_settings",
+        {"settings": {"depth_strength": 0.65}, "persist": True},
+    )
+
+
+def test_desktop_openxr_panel_close_flushes_pending_slider_value() -> None:
+    calls = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda action, **values: calls.append((action, values)) or True
+    )
+    presenter._settings_menu.set_tab("picture")
+    actions = queue.Queue()
+    actions.put(("openxr_render_scale", 1.15, False))
+    actions.put(("__settings_menu_closed__", None, True))
+    presenter._desktop_settings_window = SimpleNamespace(
+        actions=actions,
+        publish_snapshot=lambda _snapshot: None,
+    )
+
+    presenter._pump_desktop_settings_actions()
+
+    assert presenter._pending_openxr_render_scale == pytest.approx(1.15)
+    assert calls == [("persist_openxr_render_scale", {"value": pytest.approx(1.15)})]
 
 
 @pytest.mark.parametrize("rocm_backend", [True, False])
-def test_automatic_render_scale_is_capped_without_changing_manual_scale(
+def test_automatic_render_scale_uses_headset_ratio_without_changing_manual_scale(
     monkeypatch, rocm_backend,
 ) -> None:
     monkeypatch.setattr(
@@ -7879,7 +8276,7 @@ def test_automatic_render_scale_is_capped_without_changing_manual_scale(
             headset_model="Meta Quest 2",
         )
     )
-    assert startup_auto._openxr_render_scale == pytest.approx(1.0)
+    assert startup_auto._openxr_render_scale == pytest.approx(1.24)
 
     auto = OpenXrVulkanPresenter(
         OpenXrVulkanConfig(
@@ -7900,8 +8297,8 @@ def test_automatic_render_scale_is_capped_without_changing_manual_scale(
 
     auto._apply_pending_openxr_render_scale()
 
-    assert rebuild_scales == [pytest.approx(1.0)]
-    assert auto._openxr_render_scale == pytest.approx(1.0)
+    assert rebuild_scales == [pytest.approx(1.24)]
+    assert auto._openxr_render_scale == pytest.approx(1.24)
 
     manual = OpenXrVulkanPresenter(
         OpenXrVulkanConfig(

@@ -37,6 +37,7 @@ from stereo_runtime.pipeline import (
     _attach_pipeline_debug,
     _native_coreml_capture_enabled,
     _runtime_output_device,
+    _gpu_capture_input_requires_device_residency,
 )
 
 
@@ -52,6 +53,74 @@ def test_pipeline_uses_captured_dimensions_when_render_scale_is_4k():
 
     assert source_size == (1920, 1200)
     assert _resolve_pipeline_render_size(source_size, config) == (1920, 1200)
+
+
+@pytest.mark.parametrize("capture_mode", ["Video", "Image"])
+def test_gpu_required_allows_host_media_input_for_gpu_preprocessing(capture_mode):
+    captured = CapturedFrame(
+        frame=np.zeros((2, 2, 3), dtype=np.uint8),
+        target_height=2,
+        timestamp=1.0,
+        capture_mode=capture_mode,
+    )
+
+    assert not _gpu_capture_input_requires_device_residency(
+        SimpleNamespace(gpu_required=True), captured
+    )
+    assert _gpu_capture_input_requires_device_residency(
+        SimpleNamespace(gpu_required=True),
+        CapturedFrame(frame=captured.frame, target_height=2, timestamp=1.0, capture_mode="Monitor"),
+    )
+
+
+def test_media_depth_reuse_is_bounded_to_media_generation_and_age():
+    import time
+
+    loop = object.__new__(RuntimePipelineLoop)
+    loop._media_depth_profile = object()
+    loop._media_depth_source_frame_id = 11
+    loop._media_depth_cached_at = time.perf_counter()
+    frame_rgb = SimpleNamespace(device="cuda:0")
+    runtime = SimpleNamespace(
+        active_settings_version=3,
+        depth_config=SimpleNamespace(model_name="depth", resolution=518, backend="tensorrt"),
+        config=SimpleNamespace(depth_model="depth", depth_resolution=518, backend="tensorrt"),
+    )
+    ctx = SimpleNamespace(stereo_runtime=runtime)
+    captured = CapturedFrame(
+        frame=np.zeros((2, 2, 3), dtype=np.uint8),
+        target_height=2,
+        timestamp=1.0,
+        capture_mode="Video",
+        metadata={"capture_frame_id": 11, "media_generation": 4},
+    )
+    target_key = ("captured", "Video", 0, "", (("media_generation", "4"),))
+    loop._media_depth_cache_key = loop._build_cursor_depth_cache_key(
+        ctx, captured, frame_rgb, (2, 2), target_key
+    )
+
+    reuse = loop._media_depth_reuse_candidate(
+        ctx, captured, frame_rgb, (2, 2), target_key
+    )
+    assert reuse is not None
+    assert reuse[0] is loop._media_depth_profile
+    assert reuse[1] == 11
+
+    changed_generation = CapturedFrame(
+        frame=captured.frame,
+        target_height=2,
+        timestamp=1.0,
+        capture_mode="Video",
+        metadata={"capture_frame_id": 12, "media_generation": 5},
+    )
+    assert loop._media_depth_reuse_candidate(
+        ctx,
+        changed_generation,
+        frame_rgb,
+        (2, 2),
+        pipeline_module._source_target_key(changed_generation),
+    ) is None
+    assert loop._media_depth_profile is None
 
 
 def test_attach_capture_debug_marks_depth_complete_for_current_frame():
@@ -1066,7 +1135,7 @@ def test_cuda_capture_disables_previously_enabled_openxr_cuda_graph():
     _enable_openxr_depth_cuda_graph_if_needed(
         ctx,
         True,
-        SimpleNamespace(capture_tool="WindowsCaptureCUDA"),
+        SimpleNamespace(capture_tool="WindowsCaptureCUDA", capture_mode="Monitor"),
     )
 
     assert [snapshot.use_cuda_graph for snapshot in snapshots] == [False]
@@ -1096,12 +1165,40 @@ def test_cuda_capture_keeps_openxr_cuda_graph_when_prewarmed():
     _enable_openxr_depth_cuda_graph_if_needed(
         ctx,
         True,
-        SimpleNamespace(capture_tool="WindowsCaptureCUDA"),
+        SimpleNamespace(capture_tool="WindowsCaptureCUDA", capture_mode="Monitor"),
     )
 
     assert snapshots == []
     assert ctx.stereo_runtime.config.use_cuda_graph is True
     assert "openxr_depth_cuda_graph_preserved_cuda_capture" in stats
+
+
+def test_video_media_capture_keeps_openxr_cuda_graph_enabled():
+    snapshots = []
+
+    class Runtime:
+        config = SimpleNamespace(depth_backend="tensorrt_native", use_cuda_graph=True)
+
+        def apply_settings_snapshot(self, snapshot, *, active_preset):
+            snapshots.append(snapshot)
+            self.config.use_cuda_graph = snapshot.use_cuda_graph
+
+    stats = []
+    ctx = SimpleNamespace(
+        stereo_runtime=Runtime(),
+        stereo_active_preset="quality_4k",
+        source_stat_inc=lambda name, *args, **kwargs: stats.append(name),
+    )
+
+    _enable_openxr_depth_cuda_graph_if_needed(
+        ctx,
+        True,
+        SimpleNamespace(capture_tool="WindowsCaptureCUDA", capture_mode="Video"),
+    )
+
+    assert snapshots == []
+    assert ctx.stereo_runtime.config.use_cuda_graph is True
+    assert stats == []
 
 
 def test_gpu_runtime_warms_depth_and_stereo_before_capture(monkeypatch):

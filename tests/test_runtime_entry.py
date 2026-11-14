@@ -1,5 +1,6 @@
 import ast
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +26,36 @@ def _load_environment_resolver():
     namespace = {"Path": Path, "json": json}
     exec(compile(ast.Module(body=[resolver], type_ignores=[]), str(RUNTIME_ENTRY), "exec"), namespace)
     return namespace["_resolve_filament_environment_paths"]
+
+
+def test_media_capture_options_restore_saved_settings_without_gui_env(monkeypatch) -> None:
+    from app_runtime.runtime_context import _media_capture_options_from_environment
+
+    for name in (
+        "D2S_MEDIA_PATH",
+        "D2S_MEDIA_RESUME_POSITION",
+        "D2S_MEDIA_VOLUME",
+        "D2S_MEDIA_MUTED",
+        "D2S_MEDIA_BROWSER_DIRECTORY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    options = _media_capture_options_from_environment(
+        "Local Viewer",
+        {
+            "Media Path": "F:/Videos/movie.mp4",
+            "Media Playback Position": 42.5,
+            "Media Volume": 0.65,
+            "Media Muted": True,
+            "Media Browser Directory": "F:/Videos",
+        },
+    )
+
+    assert options["media_path"] == "F:/Videos/movie.mp4"
+    assert options["media_resume_position"] == pytest.approx(42.5)
+    assert options["media_volume"] == pytest.approx(0.65)
+    assert options["media_muted"] is True
+    assert options["media_browser_directory"] == "F:/Videos"
 
 
 def test_stop_request_is_consumed_only_by_target_runtime(tmp_path: Path) -> None:
@@ -62,6 +93,26 @@ def test_stop_request_watcher_sets_runtime_event(tmp_path: Path) -> None:
     assert stopped.is_set()
     assert not watcher.is_alive()
     assert not request.exists()
+
+
+def test_rocm_aotriton_is_enabled_only_for_amd_when_unset(monkeypatch) -> None:
+    from app_runtime.runtime_context import _configure_rocm_attention
+
+    monkeypatch.delenv("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", raising=False)
+    monkeypatch.delenv("D2S_ROCM_AOTRITON", raising=False)
+
+    _configure_rocm_attention(SimpleNamespace(type="cuda"), "AMD Radeon RX 9060 XT")
+    assert os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] == "1"
+
+
+def test_rocm_aotriton_preserves_explicit_disable(monkeypatch) -> None:
+    from app_runtime.runtime_context import _configure_rocm_attention
+
+    monkeypatch.setenv("D2S_ROCM_AOTRITON", "0")
+    monkeypatch.delenv("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", raising=False)
+
+    _configure_rocm_attention(SimpleNamespace(type="cuda"), "AMD Radeon RX 9060 XT")
+    assert "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL" not in os.environ
 
 
 def test_openxr_user_stop_wins_racing_fatal_device_loss():
@@ -754,3 +805,118 @@ def test_macos_local_viewer_keeps_processing_size_without_hidden_upscale(monkeyp
     }
     for key, value in expected.items():
         assert os.environ.get(key) == value
+
+
+@pytest.mark.parametrize(
+    ("run_mode", "resume_position", "expected_position", "audio_enabled"),
+    [
+        ("Local Viewer", "12.5", 12.5, True),
+        ("MJPEG Streamer", "12.5", 12.5, False),
+        ("Local Viewer", "not-a-number", 0.0, True),
+    ],
+)
+def test_runtime_context_wires_media_environment_into_capture_config(
+    monkeypatch, tmp_path, run_mode, resume_position, expected_position, audio_enabled
+):
+    import threading
+    from types import SimpleNamespace
+
+    import app_runtime.runtime_context as runtime_context
+
+    render_size_config = runtime_context.RenderSizeConfig()
+
+    class FakeStereoRuntime:
+        def __init__(self, config):
+            self.config = config
+
+        def configure_stereo(self, *_args, **_kwargs):
+            pass
+
+    class FakeOpenXRState:
+        def __init__(self, **_kwargs):
+            self.source_active = threading.Event()
+            self.render_active = threading.Event()
+            self.wait_idle_active = threading.Event()
+
+    monkeypatch.setattr(
+        runtime_context,
+        "runtime_config_from_d2s_settings",
+        lambda *_args, **_kwargs: SimpleNamespace(mode="auto", stereo_preset=None),
+    )
+    monkeypatch.setattr(runtime_context, "StereoRuntime", FakeStereoRuntime)
+    monkeypatch.setattr(runtime_context, "stereo_config_from_runtime", lambda _config: None)
+    monkeypatch.setattr(runtime_context, "OpenXRStateController", FakeOpenXRState)
+    monkeypatch.setattr(runtime_context, "SourceHealth", lambda **_kwargs: None)
+    monkeypatch.setattr(runtime_context, "StereoHotReloader", lambda **_kwargs: None)
+    monkeypatch.setattr(runtime_context, "StereoWarmupTracker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime_context, "StereoRuntimeLogger", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime_context, "FPSBreakdown", lambda **_kwargs: None)
+
+    expected_values = {
+        "D2S_MEDIA_PATH": str(tmp_path / "movie.mkv"),
+        "D2S_MEDIA_CONTROL_PATH": str(tmp_path / "control.json"),
+        "D2S_MEDIA_STATE_PATH": str(tmp_path / "state.json"),
+        "D2S_MEDIA_SESSION_ID": "session-123",
+        "D2S_MEDIA_RESUME_POSITION": resume_position,
+    }
+    for name, value in expected_values.items():
+        monkeypatch.setenv(name, value)
+
+    context = runtime_context.create_runtime_context(
+        file_path=str(tmp_path / "main.py"),
+        settings={"Run Mode": run_mode},
+        cache_path=str(tmp_path / "models"),
+        device=SimpleNamespace(type="cpu"),
+        device_info="CPU",
+        output_resolution=(1920, 1080),
+        render_size_config=render_size_config,
+        fps=60,
+        window_title="",
+        capture_mode="Video",
+        monitor_index=1,
+        capture_tool="",
+        os_name="Linux",
+        run_mode=run_mode,
+        depth_strength=1.0,
+        convergence=0.5,
+    )
+    config = context.capture_config
+
+    assert config.media_path == expected_values["D2S_MEDIA_PATH"]
+    assert config.media_control_path == f"{expected_values['D2S_MEDIA_CONTROL_PATH']}.openxr"
+    assert config.media_gui_control_path == expected_values["D2S_MEDIA_CONTROL_PATH"]
+    assert config.media_state_path == expected_values["D2S_MEDIA_STATE_PATH"]
+    assert config.media_session_id == expected_values["D2S_MEDIA_SESSION_ID"]
+    assert config.media_resume_position == expected_position
+    assert config.media_audio_enabled is audio_enabled
+    assert config.render_size_config is render_size_config
+
+
+
+def test_openxr_room_settings_load_per_environment_overrides() -> None:
+    from app_runtime.runtime_entry import _openxr_filament_config
+
+    states = {"Default": {"seat_index": 1, "seat_height": 0.5}}
+    config = _openxr_filament_config({
+        "Environment Model": "Default",
+        "OpenXR Room Settings": states,
+    })
+
+    assert config["filament_room_states"] == states
+
+
+def test_media_capture_options_derive_stable_recent_history_path(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from app_runtime.runtime_context import _media_capture_options_from_environment
+
+    state_path = tmp_path / "media-session.state.json"
+    monkeypatch.setenv("D2S_MEDIA_STATE_PATH", str(state_path))
+    monkeypatch.delenv("D2S_MEDIA_HISTORY_PATH", raising=False)
+
+    options = _media_capture_options_from_environment(
+        "Local Viewer",
+        {"Media Path": "F:/Videos/movie.mp4"},
+    )
+
+    assert options["media_history_path"] == str(tmp_path / "media-recent.json")

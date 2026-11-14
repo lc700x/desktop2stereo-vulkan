@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Callable
 
 from .types import CaptureConfig, FrameCopyMode, capture_frame_from_raw
@@ -11,6 +12,7 @@ class PollingCaptureRunner:
         self.config = config
         self._source_factory = source_factory
         self._source = None
+        self._source_stopped = False
         self._frame_id = 0
 
     def _target_fps(self) -> int:
@@ -27,8 +29,12 @@ class PollingCaptureRunner:
         return self._source
 
     def stop(self):
-        if self._source is not None and hasattr(self._source, "stop"):
-            self._source.stop()
+        if self._source is None or self._source_stopped:
+            return
+        stop = getattr(self._source, "stop", None)
+        if callable(stop):
+            stop()
+        self._source_stopped = True
 
     def run(
         self,
@@ -43,20 +49,30 @@ class PollingCaptureRunner:
         on_session_update=None,
         on_tick=None,
     ):
-        self._source = self._source_factory()
-        if on_session_update is not None:
-            on_session_update(self._source, None)
+        self._source = None
+        self._source_stopped = False
+        session_announced = False
         try:
+            self._source = self._source_factory()
+            if on_session_update is not None:
+                session_announced = True
+                on_session_update(self._source, None)
             while not shutdown_event.is_set():
                 try:
                     if on_tick is not None:
                         on_tick()
                     if is_hard_idle is not None and is_hard_idle():
+                        poll_control = getattr(self._source, "poll_control", None)
+                        if callable(poll_control):
+                            poll_control()
                         if on_paused is not None:
                             on_paused("hard_idle")
                         time.sleep(0.1)
                         continue
                     if is_paused is not None and is_paused():
+                        poll_control = getattr(self._source, "poll_control", None)
+                        if callable(poll_control):
+                            poll_control()
                         if on_paused is not None:
                             on_paused("paused")
                         time.sleep(0.05)
@@ -92,14 +108,23 @@ class PollingCaptureRunner:
                     # callbacks; the next callback owns the real frame.
                     if frame_raw is None and zero_copy is None:
                         continue
+                    frame_device = str(getattr(frame_raw, "device", ""))
+                    gpu_frame = frame_device.split(":", 1)[0] in {"cuda", "mps", "xpu", "hip"}
+                    zero_copy_ready = zero_copy is not None or gpu_frame
+                    frame_config = self.config
+                    source_mode = str(getattr(self._source, "mode", "")).casefold()
+                    if source_mode in {"video", "image"}:
+                        frame_config = replace(
+                            self.config, capture_mode=source_mode.title()
+                        )
                     on_frame(
                         capture_frame_from_raw(
                             frame_raw,
                             size,
                             capture_start_time,
-                            config=self.config,
+                            config=frame_config,
                             copy_mode=(
-                                FrameCopyMode.NONE if zero_copy is not None else FrameCopyMode.COPY
+                                FrameCopyMode.NONE if zero_copy_ready else FrameCopyMode.COPY
                             ),
                             original_format=str(getattr(self._source, "frame_format", "") or ""),
                             capture_size=(
@@ -122,17 +147,24 @@ class PollingCaptureRunner:
                                 "capture_frame_status": getattr(
                                     zero_copy, "frame_status", None
                                 ),
-                                "zero_copy": zero_copy is not None,
-                                "zero_copy_ready": zero_copy is not None,
-                                "gpu_to_cpu": False if zero_copy is not None else None,
-                                "gpu_copy_count": 0 if zero_copy is not None else None,
+                                "zero_copy": zero_copy_ready,
+                                "zero_copy_ready": zero_copy_ready,
+                                "gpu_to_cpu": False if zero_copy_ready else None,
+                                "gpu_copy_count": 0 if zero_copy_ready else None,
                                 "resource_kind": (
-                                    "iosurface_metal" if zero_copy is not None else None
+                                    "iosurface_metal" if zero_copy is not None
+                                    else "cuda_tensor" if gpu_frame
+                                    else None
                                 ),
                                 "resource_format": (
-                                    "BGRA8Unorm" if zero_copy is not None else None
+                                    "BGRA8Unorm" if zero_copy is not None
+                                    else str(getattr(self._source, "frame_format", "") or "RGBP") if gpu_frame
+                                    else None
                                 ),
                                 "capture_frame_id": self._frame_id,
+                                "media_generation": getattr(
+                                    self._source, "media_generation", None
+                                ),
                                 **({
                                     "native_depth_profile": native_depth_profile,
                                     "native_depth_backend": "openvino_d3d11_remote",
@@ -147,7 +179,12 @@ class PollingCaptureRunner:
                     else:
                         raise
         finally:
-            if on_session_update is not None:
-                on_session_update(None, None)
-            if on_closed is not None:
-                on_closed()
+            try:
+                self.stop()
+            finally:
+                try:
+                    if on_session_update is not None and session_announced:
+                        on_session_update(None, None)
+                finally:
+                    if on_closed is not None:
+                        on_closed()

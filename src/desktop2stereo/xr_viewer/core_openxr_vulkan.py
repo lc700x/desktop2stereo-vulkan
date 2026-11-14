@@ -44,6 +44,13 @@ from viewer.vulkan_msdf_quad import VulkanMsdfQuadRenderer, VulkanMsdfQuadReques
 from viewer.vulkan_projection_screen import VulkanProjectionScreenPass
 from viewer.vulkan_multiview_diagnostic import VulkanMultiviewEyeDiagnosticPass
 from app_runtime.output_contract import VulkanStereoOutputFrame
+from media_ui import (
+    build_media_bar_rgba,
+    build_media_browser_rgba,
+    media_bar_hit,
+    media_browser_hit,
+    media_control_enabled,
+)
 
 
 _OUTPUT_FRAME_UNSET = object()
@@ -119,7 +126,7 @@ from .input import (
     _touch_injector,
 )
 from utils import LANG
-from gui.localization import normalize_locale
+from gui.localization import gettext_for, normalize_locale
 from gui.config import (
     discover_environment_keys,
     environment_display_label,
@@ -134,6 +141,9 @@ from utils.screen_resolution_policy import (
 
 
 _OPENXR_SLIDER_UPDATE_INTERVAL_SECONDS = 1.0 / 60.0
+_OPENXR_SETTINGS_SAVE_DEBOUNCE_SECONDS = 0.25
+_OPENXR_MEDIA_STATE_POLL_INTERVAL_SECONDS = 0.1
+_OPENXR_MEDIA_VOLUME_UPDATE_INTERVAL_SECONDS = 0.1
 
 
 def _coalesce_desktop_settings_actions(
@@ -596,6 +606,7 @@ class OpenXrVulkanConfig:
     filament_screen_width: float = _DEFAULT_XR_HEADSET_PRESET.width_m
     filament_screen_distance: float = _DEFAULT_XR_HEADSET_PRESET.distance_m
     filament_screen_states: dict[str, Any] = field(default_factory=dict)
+    filament_room_states: dict[str, Any] = field(default_factory=dict)
     filament_glow_modes: dict[str, str] = field(default_factory=dict)
     filament_glow_transparencies: dict[str, float] = field(default_factory=dict)
     filament_ambient_light_color: tuple[float, float, float] = (0.14, 0.13, 0.15)
@@ -1242,7 +1253,24 @@ class OpenXrVulkanPresenter(
         self._settings_menu_values: dict[str, float | bool] = {}
         self._settings_menu_last_redraw = 0.0
         self._settings_menu_last_adjust = 0.0
+        self._pending_openxr_setting_persistence: dict[tuple[str, str], Any] = {}
+        self._pending_openxr_settings_persist_at = 0.0
+        self._settings_menu_last_media_poll = 0.0
+        self._settings_menu_last_media_volume_dispatch = 0.0
         self._settings_menu_reset_defaults: dict[str, Any] = {}
+        self._media_overlay_state: dict[str, Any] = {}
+        self._media_overlay_last_poll = 0.0
+        self._media_overlay_last_activity = 0.0
+        self._media_overlay_hover: str | None = None
+        self._media_overlay_scroll = 0
+        self._media_overlay_scroll_next_at = 0.0
+        self._media_overlay_trigger_down = [False, False]
+        self._media_overlay_last_click_at = 0.0
+        self._media_overlay_last_click_hit: str | None = None
+        self._media_overlay_pose: tuple[tuple[float, ...], tuple[float, ...]] | None = None
+        self._media_overlay_size = (0.92, 0.14)
+        self._media_overlay_texture_key: tuple[Any, ...] | None = None
+        self._media_overlay_browser_key: tuple[Any, ...] | None = None
         self._settings_menu_trigger_down = [False, False]
         self._settings_menu_allow_curve = True
         self._settings_menu_grab_hand: int | None = None
@@ -1985,7 +2013,9 @@ class OpenXrVulkanPresenter(
                 self._controller_input(1).get("grip", 0.0) > 0.5
             )
             if not controller_chord_consumed:
-                menu_consumed = self._handle_settings_menu_input()
+                self._refresh_openxr_media_state()
+                media_consumed = self._handle_media_overlay_input()
+                menu_consumed = media_consumed or self._handle_settings_menu_input()
                 if menu_consumed:
                     self._pointer_resume_hand = None
                 else:
@@ -1994,6 +2024,7 @@ class OpenXrVulkanPresenter(
                 self._handle_controller_shortcuts(controller_toggle_checked=True)
                 self._handle_controller_guide_input(self._last_frame_dt)
             self._persist_screen_state_if_changed()
+            self._persist_openxr_settings_if_due()
             self._last_controller_input_error = None
         except Exception as exc:
             # Keep one bad optional input path from terminating XR, but make
@@ -4698,6 +4729,7 @@ class OpenXrVulkanPresenter(
             tuple(float(value) for value in _mat3_to_quat_xyzw(basis)),
         )
         self._refresh_settings_menu_values()
+        self._refresh_openxr_media_state(force=True)
         self._settings_menu.open()
 
     def _settings_menu_matrix(self) -> np.ndarray | None:
@@ -5047,6 +5079,11 @@ class OpenXrVulkanPresenter(
                 self._update_environment_screen_lights(None, self.filament_bridge)
         else:
             return
+        if key in {"reset:room_seats", "reset:room_scene"}:
+            self._queue_openxr_setting_persistence(
+                "room:reset", None
+            )
+        self._flush_openxr_settings_and_screen_state()
         self._settings_menu.mark_dirty()
 
     def _hot_switch_environment(self, model: str) -> bool:
@@ -5456,6 +5493,117 @@ class OpenXrVulkanPresenter(
         if self._settings_menu.tab == "glow" and not show_glow:
             self._settings_menu.set_tab("picture")
 
+    def _refresh_openxr_media_state(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        last_poll = float(getattr(self, "_settings_menu_last_media_poll", 0.0))
+        if not force and now - last_poll < _OPENXR_MEDIA_STATE_POLL_INTERVAL_SECONDS:
+            return
+        self._settings_menu_last_media_poll = now
+
+        callback = self._on_controller_shortcut
+        owner = getattr(callback, "__self__", None)
+        context = getattr(owner, "context", None)
+        capture_config = getattr(context, "capture_config", None)
+        state_path = str(
+            getattr(capture_config, "media_state_path", "") or ""
+        ).strip()
+        session_id = str(
+            getattr(capture_config, "media_session_id", "") or ""
+        ).strip()
+        if not state_path or not session_id:
+            return
+        state = {}
+        if state_path and session_id:
+            try:
+                with open(state_path, "r", encoding="utf-8") as stream:
+                    candidate = json.load(stream)
+            except (OSError, UnicodeError, ValueError):
+                candidate = None
+            if isinstance(candidate, dict) and candidate.get("session") == session_id:
+                state = candidate
+
+        mode = str(state.get("mode", "")).strip().title()
+        media_path = str(state.get("path", "") or "").strip()
+        error = str(state.get("error", "") or "").strip()
+        audio_error = str(state.get("audio_error", "") or "").strip()
+        ready = bool(state.get("ready", not error))
+        video = mode == "Video" and bool(media_path) and ready
+        image = mode == "Image" and bool(media_path) and ready
+        browser = mode == "Browser" and ready and bool(state.get("browser_visible"))
+        available = video or image or browser
+
+        def finite_number(name: str, default: float) -> float:
+            try:
+                value = float(state.get(name, default))
+            except (TypeError, ValueError):
+                return default
+            return value if math.isfinite(value) else default
+
+        duration = max(0.0, finite_number("duration", 0.0)) if video else 0.0
+        position = max(0.0, finite_number("position", 0.0)) if video else 0.0
+        if duration > 0.0:
+            position = min(duration, position)
+        volume = max(0.0, min(1.0, finite_number("volume", 1.0)))
+        playing = video and bool(state.get("playing", False))
+        muted = bool(state.get("muted", False))
+        audio_enabled = video and bool(state.get("audio_enabled", False))
+        hdr = bool(state.get("hdr", False))
+        locale = self._overlay_language()
+        def translate(message: str) -> str:
+            return gettext_for(locale, message)
+        if error:
+            status = f"{translate('Media error')}: {error}"
+        elif not available:
+            status = translate("No media loaded")
+        else:
+            state_label = (
+                translate("Playing") if playing else translate("Paused")
+            ) if video else translate("Image") if image else translate("Browser")
+            status_parts = [Path(media_path).name or media_path, state_label]
+            if video:
+                status_parts.append("HDR" if hdr else "SDR")
+                if not audio_enabled:
+                    status_parts.append(translate("Audio unavailable"))
+                elif audio_error:
+                    status_parts.append(audio_error)
+            status = " · ".join(status_parts)
+
+        updates = {
+            "media_available": available,
+            "media_mode": mode if available else "",
+            "media_status": status,
+            "media_position": position,
+            "media_seek": position,
+            "media_duration": duration,
+            "media_playing": playing,
+            "media_volume": volume,
+            "media_muted": muted,
+            "media_audio_enabled": audio_enabled,
+            "media_hdr": hdr,
+            "media_error": error,
+        }
+        changed = any(
+            self._settings_menu_values.get(key) != value
+            for key, value in updates.items()
+        )
+        self._settings_menu_values.update(updates)
+        if state != self._media_overlay_state:
+            had_state = bool(self._media_overlay_state)
+            was_browser_visible = bool(
+                self._media_overlay_state.get("browser_visible")
+            )
+            self._media_overlay_state = dict(state)
+            if (
+                not had_state
+                or (
+                    bool(state.get("browser_visible"))
+                    and not was_browser_visible
+                )
+            ):
+                self._media_overlay_last_activity = now
+        if changed:
+            self._settings_menu.mark_dirty()
+
     def _ensure_desktop_settings_window(self) -> None:
         if self._desktop_settings_window is not None:
             return
@@ -5583,6 +5731,7 @@ class OpenXrVulkanPresenter(
         if window is None:
             return
         pending_actions: list[tuple[str, float | None, bool]] = []
+        flush_after_actions = False
         while True:
             try:
                 action = window.actions.get_nowait()
@@ -5596,6 +5745,9 @@ class OpenXrVulkanPresenter(
                 window.stop()
                 self._desktop_settings_window = None
                 return
+            if key == "__settings_menu_closed__":
+                flush_after_actions = True
+                continue
             persist = bool(action[2]) if len(action) >= 3 else True
             pending_actions.append((str(key), value, persist))
         force_publish = False
@@ -5609,8 +5761,87 @@ class OpenXrVulkanPresenter(
                     flush=True,
                 )
             force_publish = force_publish or persist
+        if flush_after_actions:
+            self._flush_openxr_settings_and_screen_state()
         if pending_actions:
             self._publish_desktop_settings_snapshot(force=force_publish)
+
+    def _queue_openxr_setting_persistence(
+        self, key: str, value: Any, *, flush: bool = False
+    ) -> None:
+        if key in {"media_seek", "media_volume"} or key.startswith("media:"):
+            return
+        environment = str(
+            self._filament_screen_state_environment or "Default"
+        ).strip() or "Default"
+        if key == "glow:transparency":
+            self._pending_openxr_setting_persistence[("glow_transparency", environment)] = (
+                min(1.0, max(0.0, float(value)))
+            )
+        elif key.startswith("room:"):
+            self._pending_openxr_setting_persistence[("room", environment)] = {
+                "seat_index": int(self._settings_menu_values.get(
+                    "room:seat_index", self._filament_view_pose_index
+                )),
+                "seat_height": float(self._room_seat_height_offset),
+                "exposure": float(self._filament_scene_exposure),
+                "screen_reflection_enabled": bool(
+                    self._environment_screen_light_enabled
+                ),
+            }
+        elif key == "openxr_render_scale":
+            self._pending_openxr_setting_persistence[("render_scale", "")] = float(value)
+        else:
+            self._pending_openxr_setting_persistence[("runtime", key)] = value
+        self._pending_openxr_settings_persist_at = (
+            time.monotonic() + _OPENXR_SETTINGS_SAVE_DEBOUNCE_SECONDS
+        )
+        if flush:
+            self._flush_openxr_setting_persistence()
+
+    def _persist_openxr_settings_if_due(self) -> None:
+        if (
+            self._pending_openxr_setting_persistence
+            and time.monotonic() >= self._pending_openxr_settings_persist_at
+        ):
+            self._flush_openxr_setting_persistence()
+
+    def _flush_openxr_setting_persistence(self) -> None:
+        pending = self._pending_openxr_setting_persistence
+        if not pending:
+            return
+        self._pending_openxr_setting_persistence = {}
+        self._pending_openxr_settings_persist_at = 0.0
+        runtime_settings = {
+            name: value
+            for (kind, name), value in pending.items()
+            if kind == "runtime"
+        }
+        if runtime_settings:
+            self._dispatch_controller_shortcut(
+                "set_runtime_settings", settings=runtime_settings, persist=True
+            )
+        for (kind, environment), value in pending.items():
+            if kind == "glow_transparency":
+                self._dispatch_controller_shortcut(
+                    "persist_openxr_glow_transparency",
+                    environment=environment,
+                    transparency=value,
+                )
+            elif kind == "room":
+                self._dispatch_controller_shortcut(
+                    "persist_openxr_room_settings",
+                    environment=environment,
+                    state=value,
+                )
+            elif kind == "render_scale":
+                self._dispatch_controller_shortcut(
+                    "persist_openxr_render_scale", value=value
+                )
+
+    def _flush_openxr_settings_and_screen_state(self) -> None:
+        self._flush_openxr_setting_persistence()
+        self._persist_screen_state(force=True)
 
     def _apply_desktop_settings_action(
         self,
@@ -5679,6 +5910,257 @@ class OpenXrVulkanPresenter(
             return u, v
         return None
 
+    def _media_overlay_matrix(self, *, browser: bool = False):
+        _position, width, height, _rotation = self._filament_screen or (
+            (0.0, 1.2, -2.0), 2.4, 1.35, (0.0, 0.0, 0.0)
+        )
+        width = float(width)
+        height = float(height)
+        screen_pose = self._filament_screen_pose_mat4()
+        if browser:
+            panel_w = width * 0.84
+            panel_h = min(height * 0.78, panel_w * 900.0 / 1400.0)
+            local_y = 0.0
+            local_z = 0.028
+        else:
+            panel_w = width * 0.88
+            panel_h = max(0.08, panel_w * 160.0 / 1024.0)
+            local_y = -height * 0.5 + panel_h * 0.5 + max(0.02, height * 0.035)
+            local_z = 0.024
+        matrix = screen_pose.copy()
+        matrix[:3, 3] += screen_pose[:3, :3] @ np.asarray(
+            (0.0, local_y, local_z), dtype=np.float64
+        )
+        return matrix, (panel_w, panel_h)
+
+    def _media_overlay_ray_hit(
+        self, hand: int, *, browser: bool = False
+    ) -> tuple[float, float] | None:
+        matrix, size = self._media_overlay_matrix(browser=browser)
+        origin, direction = self._controller_interaction_ray(hand)
+        if origin is None or direction is None:
+            return None
+        normal = matrix[:3, 2]
+        denominator = float(np.dot(normal, direction))
+        if abs(denominator) < 1e-6:
+            return None
+        distance = float(
+            np.dot(normal, np.asarray(matrix[:3, 3]) - origin) / denominator
+        )
+        if distance <= 0.0:
+            return None
+        world = np.asarray(origin) + np.asarray(direction) * distance
+        local = matrix[:3, :3].T @ (world - matrix[:3, 3])
+        u = float(local[0]) / float(size[0]) + 0.5
+        v = 0.5 - float(local[1]) / float(size[1])
+        if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
+            return u, v
+        return None
+
+    def _media_overlay_visible(self) -> bool:
+        return bool(self._media_overlay_state)
+
+    def _media_overlay_expanded(self) -> bool:
+        state = self._media_overlay_state
+        if not state:
+            return False
+        if bool(state.get("browser_visible")):
+            return True
+        return time.monotonic() - self._media_overlay_last_activity <= 3.0
+
+    def _dispatch_media_overlay_hit(
+        self, hit: str | None, value: Any = None
+    ) -> None:
+        if not hit:
+            return
+        state = self._media_overlay_state
+        if hit == "wake":
+            self._media_overlay_last_activity = time.monotonic()
+            return
+        if hit.startswith("seek:"):
+            try:
+                fraction = max(0.0, min(1.0, float(hit.split(":", 1)[1])))
+            except (TypeError, ValueError):
+                return
+            duration = float(state.get("duration", 0.0) or 0.0)
+            if duration > 0.0 and media_control_enabled("seek", state):
+                self._dispatch_controller_shortcut(
+                    "media_control",
+                    media_action="seek",
+                    value=fraction * duration,
+                )
+            return
+        if hit.startswith("volume:"):
+            try:
+                volume = max(0.0, min(1.0, float(hit.split(":", 1)[1])))
+            except (TypeError, ValueError):
+                return
+            if media_control_enabled("volume", state):
+                self._dispatch_controller_shortcut(
+                    "media_control", media_action="volume", value=volume
+                )
+            return
+        if hit == "seek_relative:-10" or hit == "seek_relative:10":
+            if media_control_enabled("seek_relative", state):
+                self._dispatch_controller_shortcut(
+                    "media_control",
+                    media_action="seek_relative",
+                    value=-10.0 if hit.endswith("-10") else 10.0,
+                )
+        elif hit == "browse":
+            self._dispatch_controller_shortcut("media_control", media_action="browse")
+        elif hit == "browse_disc":
+            self._dispatch_controller_shortcut(
+                "media_control", media_action="browse", value={"mode": "disc"}
+            )
+        elif hit.startswith("mount:"):
+            self._dispatch_controller_shortcut(
+                "media_control",
+                media_action="browse",
+                value=hit.split(":", 1)[1],
+            )
+        elif hit == "browser_up":
+            self._dispatch_controller_shortcut("media_control", media_action="browse_up")
+        elif hit == "browser_refresh":
+            self._dispatch_controller_shortcut(
+                "media_control", media_action="browse_refresh"
+            )
+        elif hit == "browser_close":
+            self._dispatch_controller_shortcut(
+                "media_control", media_action="browse_close"
+            )
+        elif hit == "browse_open" and value:
+            self._dispatch_controller_shortcut(
+                "media_control",
+                media_action="browse_open",
+                value={"path": str(value)},
+            )
+        elif hit.startswith("browse_open:"):
+            self._dispatch_controller_shortcut(
+                "media_control",
+                media_action="browse_open",
+                value={"path": hit.split(":", 1)[1]},
+            )
+        elif hit == "recent_remove" and value:
+            self._dispatch_controller_shortcut(
+                "media_control",
+                media_action="recent_remove",
+                value={"path": str(value)},
+            )
+        elif hit == "recent" and value:
+            self._dispatch_controller_shortcut(
+                "media_control",
+                media_action="browse_open",
+                value={"path": str(value)},
+            )
+        elif hit == "playlist_previous":
+            self._dispatch_controller_shortcut(
+                "media_control", media_action="playlist_previous"
+            )
+        elif hit == "playlist_next":
+            self._dispatch_controller_shortcut(
+                "media_control", media_action="playlist_next"
+            )
+        elif hit == "playlist_clear":
+            self._dispatch_controller_shortcut(
+                "media_control", media_action="playlist_clear"
+            )
+        elif hit == "play" and media_control_enabled("play", state):
+            self._dispatch_controller_shortcut(
+                "media_control",
+                media_action="pause" if state.get("playing") else "play",
+            )
+        elif hit == "mute" and media_control_enabled("mute", state):
+            self._dispatch_controller_shortcut(
+                "media_control",
+                media_action="mute",
+                value=not bool(state.get("muted", False)),
+            )
+        elif hit.startswith("entry:"):
+            path = hit.split(":", 1)[1]
+            now = time.monotonic()
+            double_click = (
+                hit == self._media_overlay_last_click_hit
+                and now - self._media_overlay_last_click_at <= 0.45
+            )
+            self._media_overlay_last_click_hit = hit
+            self._media_overlay_last_click_at = now
+            self._dispatch_controller_shortcut(
+                "media_control",
+                media_action="browse_open" if double_click else "browse_select",
+                value={"path": str(path)},
+            )
+        elif hit == "playlist_select" and value:
+            self._dispatch_controller_shortcut(
+                "media_control",
+                media_action="playlist_select",
+                value={"path": str(value)},
+            )
+
+    def _handle_media_overlay_input(self) -> bool:
+        if self._settings_menu.visible or not self._media_overlay_state:
+            return False
+        state = self._media_overlay_state
+        browser = bool(state.get("browser_visible"))
+        expanded = self._media_overlay_expanded()
+        consumed = False
+        hover_key: str | None = None
+        for hand in (0, 1):
+            hit = self._media_overlay_ray_hit(hand, browser=browser)
+            action = None
+            value = None
+            if hit is not None:
+                if browser:
+                    browser_hit = media_browser_hit(
+                        hit[0], hit[1], state, scroll_offset=self._media_overlay_scroll
+                    )
+                    self._settings_menu.hover_key = None
+                    if browser_hit is not None:
+                        action, value = browser_hit
+                        if hover_key is None:
+                            hover_key = (
+                                f"{action}:{value}" if value is not None else action
+                            )
+                else:
+                    action = media_bar_hit(
+                        hit[0],
+                        hit[1],
+                        state,
+                        collapsed=not expanded,
+                    )
+                    if action is not None and hover_key is None:
+                        hover_key = action
+                if action is not None or hover_key is not None:
+                    self._media_overlay_last_activity = time.monotonic()
+            trigger = float(self._controller_input(hand).get("trigger", 0.0) or 0.0)
+            if not self._media_overlay_trigger_down[hand] and trigger >= 0.7:
+                self._media_overlay_trigger_down[hand] = True
+                if action is not None:
+                    self._dispatch_media_overlay_hit(action, value)
+                    consumed = True
+            elif self._media_overlay_trigger_down[hand] and trigger <= 0.3:
+                self._media_overlay_trigger_down[hand] = False
+            vertical = -float(
+                self._controller_input(hand).get("joystick_y", 0.0) or 0.0
+            )
+            if browser and expanded and hit is not None and abs(vertical) > 0.5:
+                now = time.monotonic()
+                if now >= self._media_overlay_scroll_next_at:
+                    entries = state.get("browser_entries") or []
+                    self._media_overlay_scroll = max(
+                        0,
+                        min(
+                            max(0, len(entries) - 12),
+                            self._media_overlay_scroll + (1 if vertical > 0 else -1),
+                        ),
+                    )
+                    delay = 0.35 if self._media_overlay_scroll_next_at <= 0.0 else 0.08
+                    self._media_overlay_scroll_next_at = now + delay
+            elif abs(vertical) <= 0.5:
+                self._media_overlay_scroll_next_at = 0.0
+        self._media_overlay_hover = hover_key
+        return consumed
+
     def _settings_menu_cursor_overlay_specs(self, rgba, head):
         """Place the standard screen cursor rings on the settings panel."""
         if (
@@ -5741,6 +6223,39 @@ class OpenXrVulkanPresenter(
             self._settings_menu_values[key] = bool(self._passthrough_backdrop)
             self._settings_menu.mark_dirty()
             return
+        if key in {"media:play_pause", "media:rewind", "media:forward"}:
+            if not self._settings_menu_values.get("media_available"):
+                return
+            if key == "media:rewind":
+                self._dispatch_controller_shortcut(
+                    "media_control", media_action="seek_relative", value=-10.0
+                )
+            elif key == "media:forward":
+                self._dispatch_controller_shortcut(
+                    "media_control", media_action="seek_relative", value=10.0
+                )
+            else:
+                playing = bool(
+                    self._settings_menu_values.get("media_playing", False)
+                )
+                self._dispatch_controller_shortcut(
+                    "media_control", media_action="pause" if playing else "play"
+                )
+                self._settings_menu_values["media_playing"] = not playing
+            self._settings_menu_last_media_poll = time.monotonic()
+            self._settings_menu.mark_dirty()
+            return
+        if key == "media:toggle_mute":
+            if not self._settings_menu_values.get("media_audio_enabled"):
+                return
+            muted = not bool(self._settings_menu_values.get("media_muted", False))
+            self._dispatch_controller_shortcut(
+                "media_control", media_action="mute", value=muted
+            )
+            self._settings_menu_values["media_muted"] = muted
+            self._settings_menu_last_media_poll = time.monotonic()
+            self._settings_menu.mark_dirty()
+            return
         if key.startswith("step:"):
             _prefix, operation, target_key = key.split(":", 2)
             target = next(
@@ -5777,23 +6292,17 @@ class OpenXrVulkanPresenter(
             self._apply_settings_menu_control(
                 target, (slider_u, uv[1]), persist=True
             )
-            if target_key == "openxr_render_scale":
-                self._pending_openxr_render_scale = float(
-                    self._settings_menu_values[target_key]
-                )
-                self._dispatch_controller_shortcut(
-                    "persist_openxr_render_scale",
-                    value=self._settings_menu_values[target_key],
-                )
             return
         if key == "close":
             self._reset_settings_menu_grab()
+            self._flush_openxr_settings_and_screen_state()
             self._settings_menu.close()
             return
         if key.startswith("reset:"):
             self._reset_settings_menu_card(key)
             return
         if key == "openxr:render_auto":
+            self._flush_openxr_settings_and_screen_state()
             self._openxr_render_scale_auto = True
             value = self._recommended_openxr_render_scale()
             self._settings_menu_values["openxr_render_auto"] = True
@@ -5863,15 +6372,19 @@ class OpenXrVulkanPresenter(
         if key.startswith("room:model:"):
             model = key.split(":", 2)[2]
             self._reset_settings_menu_grab()
-            # Environment reload replaces screen state immediately; flush any
-            # final controller adjustment before switching profiles.
-            self._persist_screen_state(force=True)
+            # Environment reload replaces profile state, so flush adjustments
+            # for the current room before switching environments.
+            self._flush_openxr_settings_and_screen_state()
             self._hot_switch_environment(model)
             return
         if key.startswith("room:seat:"):
             indices = {"front": 0, "middle": 1, "back": 2}
             self._reset_settings_menu_grab()
             self._apply_settings_menu_seat(indices[key.rsplit(":", 1)[1]])
+            self._queue_openxr_setting_persistence(
+                "room:seat_index", self._settings_menu_values.get("room:seat_index", 0),
+                flush=True,
+            )
             return
         if key == "room:toggle_screen_reflection":
             enabled = not bool(self._environment_screen_light_enabled)
@@ -5883,6 +6396,9 @@ class OpenXrVulkanPresenter(
                 self._update_environment_screen_lights(
                     None, self.filament_bridge
                 )
+            self._queue_openxr_setting_persistence(
+                "room:screen_reflection_enabled", enabled, flush=True
+            )
             self._settings_menu.mark_dirty()
             return
         if key == "section:reset_defaults" and self._settings_menu.tab == "screen":
@@ -5948,6 +6464,25 @@ class OpenXrVulkanPresenter(
             return
         if control.kind == "slider":
             value = control.value_from_u(float(uv[0]))
+            if key in {"media_seek", "media_volume"}:
+                self._settings_menu_values[key] = value
+                if key == "media_seek":
+                    if persist:
+                        self._dispatch_controller_shortcut(
+                            "media_control", media_action="seek", value=value
+                        )
+                else:
+                    now = time.monotonic()
+                    last_dispatch = float(getattr(
+                        self, "_settings_menu_last_media_volume_dispatch", 0.0
+                    ))
+                    if persist or now - last_dispatch >= _OPENXR_MEDIA_VOLUME_UPDATE_INTERVAL_SECONDS:
+                        self._dispatch_controller_shortcut(
+                            "media_control", media_action="volume", value=value
+                        )
+                        self._settings_menu_last_media_volume_dispatch = now
+                self._settings_menu.mark_dirty()
+                return
             if key.startswith("screen:"):
                 if key in {"screen:crop_width", "screen:crop_height"}:
                     if key == "screen:crop_width":
@@ -5993,25 +6528,37 @@ class OpenXrVulkanPresenter(
                     self._persist_screen_state(force=True)
             elif key == "room:seat_height":
                 self._apply_settings_menu_seat_height(value)
+                self._queue_openxr_setting_persistence(
+                    key, value, flush=persist
+                )
             elif key == "room:exposure":
                 self._filament_scene_exposure = float(value)
                 self._apply_filament_scene_exposure_to_bridge()
+                self._queue_openxr_setting_persistence(
+                    key, value, flush=persist
+                )
             elif key == "glow:transparency":
                 transparency = min(1.0, max(0.0, float(value)))
                 self._veil_alpha = 1.0 - transparency
-                self._persist_filament_glow_transparency()
+                self._queue_openxr_setting_persistence(
+                    key, transparency, flush=persist
+                )
             elif not key.startswith("room:"):
                 if key == "openxr_render_scale":
                     self._openxr_render_scale_auto = False
                     self._settings_menu_values["openxr_render_auto"] = False
+                    self._pending_openxr_render_scale = float(value)
                 if key == "vulkan_projection_min_lod":
                     value = min(value, float(self._settings_menu_values.get("vulkan_projection_max_lod", 2.0)))
                 elif key == "vulkan_projection_max_lod":
                     value = max(value, float(self._settings_menu_values.get("vulkan_projection_min_lod", 0.0)))
                 if key != "openxr_render_scale":
                     self._dispatch_controller_shortcut(
-                        "set_runtime_setting", name=key, value=value, persist=persist
+                        "set_runtime_setting", name=key, value=value, persist=False
                     )
+                self._queue_openxr_setting_persistence(
+                    key, value, flush=persist
+                )
             self._settings_menu_values[key] = value
             self._settings_menu.mark_dirty()
         elif key.startswith("screen:type:"):
@@ -6130,6 +6677,13 @@ class OpenXrVulkanPresenter(
                     return True
             return False
 
+        media_slider_active = (
+            self._settings_menu.active_hand is not None
+            and self._settings_menu.active_key in {"media_seek", "media_volume"}
+        )
+        if not media_slider_active:
+            self._refresh_openxr_media_state()
+
         starting_hits = (self._settings_menu_grab_hand is None)
         if starting_hits:
             grip_hits = (self._settings_menu_ray_hit(0), self._settings_menu_ray_hit(1))
@@ -6181,6 +6735,7 @@ class OpenXrVulkanPresenter(
                     self._settings_menu_trigger_down[hand] = True
                     if hits[hand] is None:
                         self._reset_settings_menu_grab()
+                        self._flush_openxr_settings_and_screen_state()
                         self._settings_menu.close()
                     elif control_for_hand is not None:
                         self._apply_settings_menu_control(control_for_hand, hits[hand])
@@ -6188,7 +6743,7 @@ class OpenXrVulkanPresenter(
                 self._settings_menu_trigger_down[hand] = False
                 if self._settings_menu.active_hand == hand:
                     active_key = self._settings_menu.active_key
-                    if active_key and not active_key.startswith(("screen:", "room:")):
+                    if active_key:
                         active_control = next(
                             (item for item in self._settings_menu.controls(
                                 allow_curve=self._settings_menu_allow_curve,
@@ -6198,21 +6753,27 @@ class OpenXrVulkanPresenter(
                             None,
                         )
                         if active_control is not None and active_control.kind == "slider":
-                            if active_key == "openxr_render_scale":
-                                self._pending_openxr_render_scale = float(
-                                    self._settings_menu_values[active_key]
-                                )
+                            if active_key == "media_seek":
                                 self._dispatch_controller_shortcut(
-                                    "persist_openxr_render_scale",
-                                    value=self._settings_menu_values[active_key],
+                                    "media_control", media_action="seek",
+                                    value=self._settings_menu_values.get(active_key, 0.0),
                                 )
+                            elif active_key == "media_volume":
+                                self._dispatch_controller_shortcut(
+                                    "media_control", media_action="volume",
+                                    value=self._settings_menu_values.get(active_key, 1.0),
+                                )
+                                self._settings_menu_last_media_volume_dispatch = time.monotonic()
+                            elif active_key.startswith("screen:"):
+                                self._persist_screen_state(force=True)
                             else:
-                                self._dispatch_controller_shortcut(
-                                    "set_runtime_setting",
-                                    name=active_key,
-                                    value=self._settings_menu_values[active_key],
-                                    persist=True,
+                                value = self._settings_menu_values.get(active_key)
+                                if active_key == "openxr_render_scale":
+                                    self._pending_openxr_render_scale = float(value)
+                                self._queue_openxr_setting_persistence(
+                                    active_key, value
                                 )
+                                self._flush_openxr_settings_and_screen_state()
                     self._settings_menu.active_hand = None
                     self._settings_menu.active_key = None
             elif (
@@ -6464,8 +7025,8 @@ class OpenXrVulkanPresenter(
         # worker thread and can otherwise enqueue another Vulkan submission
         # while teardown is destroying the adapter/device.
         self._accept_output = False
+        self._flush_openxr_settings_and_screen_state()
         self._reset_settings_menu_grab()
-        self._persist_screen_state(force=True)
         if _TOUCH_AVAILABLE and _touch_injector is not None:
             try:
                 _touch_injector.cancel_all()
@@ -8318,18 +8879,31 @@ class OpenXrVulkanPresenter(
         target_height = int(getattr(target, "height", 0))
         if target_width <= 0 or target_height <= 0:
             raise ValueError("Vulkan Projection Composer target size is invalid")
-        # The quality chain runs before world-space projection. The final
-        # screen pass always samples the completed quality mip texture.
-        values = np.asarray(
-            (
+        plan = self._active_screen_sampling_plan
+        mode = str(getattr(plan, "mode", "") or "")
+        quality_size = getattr(plan, "quality_size", None)
+        # The quality chain runs before world-space projection. In the direct
+        # path, use EASU for magnification and footprint integration for
+        # minification; bilinear magnification was visibly soft and caused
+        # fine structures to crawl on the virtual screen.
+        if use_lanczos and mode == "upscale_easu" and quality_size is not None:
+            quality_width, quality_height = quality_size
+            values = (
+                -1.0 / float(width),
+                1.0 / float(height),
+                float(quality_width),
+                float(quality_height),
+            )
+        elif use_lanczos:
+            values = (
                 1.0 / float(width),
                 1.0 / float(height),
                 1.0,
-                1.0 if use_lanczos else 0.0,
-            ),
-            dtype="<f4",
-        )
-        return values.tobytes()
+                1.0 if mode == "downsample_lanczos_rcas" else 0.0,
+            )
+        else:
+            values = (1.0 / float(width), 1.0 / float(height), 1.0, 0.0)
+        return np.asarray(values, dtype="<f4").tobytes()
 
     def _projection_glow_state(self) -> tuple[int, bytes] | None:
         """Encode the legacy Filament Glow state for Vulkan shaders."""
@@ -8597,18 +9171,21 @@ class OpenXrVulkanPresenter(
             return False
 
     def _recommended_openxr_render_scale(self) -> float:
-        """Resolve auto scale without supersampling the runtime recommendation."""
-        scale = max(
+        """Resolve the selected headset's panel-to-eye-buffer scale.
+
+        Auto mode must not collapse every headset to the runtime's 1.0x eye
+        buffer. Pico 4, for example, needs 1.44x to match its panel sampling;
+        otherwise the virtual screen is visibly soft and fine patterns crawl.
+        Swapchain creation still clamps the result to the runtime recommended
+        and maximum extents.
+        """
+        return max(
             OPENXR_RENDER_SCALE_MIN,
             min(
                 OPENXR_RENDER_SCALE_MAX,
                 float(self._headset_preset.recommended_render_scale),
             ),
         )
-        # The runtime recommendation already includes headset distortion and
-        # compositor quality. Extra Auto supersampling competes with depth
-        # inference for GPU time; manual scales remain available separately.
-        return min(scale, 1.0)
 
     def _activate_rocm_openxr_stable_path(self) -> None:
         """Apply the validated AMD/VDXR overlay isolation after XR starts."""
@@ -10073,6 +10650,10 @@ class OpenXrVulkanPresenter(
             Path(profile_path).parent.name.strip() or "Default"
         )
         self._filament_screen_persisted_state = self._screen_state_for_environment()
+        room_states = self.config.filament_room_states
+        room_state = room_states.get(self._filament_screen_state_environment, {})
+        if not isinstance(room_state, dict):
+            room_state = {}
 
         presets = profile.get("lighting_presets")
         self._filament_lighting_presets = tuple(
@@ -10377,6 +10958,43 @@ class OpenXrVulkanPresenter(
             if self._filament_lighting_presets else {}
         )
         self._capture_settings_menu_reset_defaults(profile, lighting_defaults)
+
+        saved_seat_index = room_state.get("seat_index")
+        self._room_seat_height_offset = 0.0
+        if (
+            type(saved_seat_index) is int
+            and 0 <= saved_seat_index < len(self._filament_view_poses)
+        ):
+            self._apply_settings_menu_seat(saved_seat_index)
+            selected_pose = self._filament_view_poses[saved_seat_index]
+            self._profile_view_name = str(selected_pose.get("name", "profile"))
+            self._profile_auto_center_on_screen = bool(
+                selected_pose.get("auto_center_on_screen", False)
+            )
+        try:
+            saved_seat_height = room_state.get("seat_height", 0.0)
+            if isinstance(saved_seat_height, bool):
+                raise ValueError("room seat height must be numeric")
+            saved_seat_height = float(saved_seat_height)
+        except (TypeError, ValueError, OverflowError):
+            saved_seat_height = 0.0
+        if math.isfinite(saved_seat_height):
+            self._apply_settings_menu_seat_height(
+                max(-3.0, min(3.0, saved_seat_height))
+            )
+        try:
+            saved_exposure = room_state.get("exposure", self._filament_scene_exposure)
+            if isinstance(saved_exposure, bool):
+                raise ValueError("room exposure must be numeric")
+            saved_exposure = float(saved_exposure)
+        except (TypeError, ValueError, OverflowError):
+            saved_exposure = self._filament_scene_exposure
+        if math.isfinite(saved_exposure):
+            self._filament_scene_exposure = max(-8.0, min(8.0, saved_exposure))
+        saved_reflection = room_state.get("screen_reflection_enabled")
+        if isinstance(saved_reflection, bool):
+            self._environment_screen_light_enabled = saved_reflection
+
         print(
             f"Loaded Filament profile view: {self._profile_view_name} "
             f"world_position={world_position_vec.tolist()} glb_position={glb_position.tolist()} "
@@ -10883,14 +11501,20 @@ class OpenXrVulkanPresenter(
         return completion_timeline
 
     def _can_skip_filament_background(self) -> bool:
-        """Composer can clear an empty room before the controller-only pass."""
+        """Composer can clear an empty dark room before the controller-only pass."""
+        profile_allows_skip = (
+            not self.config.filament_profile_path
+            or bool(self._filament_profile_data.get("dark_room_background", False))
+        )
         return bool(
             self.filament_bridge is not None
             # Older bridges finish their bounded startup tracing in end_frame,
             # which the controller-only ABI does not call. Warm up both eyes
             # first so skipping backgrounds cannot turn tracing into frame logs.
             and self._filament_background_frame_count >= 8
+            and profile_allows_skip
             and not self.config.filament_glb_path
+            and not self.config.filament_panorama_path
             and not self._multiview_active
             and not self._passthrough_backdrop
             and not self._filament_projection_only
@@ -10902,13 +11526,21 @@ class OpenXrVulkanPresenter(
         # Drawing controllers before the CUDA-ready wait avoids a CPU/GPU
         # round trip through Filament's synchronous overlay. Destination alpha
         # keeps the screen behind the premultiplied controller pixels.
+        #
+        # This path is only valid with a transparent projection clear. The
+        # screen-underlay pipeline consumes destination alpha; with an opaque
+        # black clear it would hide the entire screen, and the runtime backdrop
+        # would still show through outside the finite screen quad. Opaque
+        # clears therefore use the normal screen pass followed by the
+        # transparent controller layer.
+        clear_alpha = float(self.config.clear_color[3])
         return bool(
             self._can_skip_filament_background()
             and not self._rocm_backend
             and self._filament_glow_mode == "off"
             and not self.config.filament_panorama_path
             and not self._vulkan_projection_quality_chain_requested
-            and self.config.clear_color == (0.0, 0.0, 0.0, 1.0)
+            and clear_alpha == 0.0
             and not getattr(self, "_filament_controller_overlay_empty", False)
             and callable(getattr(self.filament_bridge, "render_controller_overlay", None))
         )
@@ -11218,8 +11850,11 @@ class OpenXrVulkanPresenter(
                     controller_underlay_failed = False
                     if controller_underlay:
                         try:
+                            # This is the final opaque projection layer. Clearing
+                            # alpha to zero lets the runtime's own dark backdrop
+                            # show through outside the screen when Glow is off.
                             self._clear_projection_targets(
-                                acquired_images, clear_color=(0.0, 0.0, 0.0, 0.0)
+                                acquired_images, clear_color=self.config.clear_color
                             )
                             self._render_filament_controller_overlay(
                                 acquired_images, record_time, render_views=render_views
@@ -13390,6 +14025,97 @@ class OpenXrVulkanPresenter(
                 self._tool_quad_texture_keys["aperture"] = aperture_key
             position, rotation = self._overlay_pose_from_matrix(screen_pose)
             specs.append(("aperture", rgba, position, (width * 0.24, height * 0.06), rotation))
+
+        media_state = self._media_overlay_state
+        if media_state and self._media_overlay_visible():
+            browser_visible = bool(media_state.get("browser_visible"))
+            expanded = self._media_overlay_expanded()
+            browser_key = (
+                media_state.get("browser_revision"),
+                browser_visible,
+                media_state.get("browser_path"),
+                media_state.get("browser_parent"),
+                media_state.get("browser_selection"),
+                self._media_overlay_hover,
+                self._media_overlay_scroll,
+                tuple(
+                    (entry.get("path"), entry.get("kind"))
+                    for entry in (media_state.get("browser_entries") or [])
+                ),
+                tuple(
+                    (entry.get("path"), entry.get("kind"))
+                    for entry in (media_state.get("browser_mounts") or [])
+                ),
+                tuple(
+                    (entry.get("path"), entry.get("kind"))
+                    for entry in (media_state.get("playlist_entries") or [])
+                ),
+                tuple(
+                    (entry.get("path"), entry.get("kind"))
+                    for entry in (media_state.get("recent_entries") or [])
+                ),
+                media_state.get("playlist_index"),
+                media_state.get("browser_error"),
+                language,
+            )
+            bar_key = (
+                expanded,
+                media_state.get("mode"),
+                media_state.get("ready"),
+                media_state.get("playing"),
+                media_state.get("muted"),
+                int(float(media_state.get("position", 0.0) or 0.0)),
+                int(float(media_state.get("duration", 0.0) or 0.0)),
+                round(float(media_state.get("volume", 1.0) or 0.0), 2),
+                media_state.get("audio_enabled"),
+                self._media_overlay_hover,
+                language,
+            )
+            if browser_visible:
+                if (
+                    browser_key != self._media_overlay_browser_key
+                    or self._tool_quad_texture_cache.get("media_browser") is None
+                ):
+                    self._tool_quad_texture_cache["media_browser"] = (
+                        build_media_browser_rgba(
+                            media_state,
+                            width=1400,
+                            height=900,
+                            hover=self._media_overlay_hover,
+                            scroll_offset=self._media_overlay_scroll,
+                            lang=language,
+                        )
+                    )
+                    self._media_overlay_browser_key = browser_key
+                rgba = self._tool_quad_texture_cache["media_browser"]
+                matrix, size = self._media_overlay_matrix(browser=True)
+            else:
+                if (
+                    bar_key != self._media_overlay_texture_key
+                    or self._tool_quad_texture_cache.get("media_bar") is None
+                ):
+                    self._tool_quad_texture_cache["media_bar"] = build_media_bar_rgba(
+                        media_state,
+                        width=1024,
+                        height=160,
+                        hover=self._media_overlay_hover,
+                        lang=language,
+                        collapsed=not expanded,
+                    )
+                    self._media_overlay_texture_key = bar_key
+                rgba = self._tool_quad_texture_cache["media_bar"]
+                matrix, size = self._media_overlay_matrix(browser=False)
+            self._media_overlay_pose = self._overlay_pose_from_matrix(matrix)
+            position, rotation = self._media_overlay_pose
+            specs.append(
+                (
+                    "media_browser" if browser_visible else "media_bar",
+                    rgba,
+                    position,
+                    size,
+                    rotation,
+                )
+            )
 
         if self._settings_menu.visible and self._settings_menu_pose is not None:
             menu_now = time.perf_counter()

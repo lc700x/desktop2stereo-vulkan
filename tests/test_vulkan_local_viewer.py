@@ -705,7 +705,7 @@ def test_present_fps_is_emitted_only_after_five_seconds() -> None:
     assert present_fps_if_due(300, 5.0) == 60.0
 
 
-def test_present_fps_feedback_does_not_depend_on_log_visibility() -> None:
+def test_present_fps_feedback_does_not_depend_on_log_visibility(monkeypatch) -> None:
     samples = []
     viewer = VulkanLocalViewer(
         VulkanLocalViewerConfig(
@@ -715,10 +715,16 @@ def test_present_fps_feedback_does_not_depend_on_log_visibility() -> None:
     )
     viewer._fps_started = 0.0
     viewer._fps_frames = 299
+    viewer._present_window_start = 0.0
+    for _ in range(12):
+        viewer.record_present(reused=False)
+    for _ in range(48):
+        viewer.record_present(reused=True)
+    monkeypatch.setattr(local_viewer_module.time, "perf_counter", lambda: 1.0)
 
     assert present_fps_if_due(viewer._fps_frames + 1, 5.0) == 60.0
     assert viewer._report_present_fps(60.0, 300) == 65
-    assert samples == [(60.0, 300)]
+    assert samples == [(12.0, 12)]
 
 
 def test_local_viewer_reports_queue_and_present_breakdown(monkeypatch) -> None:

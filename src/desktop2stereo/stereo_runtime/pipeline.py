@@ -14,7 +14,11 @@ from typing import Callable
 from capture.types import CapturedFrame, compatibility_frame
 
 from .render_size import RenderSizeConfig, resolve_render_size, runtime_output_size_text
-from .settings_snapshot import RuntimeSettingsPipelineRebuildRequired, RuntimeSettingsRestartRequired, RuntimeSettingsSnapshot
+from .settings_snapshot import (
+    RuntimeSettingsPipelineRebuildRequired,
+    RuntimeSettingsRestartRequired,
+    RuntimeSettingsSnapshot,
+)
 
 
 @dataclass
@@ -411,7 +415,9 @@ def _apply_latest_settings_snapshot(ctx: RuntimePipelineContext):
 
 
 def _captured_frame_uses_cuda_capture(captured_frame: CapturedFrame | None) -> bool:
-    return str(getattr(captured_frame, "capture_tool", "") or "").strip().lower() == "windowscapturecuda"
+    if str(getattr(captured_frame, "capture_tool", "") or "").strip().lower() != "windowscapturecuda":
+        return False
+    return str(getattr(captured_frame, "capture_mode", "") or "").strip().lower() in {"monitor", "window"}
 
 
 def _enable_openxr_depth_cuda_graph_if_needed(
@@ -593,7 +599,16 @@ def _source_target_key(captured_frame: CapturedFrame | None):
     metadata = captured_frame.metadata if isinstance(captured_frame.metadata, dict) else {}
     metadata_parts = tuple(
         (key, str(metadata[key]))
-        for key in ("source_id", "source_key", "capture_source", "capture_target", "target_id", "window_handle", "hwnd")
+        for key in (
+            "source_id",
+            "source_key",
+            "capture_source",
+            "capture_target",
+            "target_id",
+            "media_generation",
+            "window_handle",
+            "hwnd",
+        )
         if key in metadata and metadata[key] is not None
     )
     return (
@@ -625,6 +640,13 @@ def _rgb_size_text(frame) -> str:
     if len(shape) == 3:
         return f"{int(shape[1])}x{int(shape[0])}"
     return "unknown"
+
+
+def _gpu_capture_input_requires_device_residency(ctx, captured_frame: CapturedFrame | None) -> bool:
+    if not bool(getattr(ctx, "gpu_required", False)):
+        return False
+    capture_mode = str(getattr(captured_frame, "capture_mode", "") or "").strip().casefold()
+    return capture_mode not in {"video", "image"}
 
 
 def _capture_zero_copy(captured_frame: CapturedFrame | None):
@@ -1333,6 +1355,11 @@ class RuntimePipelineLoop:
         self._cursor_depth_cache_key = None
         self._cursor_rgb_reference = None
         self._cursor_uv_reference = None
+        self._media_depth_profile = None
+        self._media_depth_source_frame_id = None
+        self._media_depth_cache_key = None
+        self._media_depth_cached_at = 0.0
+        self._media_depth_reuse_logged = False
         self._prepared = False
         self._consecutive_runtime_errors = 0
         self._runtime_error_backoff_s = 0.05
@@ -1353,6 +1380,93 @@ class RuntimePipelineLoop:
         self._cursor_depth_cache_key = None
         self._cursor_rgb_reference = None
         self._cursor_uv_reference = None
+
+    def _clear_media_depth_cache(self) -> None:
+        self._media_depth_profile = None
+        self._media_depth_source_frame_id = None
+        self._media_depth_cache_key = None
+        self._media_depth_cached_at = 0.0
+
+    @staticmethod
+    def _is_video_media_frame(captured_frame: CapturedFrame | None) -> bool:
+        return bool(
+            captured_frame is not None
+            and str(captured_frame.capture_mode or "").casefold() == "video"
+        )
+
+    @staticmethod
+    def _media_depth_reuse_max_age_s() -> float:
+        try:
+            value_ms = float(
+                os.environ.get("D2S_MEDIA_DEPTH_REUSE_MAX_AGE_MS", "250") or 250
+            )
+        except (TypeError, ValueError):
+            value_ms = 250.0
+        return max(0.0, min(1000.0, value_ms)) / 1000.0
+
+    def _media_depth_reuse_candidate(
+        self,
+        ctx: RuntimePipelineContext,
+        captured_frame: CapturedFrame | None,
+        frame_rgb,
+        render_size: tuple[int, int],
+        source_target_key,
+    ):
+        if (
+            not self._is_video_media_frame(captured_frame)
+            or self._media_depth_profile is None
+            or self._media_depth_cache_key is None
+        ):
+            return None
+        age_s = time.perf_counter() - float(self._media_depth_cached_at or 0.0)
+        if age_s < 0.0 or age_s > self._media_depth_reuse_max_age_s():
+            self._clear_media_depth_cache()
+            return None
+        key = self._build_cursor_depth_cache_key(
+            ctx, captured_frame, frame_rgb, render_size, source_target_key
+        )
+        if key != self._media_depth_cache_key:
+            self._clear_media_depth_cache()
+            return None
+        return (
+            self._media_depth_profile,
+            self._media_depth_source_frame_id,
+            age_s,
+        )
+
+    def _commit_media_depth_cache(
+        self,
+        ctx: RuntimePipelineContext,
+        captured_frame: CapturedFrame | None,
+        frame_rgb,
+        render_size: tuple[int, int],
+        source_target_key,
+        runtime_result,
+        *,
+        reused: bool,
+    ) -> None:
+        if not self._is_video_media_frame(captured_frame):
+            self._clear_media_depth_cache()
+            return
+        if reused:
+            return
+        profile = getattr(runtime_result, "depth_profile", None)
+        if profile is None:
+            self._clear_media_depth_cache()
+            return
+        metadata = (
+            captured_frame.metadata if isinstance(captured_frame.metadata, dict) else {}
+        )
+        try:
+            source_frame_id = int(metadata.get("capture_frame_id"))
+        except (TypeError, ValueError):
+            source_frame_id = None
+        self._media_depth_profile = profile
+        self._media_depth_source_frame_id = source_frame_id
+        self._media_depth_cache_key = self._build_cursor_depth_cache_key(
+            ctx, captured_frame, frame_rgb, render_size, source_target_key
+        )
+        self._media_depth_cached_at = time.perf_counter()
 
     @staticmethod
     def _build_cursor_depth_cache_key(
@@ -1562,8 +1676,6 @@ class RuntimePipelineLoop:
             "gpu_to_cpu": gpu_to_cpu or directml_gpu_to_cpu,
             "gpu_copy_count": gpu_copy_count,
             "directml_gpu_copy_count": debug_info.get("directml_gpu_copy_count", 0),
-            "directml_resource_mode": debug_info.get("directml_resource_mode"),
-            "directml_zero_copy_ready": debug_info.get("directml_zero_copy_ready"),
             "zero_copy": zero_copy and bool(
                 debug_info.get("directml_zero_copy_ready", True)
             ),
@@ -2091,6 +2203,8 @@ class RuntimePipelineLoop:
                     _reset_runtime_temporal_state(ctx.stereo_runtime)
                 if source_target_changed:
                     _reset_runtime_temporal_state(ctx.stereo_runtime)
+                if render_size_changed or source_target_changed:
+                    self._clear_media_depth_cache()
                 self._last_render_size = render_size
                 self._last_source_target_key = source_target_key
                 self._has_source_target_key = True
@@ -2101,7 +2215,7 @@ class RuntimePipelineLoop:
                     and getattr(captured_frame, "sck_zero_copy", None) is not None
                     and _native_coreml_capture_enabled(ctx)
                 )
-                if ctx.gpu_required and not native_sck:
+                if _gpu_capture_input_requires_device_residency(ctx, captured_frame) and not native_sck:
                     input_device = getattr(getattr(frame_input, "device", None), "type", None)
                     if input_device not in {"cuda", "mps"}:
                         raise GPURequiredError(
@@ -2166,6 +2280,7 @@ class RuntimePipelineLoop:
                         device=ctx.device,
                         use_torch=ctx.use_cudart,
                         output="tensor",
+                        original_format=captured_frame.original_format if captured_frame else "",
                         frame_raw_device=captured_frame.frame_raw_device if captured_frame else None,
                         capture_copy_mode=_capture_copy_mode(captured_frame),
                         capture_zero_copy=_capture_zero_copy(captured_frame),
@@ -2299,6 +2414,9 @@ class RuntimePipelineLoop:
                     time.perf_counter() - cursor_check_start,
                 )
                 cursor_depth_reused = False
+                media_depth_reused = False
+                media_depth_age_ms = 0.0
+                parallel_frame_id = None
                 depth_source_frame_id = None
 
                 # A native Intel capture source may already have produced a
@@ -2373,25 +2491,57 @@ class RuntimePipelineLoop:
                     scheduler.trim(self._pending_depth_limit())
                     job = scheduler.pop_ready(block=False)
                     if job is None:
-                        ctx.source_stat_inc("runtime_parallel_pending", pending_depth=len(scheduler.pending))
-                        ctx.breakdown_inc("runtime_parallel_pending")
-                        continue
-                    frame_rgb = job.frame_rgb
-                    frame_raw = job.frame_raw
-                    size = job.size
-                    capture_start_time = job.capture_start_time
-                    captured_frame = job.captured_frame
-                    render_size = job.render_size
-                    process_latency = job.process_latency
-                    source_target_changed = job.source_target_changed
-                    render_size_changed = job.render_size_changed
-                    runtime_rgb = job.runtime_rgb
-                    depth_profile = job.depth_profile
-                    if float(getattr(depth_profile, "slot_wait_ms", 0.0)) >= self._parallel_slot_wait_backoff_ms():
-                        self._parallel_reduce_for_pressure("tensorrt_slot_wait")
-                    ctx.source_stat_inc("runtime_parallel_processed")
-                    ctx.source_stat_inc("runtime_parallel_reorder_wait", frame_reorder_wait=0)
-                    parallel_frame_id = job.frame_id
+                        media_reuse = self._media_depth_reuse_candidate(
+                            ctx,
+                            captured_frame,
+                            frame_rgb,
+                            render_size,
+                            source_target_key,
+                        )
+                        if media_reuse is None:
+                            ctx.source_stat_inc(
+                                "runtime_parallel_pending",
+                                pending_depth=len(scheduler.pending),
+                            )
+                            ctx.breakdown_inc("runtime_parallel_pending")
+                            continue
+                        (
+                            depth_profile,
+                            depth_source_frame_id,
+                            media_depth_age_s,
+                        ) = media_reuse
+                        media_depth_reused = True
+                        media_depth_age_ms = media_depth_age_s * 1000.0
+                        if not self._media_depth_reuse_logged:
+                            self._media_depth_reuse_logged = True
+                            print(
+                                "[RuntimePipeline] media depth reuse active: "
+                                f"age={media_depth_age_ms:.1f}ms "
+                                f"max={self._media_depth_reuse_max_age_s() * 1000.0:.0f}ms",
+                                flush=True,
+                            )
+                        ctx.source_stat_inc("runtime_media_depth_reused")
+                        ctx.breakdown_inc("runtime_media_depth_reused")
+                    else:
+                        frame_rgb = job.frame_rgb
+                        frame_raw = job.frame_raw
+                        size = job.size
+                        capture_start_time = job.capture_start_time
+                        captured_frame = job.captured_frame
+                        render_size = job.render_size
+                        process_latency = job.process_latency
+                        source_target_changed = job.source_target_changed
+                        render_size_changed = job.render_size_changed
+                        source_target_key = _source_target_key(job.captured_frame)
+                        runtime_rgb = job.runtime_rgb
+                        depth_profile = job.depth_profile
+                        if float(getattr(depth_profile, "slot_wait_ms", 0.0)) >= self._parallel_slot_wait_backoff_ms():
+                            self._parallel_reduce_for_pressure("tensorrt_slot_wait")
+                        ctx.source_stat_inc("runtime_parallel_processed")
+                        ctx.source_stat_inc(
+                            "runtime_parallel_reorder_wait", frame_reorder_wait=0
+                        )
+                        parallel_frame_id = job.frame_id
                     if not cursor_depth_reused:
                         cursor_depth_candidate = self._cursor_depth_reuse_candidate(
                             ctx,
@@ -2532,7 +2682,18 @@ class RuntimePipelineLoop:
                         )
                 if runtime_result.depth is None:
                     self._clear_cursor_depth_cache()
-                elif cursor_depth_candidate is not None:
+                    self._clear_media_depth_cache()
+                else:
+                    self._commit_media_depth_cache(
+                        ctx,
+                        captured_frame,
+                        frame_rgb,
+                        render_size,
+                        source_target_key,
+                        runtime_result,
+                        reused=media_depth_reused,
+                    )
+                if runtime_result.depth is not None and cursor_depth_candidate is not None:
                     if cursor_depth_reused:
                         ctx.source_stat_inc("runtime_cursor_depth_reused")
                         ctx.breakdown_inc("runtime_cursor_depth_reused")
@@ -2570,6 +2731,8 @@ class RuntimePipelineLoop:
                     debug_info["parallel_inference_workers"] = int(
                         getattr(self._parallel_depth_scheduler, "worker_count", 0)
                     )
+                    debug_info["media_depth_reused"] = int(media_depth_reused)
+                    debug_info["media_depth_age_ms"] = float(media_depth_age_ms)
                     if self._parallel_depth_scheduler is not None:
                         debug_info["parallel_inference_effective_workers"] = int(
                             self._parallel_depth_scheduler.effective_limit

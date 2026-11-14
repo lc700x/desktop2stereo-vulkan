@@ -74,6 +74,7 @@ OPENXR_MENU_GROUP_LABELS = {
     "room_models": "Environment",
     "room_seats": "Seat position",
     "room_scene": "Scene controls",
+    "media_controls": "Media controls",
 }
 
 
@@ -157,7 +158,7 @@ PICTURE_DEFAULTS = {
 class OpenXrSettingsMenu:
     """Renderer-independent sidebar, hit-test, and trigger state for the XR menu."""
 
-    tabs = ("picture", "depth", "glow", "room", "screen")
+    tabs = ("picture", "depth", "glow", "room", "screen", "media")
 
     def __init__(self) -> None:
         self.visible = False
@@ -230,9 +231,21 @@ class OpenXrSettingsMenu:
         lang: str = "EN", values: Mapping[str, object] | None = None,
     ) -> MenuLayout:
         """Build one grid-aligned layout shared by rendering, ray hits and Flet."""
+        media_layout_key = None
+        if self.tab == "media":
+            media_values_for_cache = values or {}
+            media_layout_key = (
+                bool(media_values_for_cache.get("media_available", False)),
+                str(media_values_for_cache.get("media_mode", "")),
+                repr(media_values_for_cache.get("media_duration", 0.0)),
+                bool(media_values_for_cache.get("media_playing", False)),
+                bool(media_values_for_cache.get("media_muted", False)),
+                bool(media_values_for_cache.get("media_audio_enabled", False)),
+                str(media_values_for_cache.get("media_status", "")),
+            )
         cache_key = (
             self.tab, self.screen_section, bool(allow_curve), bool(show_glow),
-            str(lang), self.room_models, self.stopping,
+            str(lang), self.room_models, self.stopping, media_layout_key,
         )
         if cache_key == self._layout_cache_key and self._layout_cache_base is not None:
             return self._materialize_layout(self._layout_cache_base, values)
@@ -288,6 +301,7 @@ class OpenXrSettingsMenu:
             maximum: float,
             step: float,
             group: str,
+            enabled: bool = True,
         ) -> None:
             # +/- retain 64 px ray targets. The slider and both targets share a
             # center line, with 8 px between neighboring hit regions.
@@ -298,19 +312,19 @@ class OpenXrSettingsMenu:
                 key, label,
                 (slider_left, center_y - 24, slider_right - slider_left, 48),
                 kind="slider", minimum=minimum, maximum=maximum, step=step,
-                group=group,
+                enabled=enabled, group=group,
             )
             add(
                 f"step:minus:{key}", "-",
                 (x, center_y - 32, 64, 64),
                 kind="slider_step", minimum=minimum, maximum=maximum,
-                step=step, group=group,
+                step=step, enabled=enabled, group=group,
             )
             add(
                 f"step:plus:{key}", "+",
                 (x + row_width - 64, center_y - 32, 64, 64),
                 kind="slider_step", minimum=minimum, maximum=maximum,
-                step=step, group=group,
+                step=step, enabled=enabled, group=group,
             )
 
         def add_button(
@@ -330,7 +344,7 @@ class OpenXrSettingsMenu:
         visible_tabs = ["screen", "depth"]
         if show_glow:
             visible_tabs.append("glow")
-        visible_tabs.extend(("room", "picture"))
+        visible_tabs.extend(("room", "picture", "media"))
         for index, tab in enumerate(visible_tabs):
             y0 = 64 + index * 80
             add_button(
@@ -448,6 +462,76 @@ class OpenXrSettingsMenu:
                     584, 120, 40,
                 ),
                 group="color_adjustment",
+            )
+        elif self.tab == "media":
+            media_values = values or {}
+            media_available = bool(media_values.get("media_available", False))
+            media_video = (
+                media_available
+                and str(media_values.get("media_mode", "")).casefold() == "video"
+            )
+            media_audio = media_video and bool(
+                media_values.get("media_audio_enabled", False)
+            )
+            try:
+                media_duration = max(
+                    1.0, float(media_values.get("media_duration", 0.0) or 0.0)
+                )
+            except (TypeError, ValueError):
+                media_duration = 1.0
+            if media_duration != media_duration or media_duration == float("inf"):
+                media_duration = 1.0
+            status = str(media_values.get("media_status") or "No media loaded")
+            add_group(
+                "media_controls", _CONTENT_PANEL_LEFT, 32,
+                _CONTENT_PANEL_WIDTH, 424,
+            )
+            add_button(
+                "media:status", status,
+                (_CONTENT_LEFT, 88, _CONTENT_WIDTH, 48),
+                group="media_controls", enabled=False,
+            )
+            media_button_width = (
+                _CONTENT_WIDTH - 3 * _MENU_CONTROL_GAP
+            ) // 4
+            add_button(
+                "media:rewind",
+                "-10s",
+                (_CONTENT_LEFT, 152, media_button_width, 48),
+                group="media_controls", enabled=media_video,
+            )
+            add_button(
+                "media:play_pause",
+                "Pause" if media_values.get("media_playing", False) else "Play",
+                (
+                    _CONTENT_LEFT + media_button_width + _MENU_CONTROL_GAP,
+                    152, media_button_width, 48,
+                ), group="media_controls", enabled=media_video,
+            )
+            add_button(
+                "media:forward",
+                "+10s",
+                (
+                    _CONTENT_LEFT + 2 * (media_button_width + _MENU_CONTROL_GAP),
+                    152, media_button_width, 48,
+                ), group="media_controls", enabled=media_video,
+            )
+            add_button(
+                "media:toggle_mute",
+                "Unmute" if media_values.get("media_muted", False) else "Mute",
+                (
+                    _CONTENT_LEFT + 3 * (media_button_width + _MENU_CONTROL_GAP),
+                    152, media_button_width, 48,
+                ), group="media_controls", enabled=media_audio,
+            )
+            add_slider(
+                "media_seek", "Seek", _CONTENT_LEFT, 224, _CONTENT_WIDTH,
+                0.0, media_duration, max(0.05, media_duration / 1000.0),
+                "media_controls", enabled=media_video,
+            )
+            add_slider(
+                "media_volume", "Volume", _CONTENT_LEFT, 304, _CONTENT_WIDTH,
+                0.0, 1.0, 0.05, "media_controls", enabled=media_audio,
             )
         elif self.tab == "depth":
             add_group(

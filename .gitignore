@@ -43,3 +43,10 @@ AGENTS.md
 .tmp
 .serena
 .DS_Store
+.scratch
+.workbuddy-ai
+.vscode/
+native/*/target/
+scripts/tmp_*.py
+runtime-crash.log
+src/desktop2stereo/runtime-crash.log

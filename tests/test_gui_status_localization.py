@@ -7,7 +7,97 @@ import pytest
 import flet as ft
 
 from gui.localization import MESSAGE_CATALOGS, _STATUS_MESSAGES, translate_status
+from gui.handlers import GUIHandlerMixin
 from gui.process import GUIProcessMixin
+
+
+def test_media_controls_have_translations_for_every_locale():
+    assert MESSAGE_CATALOGS["EN"]["OpenXR Controls"] == "XR Control"
+    assert MESSAGE_CATALOGS["CN"]["OpenXR Controls"] == "XR 控件"
+    assert MESSAGE_CATALOGS["EN"]["Media Player"] == "Media Player"
+    assert MESSAGE_CATALOGS["CN"]["Media Player"] == "媒体播放器"
+    assert MESSAGE_CATALOGS["EN"]["Recent"] == "Recent"
+    assert MESSAGE_CATALOGS["CN"]["Recent"] == "最近打开"
+    assert MESSAGE_CATALOGS["EN"]["Open File"] == "Open File"
+    assert MESSAGE_CATALOGS["CN"]["Open File"] == "打开文件"
+
+
+def test_capture_tool_change_keeps_capture_mode_locked_while_runtime_runs():
+    gui = SimpleNamespace(
+        process=SimpleNamespace(returncode=None),
+        capture_mode_dd=SimpleNamespace(disabled=True, update=lambda: None),
+        set_status=lambda *_args, **_kwargs: None,
+        _sync_capture_mode_visibility=lambda: None,
+    )
+
+    GUIHandlerMixin.on_capture_tool_change(gui, None)
+    assert gui.capture_mode_dd.disabled is True
+
+    gui.process.returncode = 0
+    GUIHandlerMixin.on_capture_tool_change(gui, None)
+    assert gui.capture_mode_dd.disabled is False
+
+
+def test_media_controls_refresh_labels_and_state_for_selected_locale():
+    gui = SimpleNamespace(
+        locale="CN",
+        _media_runtime_state=None,
+        media_open_file_label=SimpleNamespace(value="Open File"),
+        media_open_folder_btn=SimpleNamespace(tooltip="Open Disc Folder"),
+        media_play_btn=SimpleNamespace(tooltip="Play/Pause"),
+        media_mute_btn=SimpleNamespace(tooltip="Mute"),
+        media_volume_label=SimpleNamespace(value="Volume"),
+        media_status_text=SimpleNamespace(value="No media loaded"),
+    )
+
+    GUIHandlerMixin._update_media_control_texts(gui)
+
+    assert gui.media_open_file_label.value == "打开文件"
+    assert gui.media_open_folder_btn.tooltip == "打开光盘文件夹"
+    assert gui.media_play_btn.tooltip == "播放/暂停"
+    assert gui.media_mute_btn.tooltip == "静音"
+    assert gui.media_volume_label.value == "音量"
+    assert gui.media_status_text.value == "尚未加载媒体"
+
+    gui.locale = "EN"
+    gui._media_runtime_state = {
+        "status": "Playing",
+        "playing": True,
+        "muted": True,
+    }
+    GUIHandlerMixin._update_media_control_texts(gui)
+
+    assert gui.media_status_text.value == "Playing"
+    assert gui.media_play_btn.tooltip == "Pause"
+    assert gui.media_mute_btn.tooltip == "Unmute"
+
+
+def test_polled_media_status_uses_selected_locale(tmp_path):
+    state_path = tmp_path / "media-state.json"
+    state_path.write_text(json.dumps({
+        "session": "test-session",
+        "path": "C:/Videos/sample.mp4",
+        "position": 1.0,
+        "duration": 10.0,
+        "mode": "video",
+        "playing": True,
+    }), encoding="utf-8")
+    gui = GUIProcessMixin()
+    gui._media_state_path = str(state_path)
+    gui._media_session_id = "test-session"
+    gui._media_path = ""
+    gui._media_resume_position = 0.0
+    gui._config = {}
+    gui.locale = "CN"
+    gui._safe_update = lambda *controls: None
+    gui.media_status_text = SimpleNamespace(value="")
+    gui.media_position_text = SimpleNamespace(value="")
+    gui.media_seek_slider = SimpleNamespace(max=1.0, value=0.0)
+    gui.media_play_btn = SimpleNamespace(icon=None, tooltip="")
+    gui.media_path_text = SimpleNamespace(value="")
+
+    assert gui._poll_media_state() is True
+    assert gui.media_status_text.value == "正在播放"
 
 
 @pytest.mark.parametrize("key", _STATUS_MESSAGES)
@@ -116,3 +206,128 @@ def test_migraphx_activity_reaches_progress_panel_and_translates(state, percent,
     gui._update_download_progress(gui._download_progress_payload)
     assert gui.download_progress_title.value == "Building MIGraphX graph: model.mgx"
     assert gui.download_progress_detail.value == "Elapsed 00:12"
+
+
+
+def test_media_selection_persists_path_and_resumes_same_video(monkeypatch, tmp_path):
+    import gui.process as gui_process
+
+    class Harness(GUIHandlerMixin, GUIProcessMixin):
+        def _fit_window_to_content(self):
+            pass
+
+        def _safe_update(self, *_controls):
+            pass
+
+        def set_status(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(gui_process, "BASE_DIR", str(tmp_path))
+    first_video = tmp_path / "first.mp4"
+    second_video = tmp_path / "second.mp4"
+    first_video.write_bytes(b"video")
+    second_video.write_bytes(b"video")
+    gui = Harness()
+    gui.locale = "EN"
+    gui.capture_mode_key = "Video"
+    gui.media_path = str(first_video)
+    gui._media_path = str(first_video)
+    gui.media_resume_position = 12.5
+    gui._media_resume_position = 12.5
+    gui._media_session_id = None
+    gui._media_runtime_state = None
+    gui._config = {"Media Path": str(first_video), "Media Playback Position": 12.5}
+    gui.media_path_text = SimpleNamespace(value="")
+
+    assert gui._set_media_source(str(first_video)) is True
+    settings = gui_process.read_yaml(str(tmp_path / "settings.yaml"))
+    assert settings["Media Path"] == str(first_video)
+    assert settings["Media Playback Position"] == 12.5
+
+    assert gui._set_media_source(str(second_video)) is True
+    settings = gui_process.read_yaml(str(tmp_path / "settings.yaml"))
+    assert settings["Media Path"] == str(second_video)
+    assert settings["Media Playback Position"] == 0.0
+
+
+def test_media_seek_and_pause_persist_latest_position(monkeypatch, tmp_path):
+    import gui.process as gui_process
+
+    class Harness(GUIHandlerMixin, GUIProcessMixin):
+        pass
+
+    monkeypatch.setattr(gui_process, "BASE_DIR", str(tmp_path))
+    media_path = tmp_path / "movie.mp4"
+    control_path = tmp_path / "media-control.json"
+    gui = Harness()
+    gui.locale = "EN"
+    gui.capture_mode_key = "Video"
+    gui.media_path = str(media_path)
+    gui._media_path = str(media_path)
+    gui.media_resume_position = 2.0
+    gui._media_resume_position = 2.0
+    gui._media_session_id = "media-session"
+    gui._media_control_path = str(control_path)
+    gui._media_command_session = None
+    gui._media_command_revision = -1
+    gui._media_runtime_state = {
+        "session": "media-session",
+        "path": str(media_path),
+        "mode": "Video",
+        "position": 2.0,
+        "duration": 30.0,
+        "playing": True,
+    }
+    gui._config = {"Media Path": str(media_path), "Media Playback Position": 2.0}
+    gui.media_seek_slider = SimpleNamespace(value=18.0)
+
+    assert gui.on_media_seek() is True
+    settings = gui_process.read_yaml(str(tmp_path / "settings.yaml"))
+    assert settings["Media Playback Position"] == 18.0
+
+    assert gui.on_media_play_pause() is True
+    settings = gui_process.read_yaml(str(tmp_path / "settings.yaml"))
+    assert settings["Media Playback Position"] == 18.0
+    assert json.loads(control_path.read_text(encoding="utf-8"))["action"] == "pause"
+
+
+def test_media_play_pause_refreshes_runtime_state_before_deciding_action(tmp_path):
+    class Harness(GUIHandlerMixin, GUIProcessMixin):
+        pass
+
+    media_path = tmp_path / "movie.mp4"
+    control_path = tmp_path / "media-control.json"
+    state_path = tmp_path / "media-state.json"
+    state_path.write_text(
+        json.dumps({
+            "session": "media-session",
+            "path": str(media_path),
+            "mode": "Video",
+            "position": 0.0,
+            "duration": 30.0,
+            "playing": False,
+        }),
+        encoding="utf-8",
+    )
+    gui = Harness()
+    gui.locale = "EN"
+    gui.capture_mode_key = "Video"
+    gui.media_path = str(media_path)
+    gui._media_path = str(media_path)
+    gui._media_resume_position = 0.0
+    gui._media_session_id = "media-session"
+    gui._media_state_path = str(state_path)
+    gui._media_control_path = str(control_path)
+    gui._media_command_session = None
+    gui._media_command_revision = -1
+    gui._media_runtime_state = {
+        "session": "media-session",
+        "path": str(media_path),
+        "mode": "Video",
+        "position": 0.0,
+        "duration": 30.0,
+        "playing": True,
+    }
+
+    assert gui.on_media_play_pause() is True
+    assert json.loads(control_path.read_text(encoding="utf-8"))["action"] == "play"
