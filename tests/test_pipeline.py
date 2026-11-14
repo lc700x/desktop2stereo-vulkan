@@ -2,43 +2,38 @@ import json
 import queue
 import sys as sys_module
 import threading
+import time
 from types import SimpleNamespace
-from pathlib import Path
 
 import numpy as np
 import pytest
-
-from path_config import APP_ROOT
-
-from path_config import APP_ROOT
-
-from capture.types import CapturedFrame
-from stereo_runtime.render_size import RenderSizeConfig
 import stereo_runtime.pipeline as pipeline_module
-
+from capture.types import CapturedFrame
+from path_config import APP_ROOT
 from stereo_runtime.pipeline import (
-    _ParallelDepthScheduler,
-    _prepare_frame_input,
     RuntimePipelineLoop,
-    _resolve_pipeline_render_size,
-    _unpack_raw_queue_item,
-    _enable_openxr_depth_cuda_graph_if_needed,
-    _prewarm_gpu_runtime_before_capture,
-    _motion_sample,
-    _motion_score,
-    _cursor_only_rgb_change,
-    _save_downsample_filter_comparison,
-    _save_preprocess_image_diagnostic,
-    _runtime_motion_gate_enabled,
-    _runtime_pending_depth_limit,
-    _runtime_parallel_adaptive_backoff_enabled,
-    _cuda_event_ready,
     _attach_capture_debug,
     _attach_pipeline_debug,
-    _native_coreml_capture_enabled,
-    _runtime_output_device,
+    _cuda_event_ready,
+    _cursor_only_rgb_change,
+    _enable_openxr_depth_cuda_graph_if_needed,
     _gpu_capture_input_requires_device_residency,
+    _motion_sample,
+    _motion_score,
+    _native_coreml_capture_enabled,
+    _ParallelDepthScheduler,
+    _prepare_frame_input,
+    _prewarm_gpu_runtime_before_capture,
+    _resolve_pipeline_render_size,
+    _runtime_motion_gate_enabled,
+    _runtime_output_device,
+    _runtime_parallel_adaptive_backoff_enabled,
+    _runtime_pending_depth_limit,
+    _save_downsample_filter_comparison,
+    _save_preprocess_image_diagnostic,
+    _unpack_raw_queue_item,
 )
+from stereo_runtime.render_size import RenderSizeConfig
 
 
 def test_pipeline_uses_captured_dimensions_when_render_scale_is_4k():
@@ -92,11 +87,20 @@ def test_media_depth_reuse_is_bounded_to_media_generation_and_age():
         target_height=2,
         timestamp=1.0,
         capture_mode="Video",
-        metadata={"capture_frame_id": 11, "media_generation": 4},
+        metadata={
+            "capture_frame_id": 11,
+            "media_generation": 4,
+            "source_frame_index": 100,
+            "source_pts": 4.0,
+        },
     )
     target_key = ("captured", "Video", 0, "", (("media_generation", "4"),))
-    loop._media_depth_cache_key = loop._build_cursor_depth_cache_key(
-        ctx, captured, frame_rgb, (2, 2), target_key
+    loop._media_depth_identity = loop._exact_video_frame_identity(captured)
+    loop._media_depth_cache_key = (
+        loop._build_cursor_depth_cache_key(
+            ctx, captured, frame_rgb, (2, 2), target_key
+        ),
+        loop._media_depth_identity,
     )
 
     reuse = loop._media_depth_reuse_candidate(
@@ -105,13 +109,19 @@ def test_media_depth_reuse_is_bounded_to_media_generation_and_age():
     assert reuse is not None
     assert reuse[0] is loop._media_depth_profile
     assert reuse[1] == 11
+    assert loop._media_depth_cache_reason == "exact_match"
 
     changed_generation = CapturedFrame(
         frame=captured.frame,
         target_height=2,
         timestamp=1.0,
         capture_mode="Video",
-        metadata={"capture_frame_id": 12, "media_generation": 5},
+        metadata={
+            "capture_frame_id": 12,
+            "media_generation": 5,
+            "source_frame_index": 0,
+            "source_pts": 0.0,
+        },
     )
     assert loop._media_depth_reuse_candidate(
         ctx,
@@ -121,6 +131,76 @@ def test_media_depth_reuse_is_bounded_to_media_generation_and_age():
         pipeline_module._source_target_key(changed_generation),
     ) is None
     assert loop._media_depth_profile is None
+    assert loop._media_depth_cache_reason == "identity_mismatch"
+
+
+def test_media_depth_reuse_rejects_changed_or_ambiguous_frames():
+    loop = object.__new__(RuntimePipelineLoop)
+    loop._media_depth_profile = object()
+    loop._media_depth_cached_at = time.perf_counter()
+    frame_rgb = SimpleNamespace(device="cuda:0")
+    runtime = SimpleNamespace(
+        active_settings_version=1,
+        depth_config=SimpleNamespace(model_name="depth", resolution=518, backend="tensorrt"),
+        config=SimpleNamespace(depth_model="depth", depth_resolution=518, backend="tensorrt"),
+    )
+    ctx = SimpleNamespace(stereo_runtime=runtime)
+    base_metadata = {
+        "capture_frame_id": 20,
+        "media_generation": 2,
+        "source_frame_index": 9,
+        "source_pts": 1.5,
+    }
+    captured = CapturedFrame(
+        frame=np.zeros((2, 2, 3), dtype=np.uint8),
+        target_height=2,
+        timestamp=1.0,
+        capture_mode="Video",
+        metadata=base_metadata,
+    )
+    target_key = pipeline_module._source_target_key(captured)
+    identity = loop._exact_video_frame_identity(captured)
+    loop._media_depth_identity = identity
+    loop._media_depth_cache_key = (
+        loop._build_cursor_depth_cache_key(
+            ctx, captured, frame_rgb, (2, 2), target_key
+        ),
+        identity,
+    )
+
+    changed_content = CapturedFrame(
+        frame=np.ones((2, 2, 3), dtype=np.uint8),
+        target_height=2,
+        timestamp=1.0,
+        capture_mode="Video",
+        metadata={
+            **base_metadata,
+            "capture_frame_id": 21,
+            "source_frame_index": 10,
+            "source_pts": 1.533333,
+        },
+    )
+    changed_key = pipeline_module._source_target_key(changed_content)
+    assert loop._media_depth_reuse_candidate(
+        ctx, changed_content, frame_rgb, (2, 2), changed_key
+    ) is None
+    assert loop._media_depth_cache_reason == "identity_mismatch"
+
+    ambiguous = CapturedFrame(
+        frame=captured.frame,
+        target_height=2,
+        timestamp=1.0,
+        capture_mode="Video",
+        metadata={"capture_frame_id": 22, "media_generation": 2},
+    )
+    assert loop._media_depth_reuse_candidate(
+        ctx,
+        ambiguous,
+        frame_rgb,
+        (2, 2),
+        pipeline_module._source_target_key(ambiguous),
+    ) is None
+    assert loop._media_depth_cache_reason == "missing_identity"
 
 
 def test_attach_capture_debug_marks_depth_complete_for_current_frame():
@@ -136,6 +216,9 @@ def test_attach_capture_debug_marks_depth_complete_for_current_frame():
         timestamp=1.0,
         metadata={
             "capture_frame_id": 42,
+            "media_generation": 3,
+            "source_frame_index": 17,
+            "source_pts": 2.5,
             "gpu_to_cpu": True,
             "gpu_copy_count": 2,
         },
@@ -154,6 +237,9 @@ def test_attach_capture_debug_marks_depth_complete_for_current_frame():
     assert result.debug_info["raw_image_cpu_readbacks"] == 1
     assert result.debug_info["capture_gpu_copy_count"] == 2
     assert result.debug_info["capture_to_runtime_ready_ms"] > 0
+    assert result.debug_info["media_generation"] == 3
+    assert result.debug_info["source_frame_index"] == 17
+    assert result.debug_info["source_pts"] == 2.5
 
 
 def test_attach_capture_debug_keeps_cursor_reused_depth_source_frame_id():

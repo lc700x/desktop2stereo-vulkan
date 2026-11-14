@@ -3,7 +3,6 @@ from __future__ import annotations
 import threading
 
 import numpy as np
-
 from capture.runners import PollingCaptureRunner
 from capture.types import CaptureConfig, CapturedFrame, FrameCopyMode
 
@@ -34,6 +33,19 @@ class FakeNativePollingSource:
 
     def stop(self):
         pass
+
+
+class FakeMediaPollingSource(FakePollingSource):
+    mode = "video"
+    media_generation = 7
+
+    def __init__(self):
+        super().__init__()
+        self._identity = (7, 42, 1.25)
+
+    @property
+    def current_source_frame_identity(self):
+        return self._identity
 
 
 class FakeControlledPollingSource:
@@ -83,6 +95,28 @@ def test_polling_capture_runner_marks_explicit_non_zero_copy_metadata():
     assert captured.capture_size == (8, 4)
     assert captured.frame_raw_device == "cpu"
     assert captured.frame_raw_dtype == "uint8"
+
+
+def test_polling_capture_runner_propagates_exact_media_frame_identity():
+    source = FakeMediaPollingSource()
+    shutdown = threading.Event()
+    frames = []
+    runner = PollingCaptureRunner(
+        CaptureConfig(output_resolution=(8, 4), fps=60, os_name="Windows"),
+        lambda: source,
+    )
+
+    def on_frame(frame):
+        frames.append(frame)
+        shutdown.set()
+
+    runner.run(shutdown_event=shutdown, on_frame=on_frame)
+
+    metadata = frames[0].metadata
+    assert frames[0].capture_mode == "Video"
+    assert metadata["media_generation"] == 7
+    assert metadata["source_frame_index"] == 42
+    assert metadata["source_pts"] == 1.25
 
 
 def test_polling_capture_runner_uses_atomic_native_zero_copy_poll():

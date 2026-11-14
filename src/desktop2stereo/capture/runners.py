@@ -117,6 +117,19 @@ class PollingCaptureRunner:
                         frame_config = replace(
                             self.config, capture_mode=source_mode.title()
                         )
+                    source_frame_identity = getattr(
+                        self._source, "current_source_frame_identity", None
+                    )
+                    source_generation = None
+                    source_frame_index = None
+                    source_pts = None
+                    if (
+                        isinstance(source_frame_identity, (tuple, list))
+                        and len(source_frame_identity) >= 3
+                    ):
+                        source_generation = source_frame_identity[0]
+                        source_frame_index = source_frame_identity[1]
+                        source_pts = source_frame_identity[2]
                     on_frame(
                         capture_frame_from_raw(
                             frame_raw,
@@ -162,9 +175,13 @@ class PollingCaptureRunner:
                                     else None
                                 ),
                                 "capture_frame_id": self._frame_id,
-                                "media_generation": getattr(
-                                    self._source, "media_generation", None
+                                "media_generation": (
+                                    source_generation
+                                    if source_generation is not None
+                                    else getattr(self._source, "media_generation", None)
                                 ),
+                                "source_frame_index": source_frame_index,
+                                "source_pts": source_pts,
                                 **({
                                     "native_depth_profile": native_depth_profile,
                                     "native_depth_backend": "openvino_d3d11_remote",

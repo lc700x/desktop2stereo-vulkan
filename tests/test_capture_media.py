@@ -1448,14 +1448,19 @@ def test_buffered_playback_uses_wall_clock_target_and_drops_stale_frames():
     source = object.__new__(MediaCaptureSource)
     source._playback_fps = 60.0
     source._frame_buffer = deque(
-        [(0.0, "frame-0"), (1.0 / 60.0, "frame-1"), (2.0 / 60.0, "frame-2")]
+        [
+            (0.0, "frame-0", 0),
+            (1.0 / 60.0, "frame-1", 1),
+            (2.0 / 60.0, "frame-2", 2),
+        ]
     )
     source._frame_buffer_condition = threading.Condition()
     source._frame_pump_done = False
 
-    frame = source._take_buffered_frame(2.0 / 60.0)
+    item = source._take_buffered_frame(2.0 / 60.0)
 
-    assert frame == "frame-2"
+    assert item[1] == "frame-2"
+    assert item[2] == 2
     assert list(source._frame_buffer) == []
 
 
@@ -1472,6 +1477,7 @@ def test_frame_pump_is_bounded_and_pause_keeps_buffered_frames():
     source._frame_pump_done = False
     source._frame_pump_error = ""
     source._frame_pump_position = 12.0
+    source._source_frame_index = 0
     source._frame_pump_thread = None
     source._decode_lock = threading.RLock()
     source._read_video_frame = lambda: object()

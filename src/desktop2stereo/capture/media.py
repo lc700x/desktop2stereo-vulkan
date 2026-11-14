@@ -646,6 +646,8 @@ class MediaCaptureSource:
         self._mounted_iso_path = None
         self._owns_iso_mount = False
         self._media_generation = 0
+        self._source_frame_index = 0
+        self._current_source_frame_identity = None
         self._session_id = str(getattr(config, "media_session_id", "") or "")
         self._video_process = None
         self._opencv_capture = None
@@ -714,6 +716,10 @@ class MediaCaptureSource:
         """Monotonic identity for seek/reopen invalidation across workers."""
         return int(getattr(self, "_media_generation", 0) or 0)
 
+    @property
+    def current_source_frame_identity(self):
+        return getattr(self, "_current_source_frame_identity", None)
+
     def _open(self) -> None:
         if not self.path:
             raise ValueError("Select a media file before starting the runtime")
@@ -731,6 +737,12 @@ class MediaCaptureSource:
             self.position = 0.0
             self._position_anchor = 0.0
             self.playing = False
+            self._source_frame_index = 0
+            self._current_source_frame_identity = (
+                self.media_generation,
+                0,
+                0.0,
+            )
             self._ready = True
             return
         if self.mode != "video":
@@ -778,6 +790,8 @@ class MediaCaptureSource:
         self._position_anchor = self.position
         self.playing = True
         self._position_anchor_time = None
+        self._source_frame_index = 0
+        self._current_source_frame_identity = None
         self._start_video(self.position, realtime=True)
         if self._has_audio:
             self._start_audio(self.position)
@@ -1149,6 +1163,7 @@ class MediaCaptureSource:
             self._frame_pump_done = False
             self._frame_pump_error = ""
             self._frame_pump_position = max(0.0, float(position))
+            self._current_source_frame_identity = None
             self._frame_buffer_condition.notify_all()
 
     def _start_frame_pump(self) -> None:
@@ -1210,8 +1225,13 @@ class MediaCaptureSource:
                     break
                 with self._frame_buffer_condition:
                     self._frame_buffer.append(
-                        (self._frame_pump_position, frame)
+                        (
+                            self._frame_pump_position,
+                            frame,
+                            int(self._source_frame_index),
+                        )
                     )
+                    self._source_frame_index += 1
                     self._frame_pump_position += self._frame_duration()
                     self._frame_buffer_condition.notify_all()
         except Exception as exc:
@@ -1230,9 +1250,9 @@ class MediaCaptureSource:
         with self._frame_buffer_condition:
             while True:
                 if self._frame_buffer and allow_first:
-                    _, frame = self._frame_buffer.popleft()
+                    item = self._frame_buffer.popleft()
                     self._frame_buffer_condition.notify_all()
-                    return frame
+                    return item
                 tolerance = self._frame_duration() * 0.5
                 while (
                     len(self._frame_buffer) > 1
@@ -1243,9 +1263,9 @@ class MediaCaptureSource:
                     self._frame_buffer
                     and self._frame_buffer[0][0] <= target_position + tolerance
                 ):
-                    _, frame = self._frame_buffer.popleft()
+                    item = self._frame_buffer.popleft()
                     self._frame_buffer_condition.notify_all()
-                    return frame
+                    return item
                 if self._frame_pump_done or time.monotonic() >= deadline:
                     return None
                 self._frame_buffer_condition.wait(timeout=0.005)
@@ -1289,6 +1309,8 @@ class MediaCaptureSource:
         if has_frame_buffer:
             self._stop_frame_pump()
             self._reset_frame_buffer(position)
+        self._source_frame_index = 0
+        self._current_source_frame_identity = None
         self._terminate(self._video_process)
         self._video_process = None
         self._close_audio()
@@ -1317,6 +1339,8 @@ class MediaCaptureSource:
 
     def _reset_media_for_open(self, path: str, mode: str, position: float) -> None:
         self._media_generation = self.media_generation + 1
+        self._source_frame_index = 0
+        self._current_source_frame_identity = None
         self.path = path
         self.mode = mode
         self._image = mode == "image"
@@ -1922,6 +1946,7 @@ class MediaCaptureSource:
             self._publish_state()
             return None, (self.width, self.height)
         if getattr(self, "_browser_mode", False):
+            self._current_source_frame_identity = None
             now = time.monotonic()
             if self._frame is None or now - self._last_browser_frame_at >= 0.2:
                 width, height = _browser_output_size(
@@ -1949,18 +1974,32 @@ class MediaCaptureSource:
                 frame = self._read_video_frame()
                 if frame is None:
                     frame = self._finish_video_stream()
+                else:
+                    source_index = int(getattr(self, "_source_frame_index", 0))
+                    self._source_frame_index = source_index + 1
+                    self._current_source_frame_identity = (
+                        self.media_generation,
+                        source_index,
+                        float(self._current_position()),
+                    )
             else:
                 if self._frame_pump_thread is None or not self._frame_pump_thread.is_alive():
                     self._start_frame_pump()
                 first_frame = self._position_anchor_time is None
-                frame = self._take_buffered_frame(
+                item = self._take_buffered_frame(
                     self._current_position(),
                     allow_first=first_frame,
                 )
-                if frame is not None:
+                if item is not None:
+                    source_pts, frame, source_index = item
                     if first_frame:
                         self._position_anchor = self._current_position()
                         self._position_anchor_time = time.monotonic()
+                    self._current_source_frame_identity = (
+                        self.media_generation,
+                        int(source_index),
+                        float(source_pts),
+                    )
                     self._displayed_frame = frame
                     self._frame = frame
                 else:

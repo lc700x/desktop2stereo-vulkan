@@ -13,6 +13,7 @@ from typing import Callable
 
 from capture.types import CapturedFrame, compatibility_frame
 
+from .cadence_governor import StableCadenceGovernor
 from .render_size import RenderSizeConfig, resolve_render_size, runtime_output_size_text
 from .settings_snapshot import (
     RuntimeSettingsPipelineRebuildRequired,
@@ -791,6 +792,9 @@ def _attach_capture_debug(
             depth_finite=int(depth_finite),
             depth_nonfinite_count=int(timing.get("depth_nonfinite_count", 0)),
             depth_reused_cursor_only=int(bool(depth_reused_cursor_only)),
+            media_generation=metadata.get("media_generation"),
+            source_frame_index=metadata.get("source_frame_index"),
+            source_pts=metadata.get("source_pts"),
         )
 
 
@@ -1358,7 +1362,9 @@ class RuntimePipelineLoop:
         self._media_depth_profile = None
         self._media_depth_source_frame_id = None
         self._media_depth_cache_key = None
+        self._media_depth_identity = None
         self._media_depth_cached_at = 0.0
+        self._media_depth_cache_reason = "no_cache"
         self._media_depth_reuse_logged = False
         self._prepared = False
         self._consecutive_runtime_errors = 0
@@ -1367,6 +1373,18 @@ class RuntimePipelineLoop:
         self._dual_pending_cooldown_until = 0.0
         self._parallel_depth_scheduler = None
         self._parallel_mps_serial_notice_emitted = False
+        self._cadence_governor = None
+        if _env_flag("D2S_CADENCE_GOVERNOR_OBSERVE"):
+            try:
+                cadence_target_hz = int(
+                    os.environ.get("D2S_CADENCE_TARGET_HZ", "72") or 72
+                )
+            except (TypeError, ValueError):
+                cadence_target_hz = 72
+            self._cadence_governor = StableCadenceGovernor(
+                cadence_target_hz,
+                observe_only=True,
+            )
         self._parallel_backoff_until = 0.0
         self._parallel_recovery_after = 0.0
         self._presenter_backpressure_active = False
@@ -1385,7 +1403,9 @@ class RuntimePipelineLoop:
         self._media_depth_profile = None
         self._media_depth_source_frame_id = None
         self._media_depth_cache_key = None
+        self._media_depth_identity = None
         self._media_depth_cached_at = 0.0
+        self._media_depth_cache_reason = "no_cache"
 
     @staticmethod
     def _is_video_media_frame(captured_frame: CapturedFrame | None) -> bool:
@@ -1393,6 +1413,28 @@ class RuntimePipelineLoop:
             captured_frame is not None
             and str(captured_frame.capture_mode or "").casefold() == "video"
         )
+
+    @classmethod
+    def _exact_video_frame_identity(cls, captured_frame: CapturedFrame | None):
+        if not cls._is_video_media_frame(captured_frame):
+            return None
+        metadata = (
+            captured_frame.metadata if isinstance(captured_frame.metadata, dict) else {}
+        )
+        generation = metadata.get("media_generation")
+        frame_index = metadata.get("source_frame_index")
+        source_pts = metadata.get("source_pts")
+        if generation is None or frame_index is None or source_pts is None:
+            return None
+        try:
+            generation = int(generation)
+            frame_index = int(frame_index)
+            source_pts = float(source_pts)
+        except (TypeError, ValueError):
+            return None
+        if generation < 0 or frame_index < 0 or not math.isfinite(source_pts):
+            return None
+        return (generation, frame_index, round(source_pts, 6))
 
     @staticmethod
     def _media_depth_reuse_max_age_s() -> float:
@@ -1412,22 +1454,34 @@ class RuntimePipelineLoop:
         render_size: tuple[int, int],
         source_target_key,
     ):
-        if (
-            not self._is_video_media_frame(captured_frame)
-            or self._media_depth_profile is None
-            or self._media_depth_cache_key is None
-        ):
+        identity = self._exact_video_frame_identity(captured_frame)
+        if identity is None:
+            self._clear_media_depth_cache()
+            self._media_depth_cache_reason = "missing_identity"
+            return None
+        if self._media_depth_profile is None or self._media_depth_cache_key is None:
+            self._media_depth_cache_reason = "no_cached_profile"
+            return None
+        if identity != self._media_depth_identity:
+            self._clear_media_depth_cache()
+            self._media_depth_cache_reason = "identity_mismatch"
             return None
         age_s = time.perf_counter() - float(self._media_depth_cached_at or 0.0)
         if age_s < 0.0 or age_s > self._media_depth_reuse_max_age_s():
             self._clear_media_depth_cache()
+            self._media_depth_cache_reason = "age_expired"
             return None
-        key = self._build_cursor_depth_cache_key(
-            ctx, captured_frame, frame_rgb, render_size, source_target_key
+        key = (
+            self._build_cursor_depth_cache_key(
+                ctx, captured_frame, frame_rgb, render_size, source_target_key
+            ),
+            identity,
         )
         if key != self._media_depth_cache_key:
             self._clear_media_depth_cache()
+            self._media_depth_cache_reason = "context_or_settings_mismatch"
             return None
+        self._media_depth_cache_reason = "exact_match"
         return (
             self._media_depth_profile,
             self._media_depth_source_frame_id,
@@ -1450,6 +1504,10 @@ class RuntimePipelineLoop:
             return
         if reused:
             return
+        identity = self._exact_video_frame_identity(captured_frame)
+        if identity is None:
+            self._clear_media_depth_cache()
+            return
         profile = getattr(runtime_result, "depth_profile", None)
         if profile is None:
             self._clear_media_depth_cache()
@@ -1463,10 +1521,15 @@ class RuntimePipelineLoop:
             source_frame_id = None
         self._media_depth_profile = profile
         self._media_depth_source_frame_id = source_frame_id
-        self._media_depth_cache_key = self._build_cursor_depth_cache_key(
-            ctx, captured_frame, frame_rgb, render_size, source_target_key
+        self._media_depth_identity = identity
+        self._media_depth_cache_key = (
+            self._build_cursor_depth_cache_key(
+                ctx, captured_frame, frame_rgb, render_size, source_target_key
+            ),
+            identity,
         )
         self._media_depth_cached_at = time.perf_counter()
+        self._media_depth_cache_reason = "cached_exact_frame"
 
     @staticmethod
     def _build_cursor_depth_cache_key(
@@ -2721,6 +2784,37 @@ class RuntimePipelineLoop:
                     depth_backend=depth_backend,
                 )
                 debug_info = getattr(runtime_result, "debug_info", None)
+                if isinstance(debug_info, dict) and self._cadence_governor is not None:
+                    pending_depth = (
+                        len(self._parallel_depth_scheduler.pending)
+                        if self._parallel_depth_scheduler is not None
+                        else 0
+                    )
+                    dropped_depth = (
+                        int(self._parallel_depth_scheduler.dropped)
+                        if self._parallel_depth_scheduler is not None
+                        else 0
+                    )
+                    cadence_decision = self._cadence_governor.observe(
+                        (time.perf_counter() - loop_start_time) * 1000.0,
+                        queue_depth=pending_depth,
+                        depth_age_ms=float(
+                            debug_info.get("capture_to_runtime_ready_ms", 0.0) or 0.0
+                        ),
+                        dropped_frames=dropped_depth,
+                    )
+                    debug_info["stable_cadence_active_hz"] = int(
+                        cadence_decision.active_hz
+                    )
+                    debug_info["stable_cadence_proposed_hz"] = int(
+                        cadence_decision.proposed_hz
+                    )
+                    debug_info["stable_cadence_reason"] = cadence_decision.reason
+                    debug_info["stable_cadence_changed"] = int(
+                        cadence_decision.changed
+                    )
+                    debug_info["stable_cadence_depth_queue"] = int(pending_depth)
+                    debug_info["stable_cadence_dropped"] = int(dropped_depth)
                 if isinstance(debug_info, dict):
                     debug_info["parallel_inference_enabled"] = int(
                         _runtime_pending_depth_limit(ctx) > 1
@@ -2733,6 +2827,9 @@ class RuntimePipelineLoop:
                     )
                     debug_info["media_depth_reused"] = int(media_depth_reused)
                     debug_info["media_depth_age_ms"] = float(media_depth_age_ms)
+                    debug_info["media_depth_cache_reason"] = str(
+                        self._media_depth_cache_reason
+                    )
                     if self._parallel_depth_scheduler is not None:
                         debug_info["parallel_inference_effective_workers"] = int(
                             self._parallel_depth_scheduler.effective_limit
