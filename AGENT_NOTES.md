@@ -700,3 +700,36 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   complete `tests/test_pipeline.py` file passes `208 passed`.
 - Do not commit `src/desktop2stereo/settings.yaml`; it contains user-local media
   path, resume position, display identity, and playback state.
+
+## 4K120 HDR media deterministic decimation and refresh-rate matching (2026-11-15)
+
+- Do not wall-clock-skip arbitrary 2/3/4/5 source frames for heavy 4K120
+  media. File playback now selects a deterministic 3:1 source cadence
+  (`0,3,6,9...`) at the decoder frame-pump boundary when source is >=90 fps and
+  the source pixel count is at least `3840x1600`. Default target is 40 fps;
+  `D2S_MEDIA_DECIMATION_TARGET_FPS` can override it and `<=0` disables this
+  cadence cap.
+- Decimated source frames are consumed in strict FIFO order and paced by source
+  PTS plus a minimum playback period. Do not bypass the wall clock entirely:
+  doing that fills `raw_q` faster than runtime consumption and causes overwrite
+  jumps/fast-forward behavior. Do not re-drop queued decimated frames by wall
+  clock either.
+- Audio remains 1.0x real time. This mode does not slow playback and does not
+  reuse stale depth. The visual update rate follows the actual depth+SBS
+  throughput, while source time advances naturally.
+- For high-frame-rate media, request `XR_FB_display_refresh_rate` 120 Hz when
+  the runtime enumerates it. On Quest 2 this lets the actual ~40 fps output land
+  every third 120 Hz tick. Runtimes that do not expose 120 Hz fall back
+  unsupported; the simulator currently exposes no refresh-rate extension.
+- Simulator verification on
+  `F:\Videos\【顶级画质】B站首支4K 120FPS HDR10影片《文字大战》\P1-【4K 120FPS HDR10】文字大战.mp4`
+  showed `media_decode_fps≈40`, actual SBS `≈38 fps`, and committed source
+  deltas overwhelmingly exactly `3`; steady state had no dynamic 6/12/24-frame
+  jumps. Two startup queue overflows remain during initial priming.
+- LSFG is not installed on this host and is an external final-window capture
+  tool; it cannot directly interpolate OpenXR per-eye swapchains. If frame
+  generation is added later, interpolate final per-eye/SBS color frames, not
+  depth alone. Interpolated depth without corresponding color/occlusion data is
+  not considered safe.
+- Focused ROCm and CUDA media/OpenXR/output tests after this change:
+  `520 passed, 2 skipped` in each environment.

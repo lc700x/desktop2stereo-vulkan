@@ -5907,6 +5907,24 @@ def test_presenter_does_not_replace_uncommitted_media_pending_frame() -> None:
     assert list(presenter._media_output_queue) == [queued]
 
 
+def test_presenter_requests_120hz_for_120fps_media_when_supported() -> None:
+    requested = []
+    presenter = OpenXrVulkanPresenter()
+    presenter.session = object()
+    presenter.xr = SimpleNamespace(
+        enumerate_display_refresh_rates_fb=lambda _session: (72.0, 90.0, 120.0),
+        get_display_refresh_rate_fb=lambda _session: 90.0,
+        request_display_refresh_rate_fb=lambda _session, rate: requested.append(rate),
+    )
+    presenter._display_refresh_rate_supported = True
+
+    presenter._request_media_display_refresh_rate(1.0 / 120.0)
+
+    assert requested == [120.0]
+    assert presenter._display_refresh_rate_requested == 120.0
+    assert presenter._display_refresh_rate_actual == 90.0
+
+
 def test_presenter_uses_3_4_tick_pulldown_for_24fps_on_90hz(monkeypatch) -> None:
     now = [0.0]
     monkeypatch.setattr(

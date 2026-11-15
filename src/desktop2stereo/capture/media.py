@@ -154,6 +154,30 @@ def _media_gpu_vendor() -> str:
     return "unknown"
 
 
+def _resolve_media_playback_cadence(
+    source_fps: float,
+    width: int,
+    height: int,
+    requested_fps: float,
+) -> tuple[float, int]:
+    """Choose deterministic source decimation for sustained 4K playback."""
+    source_fps = max(1.0, float(source_fps or 0.0))
+    requested = max(1.0, float(requested_fps or source_fps))
+    playback_fps = min(source_fps, requested)
+    pixels = max(0, int(width)) * max(0, int(height))
+    try:
+        target = float(
+            os.environ.get("D2S_MEDIA_DECIMATION_TARGET_FPS", "40") or 40.0
+        )
+    except (TypeError, ValueError):
+        target = 40.0
+    if source_fps < 90.0 or pixels < 3840 * 1600 or target <= 0.0:
+        return playback_fps, 1
+    capped_fps = min(playback_fps, target)
+    step = max(1, int(round(source_fps / max(1.0, capped_fps))))
+    return source_fps / float(step), step
+
+
 def _resolve_media_mode(path: str, configured_mode: str) -> str:
     mode = str(configured_mode or "").strip().casefold()
     if mode in {"video", "image"}:
@@ -717,6 +741,8 @@ class MediaCaptureSource:
         self._frame_pump_read_ms = deque(maxlen=120)
         self._frame_pump_frame_times = deque(maxlen=120)
         self._last_source_frame_duration = 0.0
+        self._frame_pump_decimation_step = 1
+        self._last_decimated_emit_at = 0.0
         self._frame_buffer_stale_drops = 0
         self._frame_buffer_drop_log_at = 0.0
         self._decode_lock = threading.RLock()
@@ -877,11 +903,24 @@ class MediaCaptureSource:
         self.primaries = info["primaries"]
         self.hdr = self.transfer in _HDR_TRANSFERS
         self._source_fps = float(info["fps"] or 0.0)
-        self._playback_fps = (
-            min(self._source_fps, float(self.config.fps))
+        self._playback_fps, self._frame_pump_decimation_step = (
+            _resolve_media_playback_cadence(
+                self._source_fps,
+                int(self.width),
+                int(self.height),
+                float(self.config.fps),
+            )
             if self._source_fps > 0
-            else max(1.0, float(self.config.fps))
+            else (max(1.0, float(self.config.fps)), 1)
         )
+        if self._frame_pump_decimation_step > 1:
+            print(
+                "[media] deterministic source decimation active: "
+                f"source={self._source_fps:.2f}fps "
+                f"playback={self._playback_fps:.2f}fps "
+                f"step={self._frame_pump_decimation_step}",
+                flush=True,
+            )
         self._has_audio = info["audio"] and self._audio_enabled
         self.position = min(self.position, max(0.0, self.duration - 0.05))
         self._position_anchor = self.position
@@ -1287,6 +1326,7 @@ class MediaCaptureSource:
     def _frame_duration(self) -> float:
         return 1.0 / max(1.0, float(getattr(self, "_playback_fps", 1.0) or 1.0))
 
+
     def _source_frame_duration(self) -> float:
         """Return the period of frames actually emitted by the decoder.
 
@@ -1384,6 +1424,7 @@ class MediaCaptureSource:
             self._native_frame_duration = 0.0
             self._last_source_frame_duration = 0.0
             self._current_source_frame_identity = None
+            self._last_decimated_emit_at = 0.0
             if hasattr(self, "_frame_pump_metrics_lock"):
                 with self._frame_pump_metrics_lock:
                     self._frame_pump_read_ms.clear()
@@ -1445,10 +1486,15 @@ class MediaCaptureSource:
                     frame = self._read_video_frame()
                     read_ms = max(0.0, (time.perf_counter() - read_started_at) * 1000.0)
                 now = time.perf_counter()
+                source_index = int(self._source_frame_index)
+                decimation_step = max(
+                    1, int(getattr(self, "_frame_pump_decimation_step", 1) or 1)
+                )
+                emit_frame = frame is not None and source_index % decimation_step == 0
                 metrics_lock, read_values, frame_times = self._ensure_frame_pump_metrics()
                 with metrics_lock:
                     read_values.append(read_ms)
-                    if frame is not None:
+                    if emit_frame:
                         frame_times.append(now)
                 if frame is None:
                     with self._frame_buffer_condition:
@@ -1467,16 +1513,17 @@ class MediaCaptureSource:
                         self._native_frame_pts = None
                         self._native_frame_duration = 0.0
                     self._last_source_frame_duration = max(
-                        0.0, float(frame_duration)
+                        0.0, float(frame_duration) * decimation_step
                     )
-                    self._frame_buffer.append(
-                        (
-                            source_pts,
-                            frame,
-                            int(self._source_frame_index),
+                    if emit_frame:
+                        self._frame_buffer.append(
+                            (
+                                source_pts,
+                                frame,
+                                source_index,
+                            )
                         )
-                    )
-                    self._source_frame_index += 1
+                    self._source_frame_index = source_index + 1
                     self._frame_pump_position = source_pts + frame_duration
                     self._frame_buffer_condition.notify_all()
         except Exception as exc:
@@ -1506,8 +1553,35 @@ class MediaCaptureSource:
             while True:
                 if self._frame_buffer and allow_first:
                     item = self._frame_buffer.popleft()
+                    if int(getattr(self, "_frame_pump_decimation_step", 1) or 1) > 1:
+                        self._last_decimated_emit_at = time.perf_counter()
                     self._frame_buffer_condition.notify_all()
                     return item
+
+                if int(getattr(self, "_frame_pump_decimation_step", 1) or 1) > 1:
+                    playback_period = self._frame_duration()
+                    now = time.perf_counter()
+                    pace_ready = (
+                        self._last_decimated_emit_at <= 0.0
+                        or now - self._last_decimated_emit_at
+                        >= playback_period - min(0.001, playback_period * 0.05)
+                    )
+                    if self._frame_buffer and pace_ready:
+                        candidate_pts = float(self._frame_buffer[0][0])
+                        if candidate_pts <= target_position + tolerance:
+                            item = self._frame_buffer.popleft()
+                            self._last_decimated_emit_at = now
+                            self._frame_buffer_condition.notify_all()
+                            return item
+                    if self._frame_pump_done and not self._frame_buffer:
+                        return None
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0.0:
+                        return None
+                    self._frame_buffer_condition.wait(
+                        timeout=min(0.005, remaining)
+                    )
+                    continue
 
                 if preserve_source_order:
                     dropped_stale = 0

@@ -21,6 +21,7 @@ from capture.media import (
     _preferred_audio_output_device,
     _probe_media,
     _resolve_amf_output_size,
+    _resolve_media_playback_cadence,
     _video_filter,
     _video_pixel_format,
 )
@@ -1669,6 +1670,64 @@ def test_buffered_playback_bounds_large_exact_cadence_lag() -> None:
     assert item[2] == 4
     assert source._frame_buffer_stale_drops == 4
     assert [entry[2] for entry in source._frame_buffer] == [5, 6, 7]
+
+
+def test_4k120_uses_deterministic_40fps_decimation(monkeypatch):
+    monkeypatch.delenv("D2S_MEDIA_DECIMATION_TARGET_FPS", raising=False)
+
+    assert _resolve_media_playback_cadence(120.0, 3840, 1920, 120.0) == (
+        40.0,
+        3,
+    )
+
+
+def test_frame_pump_emits_every_third_4k120_source_frame(monkeypatch):
+    monkeypatch.delenv("D2S_MEDIA_DECIMATION_TARGET_FPS", raising=False)
+    source = object.__new__(MediaCaptureSource)
+    source._image = False
+    source._ready = True
+    source.playing = True
+    source._playback_fps, source._frame_pump_decimation_step = (
+        _resolve_media_playback_cadence(120.0, 3840, 1920, 120.0)
+    )
+    source._frame_buffer_capacity = 8
+    source._frame_buffer = deque()
+    source._frame_buffer_condition = threading.Condition()
+    source._frame_pump_stop = threading.Event()
+    source._frame_pump_done = False
+    source._frame_pump_error = ""
+    source._frame_pump_position = 0.0
+    source._source_frame_index = 0
+    source._frame_pump_thread = None
+    source._decode_lock = threading.RLock()
+    source._frame_pump_read_ms = deque(maxlen=120)
+    source._frame_pump_frame_times = deque(maxlen=120)
+    source._frame_pump_metrics_lock = threading.Lock()
+    next_source_index = [0]
+
+    def read_frame():
+        index = next_source_index[0]
+        next_source_index[0] += 1
+        source._native_frame_pts = index / 120.0
+        source._native_frame_duration = 1.0 / 120.0
+        return f"frame-{index}"
+
+    source._read_video_frame = read_frame
+    source._start_frame_pump()
+    try:
+        deadline = time.monotonic() + 1.0
+        while len(source._frame_buffer) < 6 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert [item[2] for item in list(source._frame_buffer)[:6]] == [
+            0,
+            3,
+            6,
+            9,
+            12,
+            15,
+        ]
+    finally:
+        source._stop_frame_pump()
 
 
 def test_frame_pump_is_bounded_and_pause_keeps_buffered_frames():

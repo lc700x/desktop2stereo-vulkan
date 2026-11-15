@@ -806,6 +806,10 @@ class OpenXrVulkanPresenter(
         self._panorama_layer: Any = None
         self._openxr_equirect_supported = False
         self._openxr_cylinder_supported = False
+        self._display_refresh_rate_supported = False
+        self._display_refresh_rate_requested = 0.0
+        self._display_refresh_rate_actual = 0.0
+        self._display_refresh_rate_error = ""
         self._panorama_skip_logged = False
         self._panorama_failed = False
         self._vulkan_panorama_image = None
@@ -1775,6 +1779,9 @@ class OpenXrVulkanPresenter(
         optional_cylinder = getattr(
             xr, "KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME", None
         )
+        optional_refresh_rate = getattr(
+            xr, "FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME", None
+        )
         enabled_extensions = [self._VULKAN_EXTENSION]
         if optional_equirect and optional_equirect in available_extensions:
             enabled_extensions.append(optional_equirect)
@@ -1788,6 +1795,20 @@ class OpenXrVulkanPresenter(
         )
         if self._openxr_cylinder_supported:
             enabled_extensions.append(optional_cylinder)
+        self._display_refresh_rate_supported = bool(
+            optional_refresh_rate
+            and optional_refresh_rate in available_extensions
+            and hasattr(xr, "enumerate_display_refresh_rates_fb")
+            and hasattr(xr, "request_display_refresh_rate_fb")
+        )
+        if self._display_refresh_rate_supported:
+            enabled_extensions.append(optional_refresh_rate)
+        print(
+            "[OpenXRViewer] Display refresh-rate capability: "
+            f"extension={bool(optional_refresh_rate and optional_refresh_rate in available_extensions)} "
+            f"active={self._display_refresh_rate_supported}",
+            flush=True,
+        )
         print(
             "[OpenXRViewer] Equirect background capability: "
             f"extension={bool(optional_equirect and optional_equirect in available_extensions)} "
@@ -8547,6 +8568,68 @@ class OpenXrVulkanPresenter(
             return None
         return generation, frame_index, source_pts
 
+    def _request_media_display_refresh_rate(self, source_period_s: float) -> None:
+        """Match high-rate media to a supported headset refresh mode."""
+        if (
+            not self._display_refresh_rate_supported
+            or self.session is None
+            or source_period_s <= 0.0
+        ):
+            return
+        source_fps = 1.0 / source_period_s
+        if source_fps < 100.0:
+            return
+        xr = self.xr
+        try:
+            rates = tuple(
+                float(rate)
+                for rate in xr.enumerate_display_refresh_rates_fb(self.session)
+                if float(rate) > 0.0
+            )
+        except Exception as exc:
+            if not self._display_refresh_rate_error:
+                self._display_refresh_rate_error = (
+                    f"enumerate: {type(exc).__name__}: {exc}"
+                )
+                print(
+                    "[OpenXRViewer] Display refresh-rate enumeration failed: "
+                    f"{self._display_refresh_rate_error}",
+                    flush=True,
+                )
+            return
+        if not rates:
+            return
+        desired = 120.0 if any(abs(rate - 120.0) < 0.01 for rate in rates) else max(
+            rate for rate in rates if rate <= 120.0
+        )
+        if abs(self._display_refresh_rate_requested - desired) < 0.01:
+            return
+        try:
+            previous = float(xr.get_display_refresh_rate_fb(self.session))
+        except Exception:
+            previous = 0.0
+        try:
+            xr.request_display_refresh_rate_fb(self.session, desired)
+            actual = float(xr.get_display_refresh_rate_fb(self.session))
+        except Exception as exc:
+            self._display_refresh_rate_requested = desired
+            self._display_refresh_rate_error = f"request: {type(exc).__name__}: {exc}"
+            print(
+                "[OpenXRViewer] Display refresh-rate request failed; "
+                f"requested={desired:.1f} error={self._display_refresh_rate_error}",
+                flush=True,
+            )
+            return
+        self._display_refresh_rate_requested = desired
+        self._display_refresh_rate_actual = actual
+        self._display_refresh_rate_error = ""
+        print(
+            "[OpenXRViewer] Media display refresh rate: "
+            f"source={source_fps:.2f}fps previous={previous:.1f} "
+            f"requested={desired:.1f} actual={actual:.1f} supported={rates}",
+            flush=True,
+        )
+
     def _accept_output_source_order(self, frame: VulkanStereoOutputFrame) -> bool:
         """Discard duplicate or out-of-order media results before presentation."""
         identity = self._output_source_identity(frame)
@@ -8569,6 +8652,7 @@ class OpenXrVulkanPresenter(
                 period = pts_delta / float(index_delta)
                 if 0.001 <= period <= 1.0:
                     self._media_source_period_s = period
+                    self._request_media_display_refresh_rate(period)
             self._last_output_source_identity = identity
             return True
         kind = "duplicate" if frame_index == previous_index else "regression"
