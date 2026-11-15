@@ -613,3 +613,33 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   `{"action":"browse_select","value":{"path":"F:\\Videos\\d2s lossless scailing"}}`,
   updated `browser_selection`, and rendered the blue selected-row state. Full
   suite: `2817 passed, 70 skipped`.
+
+## Media browser spacing, playlist handoff, and audio (2026-11-15)
+
+- Local Viewer and OpenXR use the same `1600x1200` media browser texture and the
+  same painting/hit-test geometry. Do not fork the browser layout in either
+  presenter. The Local Viewer browser is verified in the real Vulkan
+  Half-SBS window, including single-click row selection, Open navigation, and
+  the large left/right-eye presentation.
+- Browser footer actions use a `48 px` content inset and `24 px` group gap in
+  texture coordinates. This keeps Previous / Next / Clear aligned with the
+  sidebar content inset and prevents the group from hugging the lower-left
+  corner after scaling into each eye.
+- Playlist auto-advance must return the next decoded frame, not the recursive
+  `grab()` result. `_finish_video_stream()` previously returned
+  `(frame, size)`, which became a tuple `frame_raw` and crashed preprocessing
+  with `TypeError: frame_raw must be a torch.Tensor or numpy.ndarray`. The
+  regression is covered by `tests/test_capture_media.py`.
+- Windows media audio prefers the WASAPI default output device. MME can open
+  successfully but later fail writes with `PortAudioError` and "no driver
+  installed"; use `D2S_MEDIA_AUDIO_DEVICE` only as an explicit override, and
+  always fall back to the system default if the preferred device cannot open.
+  Runtime audio write failures must set `audio_error`, stop/close the audio
+  stream and FFmpeg audio process, and never escape as an unhandled thread
+  exception.
+- Verification (2026-11-15): full suite `2821 passed, 70 skipped`; a live Local
+  Viewer run played media for 20 seconds with no `audio_error`, opened the
+  shared browser, selected a row, and navigated a directory through the
+  in-output Open action. Screenshots:
+  `.scratch/media-client-test-20261115/viewer-footer-spacing-verified.png` and
+  `.scratch/media-client-test-20261115/browser-footer-spacing-final-preview.png`.

@@ -147,6 +147,22 @@ def test_browser_texture_and_playlist_hit_targets():
     ) == ("browse_open", "C:/Videos/movie.mp4")
 
 
+def test_browser_footer_actions_use_content_inset_and_stable_group_gap():
+    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    rects = _browser_button_rects(width, height)
+    previous = rects["playlist_previous"]
+    next_button = rects["playlist_next"]
+    clear = rects["playlist_clear"]
+    open_button = rects["browse_open"]
+
+    assert previous[0] == 48
+    assert height - max(previous[3], next_button[3], clear[3]) == 48
+    assert next_button[0] - previous[2] == 24
+    assert clear[0] - next_button[2] == 24
+    assert open_button[2] == width - 48
+    assert open_button[3] == height - 48
+
+
 def test_browser_mounts_and_row_bounds_are_clickable_only_inside_geometry():
     state = {
         **_state(),

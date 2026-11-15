@@ -282,45 +282,61 @@ def _browser_button_rects(
     width: int, height: int
 ) -> dict[str, tuple[int, int, int, int]]:
     """Return MetaXR-sized browser actions with at least 48 px targets."""
-    margin = max(24, int(width * 0.018))
-    gap = max(10, int(width * 0.008))
+    top_margin = max(24, int(width * 0.018))
+    footer_margin = max(48, int(width * 0.030))
+    top_gap = max(10, int(width * 0.008))
+    footer_gap = max(24, int(width * 0.015))
     button_w = 112
+    footer_button_w = 112
     button_h = 56
-    footer_y = height - margin - button_h
-    refresh_x = width - margin - button_w
-    up_x = refresh_x - gap - button_w
-    close_x = up_x - gap - button_w
+    footer_y = height - footer_margin - button_h
+    refresh_x = width - top_margin - button_w
+    up_x = refresh_x - top_gap - button_w
+    close_x = up_x - top_gap - button_w
+    previous_x = footer_margin
+    next_x = previous_x + footer_button_w + footer_gap
+    clear_x = next_x + footer_button_w + footer_gap
     return {
-        "browser_close": (close_x, margin, close_x + button_w, margin + button_h),
-        "browser_up": (up_x, margin, up_x + button_w, margin + button_h),
+        "browser_close": (
+            close_x,
+            top_margin,
+            close_x + button_w,
+            top_margin + button_h,
+        ),
+        "browser_up": (
+            up_x,
+            top_margin,
+            up_x + button_w,
+            top_margin + button_h,
+        ),
         "browser_refresh": (
             refresh_x,
-            margin,
+            top_margin,
             refresh_x + button_w,
-            margin + button_h,
+            top_margin + button_h,
         ),
         "browse_open": (
-            width - margin - 176,
+            width - footer_margin - 176,
             footer_y,
-            width - margin,
+            width - footer_margin,
             footer_y + button_h,
         ),
         "playlist_previous": (
-            margin,
+            previous_x,
             footer_y,
-            margin + 104,
+            previous_x + footer_button_w,
             footer_y + button_h,
         ),
         "playlist_next": (
-            margin + 116,
+            next_x,
             footer_y,
-            margin + 220,
+            next_x + footer_button_w,
             footer_y + button_h,
         ),
         "playlist_clear": (
-            margin + 232,
+            clear_x,
             footer_y,
-            margin + 336,
+            clear_x + footer_button_w,
             footer_y + button_h,
         ),
     }

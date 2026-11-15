@@ -83,6 +83,33 @@ def _is_software_decoder_unavailable(exc: Exception) -> bool:
     )
 
 
+def _preferred_audio_output_device(sounddevice_module) -> int | None:
+    """Prefer WASAPI on Windows; MME can report no driver during playback writes."""
+    override = os.environ.get("D2S_MEDIA_AUDIO_DEVICE", "").strip()
+    if override:
+        try:
+            device = int(override)
+        except ValueError:
+            return None
+        return device if device >= 0 else None
+    if os.name != "nt":
+        return None
+    try:
+        hostapis = sounddevice_module.query_hostapis()
+    except Exception:
+        return None
+    for hostapi in hostapis:
+        name = str(hostapi.get("name") or "").casefold()
+        if "wasapi" not in name:
+            continue
+        try:
+            device = int(hostapi.get("default_output_device", -1))
+        except (TypeError, ValueError):
+            return None
+        return device if device >= 0 else None
+    return None
+
+
 def _is_amf_vpp_unavailable(message: str) -> bool:
     text = str(message).casefold()
     return "vpp_amf" in text and any(
@@ -1156,9 +1183,22 @@ class MediaCaptureSource:
                 stderr=subprocess.DEVNULL,
                 bufsize=0,
             )
-            self._audio_stream = sd.RawOutputStream(
-                samplerate=48000, channels=2, dtype="float32", blocksize=0
-            )
+            stream_kwargs = {
+                "samplerate": 48000,
+                "channels": 2,
+                "dtype": "float32",
+                "blocksize": 0,
+            }
+            preferred_device = _preferred_audio_output_device(sd)
+            if preferred_device is not None:
+                stream_kwargs["device"] = preferred_device
+            try:
+                self._audio_stream = sd.RawOutputStream(**stream_kwargs)
+            except Exception:
+                if preferred_device is None:
+                    raise
+                stream_kwargs.pop("device", None)
+                self._audio_stream = sd.RawOutputStream(**stream_kwargs)
             self._audio_stream.start()
             self._audio_stop.clear()
             self._audio_position_anchor = max(0.0, float(position))
@@ -1184,8 +1224,19 @@ class MediaCaptureSource:
                     samples *= gain
                 if self._audio_stream is not None:
                     self._audio_stream.write(samples)
-        except (OSError, RuntimeError):
-            pass
+        except Exception as exc:
+            self.audio_error = f"{type(exc).__name__}: {exc}"
+            self._audio_stop.set()
+            process, self._audio_process = self._audio_process, None
+            self._terminate(process)
+            stream, self._audio_stream = self._audio_stream, None
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
+            print(f"[media] audio output stopped: {self.audio_error}", flush=True)
 
     @staticmethod
     def _terminate(process) -> None:
@@ -2188,7 +2239,8 @@ class MediaCaptureSource:
             else None
         )
         if next_path and self._open_playlist_path(next_path):
-            return self.grab()
+            next_frame, _next_size = self.grab()
+            return next_frame
         final_position = self._current_position()
         self.playing = False
         self.position = self.duration or final_position

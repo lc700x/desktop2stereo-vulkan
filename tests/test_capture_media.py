@@ -18,6 +18,7 @@ from capture.media import (
     _is_hardware_decode_unavailable,
     _is_software_decoder_unavailable,
     _media_frame_format,
+    _preferred_audio_output_device,
     _probe_media,
     _resolve_amf_output_size,
     _video_filter,
@@ -1059,6 +1060,23 @@ def test_browse_select_keeps_media_and_browse_close_restores_last_frame(tmp_path
     assert frame is source._frame
 
 
+def test_playlist_auto_advance_returns_next_frame_not_grab_tuple():
+    next_frame = object()
+    source = object.__new__(MediaCaptureSource)
+    source._browser = SimpleNamespace(playlist_step=lambda _direction: "next.mp4")
+    source._open_playlist_path = lambda path: path == "next.mp4"
+    source._stop_frame_pump = lambda: None
+    source._close_native_decoder = lambda: None
+    source._close_nvdec = lambda: None
+    source._close_opencv = lambda: None
+    source._close_audio = lambda: None
+    source._video_process = None
+    source._terminate = lambda _process: None
+    source.grab = lambda: (next_frame, (4, 2))
+
+    assert source._finish_video_stream() is next_frame
+
+
 def test_video_eof_returns_last_decoded_frame_to_presenter():
     last_frame = object()
     source = object.__new__(MediaCaptureSource)
@@ -1246,6 +1264,57 @@ def test_openxr_media_command_writer_serializes_session_revision_and_value(tmp_p
         "action": "browse_select",
         "value": {"path": "F:/Videos/movie.mp4"},
     }
+
+
+def test_preferred_audio_output_device_prefers_windows_wasapi(monkeypatch):
+    class SoundDevice:
+        @staticmethod
+        def query_hostapis():
+            return [
+                {"name": "MME", "default_output_device": 13},
+                {"name": "Windows WASAPI", "default_output_device": 40},
+            ]
+
+    monkeypatch.setattr("capture.media.os.name", "nt")
+    monkeypatch.delenv("D2S_MEDIA_AUDIO_DEVICE", raising=False)
+
+    assert _preferred_audio_output_device(SoundDevice) == 40
+
+    monkeypatch.setenv("D2S_MEDIA_AUDIO_DEVICE", "17")
+    assert _preferred_audio_output_device(SoundDevice) == 17
+
+
+def test_audio_loop_records_device_failure_without_thread_exception():
+    class Stream:
+        def write(self, _samples):
+            raise RuntimeError("no audio driver")
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    process = SimpleNamespace(
+        stdout=io.BytesIO(np.zeros(4096, dtype=np.float32).tobytes())
+    )
+    source = object.__new__(MediaCaptureSource)
+    source._audio_stop = threading.Event()
+    source._audio_process = process
+    source._audio_stream = Stream()
+    source.volume = 1.0
+    source.muted = False
+    source.audio_error = ""
+    terminated = []
+    source._terminate = lambda value: terminated.append(value)
+
+    source._audio_loop()
+
+    assert "no audio driver" in source.audio_error
+    assert source._audio_stop.is_set()
+    assert source._audio_process is None
+    assert source._audio_stream is None
+    assert terminated == [process]
 
 
 def test_media_state_publishes_session_and_playback_facts(tmp_path):
