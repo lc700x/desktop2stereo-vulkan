@@ -1870,7 +1870,7 @@ def test_projection_sampling_uses_openxr_screen_footprint_for_quality_size() -> 
     plan = presenter._apply_screen_sampling_policy(frame, [object(), object()])
 
     assert plan is not None
-    assert plan.quality_size == (3000, 1688)
+    assert plan.quality_size == (3008, 1692)
     assert plan.quality_width > 2048
 
 
@@ -1917,6 +1917,11 @@ def test_screen_sampling_log_coalesces_pose_driven_policy_changes(monkeypatch, c
     presenter._apply_screen_sampling_policy(frame)
     assert capsys.readouterr().out == ""
 
+    for index in range(1, 8):
+        now[0] = 101.0 + index * 0.1
+        presenter._apply_screen_sampling_policy(frame)
+    assert capsys.readouterr().out == ""
+
     now[0] = 102.1
     presenter._apply_screen_sampling_policy(frame)
     output = capsys.readouterr().out
@@ -1958,8 +1963,8 @@ def test_direct_projection_uses_easu_only_for_magnification() -> None:
         dtype="<f4",
     )
     assert upscale[0] < 0.0
-    assert upscale[2] == pytest.approx(1200)
-    assert upscale[3] == pytest.approx(1200)
+    assert upscale[2] == pytest.approx(1216)
+    assert upscale[3] == pytest.approx(1216)
 
     presenter._active_screen_sampling_plan = build_projection_screen_sampling_plan(
         1920, 1080, 960, 540

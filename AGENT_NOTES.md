@@ -643,3 +643,25 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   in-output Open action. Screenshots:
   `.scratch/media-client-test-20261115/viewer-footer-spacing-verified.png` and
   `.scratch/media-client-test-20261115/browser-footer-spacing-final-preview.png`.
+
+## OpenXR sampling flicker on Quest 2 over Virtual Desktop (2026-11-15)
+
+- Wireless Quest 2 debug target: `192.168.0.192:5555` (`hollywood`,
+  Android 14 / SDK 34). Virtual Desktop client PID `6121` reports a stable
+  `90/90 FPS`, `Tear=0`, `Stale=0`, and `Stale2/5/10/max=0/0/0/0`, so the
+  observed flicker is not a lost-headset-compositor frame.
+- Root cause: `build_projection_screen_sampling_plan()` used a hard ~1%
+  native-scale threshold. Small head-pose changes moved the projected screen
+  footprint between roughly 1893, 1918, and 1975 px for a 1920 px source,
+  repeatedly toggling `downsample_lanczos_rcas`, `native_mip`, and
+  `upscale_easu`. The presenter applied every new plan immediately, causing
+  visible sharpness/scale pulsing even though XR submission stayed at target.
+- Stabilization: keep a 10% native deadband around source width, quantize
+  non-native quality widths to 64 px, and require a candidate sampling plan to
+  persist for at least 0.60 seconds and 8 frames before applying it. Source
+  resolution changes (playlist/media changes) still switch immediately.
+- Verified on the Quest 2 + Virtual Desktop path with a 75-second OpenXR run:
+  only one sampling plan was applied (`1920x800 native_mip`), media decode was
+  `23.97 FPS`, capture/runtime were `24 FPS`, XR presentation was `71.9 FPS`,
+  `xr_no_fresh=0`, and headset VrApi remained `90/90`, `Stale=0`, `Tear=0`.
+  Full suite: `2824 passed, 70 skipped`.

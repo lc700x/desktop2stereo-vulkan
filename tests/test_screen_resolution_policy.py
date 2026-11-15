@@ -1,6 +1,7 @@
 import pytest
 
 from utils.screen_resolution_policy import (
+    ScreenSamplingPlanStabilizer,
     build_output_sampling_plan,
     build_projection_screen_sampling_plan,
     build_screen_sampling_plan,
@@ -71,7 +72,7 @@ def test_projection_plan_uses_visible_footprint_instead_of_quest2_2k_tier():
     plan = build_projection_screen_sampling_plan(3840, 2160, 3000, 1687)
 
     assert plan.mode == "downsample_lanczos_rcas"
-    assert plan.quality_size == (3000, 1688)
+    assert plan.quality_size == (3008, 1692)
     assert plan.quality_width > 2048
     assert plan.quality_width / plan.quality_height == pytest.approx(3840 / 2160, rel=1e-3)
 
@@ -80,5 +81,36 @@ def test_projection_plan_preserves_1920x1200_aspect_ratio():
     plan = build_projection_screen_sampling_plan(1920, 1200, 2400, 1500)
 
     assert plan.mode == "upscale_easu"
-    assert plan.quality_size == (2400, 1500)
+    assert plan.quality_size == (2432, 1520)
     assert plan.quality_width / plan.quality_height == pytest.approx(16 / 10)
+
+
+def test_projection_plan_keeps_native_mode_across_small_pose_footprint_jitter():
+    for footprint_width in (1893, 1918, 1975):
+        plan = build_projection_screen_sampling_plan(
+            1920, 800, footprint_width, 1000
+        )
+        assert plan.mode == "native_mip"
+        assert plan.quality_size == (1920, 800)
+
+
+def test_projection_sampling_plan_requires_persistent_candidate_before_switch():
+    active = build_projection_screen_sampling_plan(1920, 1080, 1500, 844)
+    candidate = build_projection_screen_sampling_plan(1920, 1080, 2400, 1350)
+    alternate = build_projection_screen_sampling_plan(1920, 1080, 1600, 900)
+    stabilizer = ScreenSamplingPlanStabilizer()
+
+    assert stabilizer.select(active, candidate, 0.0) == active
+    assert stabilizer.select(active, alternate, 0.1) == active
+    assert stabilizer.select(active, candidate, 0.2) == active
+    for index in range(1, 7):
+        assert stabilizer.select(active, candidate, 0.2 + index * 0.1) == active
+    assert stabilizer.select(active, candidate, 0.9) == candidate
+
+
+def test_projection_sampling_plan_switches_immediately_on_source_change():
+    active = build_projection_screen_sampling_plan(1920, 1080, 1500, 844)
+    candidate = build_projection_screen_sampling_plan(1280, 720, 1500, 844)
+    stabilizer = ScreenSamplingPlanStabilizer()
+
+    assert stabilizer.select(active, candidate, 0.0) == candidate

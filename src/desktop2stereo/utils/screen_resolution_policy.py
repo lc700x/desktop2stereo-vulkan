@@ -12,6 +12,8 @@ STANDARD_INPUT_RESOLUTIONS = {
 }
 INPUT_TO_HEADSET_TIER = {1: 2, 2: 4, 4: 8}
 HEADSET_TIERS = (2, 4, 8)
+PROJECTION_NATIVE_DEADBAND = 0.10
+PROJECTION_QUALITY_WIDTH_QUANTUM = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +46,54 @@ class ScreenSamplingPlan:
         if self.quality_width is None or self.quality_height is None:
             return None
         return self.quality_width, self.quality_height
+
+
+@dataclass(slots=True)
+class ScreenSamplingPlanStabilizer:
+    """Keep a materially stable sampling plan across head-pose noise."""
+
+    stable_seconds: float = 0.60
+    minimum_frames: int = 8
+    candidate: ScreenSamplingPlan | None = None
+    candidate_since: float = 0.0
+    candidate_frames: int = 0
+
+    def reset(self) -> None:
+        self.candidate = None
+        self.candidate_since = 0.0
+        self.candidate_frames = 0
+
+    def select(
+        self,
+        active: ScreenSamplingPlan | None,
+        candidate: ScreenSamplingPlan | None,
+        now: float,
+    ) -> ScreenSamplingPlan | None:
+        if active is None:
+            self.reset()
+            return candidate
+        if candidate is None or candidate == active:
+            self.reset()
+            return active
+        if (
+            candidate.source_width != active.source_width
+            or candidate.source_height != active.source_height
+        ):
+            self.reset()
+            return candidate
+        if self.candidate != candidate:
+            self.candidate = candidate
+            self.candidate_since = float(now)
+            self.candidate_frames = 1
+            return active
+        self.candidate_frames += 1
+        if (
+            float(now) - self.candidate_since >= self.stable_seconds
+            and self.candidate_frames >= self.minimum_frames
+        ):
+            self.reset()
+            return candidate
+        return active
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,9 +228,29 @@ def build_projection_screen_sampling_plan(
         raise ValueError("screen footprint must be positive")
     oversample = max(1.0, float(oversample))
     aspect = width / float(height)
-    quality_width = max(16, int(round(footprint_width * oversample)) & ~1)
-    # Width is authoritative so a curved/oblique projection cannot introduce
-    # a second aspect-ratio conversion in the quality pass.
+    footprint_scale = float(footprint_width) / float(width)
+    if abs(footprint_scale - 1.0) <= PROJECTION_NATIVE_DEADBAND:
+        return ScreenSamplingPlan(
+            source_width=width,
+            source_height=height,
+            input_tier_k=classify_input_resolution(width, height),
+            headset_tier_k=0,
+            recommended_headset_tier_k=0,
+            effective_tier_k=0,
+            filter_scale=1.0,
+            upscale_scale=1.0,
+            mode="native_mip",
+            quality_width=width,
+            quality_height=height,
+        )
+    unquantized_width = float(footprint_width) * oversample
+    quality_width = max(
+        PROJECTION_QUALITY_WIDTH_QUANTUM,
+        int(
+            round(unquantized_width / PROJECTION_QUALITY_WIDTH_QUANTUM)
+            * PROJECTION_QUALITY_WIDTH_QUANTUM
+        ),
+    )
     quality_height = max(16, int(round(quality_width / aspect)) & ~1)
     scale = quality_width / float(width)
     input_tier = classify_input_resolution(width, height)

@@ -139,6 +139,7 @@ from gui.config import (
 from utils.xr_headset_presets import resolve_xr_headset_preset
 from utils.screen_resolution_policy import (
     ScreenSamplingPlan,
+    ScreenSamplingPlanStabilizer,
     build_projection_screen_sampling_plan,
     build_screen_sampling_plan,
 )
@@ -997,6 +998,7 @@ class OpenXrVulkanPresenter(
         self._pending_screen_sampling_plan: ScreenSamplingPlan | None = None
         self._last_screen_sampling_log_t = 0.0
         self._active_screen_sampling_plan: ScreenSamplingPlan | None = None
+        self._screen_sampling_stabilizer = ScreenSamplingPlanStabilizer()
         self._last_runtime_output_conversion_error: str | None = None
         self._controller_hdr_lighting = False
         self._filament_fill_light_color = self.config.filament_fill_light_color
@@ -10079,6 +10081,13 @@ class OpenXrVulkanPresenter(
             # Let the mip chain prefilter minified CUDA screen textures before
             # the final OpenXR projection instead of using a one-level image.
             plan = replace(plan, mode="native_mip", quality_width=None, quality_height=None)
+        plan = self._screen_sampling_stabilizer.select(
+            self._active_screen_sampling_plan,
+            plan,
+            time.perf_counter(),
+        )
+        if plan is None:
+            return None
         status = (
             plan.source_width,
             plan.source_height,
