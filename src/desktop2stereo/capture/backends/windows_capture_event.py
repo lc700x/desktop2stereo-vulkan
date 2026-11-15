@@ -90,11 +90,24 @@ def _windows_capture_kwargs(config, capture_tool, *, include_window_exclusion=Tr
         device_id = getattr(config, "device_id", None)
         if device_id is not None:
             optional["device_id"] = int(device_id)
+        output_buffer_count = _env_int("D2S_WGC_OUTPUT_BUFFER_COUNT") or 6
         if capture_tool == "WindowsCaptureCUDA":
+            reuse_output_buffer = _env_bool("D2S_WGC_REUSE_OUTPUT_BUFFER")
             optional.update(
-                reuse_output_buffer=_env_bool("D2S_WGC_REUSE_OUTPUT_BUFFER"),
-                output_buffer_count=_env_int("D2S_WGC_OUTPUT_BUFFER_COUNT"),
+                # Pool by default: allocating a 4K BGRA tensor on every WGC
+                # callback is both slower and more fragmented than reusing a
+                # small bounded ring. The CUDA bridge waits on the consumer
+                # stream before it overwrites a recycled slot.
+                reuse_output_buffer=(
+                    True if reuse_output_buffer is None else bool(reuse_output_buffer)
+                ),
+                output_buffer_count=output_buffer_count,
             )
+        else:
+            # The bundled ROCm wrapper owns the HIP bridge. It preallocates a
+            # pool per shared D3D11 texture and applies the same consumer-stream
+            # backpressure when a slot wraps around.
+            optional["output_buffer_count"] = output_buffer_count
         kwargs.update({key: value for key, value in optional.items() if value is not None})
     return kwargs
 

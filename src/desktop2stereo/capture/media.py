@@ -655,6 +655,10 @@ class MediaCaptureSource:
         self._opencv_next_frame_at = None
         self._opencv_skip_fraction = 0.0
         self._opencv_realtime = False
+        self._native_decoder = None
+        self._native_frame_importer = None
+        self._native_frame_pts = None
+        self._native_frame_duration = 0.0
         self._audio_process = None
         self._audio_stream = None
         self._audio_thread = None
@@ -840,7 +844,11 @@ class MediaCaptureSource:
         self.primaries = info["primaries"]
         self.hdr = self.transfer in _HDR_TRANSFERS
         self._source_fps = float(info["fps"] or 0.0)
-        self._playback_fps = min(self._source_fps, float(self.config.fps)) if self._source_fps > 0 else max(1.0, float(self.config.fps))
+        self._playback_fps = (
+            min(self._source_fps, float(self.config.fps))
+            if self._source_fps > 0
+            else max(1.0, float(self.config.fps))
+        )
         self._has_audio = info["audio"] and self._audio_enabled
         self.position = min(self.position, max(0.0, self.duration - 0.05))
         self._position_anchor = self.position
@@ -860,6 +868,7 @@ class MediaCaptureSource:
         self._video_process = None
         self._close_nvdec()
         self._close_opencv()
+        self._close_native_decoder()
         vendor = getattr(self, "_gpu_vendor", None) or _media_gpu_vendor()
         is_10_bit = getattr(self, "_frame_pixel_format", "") == "p010le"
         if (
@@ -895,9 +904,13 @@ class MediaCaptureSource:
                 self._frame_format = "bgr24_sdr_bt2020"
             else:
                 self._frame_format = "bgr24"
+        if vendor == "amd" and self._start_d3d11_video(position):
+            return
         if vendor == "amd" and self._amf_decoder and not self._amf_disabled:
             self._decode_backend = "ffmpeg-amf"
-            self._start_ffmpeg_video(position, realtime=realtime, decoder=self._amf_decoder)
+            self._start_ffmpeg_video(
+                position, realtime=realtime, decoder=self._amf_decoder
+            )
             return
         self._decode_backend = "ffmpeg-software"
         self._start_ffmpeg_video(position, realtime=realtime)
@@ -1213,12 +1226,85 @@ class MediaCaptureSource:
     def _frame_duration(self) -> float:
         return 1.0 / max(1.0, float(getattr(self, "_playback_fps", 1.0) or 1.0))
 
+    def _close_native_decoder(self) -> None:
+        importer = getattr(self, "_native_frame_importer", None)
+        decoder = getattr(self, "_native_decoder", None)
+        self._native_frame_importer = None
+        self._native_decoder = None
+        if importer is not None:
+            try:
+                importer.close()
+            except Exception:
+                pass
+        if decoder is not None:
+            try:
+                decoder.close()
+            except Exception:
+                pass
+        self._native_frame_pts = None
+        self._native_frame_duration = 0.0
+
+    def _start_d3d11_video(self, position: float) -> bool:
+        if os.name != "nt" or not getattr(self, "_nvdec_source_path", None):
+            return False
+        source_path = Path(self._nvdec_source_path)
+        if not source_path.is_file():
+            return False
+        if str(os.environ.get("D2S_MEDIA_D3D11_DECODER", "1")).strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return False
+        try:
+            from capture.media_d3d11 import (
+                D3D11VideoFrameImporter,
+                FFmpegD3D11Decoder,
+                d3d11_decoder_available,
+            )
+
+            if not d3d11_decoder_available():
+                return False
+            decoder = FFmpegD3D11Decoder(
+                self._nvdec_source_path,
+                start_seconds=position,
+                ring_size=8,
+            )
+            try:
+                importer = D3D11VideoFrameImporter()
+            except Exception:
+                decoder.close()
+                raise
+            self._native_decoder = decoder
+            self._native_frame_importer = importer
+            self._decode_backend = "ffmpeg-d3d11va-gpu"
+            self._frame_format = "bgr24_sdr_bt709"
+            self.decode_fallback_reason = ""
+            print(
+                "[media] GPU video path active: "
+                f"backend={self._decode_backend} source={self._source_fps:.2f}fps "
+                "transfer=d3d11_video_processor_sdr",
+                flush=True,
+            )
+            return True
+        except Exception as exc:
+            self.decode_fallback_reason = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[media] D3D11VA GPU decode unavailable "
+                f"({self.decode_fallback_reason}); using FFmpeg fallback",
+                flush=True,
+            )
+            return False
+
     def _reset_frame_buffer(self, position: float) -> None:
         with self._frame_buffer_condition:
             self._frame_buffer.clear()
             self._frame_pump_done = False
             self._frame_pump_error = ""
             self._frame_pump_position = max(0.0, float(position))
+            self._native_frame_pts = None
+            self._native_frame_duration = 0.0
             self._current_source_frame_identity = None
             if hasattr(self, "_frame_pump_metrics_lock"):
                 with self._frame_pump_metrics_lock:
@@ -1292,15 +1378,25 @@ class MediaCaptureSource:
                         self._frame_buffer_condition.notify_all()
                     break
                 with self._frame_buffer_condition:
+                    source_pts = self._frame_pump_position
+                    frame_duration = self._frame_duration()
+                    native_pts = getattr(self, "_native_frame_pts", None)
+                    if native_pts is not None:
+                        source_pts = native_pts
+                        frame_duration = getattr(
+                            self, "_native_frame_duration", 0.0
+                        ) or frame_duration
+                        self._native_frame_pts = None
+                        self._native_frame_duration = 0.0
                     self._frame_buffer.append(
                         (
-                            self._frame_pump_position,
+                            source_pts,
                             frame,
                             int(self._source_frame_index),
                         )
                     )
                     self._source_frame_index += 1
-                    self._frame_pump_position += self._frame_duration()
+                    self._frame_pump_position = source_pts + frame_duration
                     self._frame_buffer_condition.notify_all()
         except Exception as exc:
             with self._frame_buffer_condition:
@@ -1650,7 +1746,51 @@ class MediaCaptureSource:
         self._read_control()
         self._publish_state()
 
+    def _read_d3d11_frame(self):
+        decoder = self._native_decoder
+        importer = self._native_frame_importer
+        if decoder is None or importer is None:
+            return None
+        position = self._current_position()
+        try:
+            frame = decoder.next_frame(position)
+            if frame is None:
+                return None
+            tensor = importer.import_frame(frame)
+            self._native_frame_pts = float(frame.pts_seconds)
+            self._native_frame_duration = max(
+                0.0, float(frame.duration_seconds)
+            )
+            self._frame = tensor
+            return tensor
+        except Exception as exc:
+            fallback_reason = f"{type(exc).__name__}: {exc}"
+            self.decode_fallback_reason = fallback_reason
+            print(
+                f"[media] D3D11VA GPU decode failed ({fallback_reason}); "
+                "falling back to FFmpeg",
+                flush=True,
+            )
+            self._close_native_decoder()
+            if self._amf_decoder and not self._amf_disabled:
+                self._decode_backend = "ffmpeg-amf"
+                self._start_ffmpeg_video(
+                    position, realtime=True, decoder=self._amf_decoder
+                )
+            else:
+                self._decode_backend = "ffmpeg-software"
+                self._start_ffmpeg_video(position, realtime=True)
+            self._frame_format = (
+                getattr(self, "_ffmpeg_frame_format", "bgr24")
+                if getattr(self, "_frame_pixel_format", "bgr24")
+                in {"nv12", "p010le"}
+                else "bgr24_sdr_bt709"
+            )
+            return self._read_video_frame()
+
     def _read_video_frame(self):
+        if getattr(self, "_native_decoder", None) is not None:
+            return self._read_d3d11_frame()
         if self._decode_backend.startswith("nvdec"):
             return self._read_nvdec_frame()
         if self._decode_backend == "opencv-software":
@@ -1979,6 +2119,7 @@ class MediaCaptureSource:
     def _finish_video_stream(self):
         if hasattr(self, "_frame_buffer_condition"):
             self._stop_frame_pump()
+        self._close_native_decoder()
         self._terminate(self._video_process)
         self._video_process = None
         self._close_nvdec()
@@ -2091,6 +2232,7 @@ class MediaCaptureSource:
         self.position = self._current_position()
         if hasattr(self, "_frame_buffer_condition"):
             self._stop_frame_pump()
+        self._close_native_decoder()
         self._terminate(self._video_process)
         self._video_process = None
         self._close_nvdec()

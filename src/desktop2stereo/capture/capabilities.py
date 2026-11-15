@@ -10,6 +10,7 @@ import importlib.util
 import os
 import platform
 import shutil
+from pathlib import Path
 from typing import Any
 
 
@@ -100,6 +101,17 @@ def probe_windows_capture_capabilities() -> dict[str, Any]:
             "hardware_verified": False,
             "status": "待真实硬件验证",
         },
+        "gpu_media_decode": {
+            "decoder_bridge": "ffmpeg-d3d11va",
+            "bridge_present": False,
+            "transport": "shared D3D11 BGRA texture + hardware fence -> HIP tensor",
+            "hdr_output": "GPU D3D11 Video Processor -> SDR BT.709",
+            "supported_input_transfers": ["PQ", "HLG", "BT.2020 SDR", "SDR full/studio range"],
+            "cpu_pixel_readback": False,
+            "hot_path_cpu_synchronize": False,
+            "hardware_verified": False,
+            "status": "bridge unavailable",
+        },
         "directml": {
             "available": False,
             "model_operator_support": "not_probed",
@@ -111,6 +123,23 @@ def probe_windows_capture_capabilities() -> dict[str, Any]:
     if platform.system() != "Windows":
         report["reason"] = "Windows-only probe skipped on this platform"
         return report
+
+    decoder_bridge = (
+        Path(__file__).resolve().parent
+        / "native"
+        / "windows"
+        / "d2s_ffmpeg_d3d11_decoder.dll"
+    )
+    report["gpu_media_decode"].update({
+        "bridge_present": decoder_bridge.is_file(),
+        "bridge_path": str(decoder_bridge),
+        "hardware_verified": False,
+        "status": (
+            "bundled; hardware capability is checked per source/codec"
+            if decoder_bridge.is_file()
+            else "bridge unavailable; AMF/software fallback only"
+        ),
+    })
 
     report["tools"] = {
         "WindowsCapture": {

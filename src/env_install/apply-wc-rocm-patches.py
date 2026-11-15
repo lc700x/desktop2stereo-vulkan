@@ -44,6 +44,152 @@ def _d2s_set_window_capture_affinity(hwnd, affinity):
 """
 _OLD_ROCM_ADAPTER_LUID_MARKER = "# D2S: map HIP ordinals to AMD DXGI adapter identities."
 _ROCM_ADAPTER_LUID_MARKER = "# D2S: use HIP's per-device graphics LUID (works with multiple AMD GPUs)."
+_ROCM_BUFFER_POOL_MARKER = "# D2S: GPU-resident frame pool with async backpressure."
+
+
+def _patch_rocm_buffer_pool(source: str, newline: str) -> str:
+    """Preallocate a small tensor pool and backpressure only on slot wrap.
+
+    The native WGC producer already uses two shared D3D11 textures. Each
+    Python bridge used exactly two tensors and overwrote a tensor as soon as
+    its turn came, even if the consumer was still using it. This patch keeps a
+    bounded pool and waits on the consumer stream only when a slot is reused.
+    """
+    if _ROCM_BUFFER_POOL_MARKER in source:
+        # Migrate the first pool revision, which still used a two-slot modulo-2
+        # increment, without duplicating the rest of the patch.
+        return source.replace(
+            f"        self._idx ^= 1  # swap to the other buffer for next frame{newline}",
+            f"        self._idx = (self._idx + 1) % len(self._tensors){newline}",
+        )
+    if "class _HipD3D11Bridge:" not in source:
+        return source
+
+    bridge_header = (
+        f"class _HipD3D11Bridge:{newline}"
+        f"    \"\"\"{newline}"
+        f"    Imports a D3D11 shared texture into HIP once, then DMAs into a pair of{newline}"
+        f"    pre-allocated ROCm tensors (double-buffer) so update() never needs clone().{newline}"
+        f"    \"\"\"{newline}"
+        f"{newline}"
+        f"    def __init__(self, shared_handle_int: int, width: int, height: int, device_id: int):{newline}"
+    )
+    bridge_header_new = (
+        f"class _HipD3D11Bridge:{newline}"
+        f"    {_ROCM_BUFFER_POOL_MARKER}{newline}"
+        f"    \"\"\"Import a shared D3D11 texture into a bounded GPU tensor pool.\"\"\"{newline}"
+        f"{newline}"
+        f"    def __init__(self, shared_handle_int: int, width: int, height: int, device_id: int, output_buffer_count: int = 6):{newline}"
+    )
+    bridge_init = (
+        f"        self._hip    = _get_hip(){newline}"
+        f"        self._hip.hipSetDevice(device_id){newline}"
+    )
+    bridge_init_new = (
+        bridge_init
+        + f"        self._device_id = int(device_id){newline}"
+        + f"        self._output_buffer_count = max(2, min(12, int(output_buffer_count))){newline}"
+        + f"        self._writes = 0{newline}"
+    )
+    old_tensors = (
+        f"        # Double-buffer: two tensors ping-pong so update() never needs .clone(){newline}"
+        f"        self._tensors = [{newline}"
+        f"            torch.empty((height, width, 4), dtype=torch.uint8, device=f\"cuda:{{device_id}}\"),{newline}"
+        f"            torch.empty((height, width, 4), dtype=torch.uint8, device=f\"cuda:{{device_id}}\"),{newline}"
+        f"        ]{newline}"
+    )
+    new_tensors = (
+        f"        # Preallocate the bounded GPU-resident pool once per D3D11 texture.{newline}"
+        f"        self._tensors = [{newline}"
+        f"            torch.empty((height, width, 4), dtype=torch.uint8, device=f\"cuda:{{device_id}}\"){newline}"
+        f"            for _ in range(self._output_buffer_count){newline}"
+        f"        ]{newline}"
+    )
+    old_update = (
+        f"    def update(self, stream, synchronize: bool = False) -> torch.Tensor:{newline}"
+        f"        \"\"\"Async DMA into the current buffer and optionally synchronize stream.\"\"\"{newline}"
+        f"        err = self._hip.hipMemcpy2DFromArrayAsync({newline}"
+    )
+    new_update = (
+        f"    def update(self, stream, synchronize: bool = False) -> torch.Tensor:{newline}"
+        f"        \"\"\"Async DMA into the current buffer and optionally synchronize stream.\"\"\"{newline}"
+        f"        if self._writes >= len(self._tensors):{newline}"
+        f"            # The slot is being reused. Wait on the consumer stream instead{newline}"
+        f"            # of stalling the capture thread; the wait is GPU-side only.{newline}"
+        f"            consumer_stream = torch.cuda.current_stream(self._device_id){newline}"
+        f"            stream.wait_stream(consumer_stream){newline}"
+        f"            self._writes = 0{newline}"
+        f"        err = self._hip.hipMemcpy2DFromArrayAsync({newline}"
+    )
+    old_swap = f"        self._idx ^= 1  # swap to the other buffer for next frame{newline}"
+    new_swap = (
+        f"        self._idx = (self._idx + 1) % len(self._tensors){newline}"
+        f"        self._writes += 1{newline}"
+    )
+
+    if source.count(bridge_header) != 1:
+        raise ValueError("Unsupported wc-rocm source layout; bridge header not found")
+    source = source.replace(bridge_header, bridge_header_new, 1)
+    if source.count(bridge_init) != 1:
+        raise ValueError("Unsupported wc-rocm source layout; bridge init not found")
+    source = source.replace(bridge_init, bridge_init_new, 1)
+    if source.count(old_tensors) != 1:
+        raise ValueError("Unsupported wc-rocm source layout; bridge tensors not found")
+    source = source.replace(old_tensors, new_tensors, 1)
+    if source.count(old_update) != 1:
+        raise ValueError("Unsupported wc-rocm source layout; bridge update not found")
+    source = source.replace(old_update, new_update, 1)
+    if source.count(old_swap) != 1:
+        raise ValueError("Unsupported wc-rocm source layout; bridge swap not found")
+    source = source.replace(old_swap, new_swap, 1)
+
+    constructor_old = (
+        f"        excluded_window_handles: Optional[list[int]] = None,{newline}"
+        f"    ):{newline}"
+    )
+    constructor_new = (
+        f"        excluded_window_handles: Optional[list[int]] = None,{newline}"
+        f"        output_buffer_count: int = 6,{newline}"
+        f"    ):{newline}"
+    )
+    if source.count(constructor_old) != 1:
+        # Some upstream releases use the plain capture signature. The bridge
+        # still gets its six-buffer default; only an unavailable constructor
+        # argument is skipped.
+        constructor_old = f"        use_gpu_fence: bool = True,{newline}    ):{newline}"
+        constructor_new = (
+            f"        use_gpu_fence: bool = True,{newline}"
+            f"        output_buffer_count: int = 6,{newline}"
+            f"    ):{newline}"
+        )
+    if source.count(constructor_old) != 1:
+        raise ValueError("Unsupported wc-rocm source layout; capture constructor not found")
+    source = source.replace(constructor_old, constructor_new, 1)
+
+    output_count_anchor = f"        self._required_configuration_iteration = 0{newline}"
+    if source.count(output_count_anchor) != 1:
+        raise ValueError("Unsupported wc-rocm source layout; buffer count anchor not found")
+    source = source.replace(
+        output_count_anchor,
+        output_count_anchor
+        + f"        self._output_buffer_count = max(2, min(12, int(output_buffer_count))){newline}",
+        1,
+    )
+    bridge_ctor_old = (
+        f"                    self._bridges[buf_idx] = _HipD3D11Bridge({newline}"
+        f"                        gpu_frame.shared_handle, w, h, self.device_id{newline}"
+        f"                    ){newline}"
+    )
+    bridge_ctor_new = (
+        f"                    self._bridges[buf_idx] = _HipD3D11Bridge({newline}"
+        f"                        gpu_frame.shared_handle, w, h, self.device_id,{newline}"
+        f"                        output_buffer_count=self._output_buffer_count,{newline}"
+        f"                    ){newline}"
+    )
+    if source.count(bridge_ctor_old) != 1:
+        raise ValueError("Unsupported wc-rocm source layout; bridge call site not found")
+    source = source.replace(bridge_ctor_old, bridge_ctor_new, 1)
+    return source
 
 
 def patched_source(source: str) -> str:
@@ -144,6 +290,21 @@ def patched_source(source: str) -> str:
             f"                    continue{newline}",
         ),
         (
+            (
+                f"                tensor = self._bridges[buf_idx].update({newline}"
+                f"                    self._stream, synchronize=self.synchronize_copy{newline}"
+                f"                ){newline}"
+            ),
+            (
+                f"                tensor = self._bridges[buf_idx].update({newline}"
+                f"                    self._stream, synchronize=self.synchronize_copy{newline}"
+                f"                ){newline}"
+                f"                # Hand the tensor to the runtime only after its GPU copy is{newline}"
+                f"                # ordered on the consumer stream; no host synchronization.{newline}"
+                f"                self._consumer_stream.wait_stream(self._stream){newline}"
+            ),
+        ),
+        (
             f"                self.frame_handler(Frame(tensor[:oh, :ow], ow, oh), self._control){newline}",
             f"                self.frame_handler(Frame({newline}"
             f"                    tensor[:oh, :ow], ow, oh,{newline}"
@@ -155,6 +316,22 @@ def patched_source(source: str) -> str:
             (
                 f"        self._stream        = None{newline}"
                 f"        self._minimum_update_interval_s = max(0.0, float(minimum_update_interval or 0) / 1000.0){newline}"
+            ),
+        ),
+        (
+            f"        self._stream   = torch.cuda.current_stream(self.device_id){newline}",
+            (
+                f"        self._consumer_stream = torch.cuda.current_stream(self.device_id){newline}"
+                f"        self._stream = torch.cuda.Stream(device=self.device_id){newline}"
+            ),
+        ),
+        (
+            f"            self.use_gpu_fence = False{newline}",
+            (
+                f"            self.use_gpu_fence = False{newline}"
+                f"            self.synchronize_copy = True{newline}"
+                f"            # Without a shared fence, keep the legacy fallback safe; this{newline}"
+                f"            # path is rare and must not expose an in-flight shared texture.{newline}"
             ),
         ),
         (
@@ -226,6 +403,10 @@ def patched_source(source: str) -> str:
                 "window_exclusion",
                 "configuration_iteration",
                 "set_excluded_windows",
+                "self._bridges",
+                "consumer_stream",
+                "self._stream   = torch.cuda.current_stream",
+                "use_gpu_fence = False",
             )
         ):
             continue
@@ -238,11 +419,20 @@ def patched_source(source: str) -> str:
         if new in source:
             continue
         if source.count(old) != 1:
+            # The constructor is intentionally extended by the bounded-pool
+            # patch below. Treat an already-extended signature as satisfied.
+            if (
+                old.startswith("        use_gpu_fence: bool = True")
+                and "excluded_window_handles: Optional[list[int]] = None" in source
+                and "output_buffer_count: int = 6" in source
+            ):
+                continue
             raise ValueError(
                 "Unsupported wc-rocm source layout; no file was changed. "
                 f"Missing unique source block {old!r}"
             )
         source = source.replace(old, new, 1)
+    source = _patch_rocm_buffer_pool(source, newline)
     if has_capture_binding:
         property_anchor = f"    def set_excluded_windows(self, window_handles) -> int:{newline}"
         property_source = (

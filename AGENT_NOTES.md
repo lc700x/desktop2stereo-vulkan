@@ -512,3 +512,34 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
 - Local Viewer player-bar polish (2026-11-15): the media bar now follows the supplied Bilibili-style reference hierarchy while retaining Desktop2Stereo-specific Open File/Open Disc controls: timestamps above a slim full-width scrubber; a prominent 80 px accent-ring Play/Pause control; 64 px previous/next/±10s/mute targets; equal outer margins and equal flexible gutters between the left/utility/transport groups; and an inset volume slider whose click/drag coordinates map to the visible track. Pointer polling supplements GLFW cursor events so controls can still reveal when the viewer uses click-through cursor passthrough.
 - Stable FPS plan progress (2026-11-15): Phase 0 baseline is documented in `docs/stable-fps-baseline.md`. Phase 1 exact-depth identity is implemented: media frames carry `(media_generation, source_frame_index, source_pts)` through `PollingCaptureRunner`, the pipeline cache key includes that identity plus source-target/render-size/depth-settings, and changed or ambiguous content fails closed. Debug output now carries the media identity and `media_depth_cache_reason`. A pure `StableCadenceGovernor` policy module (`stereo_runtime/cadence_governor.py`) with 72/60/45/30 hysteresis, queue/depth-age guards, and observe-only default is unit-tested; it is not yet wired to change presentation cadence.
 - Stable FPS observability/observe run (2026-11-15): `FPSBreakdown` now emits media generation/source frame/PTS, exact-cache reason, depth reuse/age, OpenXR render time, and observe-only cadence active/proposed/reason/queue/drop fields. Local Viewer metrics now emit `present_unique_fps` and `present_repeat_fps` separately from `content_fps`. A 40s 4K HDR local-viewer run with `D2S_CADENCE_GOVERNOR_OBSERVE=1` and target 59 Hz stayed `cadence_active=59 / proposed=59 / reason=steady`; presentation was 58.05-59.16 FPS, unique content 31.78-32.32 FPS, and changed frames reported `depth_cache=no_cache` rather than reusing unrelated depth. The baseline document records the run and remaining cadence-governor control work.
+
+## GPU media/capture frame-pool follow-up (2026-11-15)
+
+- The D3D11VA HDR video path now uses a slot-indexed ROCm tensor pool in
+  `capture/media_d3d11.py`. The decoder's shared BGRA texture slots are copied
+  on a dedicated HIP stream, then the consumer stream is ordered with
+  `wait_stream`; per-frame `stream.synchronize()` is gone. Keep the pool sized
+  to the native decoder ring (8) so a slot is not overwritten before its
+  previous consumer work is ordered.
+- The native FFmpeg D3D11 decoder closes both shared fence `HANDLE`s and maps
+  PQ and HLG BT.2020 plus SDR full/studio range through the D3D11 Video
+  Processor to SDR BT.709. Unsupported hardware/codecs still fall back to
+  AMF/software.
+- `apply-wc-rocm-patches.py` now builds a six-slot per-D3D11-texture HIP tensor
+  pool, uses a dedicated capture stream, waits on the consumer stream only when
+  a slot wraps, and orders the consumer stream against the copy before calling
+  the frame handler. The installed `src/python3/Lib/site-packages/wc_rocm`
+  wrapper must be regenerated with this patch and the native `_wc_rocm.pyd`
+  rebuilt.
+- `capture/backends/windows_capture_event.py` defaults CUDA WGC to bounded
+  output-buffer reuse (6) and passes `output_buffer_count=6` to the patched
+  ROCm wrapper. `D2S_WGC_REUSE_OUTPUT_BUFFER=0` and
+  `D2S_WGC_OUTPUT_BUFFER_COUNT=N` remain explicit overrides.
+- Verified 4K HDR media: import p50 ~0.20 ms / p95 ~1.08 ms; Local Viewer
+  media read p50 ~0.32 ms / p95 ~0.62 ms; OpenXR media read p50 ~0.40-0.44 ms
+  / p95 ~1.4-1.9 ms, buffer 8/8, decode pump ~120 fps. OpenXR rendered
+  non-black SBS; its harness stop still produced Windows `0xC0000409` in the
+  simulator/Filament teardown path (Local Viewer exits cleanly).
+- Monitor and Window `WindowsCaptureROCm` Local Viewer smoke runs exit 0.
+  The native WGC-only 4K desktop probe measured ~38 fps, so do not attribute
+  that ceiling to a CPU readback in the D2S capture path.

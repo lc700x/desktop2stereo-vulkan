@@ -181,3 +181,48 @@ Before enabling governor control, collect the same metrics on a runtime that can
 actually select 72/60 Hz, then repeat the A/B after moving 10-bit media frames to
 a GPU-resident decode/import path. Acceptance still requires no stale-depth reuse,
 no hidden scaling, source-time 1.0x playback, and no depth or stereo math changes.
+
+## GPU Media Pool Result
+
+Measured 2026-11-15 after replacing the per-frame ROCm tensor allocation and
+CPU stream synchronize with a slot-indexed GPU tensor pool:
+
+- decoder: `ffmpeg-d3d11va-gpu`;
+- source: 4K 120 fps HDR10 HEVC, start 60 seconds;
+- `ring_size=8` and `D2S_MEDIA_FRAME_BUFFER=8`;
+- 180-frame direct decoder/import smoke: 8 imported textures and 8 reusable
+  tensors, no hot-path CPU synchronize;
+- import timing p50 `0.20 ms`, p95 `1.08 ms`;
+- local viewer: media read p50 `0.32 ms`, p95 `0.62 ms`, decode pump
+  `120.77 fps`;
+- OpenXR: media read p50 `0.40-0.44 ms`, p95 `1.41-1.93 ms`, decode pump
+  `120.5-120.9 fps`, buffer `8/8`;
+- OpenXR content rate improved from the earlier `22-28 fps` to `37-38 fps`;
+- a simulator screenshot after the 60-second resume showed the expected
+  PQ/BT.2020 -> SDR/BT.709 non-black SBS image.
+
+The remaining OpenXR limit is the depth/runtime completion wait, not media
+readback. The generated content cadence still cannot be claimed as 60 fps.
+
+## Screen and Window Pool Result
+
+`WindowsCaptureROCm` now passes a six-slot output pool to the bundled WGC
+wrapper. The wrapper uses a dedicated HIP copy stream, waits on the consumer
+stream only when a slot wraps, and orders the consumer stream against the copy
+before publishing the tensor. No CPU pixel readback or per-frame clone is added.
+
+Validation runs:
+
+- Monitor Local Viewer: exit 0, source `3840x2160`, capture-to-runtime RGB
+  preprocessing `0.19 ms`, non-black output;
+- Window Local Viewer: exit 0, source `1802x1400`, capture-to-runtime RGB
+  preprocessing observed after warmup, non-black output;
+- native WGC without HIP import on the same 4K desktop produced about 38 fps,
+  so the remaining capture-rate floor is in the WGC/desktop producer on this
+  host rather than a CPU readback in D2S.
+
+The OpenXR Simulator media run rendered correctly but its process exited with
+Windows status `0xC0000409` when the harness stopped the runtime. The failure
+reproduces with tool quads disabled and does not occur in the Local Viewer run;
+it is currently treated as an OpenXR Simulator/Filament teardown issue, not a
+media decode fallback or a black-frame failure.

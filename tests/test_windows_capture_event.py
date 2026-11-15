@@ -301,6 +301,8 @@ def test_windows_capture_runner_uses_copy_or_clone_buffers(monkeypatch):
         "cursor_capture": True,
         "minimum_update_interval": 16,
         "device_id": 1,
+        "reuse_output_buffer": True,
+        "output_buffer_count": 6,
     }
     assert len(capture.handlers) == 2
 
@@ -817,18 +819,44 @@ def test_windows_capture_cuda_accepts_env_capture_options(monkeypatch):
         "monitor_index": 1,
         "cursor_capture": True,
         "minimum_update_interval": 16,
+        "reuse_output_buffer": True,
+        "output_buffer_count": 6,
     }
 
-    monkeypatch.setenv("D2S_WGC_REUSE_OUTPUT_BUFFER", "1")
-    monkeypatch.setenv("D2S_WGC_OUTPUT_BUFFER_COUNT", "6")
+    monkeypatch.setenv("D2S_WGC_REUSE_OUTPUT_BUFFER", "0")
+    monkeypatch.setenv("D2S_WGC_OUTPUT_BUFFER_COUNT", "8")
 
     assert windows_capture_event._windows_capture_kwargs(config, "WindowsCaptureCUDA") == {
         "monitor_index": 1,
         "cursor_capture": True,
         "minimum_update_interval": 16,
-        "reuse_output_buffer": True,
+        "reuse_output_buffer": False,
+        "output_buffer_count": 8,
+    }
+
+
+def test_windows_capture_rocm_uses_bounded_gpu_tensor_pool(monkeypatch):
+    config = CaptureConfig(
+        capture_tool="WindowsCaptureROCm",
+        capture_mode="Window",
+        window_title="Player",
+        device_id=0,
+    )
+
+    assert windows_capture_event._windows_capture_kwargs(
+        config, "WindowsCaptureROCm"
+    ) == {
+        "window_name": "Player",
+        "cursor_capture": True,
+        "minimum_update_interval": 16,
+        "device_id": 0,
         "output_buffer_count": 6,
     }
+
+    monkeypatch.setenv("D2S_WGC_OUTPUT_BUFFER_COUNT", "4")
+    assert windows_capture_event._windows_capture_kwargs(
+        config, "WindowsCaptureROCm"
+    )["output_buffer_count"] == 4
 
 
 def test_windows_capture_can_disable_source_cursor_for_sbs_overlay():

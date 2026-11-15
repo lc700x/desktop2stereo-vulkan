@@ -1096,6 +1096,7 @@ def verify_package(
         app_root / "gui" / "flet_packages" / "flet-windows.zip",
         app_root / "xr_viewer" / "native" / "windows" / "filament_bridge.dll",
         app_root / "capture" / "native" / "desktop_duplication" / "d2s_desktop_duplication.dll",
+        app_root / "capture" / "native" / "windows" / "d2s_ffmpeg_d3d11_decoder.dll",
         app_root / "streaming" / "amd_encoder" / "d2s_amd_encoder.dll",
         app_root / "streaming" / "nvenc_cudaarray_bridge" / "d2s_nvenc_cudaarray_bridge.dll",
         app_root / "streaming" / "native_rtsp_output" / "opus.dll",
