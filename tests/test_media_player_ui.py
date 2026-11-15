@@ -5,6 +5,9 @@ from types import SimpleNamespace
 
 import numpy as np
 from media_ui import (
+    MEDIA_BROWSER_TEXTURE_SIZE,
+    _browser_button_rects,
+    _browser_layout,
     _button_rects,
     build_media_bar_rgba,
     build_media_browser_rgba,
@@ -102,25 +105,46 @@ def test_disabled_media_controls_are_not_actionable():
     assert media_bar_hit(0.08, 0.72, stopped) is None
 
 
+def _browser_uv(x: float, y: float) -> tuple[float, float]:
+    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    return x / width, y / height
+
+
 def test_browser_texture_and_playlist_hit_targets():
-    rgba = build_media_browser_rgba(_state(), width=1400, height=900)
-    assert rgba.shape == (900, 1400, 4)
-    assert media_browser_hit(0.87, 0.05, _state()) == ("browser_up", None)
-    entry_hit = media_browser_hit(0.1, 0.322, _state())
-    assert entry_hit is not None
-    assert entry_hit[0] == "playlist_select"
-    assert media_browser_hit(0.07, 0.216, _state()) == (
-        "recent",
-        "F:/Videos/recent.mp4",
+    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    rgba = build_media_browser_rgba(_state())
+    assert rgba.shape == (height, width, 4)
+    rects = _browser_button_rects(width, height)
+    layout = _browser_layout(_state(), width, height)
+
+    up = rects["browser_up"]
+    assert media_browser_hit(
+        *_browser_uv((up[0] + up[2]) / 2, (up[1] + up[3]) / 2), _state()
+    ) == ("browser_up", None)
+
+    playlist_y = (
+        layout["playlist_rows_y"] + layout["playlist_row_height"] / 2
     )
-    assert media_browser_hit(0.20, 0.216, _state()) == (
-        "recent_remove",
-        "F:/Videos/recent.mp4",
-    )
-    assert media_browser_hit(0.96, 0.96, _state()) == (
-        "browse_open",
-        "C:/Videos/movie.mp4",
-    )
+    assert media_browser_hit(
+        *_browser_uv(layout["sidebar_right"] / 2, playlist_y), _state()
+    ) == ("playlist_select", "C:/Videos/movie.mp4")
+
+    recent_y = layout["recent_rows_y"] + layout["recent_row_height"] / 2
+    assert media_browser_hit(
+        *_browser_uv(layout["sidebar_right"] / 2, recent_y), _state()
+    ) == ("recent", "F:/Videos/recent.mp4")
+    assert media_browser_hit(
+        *_browser_uv(layout["sidebar_right"] - 24, recent_y), _state()
+    ) == ("recent_remove", "F:/Videos/recent.mp4")
+
+    open_rect = rects["browse_open"]
+    assert media_browser_hit(
+        *_browser_uv(
+            (open_rect[0] + open_rect[2]) / 2,
+            (open_rect[1] + open_rect[3]) / 2,
+        ),
+        _state(),
+    ) == ("browse_open", "C:/Videos/movie.mp4")
 
 
 def test_browser_mounts_and_row_bounds_are_clickable_only_inside_geometry():
@@ -138,7 +162,19 @@ def test_browser_mounts_and_row_bounds_are_clickable_only_inside_geometry():
             for index in range(20)
         ],
     }
-    assert media_browser_hit(0.1, 0.14, state) == ("mount", "F:/")
+    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    layout = _browser_layout(state, width, height)
+    mount_y = layout["mount_top"] + layout["mount_row_height"] / 2
+    assert media_browser_hit(
+        *_browser_uv(layout["sidebar_right"] / 2, mount_y), state
+    ) == ("mount", "F:/")
+    assert layout["file_row_height"] >= 72
+    row_x = (layout["sidebar_right"] + width) / 2
+    row_y = layout["file_rows_y"] + layout["file_row_height"] / 2
+    assert media_browser_hit(*_browser_uv(row_x, row_y), state) == (
+        "entry",
+        "F:/Videos/movie-0.mp4",
+    )
     assert media_browser_hit(0.72, 0.05, state) is None
 
 
@@ -214,6 +250,10 @@ def test_local_viewer_places_media_overlays_inside_each_eye():
     assert left[0] >= 0 and left[2] <= 960
     assert right[0] >= 960 and right[2] <= 1920
     assert left[3] <= 1080 and right[3] <= 1080
+
+    browser = viewer._media_rect_for_eye((0, 0, 960, 1080), browser=True)
+    assert browser[2] - browser[0] >= int(960 * 0.95)
+    assert browser[3] - browser[1] >= int(1080 * 0.60)
 
 
 def test_media_transport_icon_matches_available_action():

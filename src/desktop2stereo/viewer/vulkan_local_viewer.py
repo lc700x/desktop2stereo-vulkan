@@ -19,6 +19,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from media_ui import (
+    MEDIA_BROWSER_TEXTURE_ASPECT,
+    MEDIA_BROWSER_TEXTURE_SIZE,
+    MEDIA_BROWSER_VISIBLE_ROWS,
     build_media_bar_rgba,
     build_media_browser_rgba,
     build_pointer_rgba,
@@ -1369,8 +1372,14 @@ class VulkanLocalViewer:
         eye_w = max(1, right - left)
         eye_h = max(1, bottom - top)
         if browser:
-            panel_w = min(int(eye_w * 0.86), 1200)
-            panel_h = min(int(eye_h * 0.78), int(panel_w * 900 / 1400))
+            max_w = max(1, int(eye_w * 0.98))
+            max_h = max(1, int(eye_h * 0.88))
+            if max_w / max_h > MEDIA_BROWSER_TEXTURE_ASPECT:
+                panel_h = max_h
+                panel_w = max(1, int(panel_h * MEDIA_BROWSER_TEXTURE_ASPECT))
+            else:
+                panel_w = max_w
+                panel_h = max(1, int(panel_w / MEDIA_BROWSER_TEXTURE_ASPECT))
         else:
             panel_w = min(int(eye_w * 0.92), 1024)
             panel_h = max(70, int(panel_w * 160 / 1024))
@@ -1429,7 +1438,8 @@ class VulkanLocalViewer:
 
     def _refresh_media_textures(self) -> None:
         language = "CN" if getattr(self.config, "locale", "EN") == "CN" else "EN"
-        if self._media_bar_overlay is not None and self._media_bar_visible():
+        media_bar_overlay = getattr(self, "_media_bar_overlay", None)
+        if media_bar_overlay is not None and self._media_bar_visible():
             key = self._media_bar_texture_key_value()
             if key != self._media_bar_texture_key:
                 rgba = build_media_bar_rgba(
@@ -1440,20 +1450,23 @@ class VulkanLocalViewer:
                     lang=language,
                     collapsed=not self._media_bar_expanded(),
                 )
-                self._media_bar_overlay.set_rgba(rgba.tobytes(), (1024, 160))
+                media_bar_overlay.set_rgba(rgba.tobytes(), (1024, 160))
                 self._media_bar_texture_key = key
-        if self._media_browser_overlay is not None and self._media_browser_visible():
+        media_browser_overlay = getattr(self, "_media_browser_overlay", None)
+        if media_browser_overlay is not None and self._media_browser_visible():
             key = self._media_browser_texture_key_value()
             if key != self._media_browser_texture_key:
                 rgba = build_media_browser_rgba(
                     self._media_state,
-                    width=1400,
-                    height=900,
+                    width=MEDIA_BROWSER_TEXTURE_SIZE[0],
+                    height=MEDIA_BROWSER_TEXTURE_SIZE[1],
                     hover=self._media_bar_hover,
                     scroll_offset=self._media_browser_scroll,
                     lang=language,
                 )
-                self._media_browser_overlay.set_rgba(rgba.tobytes(), (1400, 900))
+                media_browser_overlay.set_rgba(
+                    rgba.tobytes(), MEDIA_BROWSER_TEXTURE_SIZE
+                )
                 self._media_browser_texture_key = key
 
     def _media_hit(self, u: float, v: float) -> str | None:
@@ -1484,7 +1497,22 @@ class VulkanLocalViewer:
             return
         if hit.startswith("entry:"):
             path = hit.split(":", 1)[1]
-            self._media_action("browse_open" if double_click else "browse_select", {"path": path})
+            if not double_click:
+                self._media_state = {
+                    **self._media_state,
+                    "browser_selection": path,
+                    "browser_revision": int(
+                        self._media_state.get("browser_revision", 0) or 0
+                    ) + 1,
+                }
+                self._media_browser_texture_key = None
+                refresh = getattr(self, "_refresh_media_textures", None)
+                if callable(refresh):
+                    refresh()
+            self._media_action(
+                "browse_open" if double_click else "browse_select",
+                {"path": path},
+            )
             return
         if hit.startswith("mount:"):
             self._media_action("browse", hit.split(":", 1)[1])
@@ -1707,7 +1735,7 @@ class VulkanLocalViewer:
         self._media_browser_scroll = max(
             0,
             min(
-                max(0, len(entries) - 12),
+                max(0, len(entries) - MEDIA_BROWSER_VISIBLE_ROWS),
                 self._media_browser_scroll + (-3 if yoffset > 0 else 3),
             ),
         )

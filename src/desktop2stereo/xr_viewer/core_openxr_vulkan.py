@@ -45,6 +45,9 @@ from viewer.vulkan_projection_screen import VulkanProjectionScreenPass
 from viewer.vulkan_multiview_diagnostic import VulkanMultiviewEyeDiagnosticPass
 from app_runtime.output_contract import VulkanStereoOutputFrame
 from media_ui import (
+    MEDIA_BROWSER_TEXTURE_ASPECT,
+    MEDIA_BROWSER_TEXTURE_SIZE,
+    MEDIA_BROWSER_VISIBLE_ROWS,
     build_media_bar_rgba,
     build_media_browser_rgba,
     media_bar_hit,
@@ -55,7 +58,6 @@ from media_ui import (
 
 _OUTPUT_FRAME_UNSET = object()
 _MEDIA_BAR_TEXTURE_ASPECT = 1024.0 / 160.0
-_MEDIA_BROWSER_TEXTURE_ASPECT = 1400.0 / 900.0
 # Screen geometry is evaluated from the live headset pose, so its diagnostic
 # values can change every frame while the user is looking around. Keep the
 # diagnostics useful without allowing pose-driven changes to flood the child
@@ -1267,6 +1269,7 @@ class OpenXrVulkanPresenter(
         self._media_overlay_scroll = 0
         self._media_overlay_scroll_next_at = 0.0
         self._media_overlay_trigger_down = [False, False]
+        self._media_overlay_pending_selection: tuple[int, str, Any] | None = None
         self._media_overlay_last_click_at = 0.0
         self._media_overlay_last_click_hit: str | None = None
         self._media_overlay_pose: tuple[tuple[float, ...], tuple[float, ...]] | None = None
@@ -2847,6 +2850,8 @@ class OpenXrVulkanPresenter(
         if desktop_only:
             return
 
+        self._media_overlay_trigger_down = [False, False]
+        self._media_overlay_pending_selection = None
         self._settings_menu_trigger_down = [False, False]
         if hasattr(self._settings_menu, "_trigger_down"):
             self._settings_menu._trigger_down = [False, False]
@@ -5936,18 +5941,18 @@ class OpenXrVulkanPresenter(
         height = float(height)
         screen_pose = self._filament_screen_pose_mat4()
         if browser:
-            max_w = max(0.01, width * 0.84)
-            max_h = max(0.01, height * 0.78)
-            # Fit the 1400x900 browser texture inside the screen instead of
+            max_w = max(0.01, width * 0.94)
+            max_h = max(0.01, height * 0.90)
+            # Fit the browser texture inside the virtual screen instead of
             # independently stretching width and height. The same panel size
             # drives painting and ray hit-testing, so keeping one aspect ratio
             # also keeps the visible controls aligned with controller rays.
-            if max_w / max_h > _MEDIA_BROWSER_TEXTURE_ASPECT:
+            if max_w / max_h > MEDIA_BROWSER_TEXTURE_ASPECT:
                 panel_h = max_h
-                panel_w = panel_h * _MEDIA_BROWSER_TEXTURE_ASPECT
+                panel_w = panel_h * MEDIA_BROWSER_TEXTURE_ASPECT
             else:
                 panel_w = max_w
-                panel_h = panel_w / _MEDIA_BROWSER_TEXTURE_ASPECT
+                panel_h = panel_w / MEDIA_BROWSER_TEXTURE_ASPECT
             local_y = 0.0
             local_z = 0.028
         else:
@@ -6093,6 +6098,20 @@ class OpenXrVulkanPresenter(
             self._dispatch_controller_shortcut(
                 "media_control", media_action="playlist_clear"
             )
+        elif hit == "entry" and value:
+            path = str(value)
+            now = time.monotonic()
+            double_click = (
+                hit == self._media_overlay_last_click_hit
+                and now - self._media_overlay_last_click_at <= 0.45
+            )
+            self._media_overlay_last_click_hit = hit
+            self._media_overlay_last_click_at = now
+            self._dispatch_controller_shortcut(
+                "media_control",
+                media_action="browse_open" if double_click else "browse_select",
+                value={"path": path},
+            )
         elif hit == "play" and media_control_enabled("play", state):
             self._dispatch_controller_shortcut(
                 "media_control",
@@ -6163,11 +6182,35 @@ class OpenXrVulkanPresenter(
             trigger = float(self._controller_input(hand).get("trigger", 0.0) or 0.0)
             if not self._media_overlay_trigger_down[hand] and trigger >= 0.7:
                 self._media_overlay_trigger_down[hand] = True
-                if action is not None:
+                if action in {"entry", "playlist_select"}:
+                    self._media_overlay_pending_selection = (hand, action, value)
+                    consumed = True
+                elif action is not None:
                     self._dispatch_media_overlay_hit(action, value)
                     consumed = True
             elif self._media_overlay_trigger_down[hand] and trigger <= 0.3:
                 self._media_overlay_trigger_down[hand] = False
+                pending = self._media_overlay_pending_selection
+                if pending is not None and pending[0] == hand:
+                    _pending_hand, pending_action, pending_value = pending
+                    self._media_overlay_pending_selection = None
+                    # Lock selection to the row hit on trigger-down. XR ray
+                    # smoothing can move a few pixels before the release frame;
+                    # cancelling the whole click made file rows feel inert.
+                    if pending_action == "entry" and isinstance(pending_value, str):
+                        selected_state = self._media_overlay_state or state
+                        self._media_overlay_state = {
+                            **selected_state,
+                            "browser_selection": pending_value,
+                            "browser_revision": int(
+                                selected_state.get("browser_revision", 0) or 0
+                            ) + 1,
+                        }
+                        self._media_overlay_browser_key = None
+                    self._dispatch_media_overlay_hit(
+                        pending_action, pending_value
+                    )
+                    consumed = True
             vertical = -float(
                 self._controller_input(hand).get("joystick_y", 0.0) or 0.0
             )
@@ -6178,7 +6221,7 @@ class OpenXrVulkanPresenter(
                     self._media_overlay_scroll = max(
                         0,
                         min(
-                            max(0, len(entries) - 12),
+                            max(0, len(entries) - MEDIA_BROWSER_VISIBLE_ROWS),
                             self._media_overlay_scroll + (1 if vertical > 0 else -1),
                         ),
                     )
@@ -7743,7 +7786,7 @@ class OpenXrVulkanPresenter(
             "screen_help": (1280, 1536),
             "hand_help": (2048, 768),
             "media_bar": (1024, 160),
-            "media_browser": (1400, 900),
+            "media_browser": MEDIA_BROWSER_TEXTURE_SIZE,
         }
         minimum = minimum_sizes.get(key, pool_size)
         return max(pool_size[0], minimum[0]), max(pool_size[1], minimum[1])
@@ -14117,8 +14160,8 @@ class OpenXrVulkanPresenter(
                     self._tool_quad_texture_cache["media_browser"] = (
                         build_media_browser_rgba(
                             media_state,
-                            width=1400,
-                            height=900,
+                            width=MEDIA_BROWSER_TEXTURE_SIZE[0],
+                            height=MEDIA_BROWSER_TEXTURE_SIZE[1],
                             hover=self._media_overlay_hover,
                             scroll_offset=self._media_overlay_scroll,
                             lang=language,
@@ -14958,7 +15001,7 @@ class OpenXrVulkanPresenter(
             entry["content_size"] = (width, height)
         # Pooled canvases can be taller or wider than their content (the
         # settings menu is 1024x832 in a 1024x1024 pool, and the media browser
-        # is 1400x900 in a 1400x1024 pool). Sample only the populated sub-rect
+        # is 1600x1200 in a 1600x1200 pool). Sample only the populated sub-rect
         # so the UI keeps its aspect and ray hits stay aligned with it.
         sub_image_rect = (
             (0, 0, int(width), int(height))

@@ -588,3 +588,28 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   `Present mode: FIFO_LATEST_READY vsync=True`. Source-PTS tick tests cover
   59/60/72/90/120 Hz output against 120 fps input. Full suite:
   `2816 passed, 70 skipped`.
+
+## OpenXR media browser selection and shared sizing (2026-11-15)
+
+- Root cause of dead file-row clicks in OpenXR: `_handle_media_overlay_input()`
+  correctly emitted `action="entry"` plus a path value, but
+  `_dispatch_media_overlay_hit()` only handled the Local Viewer encoding
+  `"entry:<path>"`. File rows therefore did nothing while bar buttons worked.
+  The dispatcher now handles `hit == "entry"` with its value and resolves to
+  `browse_select` (first click) or `browse_open` (double click).
+- OpenXR entry selection is locked from trigger-down and committed on release.
+  Ray smoothing can move by a few pixels during the press; requiring the release
+  frame to still hit the same tiny row made clicks cancel. The presenter updates
+  `browser_selection` optimistically on release so the row highlights before the
+  media state file refreshes.
+- Shared browser sizing is now `1600x1200` (4:3). The main file rows are about
+  91 px high with 21 px text; top/bottom browser actions are at least 56 px and
+  the sidebar uses 56-60 px item targets, following the Horizon/MetaXR 48 px
+  minimum interaction target. OpenXR uses a 0.94 x 0.90 screen fit; Local Viewer
+  uses a 0.98 x 0.88 eye fit. Browser painting and hit testing share the same
+  geometry.
+- OpenXR Simulator live verification: single trigger click selected
+  `F:\Videos\d2s lossless scailing`, wrote
+  `{"action":"browse_select","value":{"path":"F:\\Videos\\d2s lossless scailing"}}`,
+  updated `browser_selection`, and rendered the blue selected-row state. Full
+  suite: `2817 passed, 70 skipped`.

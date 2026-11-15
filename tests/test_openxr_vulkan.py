@@ -7340,6 +7340,28 @@ def test_settings_menu_plus_button_applies_exact_slider_step() -> None:
     )
 
 
+def test_openxr_media_overlay_entry_action_dispatches_browse_select():
+    actions = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda action, **values: actions.append(
+            (action, values)
+        ) or True
+    )
+    presenter._media_overlay_state = {"ready": True, "mode": "Browser"}
+
+    presenter._dispatch_media_overlay_hit("entry", "F:/Videos/movie.mkv")
+
+    assert actions == [
+        (
+            "media_control",
+            {
+                "media_action": "browse_select",
+                "value": {"path": "F:/Videos/movie.mkv"},
+            },
+        )
+    ]
+
+
 def test_openxr_media_overlay_dispatches_shared_player_actions():
     class Callback:
         def __init__(self):
@@ -7417,7 +7439,7 @@ def test_openxr_media_overlay_dispatches_shared_player_actions():
     ]
 
 
-def test_openxr_media_browser_trigger_click_dispatches_entry_on_press():
+def test_openxr_media_browser_trigger_click_dispatches_entry_on_release():
     calls = []
     presenter = OpenXrVulkanPresenter()
     presenter._media_overlay_state = {
@@ -7446,11 +7468,24 @@ def test_openxr_media_browser_trigger_click_dispatches_entry_on_press():
     )
 
     assert presenter._handle_media_overlay_input() is True
-    assert calls == [("entry", "F:/Videos/movie.mkv")]
+    assert calls == []
+    assert presenter._media_overlay_pending_selection is not None
 
+    presenter._media_overlay_ray_hit = lambda hand, browser=False: None
     presenter._controller_inputs = ({}, {"trigger": 0.0})
-    presenter._handle_media_overlay_input()
+    assert presenter._handle_media_overlay_input() is True
+    assert calls == [("entry", "F:/Videos/movie.mkv")]
+    assert (
+        presenter._media_overlay_state["browser_selection"]
+        == "F:/Videos/movie.mkv"
+    )
+
+    presenter._media_overlay_ray_hit = (
+        lambda hand, browser=False: (0.5, 0.18) if hand == 1 else None
+    )
     presenter._controller_inputs = ({}, {"trigger": 1.0})
+    assert presenter._handle_media_overlay_input() is True
+    presenter._controller_inputs = ({}, {"trigger": 0.0})
     assert presenter._handle_media_overlay_input() is True
     assert calls[-1] == ("entry", "F:/Videos/movie.mkv")
 
@@ -7465,9 +7500,9 @@ def test_openxr_media_browser_fits_texture_aspect_inside_screen():
 
     _matrix, size = presenter._media_overlay_matrix(browser=True)
 
-    assert size[0] / size[1] == pytest.approx(1400.0 / 900.0)
-    assert size[0] <= screen_width * 0.84 + 1e-6
-    assert size[1] <= screen_height * 0.78 + 1e-6
+    assert size[0] / size[1] == pytest.approx(1600.0 / 1200.0)
+    assert size[0] <= screen_width * 0.94 + 1e-6
+    assert size[1] <= screen_height * 0.90 + 1e-6
 
 
 def test_openxr_media_overlays_are_precreated_for_vdxr_safe_uploads():
@@ -7478,7 +7513,7 @@ def test_openxr_media_overlays_are_precreated_for_vdxr_safe_uploads():
     ) == (1024, 1024)
     assert OpenXrVulkanPresenter._tool_quad_precreate_size(
         "media_browser", pool
-    ) == (1400, 1024)
+    ) == (1600, 1200)
 
 
 def test_openxr_media_state_and_controls_use_the_active_capture_session(tmp_path):

@@ -9,8 +9,13 @@ from xr_viewer.settings_menu import OPENXR_MENU_COLORS, OPENXR_MENU_RADII
 
 _FONT_PATH = Path(__file__).resolve().parent / "xr_viewer" / "fonts" / "InterVariable.ttf"
 _MEDIA_BAR_SIZE = (1024, 160)
-_MEDIA_BROWSER_SIZE = (1400, 900)
-_BROWSER_VISIBLE_ROWS = 12
+MEDIA_BROWSER_TEXTURE_SIZE = (1600, 1200)
+MEDIA_BROWSER_TEXTURE_ASPECT = (
+    MEDIA_BROWSER_TEXTURE_SIZE[0] / MEDIA_BROWSER_TEXTURE_SIZE[1]
+)
+_MEDIA_BROWSER_SIZE = MEDIA_BROWSER_TEXTURE_SIZE
+MEDIA_BROWSER_VISIBLE_ROWS = 10
+_BROWSER_VISIBLE_ROWS = MEDIA_BROWSER_VISIBLE_ROWS
 
 
 def _rgba(token: str, alpha: int = 255) -> tuple[int, int, int, int]:
@@ -238,20 +243,21 @@ def _browser_layout(state: dict, width: int, height: int) -> dict[str, int]:
     mounts = list(state.get("browser_mounts") or [])
     recent = list(state.get("recent_entries") or [])
     playlist = list(state.get("playlist_entries") or [])
-    sidebar_right = 320
-    mount_count = min(4, len(mounts))
-    recent_count = min(5, len(recent))
+    sidebar_right = max(360, min(420, int(width * 0.25)))
+    mount_count = min(3, len(mounts))
+    recent_count = min(4, len(recent))
     playlist_count = min(4, len(playlist))
-    mount_top = 112
-    mount_row_height = 42
-    recent_heading_y = mount_top + mount_count * mount_row_height + 32
-    recent_rows_y = recent_heading_y + 30
-    recent_row_height = 40
+    mount_top = max(150, int(height * 0.125))
+    mount_row_height = 60
+    recent_heading_y = mount_top + mount_count * mount_row_height + 34
+    recent_rows_y = recent_heading_y + 36
+    recent_row_height = 56
     playlist_heading_y = (
-        recent_rows_y + max(1, recent_count) * recent_row_height + 28
+        recent_rows_y + max(1, recent_count) * recent_row_height + 34
     )
-    playlist_rows_y = playlist_heading_y + 30
-    playlist_row_height = 36
+    playlist_rows_y = playlist_heading_y + 36
+    playlist_row_height = 52
+    file_rows_y = max(164, int(height * 0.14))
     return {
         "sidebar_right": sidebar_right,
         "mount_top": mount_top,
@@ -265,8 +271,58 @@ def _browser_layout(state: dict, width: int, height: int) -> dict[str, int]:
         "playlist_rows_y": playlist_rows_y,
         "playlist_count": playlist_count,
         "playlist_row_height": playlist_row_height,
-        "file_rows_y": 136,
-        "file_row_height": max(44, (height - 136 - 84) // _BROWSER_VISIBLE_ROWS),
+        "file_rows_y": file_rows_y,
+        "file_row_height": max(
+            72, (height - file_rows_y - 120) // _BROWSER_VISIBLE_ROWS
+        ),
+    }
+
+
+def _browser_button_rects(
+    width: int, height: int
+) -> dict[str, tuple[int, int, int, int]]:
+    """Return MetaXR-sized browser actions with at least 48 px targets."""
+    margin = max(24, int(width * 0.018))
+    gap = max(10, int(width * 0.008))
+    button_w = 112
+    button_h = 56
+    footer_y = height - margin - button_h
+    refresh_x = width - margin - button_w
+    up_x = refresh_x - gap - button_w
+    close_x = up_x - gap - button_w
+    return {
+        "browser_close": (close_x, margin, close_x + button_w, margin + button_h),
+        "browser_up": (up_x, margin, up_x + button_w, margin + button_h),
+        "browser_refresh": (
+            refresh_x,
+            margin,
+            refresh_x + button_w,
+            margin + button_h,
+        ),
+        "browse_open": (
+            width - margin - 176,
+            footer_y,
+            width - margin,
+            footer_y + button_h,
+        ),
+        "playlist_previous": (
+            margin,
+            footer_y,
+            margin + 104,
+            footer_y + button_h,
+        ),
+        "playlist_next": (
+            margin + 116,
+            footer_y,
+            margin + 220,
+            footer_y + button_h,
+        ),
+        "playlist_clear": (
+            margin + 232,
+            footer_y,
+            margin + 336,
+            footer_y + button_h,
+        ),
     }
 
 
@@ -634,8 +690,8 @@ def build_pointer_rgba(size: int = 48) -> np.ndarray:
 def build_media_browser_rgba(
     state: dict,
     *,
-    width: int = 1400,
-    height: int = 900,
+    width: int = MEDIA_BROWSER_TEXTURE_SIZE[0],
+    height: int = MEDIA_BROWSER_TEXTURE_SIZE[1],
     hover: str | None = None,
     scroll_offset: int = 0,
     lang: str = "EN",
@@ -646,7 +702,7 @@ def build_media_browser_rgba(
     draw = ImageDraw.Draw(image)
     width, height = image.size
     layout = _browser_layout(state, width, height)
-    rects = _button_rects(width, height)
+    rects = _browser_button_rects(width, height)
     shell = (12, 12, width - 13, height - 13)
     draw.rounded_rectangle(shell, radius=OPENXR_MENU_RADII["panel"], fill=_rgba("surface", 238))
     sidebar_right = layout["sidebar_right"]
@@ -659,9 +715,9 @@ def build_media_browser_rgba(
         return gettext_for(normalize_locale(lang), message)
 
     draw.text(
-        (48, 72),
+        (48, 84),
         translate("Locations"),
-        font=_font(18, bold=True),
+        font=_font(22, bold=True),
         fill=_rgba("text_secondary"),
     )
     mounts = list(state.get("browser_mounts") or [])
@@ -704,7 +760,7 @@ def build_media_browser_rgba(
     draw.text(
         (48, layout["recent_heading_y"]),
         translate("Recent"),
-        font=_font(18, bold=True),
+        font=_font(22, bold=True),
         fill=_rgba("text_secondary"),
     )
     if recent:
@@ -763,7 +819,7 @@ def build_media_browser_rgba(
     draw.text(
         (48, layout["playlist_heading_y"]),
         translate("Playlist"),
-        font=_font(18, bold=True),
+        font=_font(22, bold=True),
         fill=_rgba("text_secondary"),
     )
     playlist_index = int(state.get("playlist_index", -1) or -1)
@@ -847,17 +903,17 @@ def build_media_browser_rgba(
     path_text = str(state.get("browser_path") or "")
     header_left = sidebar_right + 34
     draw.text(
-        (header_left, 32),
+        (header_left, 42),
         translate("Files"),
-        font=_font(22, bold=True),
+        font=_font(28, bold=True),
         fill=_rgba("text_primary"),
     )
     header_actions_left = rects["browser_close"][0] - 24
     _text(
         draw,
-        (header_left, 72),
-        _fit_text(draw, path_text, 17, header_actions_left - header_left),
-        17,
+        (header_left, 94),
+        _fit_text(draw, path_text, 19, header_actions_left - header_left),
+        19,
         fill=_rgba("text_secondary"),
     )
     for key, label in (
@@ -876,7 +932,7 @@ def build_media_browser_rgba(
             draw,
             ((x0 + x1) // 2, (y0 + y1) // 2),
             label,
-            16,
+            18,
             fill=_rgba("text_primary", 255 if enabled else 104),
             anchor="mm",
         )
@@ -912,10 +968,10 @@ def build_media_browser_rgba(
             _fit_text(
                 draw,
                 str(entry.get("name") or path),
-                17,
-                width - sidebar_right - 136,
+                21,
+                width - sidebar_right - 150,
             ),
-            17,
+            21,
             fill=_rgba("text_primary"),
             anchor="lm",
         )
@@ -940,9 +996,9 @@ def build_media_browser_rgba(
     open_x0, open_y0, _open_x1, _open_y1 = rects["browse_open"]
     _text(
         draw,
-        (open_x0 - 16, open_y0 + 24),
+        (open_x0 - 18, open_y0 + 28),
         translate("Click to select · Double-click to open"),
-        16,
+        18,
         fill=_rgba("text_secondary"),
         anchor="rm",
     )
@@ -958,7 +1014,7 @@ def media_browser_hit(
 ) -> tuple[str, object] | None:
     width, height = _MEDIA_BROWSER_SIZE
     x, y = float(u) * width, float(v) * height
-    rects = _button_rects(width, height)
+    rects = _browser_button_rects(width, height)
     for key in (
         "browser_up",
         "browser_refresh",
