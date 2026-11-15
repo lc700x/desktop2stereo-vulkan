@@ -665,3 +665,38 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   `23.97 FPS`, capture/runtime were `24 FPS`, XR presentation was `71.9 FPS`,
   `xr_no_fresh=0`, and headset VrApi remained `90/90`, `Stale=0`, `Tear=0`.
   Full suite: `2824 passed, 70 skipped`.
+
+## OpenXR media cadence and source-order stability (2026-11-15)
+
+- 24 fps media on the 90 Hz OpenXR Simulator must consume the nearest
+  compositor tick, not wait until the nominal source timestamp has passed.
+  `_select_presentable_output_frame()` permits at most half an XR tick early,
+  producing the required 3/4/4/4 tick pulldown instead of every frame landing
+  four ticks late (22.5 fps) and overflowing the presenter queue.
+- A selected `_pending_output` must never be replaced by another queued media
+  frame before that pending frame is rendered/committed. The presenter now
+  returns the existing pending frame and leaves the queue untouched, preventing
+  a forward skip caused by selecting ahead.
+- When decoder cadence already matches playback cadence, `_take_buffered_frame`
+  preserves source order and only drops stale frames after more than roughly
+  three source periods of lag. Higher-rate sources still use deterministic
+  decimation. `media_stale_drops` reports bounded catch-up drops.
+- OpenXR now records the actual committed media source sequence when
+  `D2S_OPENXR_SCREEN_INTERVAL_TRACE=1`; use committed source indexes, not the
+  pre-render selection trace, when judging playback order.
+- A/B result: this is not AMD-only. With AMD Vulkan forced off and CUDA +
+  RTX 2070 Vulkan forced on via `VK_ICD_FILENAMES`/`VK_DRIVER_FILES`, the same
+  source-order class reproduced (including startup commit gaps and queue
+  overflows). The pure NVIDIA NVDEC/TensorRT path also showed more severe
+  startup throttling. Do not attribute this playback bug solely to ROCm.
+- Final AMD ROCm + OpenXR Simulator verification: 735 committed media frames
+  from source 38 through 776 had exactly one startup gap (38 -> 43) and then a
+  contiguous sequence; XR submission stayed about 90 fps. The user confirmed
+  the live playback is stable.
+- Verification: focused ROCm and CUDA suites each `546 passed, 2 skipped`.
+  ROCm full suite `2832 passed, 70 skipped`. CUDA full suite produced the
+  known order-dependent `test_quality_scale_gpu_preprocess_matches_final_pipeline_size[100%-capture_size1]`
+  context error after `2863 passed, 37 skipped`; the test passes alone and the
+  complete `tests/test_pipeline.py` file passes `208 passed`.
+- Do not commit `src/desktop2stereo/settings.yaml`; it contains user-local media
+  path, resume position, display identity, and playback state.

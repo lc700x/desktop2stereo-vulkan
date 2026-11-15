@@ -86,10 +86,15 @@ LATEST_KEYS = {
     "media_read_max",
     "media_buffer_depth",
     "media_buffer_capacity",
+    "media_buffer_stale_drops",
     "media_decode_backend",
     "media_fallback_reason",
     "openxr_vulkan_projection_quality_chain_requested",
     "openxr_vulkan_projection_quality_chain_active",
+    "openxr_screen_new_interval_p50_ms",
+    "openxr_screen_new_interval_min_ms",
+    "openxr_screen_new_interval_p95_ms",
+    "openxr_screen_new_interval_max_ms",
     "sys_gpu",
     "sys_gpu_max",
 }
@@ -542,6 +547,10 @@ class FPSBreakdown:
             f"present_interval_max={timing_max('local_present_interval'):.2f}ms "
             f"local_present_pack_ms={avg_ms('local_present_pack'):.2f}ms "
             f"screen_new={rate('openxr_new_screen_frame'):.1f} "
+            f"screen_new_interval_p50={float(stats.get('openxr_screen_new_interval_p50_ms', 0.0)):.2f}ms "
+            f"screen_new_interval_min={float(stats.get('openxr_screen_new_interval_min_ms', 0.0)):.2f}ms "
+            f"screen_new_interval_p95={float(stats.get('openxr_screen_new_interval_p95_ms', 0.0)):.2f}ms "
+            f"screen_new_interval_max={float(stats.get('openxr_screen_new_interval_max_ms', 0.0)):.2f}ms "
             f"screen_reuse={rate('openxr_reused_screen_frame'):.1f} "
             f"screen_replay={rate('openxr_replayed_screen_frame'):.1f} "
             f"screen_proj={rate('openxr_projection_screen_present'):.1f} "
@@ -807,6 +816,7 @@ class FPSBreakdown:
             f"media_read_p50={float(stats.get('media_read_p50', 0.0) or 0.0):.2f}ms "
             f"media_read_p95={float(stats.get('media_read_p95', 0.0) or 0.0):.2f}ms "
             f"media_buffer={int(stats.get('media_buffer_depth', 0) or 0)}/{int(stats.get('media_buffer_capacity', 0) or 0)} "
+            f"media_stale_drops={int(stats.get('media_buffer_stale_drops', 0) or 0)} "
             f"media_decode={stats.get('media_decode_backend', 'n/a')} "
             f"media_gen={stats.get('media_generation', 'n/a')} "
             f"source_frame={stats.get('source_frame_index', 'n/a')} "

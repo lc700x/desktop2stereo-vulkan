@@ -103,7 +103,7 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
     def __init__(self, presenter):
         self.presenter = presenter
         self.importer = None
-        self.ring_size = max(2, int(os.environ.get("D2S_VULKAN_OUTPUT_RING_SIZE", "3")))
+        self.ring_size = max(2, int(os.environ.get("D2S_VULKAN_OUTPUT_RING_SIZE", "4")))
         self.left_slots = []
         self.right_slots = []
         self.left_ready_semaphores = []

@@ -654,6 +654,7 @@ def test_output_contract_publishes_actual_source_layout_and_queue_family() -> No
 def test_cuda_tensor_reaches_vulkan_output_slot_without_cpu_roundtrip(monkeypatch) -> None:
     # This test exercises the production CUDA timeline-semaphore path.
     monkeypatch.setenv("D2S_ENABLE_CUDA_EXTERNAL_SEMAPHORE", "1")
+    monkeypatch.setenv("D2S_VULKAN_OUTPUT_RING_SIZE", "3")
     required_extensions = tuple(
         dict.fromkeys(
             VulkanExportableImage.required_device_extensions()

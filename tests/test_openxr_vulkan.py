@@ -4416,7 +4416,8 @@ def test_openxr_frame_gate_waits_for_runtime_output_before_filament() -> None:
     source = (APP_ROOT /
               "xr_viewer/core_openxr_vulkan.py").read_text(encoding="utf-8")
 
-    assert "self._pending_output is None" in source
+    assert "output_frame is None" in source
+    assert "not self._has_presented_frame" in source
     assert "and not self._has_presented_frame" in source
     assert "and not self._projection_array_eye_diagnostic" in source
     assert "and not self._vulkan_multiview_eye_diagnostic" in source
@@ -5778,6 +5779,191 @@ def test_presenter_queues_output_from_non_owner_thread() -> None:
     assert presenter._pending_output is None
     presenter._drain_presenter_commands()
     assert presenter._pending_output is frame
+
+
+def _media_output_frame(
+    frame_id: int,
+    source_index: int,
+    source_pts: float,
+    *, generation: int = 0,
+    replayed_static: bool = False,
+) -> VulkanStereoOutputFrame:
+    return VulkanStereoOutputFrame(
+        frame_id=frame_id,
+        timestamp=float(frame_id),
+        left_eye=object(),
+        right_eye=object(),
+        metadata={
+            "media_generation": generation,
+            "source_frame_index": source_index,
+            "source_pts": source_pts,
+            "replayed_static_frame": int(replayed_static),
+        },
+    )
+
+
+def test_presenter_drops_duplicate_and_out_of_order_media_frames() -> None:
+    presenter = OpenXrVulkanPresenter()
+    released = []
+    counters = {}
+    presenter._release_output_frame = released.append
+    presenter._on_breakdown_inc = lambda key, amount: counters.__setitem__(
+        key, counters.get(key, 0) + amount
+    )
+    first = _media_output_frame(1, 10, 0.4)
+    newest = _media_output_frame(2, 12, 0.5)
+    regression = _media_output_frame(3, 11, 0.45)
+    duplicate = _media_output_frame(4, 12, 0.5)
+
+    presenter._submit_output_on_presenter(first)
+    presenter._submit_output_on_presenter(newest)
+    released.clear()
+
+    presenter._submit_output_on_presenter(regression)
+    presenter._submit_output_on_presenter(duplicate)
+
+    assert list(presenter._media_output_queue) == [first, newest]
+    assert released == [regression, duplicate]
+    assert counters == {
+        "openxr_output_source_regression_drop": 1,
+        "openxr_output_source_duplicate_drop": 1,
+    }
+
+
+def test_presenter_accepts_lower_source_index_for_new_media_generation() -> None:
+    presenter = OpenXrVulkanPresenter()
+    released = []
+    presenter._release_output_frame = released.append
+    previous = _media_output_frame(1, 400, 16.0, generation=0)
+    restarted = _media_output_frame(2, 0, 0.0, generation=1)
+
+    presenter._submit_output_on_presenter(previous)
+    released.clear()
+    presenter._submit_output_on_presenter(restarted)
+
+    assert list(presenter._media_output_queue) == [restarted]
+    assert presenter._media_output_generation == 1
+    assert released == [previous]
+
+
+def test_presenter_allows_replayed_static_media_frame() -> None:
+    presenter = OpenXrVulkanPresenter()
+    released = []
+    presenter._release_output_frame = released.append
+    first = _media_output_frame(1, 20, 0.8)
+    replayed = _media_output_frame(2, 20, 0.8, replayed_static=True)
+
+    presenter._submit_output_on_presenter(first)
+    released.clear()
+    presenter._submit_output_on_presenter(replayed)
+
+    assert presenter._pending_output is replayed
+    assert released == [first]
+
+
+def test_presenter_primes_two_media_frames_before_cadence_output(monkeypatch) -> None:
+    now = [10.0]
+    monkeypatch.setattr(
+        core_openxr_vulkan.time, "perf_counter", lambda: now[0]
+    )
+    presenter = OpenXrVulkanPresenter()
+    presenter._release_output_frame = lambda _frame: None
+    presenter._last_frame_dt = 1.0 / 72.0
+    period = 1.0 / 24.0
+    first = _media_output_frame(1, 0, 0.0)
+    second = _media_output_frame(2, 1, period)
+
+    presenter._submit_output_on_presenter(first)
+    assert presenter._select_presentable_output_frame(now[0]) is None
+
+    now[0] += period
+    presenter._submit_output_on_presenter(second)
+    assert presenter._select_presentable_output_frame(now[0]) is first
+    presenter._commit_output_frame(first)
+    assert presenter._media_next_present_at == pytest.approx(now[0] + period)
+
+    now[0] += period * 0.25
+    assert presenter._select_presentable_output_frame(now[0]) is None
+
+    now[0] += period * 0.75
+    assert presenter._select_presentable_output_frame(now[0]) is second
+
+
+def test_presenter_does_not_replace_uncommitted_media_pending_frame() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._release_output_frame = lambda _frame: None
+    presenter._last_frame_dt = 1.0 / 90.0
+    presenter._media_next_present_at = 0.0
+    pending = _media_output_frame(1, 0, 0.0)
+    queued = _media_output_frame(2, 1, 1.0 / 24.0)
+    presenter._pending_output = pending
+    presenter._media_output_queue.append(queued)
+    presenter._media_output_queue_arrivals.append(0.0)
+
+    selected = presenter._select_presentable_output_frame(1.0)
+
+    assert selected is pending
+    assert presenter._pending_output is pending
+    assert list(presenter._media_output_queue) == [queued]
+
+
+def test_presenter_uses_3_4_tick_pulldown_for_24fps_on_90hz(monkeypatch) -> None:
+    now = [0.0]
+    monkeypatch.setattr(
+        core_openxr_vulkan.time, "perf_counter", lambda: now[0]
+    )
+    presenter = OpenXrVulkanPresenter()
+    presenter._release_output_frame = lambda _frame: None
+    presenter._last_frame_dt = 1.0 / 90.0
+    source_period = 1.0 / 24.0
+    frames = [_media_output_frame(i + 1, i, i * source_period) for i in range(60)]
+    next_source = 0
+    next_source_at = 0.0
+    presented_times = []
+    presented_indices = []
+
+    for tick in range(1, 181):
+        now[0] = tick / 90.0
+        while (
+            next_source < len(frames)
+            and next_source_at <= now[0] + 1e-9
+        ):
+            presenter._submit_output_on_presenter(frames[next_source])
+            next_source += 1
+            next_source_at = next_source * source_period
+        frame = presenter._select_presentable_output_frame(now[0])
+        if frame is None:
+            continue
+        presenter._commit_output_frame(frame)
+        presented_times.append(now[0])
+        presented_indices.append(frame.metadata["source_frame_index"])
+
+    intervals = [
+        round((right - left) * 90.0)
+        for left, right in zip(presented_times, presented_times[1:])
+    ]
+    assert len(intervals) >= 40
+    assert set(intervals) <= {3, 4}
+    assert 3 in intervals
+    assert 4 in intervals
+    assert abs(sum(intervals) / len(intervals) - 3.75) < 0.08
+    assert presented_indices == list(range(len(presented_indices)))
+
+
+def test_presenter_commits_one_pending_media_frame_without_extra_buffer() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._release_output_frame = lambda _frame: None
+    presenter._last_frame_dt = 1.0 / 72.0
+    presenter._media_source_period_s = 1.0 / 24.0
+    frame = _media_output_frame(1, 0, 0.0)
+    presenter._pending_output = frame
+
+    presenter._commit_output_frame(frame)
+
+    assert presenter._displayed_output is frame
+    assert presenter._pending_output is None
+    assert presenter._media_next_present_at > 0.0
+    assert presenter._media_present_generation == 0
 
 
 def test_presenter_submits_raw_runtime_result_on_owner_thread() -> None:

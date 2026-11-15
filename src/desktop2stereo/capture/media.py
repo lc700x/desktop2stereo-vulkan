@@ -717,6 +717,8 @@ class MediaCaptureSource:
         self._frame_pump_read_ms = deque(maxlen=120)
         self._frame_pump_frame_times = deque(maxlen=120)
         self._last_source_frame_duration = 0.0
+        self._frame_buffer_stale_drops = 0
+        self._frame_buffer_drop_log_at = 0.0
         self._decode_lock = threading.RLock()
         try:
             self._open()
@@ -803,6 +805,9 @@ class MediaCaptureSource:
             "read_ms_max": max(ordered) if ordered else 0.0,
             "buffer_depth": buffer_depth,
             "buffer_capacity": self._frame_buffer_capacity,
+            "buffer_stale_drops": int(
+                getattr(self, "_frame_buffer_stale_drops", 0)
+            ),
             "pump_done": pump_done,
             "decode_backend": str(getattr(self, "_decode_backend", "") or ""),
             "fallback_reason": str(getattr(self, "decode_fallback_reason", "") or ""),
@@ -1489,6 +1494,12 @@ class MediaCaptureSource:
         playback_period = self._frame_duration()
         source_period = self._source_frame_duration()
         tolerance = 0.5 * min(playback_period, source_period)
+        # When the decoder already emits at the playback cadence, small consumer
+        # jitter is recoverable: return the oldest due source frame and let the
+        # next grab catch up. Selecting the newest due frame here drops source
+        # frames every time one inference tick slips, which reads as a jump.
+        preserve_source_order = source_period >= playback_period * 0.95
+        max_exact_lateness = 3.0 * max(playback_period, source_period)
         wait_budget = min(0.02, max(0.002, source_period * 1.5))
         deadline = time.perf_counter() + wait_budget
         with self._frame_buffer_condition:
@@ -1498,42 +1509,68 @@ class MediaCaptureSource:
                     self._frame_buffer_condition.notify_all()
                     return item
 
-                # Keep exactly the newest source frame whose PTS has reached
-                # the wall-clock media position. Do not consume a previous
-                # frame merely because the next source frame is a few
-                # milliseconds late: that is what creates alternating 1/2/3
-                # source-frame jumps on 120 fps media at 60/72 Hz.
-                while (
-                    len(self._frame_buffer) > 1
-                    and self._frame_buffer[1][0] <= target_position
-                ):
-                    self._frame_buffer.popleft()
-
-                if self._frame_buffer:
-                    candidate = self._frame_buffer[0]
-                    candidate_pts = float(candidate[0])
-                    latest_is_proven = (
-                        len(self._frame_buffer) > 1
-                        and float(self._frame_buffer[1][0]) > target_position
-                    )
-                    close_enough = (
-                        candidate_pts <= target_position
-                        and target_position - candidate_pts <= tolerance
-                    )
-                    if candidate_pts <= target_position and (
-                        latest_is_proven or close_enough
+                if preserve_source_order:
+                    dropped_stale = 0
+                    while (
+                        self._frame_buffer
+                        and target_position - float(self._frame_buffer[0][0])
+                        > max_exact_lateness
                     ):
-                        item = self._frame_buffer.popleft()
-                        self._frame_buffer_condition.notify_all()
-                        return item
-                    if self._frame_pump_done:
-                        if candidate_pts <= target_position:
+                        self._frame_buffer.popleft()
+                        dropped_stale += 1
+                    if dropped_stale:
+                        self._frame_buffer_stale_drops += dropped_stale
+                        now = time.perf_counter()
+                        if now - self._frame_buffer_drop_log_at >= 2.0:
+                            self._frame_buffer_drop_log_at = now
+                            print(
+                                "[media] bounded catch-up dropped "
+                                f"{dropped_stale} stale source frame(s)",
+                                flush=True,
+                            )
+                    if self._frame_buffer:
+                        candidate_pts = float(self._frame_buffer[0][0])
+                        if candidate_pts <= target_position + tolerance:
                             item = self._frame_buffer.popleft()
                             self._frame_buffer_condition.notify_all()
                             return item
+                    if self._frame_pump_done:
                         return None
-                elif self._frame_pump_done:
-                    return None
+                else:
+                    # Keep exactly the newest source frame whose PTS has reached
+                    # the wall-clock media position when the decoder is
+                    # intentionally resampling a higher source cadence.
+                    while (
+                        len(self._frame_buffer) > 1
+                        and self._frame_buffer[1][0] <= target_position
+                    ):
+                        self._frame_buffer.popleft()
+
+                    if self._frame_buffer:
+                        candidate = self._frame_buffer[0]
+                        candidate_pts = float(candidate[0])
+                        latest_is_proven = (
+                            len(self._frame_buffer) > 1
+                            and float(self._frame_buffer[1][0]) > target_position
+                        )
+                        close_enough = (
+                            candidate_pts <= target_position
+                            and target_position - candidate_pts <= tolerance
+                        )
+                        if candidate_pts <= target_position and (
+                            latest_is_proven or close_enough
+                        ):
+                            item = self._frame_buffer.popleft()
+                            self._frame_buffer_condition.notify_all()
+                            return item
+                        if self._frame_pump_done:
+                            if candidate_pts <= target_position:
+                                item = self._frame_buffer.popleft()
+                                self._frame_buffer_condition.notify_all()
+                                return item
+                            return None
+                    elif self._frame_pump_done:
+                        return None
 
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0.0:

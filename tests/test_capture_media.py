@@ -1622,9 +1622,13 @@ def test_120fps_buffer_waits_for_exact_sample_instead_of_returning_stale_frame()
     assert item[2] == 2
 
 
-def test_buffered_playback_uses_wall_clock_target_and_drops_stale_frames():
+def test_buffered_playback_preserves_small_source_order_slip() -> None:
     source = object.__new__(MediaCaptureSource)
     source._playback_fps = 60.0
+    source._source_fps = 60.0
+    source._last_source_frame_duration = 1.0 / 60.0
+    source._frame_buffer_stale_drops = 0
+    source._frame_buffer_drop_log_at = 0.0
     source._frame_buffer = deque(
         [
             (0.0, "frame-0", 0),
@@ -1637,9 +1641,34 @@ def test_buffered_playback_uses_wall_clock_target_and_drops_stale_frames():
 
     item = source._take_buffered_frame(2.0 / 60.0)
 
-    assert item[1] == "frame-2"
-    assert item[2] == 2
-    assert list(source._frame_buffer) == []
+    assert item[1] == "frame-0"
+    assert item[2] == 0
+    assert source._frame_buffer_stale_drops == 0
+    assert list(source._frame_buffer) == [
+        (1.0 / 60.0, "frame-1", 1),
+        (2.0 / 60.0, "frame-2", 2),
+    ]
+
+
+def test_buffered_playback_bounds_large_exact_cadence_lag() -> None:
+    source = object.__new__(MediaCaptureSource)
+    source._playback_fps = 60.0
+    source._source_fps = 60.0
+    source._last_source_frame_duration = 1.0 / 60.0
+    source._frame_buffer_stale_drops = 0
+    source._frame_buffer_drop_log_at = 0.0
+    source._frame_buffer = deque(
+        (index / 60.0, f"frame-{index}", index) for index in range(8)
+    )
+    source._frame_buffer_condition = threading.Condition()
+    source._frame_pump_done = False
+
+    item = source._take_buffered_frame(7.0 / 60.0)
+
+    assert item[1] == "frame-4"
+    assert item[2] == 4
+    assert source._frame_buffer_stale_drops == 4
+    assert [entry[2] for entry in source._frame_buffer] == [5, 6, 7]
 
 
 def test_frame_pump_is_bounded_and_pause_keeps_buffered_frames():

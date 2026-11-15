@@ -136,6 +136,7 @@ class RuntimeCallbacks:
             "read_ms_max",
             "buffer_depth",
             "buffer_capacity",
+            "buffer_stale_drops",
             "decode_backend",
             "fallback_reason",
         ):
