@@ -54,6 +54,8 @@ from media_ui import (
 
 
 _OUTPUT_FRAME_UNSET = object()
+_MEDIA_BAR_TEXTURE_ASPECT = 1024.0 / 160.0
+_MEDIA_BROWSER_TEXTURE_ASPECT = 1400.0 / 900.0
 # Screen geometry is evaluated from the live headset pose, so its diagnostic
 # values can change every frame while the user is looking around. Keep the
 # diagnostics useful without allowing pose-driven changes to flood the child
@@ -5934,13 +5936,23 @@ class OpenXrVulkanPresenter(
         height = float(height)
         screen_pose = self._filament_screen_pose_mat4()
         if browser:
-            panel_w = width * 0.84
-            panel_h = min(height * 0.78, panel_w * 900.0 / 1400.0)
+            max_w = max(0.01, width * 0.84)
+            max_h = max(0.01, height * 0.78)
+            # Fit the 1400x900 browser texture inside the screen instead of
+            # independently stretching width and height. The same panel size
+            # drives painting and ray hit-testing, so keeping one aspect ratio
+            # also keeps the visible controls aligned with controller rays.
+            if max_w / max_h > _MEDIA_BROWSER_TEXTURE_ASPECT:
+                panel_h = max_h
+                panel_w = panel_h * _MEDIA_BROWSER_TEXTURE_ASPECT
+            else:
+                panel_w = max_w
+                panel_h = panel_w / _MEDIA_BROWSER_TEXTURE_ASPECT
             local_y = 0.0
             local_z = 0.028
         else:
-            panel_w = width * 0.88
-            panel_h = max(0.08, panel_w * 160.0 / 1024.0)
+            panel_w = max(0.01, width * 0.88)
+            panel_h = max(0.08, panel_w / _MEDIA_BAR_TEXTURE_ASPECT)
             local_y = -height * 0.5 + panel_h * 0.5 + max(0.02, height * 0.035)
             local_z = 0.024
         matrix = screen_pose.copy()
@@ -7730,6 +7742,8 @@ class OpenXrVulkanPresenter(
             # for the complete Chinese and English operation rows.
             "screen_help": (1280, 1536),
             "hand_help": (2048, 768),
+            "media_bar": (1024, 160),
+            "media_browser": (1400, 900),
         }
         minimum = minimum_sizes.get(key, pool_size)
         return max(pool_size[0], minimum[0]), max(pool_size[1], minimum[1])
@@ -7758,6 +7772,8 @@ class OpenXrVulkanPresenter(
                 "aperture",
                 "keyboard",
                 "settings_menu",
+                "media_bar",
+                "media_browser",
                 "controller_proxy_callout",
                 "laser_cursor_0",
                 "laser_cursor_1",
@@ -14827,8 +14843,17 @@ class OpenXrVulkanPresenter(
                 entry["image_index"] = image_index
             entry["content"] = request
             entry["content_size"] = (width, height)
+        # Pooled swapchains may be larger than the populated content. Sample
+        # only the rendered sub-rectangle so the compositor does not stretch
+        # unused rows into the visible quad.
+        sub_image_rect = (
+            (0, 0, int(width), int(height))
+            if (int(width), int(height)) != (int(render_width), int(render_height))
+            else None
+        )
         return self._make_tool_quad_layer(
-            entry, width, height, position, size, rotation, key=key
+            entry, width, height, position, size, rotation, key=key,
+            sub_image_rect=sub_image_rect,
         )
 
     def _destroy_tool_quad_entry(self, entry: dict[str, Any]) -> None:
@@ -14931,8 +14956,18 @@ class OpenXrVulkanPresenter(
                 entry["image_index"] = image_index
             entry["content"] = rgba
             entry["content_size"] = (width, height)
+        # Pooled canvases can be taller or wider than their content (the
+        # settings menu is 1024x832 in a 1024x1024 pool, and the media browser
+        # is 1400x900 in a 1400x1024 pool). Sample only the populated sub-rect
+        # so the UI keeps its aspect and ray hits stay aligned with it.
+        sub_image_rect = (
+            (0, 0, int(width), int(height))
+            if (int(width), int(height)) != (int(render_width), int(render_height))
+            else None
+        )
         return self._make_tool_quad_layer(
-            entry, width, height, position, size, rotation, key=key
+            entry, width, height, position, size, rotation, key=key,
+            sub_image_rect=sub_image_rect,
         )
 
     def _tool_quad_format(self) -> int:

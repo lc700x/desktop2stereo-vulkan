@@ -3420,6 +3420,44 @@ def test_curved_screen_fps_overlay_uses_matching_cylinder_layer() -> None:
     assert flat_layer["layer_type"] == "quad"
 
 
+def test_pooled_settings_menu_uses_content_subrect_for_aspect_and_hits() -> None:
+    presenter = OpenXrVulkanPresenter()
+    rgba = np.zeros((832, 1024, 4), dtype=np.uint8)
+    presenter._overlay_quad_entries = {
+        "settings_menu": {
+            "swapchain": "menu-swapchain",
+            "size": (1024, 1024),
+            "format": 43,
+            "resources": [],
+            "staging": object(),
+            "staging_size": (1024, 832),
+            "image_index": 0,
+            "content": rgba,
+            "pooled": True,
+            "content_size": (1024, 832),
+        }
+    }
+    presenter._tool_quad_format = lambda: 43
+    captured = {}
+
+    def fake_layer(*_args, **kwargs):
+        captured.update(kwargs)
+        return "menu-layer"
+
+    presenter._make_tool_quad_layer = fake_layer
+
+    result = presenter._upload_tool_quad(
+        "settings_menu",
+        rgba,
+        (0.0, 0.0, -1.0),
+        (0.95, 0.77),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+
+    assert result == "menu-layer"
+    assert captured["sub_image_rect"] == (0, 0, 1024, 832)
+
+
 def test_msdf_osd_canvas_width_follows_text_advance() -> None:
     atlas = MsdfFontAtlas()
     short_width, short_height, _ = _layout_msdf_osd_runs(
@@ -7379,6 +7417,70 @@ def test_openxr_media_overlay_dispatches_shared_player_actions():
     ]
 
 
+def test_openxr_media_browser_trigger_click_dispatches_entry_on_press():
+    calls = []
+    presenter = OpenXrVulkanPresenter()
+    presenter._media_overlay_state = {
+        "ready": True,
+        "mode": "Video",
+        "playing": True,
+        "duration": 120.0,
+        "audio_enabled": True,
+        "browser_visible": True,
+        "browser_path": "F:/Videos",
+        "browser_parent": "F:/",
+        "browser_selection": "",
+        "browser_entries": [
+            {"name": "movie.mkv", "path": "F:/Videos/movie.mkv", "kind": "video"}
+        ],
+        "browser_mounts": [],
+        "recent_entries": [],
+        "playlist_entries": [],
+    }
+    presenter._controller_inputs = ({}, {"trigger": 1.0})
+    presenter._media_overlay_ray_hit = (
+        lambda hand, browser=False: (0.5, 0.18) if hand == 1 else None
+    )
+    presenter._dispatch_media_overlay_hit = (
+        lambda action, value=None: calls.append((action, value))
+    )
+
+    assert presenter._handle_media_overlay_input() is True
+    assert calls == [("entry", "F:/Videos/movie.mkv")]
+
+    presenter._controller_inputs = ({}, {"trigger": 0.0})
+    presenter._handle_media_overlay_input()
+    presenter._controller_inputs = ({}, {"trigger": 1.0})
+    assert presenter._handle_media_overlay_input() is True
+    assert calls[-1] == ("entry", "F:/Videos/movie.mkv")
+
+
+def test_openxr_media_browser_fits_texture_aspect_inside_screen():
+    presenter = OpenXrVulkanPresenter()
+    screen_width = 23.09
+    screen_height = 12.988
+    presenter._filament_screen = (
+        (0.0, 1.2, -2.0), screen_width, screen_height, (0.0, 0.0, 0.0)
+    )
+
+    _matrix, size = presenter._media_overlay_matrix(browser=True)
+
+    assert size[0] / size[1] == pytest.approx(1400.0 / 900.0)
+    assert size[0] <= screen_width * 0.84 + 1e-6
+    assert size[1] <= screen_height * 0.78 + 1e-6
+
+
+def test_openxr_media_overlays_are_precreated_for_vdxr_safe_uploads():
+    pool = (1024, 1024)
+
+    assert OpenXrVulkanPresenter._tool_quad_precreate_size(
+        "media_bar", pool
+    ) == (1024, 1024)
+    assert OpenXrVulkanPresenter._tool_quad_precreate_size(
+        "media_browser", pool
+    ) == (1400, 1024)
+
+
 def test_openxr_media_state_and_controls_use_the_active_capture_session(tmp_path):
     class Callback:
         def __init__(self):
@@ -7421,33 +7523,14 @@ def test_openxr_media_state_and_controls_use_the_active_capture_session(tmp_path
     assert presenter._settings_menu_values["media_audio_enabled"] is True
     assert presenter._settings_menu_values["media_hdr"] is True
 
-    presenter._settings_menu.set_tab("media")
-    controls = {
-        control.key: control
+    assert "media" not in presenter._settings_menu.tabs
+    assert presenter._settings_menu.set_tab("media") is False
+    assert not any(
+        control.key.startswith("media")
         for control in presenter._settings_menu.controls(
             values=presenter._settings_menu_values
         )
-    }
-    presenter._apply_settings_menu_control(controls["media:play_pause"], None)
-    presenter._apply_settings_menu_control(controls["media:toggle_mute"], None)
-    seek = controls["media_seek"]
-    presenter._apply_settings_menu_control(
-        seek, (seek.rect[2], 0.0), persist=True
     )
-    volume = controls["media_volume"]
-    volume_u = volume.rect[0] + (volume.rect[2] - volume.rect[0]) * 0.25
-    presenter._apply_settings_menu_control(
-        volume, (volume_u, 0.0), persist=True
-    )
-
-    assert callback.actions[:2] == [
-        ("media_control", {"media_action": "pause"}),
-        ("media_control", {"media_action": "mute", "value": True}),
-    ]
-    assert callback.actions[2][1]["media_action"] == "seek"
-    assert callback.actions[2][1]["value"] == pytest.approx(120.0)
-    assert callback.actions[3][1]["media_action"] == "volume"
-    assert callback.actions[3][1]["value"] == pytest.approx(0.25)
 
     state_path.write_text(json.dumps({
         "session": "session-123",
@@ -7465,13 +7548,7 @@ def test_openxr_media_state_and_controls_use_the_active_capture_session(tmp_path
         "replacement file is unavailable"
         in presenter._settings_menu_values["media_error"]
     )
-    controls = {
-        control.key: control
-        for control in presenter._settings_menu.controls(
-            values=presenter._settings_menu_values
-        )
-    }
-    assert controls["media:play_pause"].enabled is True
+    assert presenter._settings_menu_values["media_available"] is True
 
     state_path.write_text(json.dumps({"session": "stale-session"}), encoding="utf-8")
     presenter._refresh_openxr_media_state(force=True)
@@ -7964,6 +8041,48 @@ def test_live_seat_switch_does_not_bake_current_menu_gaze_into_space() -> None:
     assert created == pytest.approx(expected, abs=1e-5)
     assert presenter._profile_space_applied
     assert not presenter._profile_space_preserve_anchor
+
+
+def test_settings_menu_single_trigger_click_applies_hovered_ray_control() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._settings_menu.set_tab("depth")
+    presenter._settings_menu.open()
+    presenter._settings_menu_values.update({
+        "depth_strength": 0.25,
+        "cross_eyed": False,
+    })
+    controls = {
+        control.key: control
+        for control in presenter._settings_menu.controls(
+            values=presenter._settings_menu_values
+        )
+    }
+    target = controls["depth:toggle_stereo"]
+    hit = (
+        (target.rect[0] + target.rect[2]) * 0.5,
+        (target.rect[1] + target.rect[3]) * 0.5,
+    )
+    presenter._settings_menu_ray_hit = lambda _hand: hit
+    presenter._grip_mat_l = None
+    presenter._grip_mat_r = None
+    presenter._settings_menu_trigger_down = [False, False]
+    presenter._controller_inputs = (
+        {"trigger": 0.0, "grip": 0.0},
+        {"trigger": 0.0, "grip": 0.0},
+    )
+    presenter._refresh_openxr_media_state = lambda **_kwargs: None
+    presenter._refresh_settings_menu_values = lambda: None
+    calls = []
+    presenter._apply_settings_menu_control = (
+        lambda control, uv, **_kwargs: calls.append((control.key, uv))
+    )
+
+    presenter._controller_inputs[1]["trigger"] = 1.0
+    assert presenter._handle_settings_menu_input() is True
+    assert calls and calls[0][0] == "depth:toggle_stereo"
+
+    presenter._controller_inputs[1]["trigger"] = 0.0
+    presenter._handle_settings_menu_input()
 
 
 def test_settings_menu_follows_live_seat_height_change() -> None:

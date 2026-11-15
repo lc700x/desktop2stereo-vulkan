@@ -99,112 +99,13 @@ def test_picture_layout_exposes_all_planned_controls():
     } <= keys
 
 
-def test_media_tab_exposes_playback_and_audio_controls_from_runtime_state():
+def test_media_controls_are_not_exposed_in_main_settings_menu():
     menu = OpenXrSettingsMenu()
-    menu.set_tab("media")
-    values = {
-        "media_available": True,
-        "media_mode": "Video",
-        "media_duration": 120.0,
-        "media_position": 24.0,
-        "media_playing": True,
-        "media_volume": 0.65,
-        "media_muted": False,
-        "media_audio_enabled": True,
-        "media_status": "movie.mkv · Playing · HDR",
-    }
 
-    controls = {
-        control.key: control
-        for control in menu.controls(values=values)
-    }
-
-    assert controls["media:status"].label == values["media_status"]
-    assert controls["media:play_pause"].label == "Pause"
-    assert controls["media:play_pause"].enabled
-    assert controls["media:toggle_mute"].label == "Mute"
-    assert controls["media:toggle_mute"].enabled
-    assert controls["media_seek"].maximum == 120.0
-    assert controls["media_volume"].maximum == 1.0
-
-
-def test_media_tab_refreshes_controls_when_runtime_media_changes():
-    menu = OpenXrSettingsMenu()
-    menu.set_tab("media")
-    empty = {
-        "media_available": False,
-        "media_mode": "",
-        "media_duration": 0.0,
-        "media_status": "No media loaded",
-    }
-    initial = {
-        control.key: control
-        for control in menu.controls(values=empty)
-    }
-    assert not initial["media:play_pause"].enabled
-    assert initial["media_seek"].maximum == 1.0
-
-    playing = {
-        "media_available": True,
-        "media_mode": "Video",
-        "media_duration": 120.0,
-        "media_position": 24.0,
-        "media_seek": 24.0,
-        "media_playing": True,
-        "media_volume": 0.65,
-        "media_muted": False,
-        "media_audio_enabled": True,
-        "media_status": "movie.mkv · Playing · HDR",
-    }
-    active = {
-        control.key: control
-        for control in menu.controls(values=playing)
-    }
-    assert active["media:status"].label == playing["media_status"]
-    assert active["media:play_pause"].label == "Pause"
-    assert active["media:play_pause"].enabled
-    assert active["media:toggle_mute"].enabled
-    assert active["media_seek"].maximum == 120.0
-    assert active["step:minus:media_seek"].enabled
-    assert active["step:plus:media_seek"].enabled
-
-    paused_and_muted = dict(playing)
-    paused_and_muted.update(
-        media_position=120.0,
-        media_seek=120.0,
-        media_playing=False,
-        media_muted=True,
-        media_audio_enabled=False,
-        media_status="movie.mkv · Paused · HDR · Audio unavailable",
-    )
-    ended = {
-        control.key: control
-        for control in menu.controls(values=paused_and_muted)
-    }
-    assert ended["media:play_pause"].label == "Play"
-    assert ended["media:toggle_mute"].label == "Unmute"
-    assert not ended["media:toggle_mute"].enabled
-    assert not ended["media_volume"].enabled
-    assert ended["step:minus:media_seek"].enabled
-    assert not ended["step:plus:media_seek"].enabled
-
-
-def test_media_tab_disables_playback_for_images_and_audio_without_track():
-    menu = OpenXrSettingsMenu()
-    menu.set_tab("media")
-    controls = {
-        control.key: control
-        for control in menu.controls(values={
-            "media_available": True,
-            "media_mode": "Image",
-            "media_audio_enabled": False,
-        })
-    }
-
-    assert not controls["media:play_pause"].enabled
-    assert not controls["media:toggle_mute"].enabled
-    assert not controls["media_seek"].enabled
-    assert not controls["media_volume"].enabled
+    assert "media" not in menu.tabs
+    assert menu.set_tab("media") is False
+    controls = {control.key for control in menu.controls()}
+    assert not any(key.startswith("media") for key in controls)
 
 
 def test_screen_tab_precedes_picture_tab_in_shared_layout():
@@ -216,7 +117,6 @@ def test_screen_tab_precedes_picture_tab_in_shared_layout():
 
     assert tabs == [
         "tab:screen", "tab:depth", "tab:glow", "tab:room", "tab:picture",
-        "tab:media",
     ]
 
 
@@ -344,7 +244,7 @@ def test_sidebar_navigation_has_fixed_aligned_targets_for_every_locale():
         control for control in menu.controls(show_glow=True, lang="CN")
         if control.key.startswith("tab:")
     ]
-    assert len(english) == 6
+    assert len(english) == 5
     assert all(
         tuple(round(value * size) for value, size in zip(
             control.rect, SETTINGS_MENU_TEXTURE_SIZE * 2
