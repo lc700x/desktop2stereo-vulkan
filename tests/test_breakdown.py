@@ -147,6 +147,52 @@ def test_fps_breakdown_reports_bounded_openxr_timing_percentiles(capsys):
     assert "rt_slot_wait_p95=14.50ms" in output
 
 
+def test_fps_breakdown_reports_stable_cadence_and_media_depth_identity(capsys):
+    breakdown = FPSBreakdown(enabled=True, target_fps=72)
+    start = breakdown.last_log
+    runtime_result = type(
+        "Result",
+        (),
+        {
+            "timing": {
+                "depth_total_ms": 18.0,
+                "synthesis_ms": 5.0,
+                "openxr_render_ms": 7.0,
+                "pack_ms": 2.0,
+            },
+            "debug_info": {
+                "media_generation": 4,
+                "source_frame_index": 88,
+                "source_pts": 2.933333,
+                "media_depth_reused": 1,
+                "media_depth_age_ms": 12.5,
+                "media_depth_cache_reason": "exact_match",
+                "stable_cadence_active_hz": 72,
+                "stable_cadence_proposed_hz": 60,
+                "stable_cadence_reason": "sustained_over_budget",
+                "stable_cadence_depth_queue": 2,
+                "stable_cadence_dropped": 3,
+            },
+        },
+    )()
+
+    breakdown.add_runtime_timing(runtime_result)
+    breakdown.log(now=start + 15.0)
+
+    output = capsys.readouterr().out
+    assert "rt_depth=18.00ms" in output
+    assert "rt_synth=5.00ms" in output
+    assert "openxr_render=7.00ms" in output
+    assert "media_gen=4" in output
+    assert "source_frame=88" in output
+    assert "depth_reused=1" in output
+    assert "depth_age_ms=12.50" in output
+    assert "depth_cache=exact_match" in output
+    assert "cadence_active=72" in output
+    assert "cadence_proposed=60" in output
+    assert "cadence_reason=sustained_over_budget" in output
+
+
 def test_fps_breakdown_reports_gc_and_optional_gpu_metrics(capsys):
     breakdown = FPSBreakdown(enabled=True, target_fps=60)
     start = breakdown.last_log

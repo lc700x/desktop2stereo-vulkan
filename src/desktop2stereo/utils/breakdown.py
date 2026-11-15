@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass
-
 import os
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -218,7 +217,7 @@ class FPSBreakdown:
         timing = getattr(runtime_result, "timing", None) or {}
         debug = getattr(runtime_result, "debug_info", None) or {}
         with self.lock:
-            for key in ("depth_total_ms", "depth_preprocess_ms", "depth_model_ms", "depth_slot_wait_ms", "depth_postprocess_ms", "synthesis_ms", "pack_ms", "total_ms",
+            for key in ("depth_total_ms", "depth_preprocess_ms", "depth_model_ms", "depth_slot_wait_ms", "depth_postprocess_ms", "synthesis_ms", "openxr_render_ms", "pack_ms", "total_ms",
                         "sbs_host_ms", "sbs_host_device_ms", "sbs_host_copy_ms", "sbs_host_numpy_ms",
                         "packer_ms", "rt_fused_pack_ms"):
                 value = timing.get(key)
@@ -321,6 +320,24 @@ class FPSBreakdown:
                 self.stats["parallel_inference_pending"] = int(debug.get("parallel_inference_pending", 0))
             if "parallel_inference_dropped" in debug:
                 self.stats["parallel_inference_dropped"] = int(debug.get("parallel_inference_dropped", 0))
+            for key in (
+                "media_generation",
+                "source_frame_index",
+                "source_pts",
+                "media_depth_reused",
+                "media_depth_age_ms",
+                "media_depth_cache_reason",
+                "stable_cadence_active_hz",
+                "stable_cadence_proposed_hz",
+                "stable_cadence_reason",
+                "stable_cadence_changed",
+                "stable_cadence_depth_queue",
+                "stable_cadence_dropped",
+            ):
+                if key in debug:
+                    value = debug.get(key)
+                    if isinstance(value, (int, float, str)) or value is None:
+                        self.stats[key] = value
             if "openxr_vulkan_projection_quality_chain_requested" in debug:
                 self.stats["openxr_vulkan_projection_quality_chain_requested"] = int(
                     bool(debug.get("openxr_vulkan_projection_quality_chain_requested", 0))
@@ -693,6 +710,7 @@ class FPSBreakdown:
             f"metal_vulkan_gpu_copies={int(stats.get('rt_metal_vulkan_gpu_copy_count', 0))} "
             f"rt_slot_wait={stats.get('rt_depth_slot_wait_ms', 0.0):.2f}ms "
             f"rt_synth={stats.get('rt_synthesis_ms', 0.0):.2f}ms "
+            f"openxr_render={stats.get('rt_openxr_render_ms', 0.0):.2f}ms "
             f"rt_total={stats.get('rt_total_ms', 0.0):.2f}ms "
             f"rt_total_p50={timing_stat('rt_total', 0.50):.2f}ms "
             f"rt_total_p95={timing_stat('rt_total', 0.95):.2f}ms "
@@ -706,6 +724,17 @@ class FPSBreakdown:
             f"rt_sbs_host_presync={stats.get('rt_sbs_host_presync_ms', 0.0):.2f}ms "
             f"packer={stats.get('packer_ms', 0.0):.2f}ms "
             f"fused_pack={stats.get('rt_fused_pack_ms', 0.0):.2f}ms "
+            f"media_gen={stats.get('media_generation', 'n/a')} "
+            f"source_frame={stats.get('source_frame_index', 'n/a')} "
+            f"source_pts={stats.get('source_pts', 'n/a')} "
+            f"depth_reused={int(bool(stats.get('media_depth_reused', 0)))} "
+            f"depth_age_ms={float(stats.get('media_depth_age_ms', 0.0) or 0.0):.2f} "
+            f"depth_cache={stats.get('media_depth_cache_reason', 'n/a')} "
+            f"cadence_active={stats.get('stable_cadence_active_hz', 'n/a')} "
+            f"cadence_proposed={stats.get('stable_cadence_proposed_hz', 'n/a')} "
+            f"cadence_reason={stats.get('stable_cadence_reason', 'n/a')} "
+            f"cadence_depth_queue={stats.get('stable_cadence_depth_queue', 'n/a')} "
+            f"cadence_dropped={stats.get('stable_cadence_dropped', 'n/a')} "
             f"rt_depth_backend={stats.get('rt_depth_backend', 'unknown')} "
             f"rt_depth_slot={stats.get('rt_depth_slot', 'n/a')}/{stats.get('rt_depth_slot_count', 1)} "
             f"rt_out={stats.get('rt_output_dtype', 'unknown')} "

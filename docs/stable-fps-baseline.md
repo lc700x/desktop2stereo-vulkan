@@ -117,3 +117,20 @@ In this mode it records `stable_cadence_active_hz`,
 `stable_cadence_proposed_hz`, `stable_cadence_reason`,
 `stable_cadence_depth_queue`, and `stable_cadence_dropped` in runtime debug
 metadata. It does not change presentation or content cadence.
+
+Observed local-viewer run (about 40 seconds, target 59 Hz):
+
+```text
+cadence_active=59 cadence_proposed=59 cadence_reason=steady
+present_fps=58.05-59.16 content_fps=31.78-32.32
+present_unique_fps=31.78-32.32 present_repeat_fps=25.73-27.38
+depth_total=1.55ms depth_model=0.94ms synthesis=0.48ms
+rt_total_p95=3.58ms runtime_execution_p95=4.12-4.38ms
+runtime_gpu_wait_p95=18.15-18.68ms
+media_gen=0 source_frame=751 source_pts=24.52 depth_cache=no_cache
+```
+
+The live run confirms that changed video frames do not reuse an unrelated
+cached depth profile. The missing cache is expected on continuous motion when
+no exact duplicate frame is available; the pipeline reports a skip/miss instead
+of silently substituting stale depth.

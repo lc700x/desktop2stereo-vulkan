@@ -1597,8 +1597,11 @@ def test_latency_explicit_anchor_and_percentiles_keep_one_clock(monkeypatch, cap
     clock[0] = 1.044
     viewer.record_frame_latency(1.0, stage_timing={"capture_poll_returned_at": 1.020})
     assert viewer._latency_history == pytest.approx([20.0, 24.0])
+    viewer._reuse_ratio = 0.25
     viewer._log_present_metrics(60.0, None)
     line = capsys.readouterr().out
+    assert "present_unique_fps=45.00" in line
+    assert "present_repeat_fps=15.00" in line
     assert "latency_anchor=capture_return" in line
     assert "avg_latency_ms=22.00" in line
     assert "latency_p50_ms=22.00" in line

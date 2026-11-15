@@ -7,22 +7,17 @@ separate GLFW/Vulkan swapchain and never creates an OpenGL context.
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass, replace
 import json
 import math
-from pathlib import Path
 import os
 import queue
 import sys
 import threading
 import time
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Callable
 
-from utils.display_info import resolve_glfw_monitor_index
-from utils.queue_utils import _release_item
-from utils.sys_load import format_load_fields
-from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
-from viewer.direct_sink import DIRECT_SINK, direct_staging_enabled
 from media_ui import (
     build_media_bar_rgba,
     build_media_browser_rgba,
@@ -32,19 +27,25 @@ from media_ui import (
     media_browser_hit,
     media_control_enabled,
 )
-from viewer.vulkan_fps_overlay import VulkanFpsOverlay, build_fps_panel_rgba
-from viewer.vulkan_context import _query_adapter_luid
-from viewer.vulkan_resources import (
-    VulkanExportableBuffer,
-    VulkanExportableImage,
-    VulkanExportableSemaphore,
-)
+from utils.display_info import resolve_glfw_monitor_index
+from utils.queue_utils import _release_item
+from utils.sys_load import format_load_fields
+
+from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
+from viewer.direct_sink import DIRECT_SINK, direct_staging_enabled
 from viewer.source_pointer import (
     send_screen_pointer_click,
     send_screen_pointer_move,
     send_window_pointer_click,
     send_window_pointer_move,
     source_pointer_point,
+)
+from viewer.vulkan_context import _query_adapter_luid
+from viewer.vulkan_fps_overlay import VulkanFpsOverlay, build_fps_panel_rgba
+from viewer.vulkan_resources import (
+    VulkanExportableBuffer,
+    VulkanExportableImage,
+    VulkanExportableSemaphore,
 )
 from viewer.window_control import (
     capture_cursor_snapshot,
@@ -56,7 +57,6 @@ from viewer.window_control import (
     show_window_in_capture,
     update_native_cursor_suppression,
 )
-
 
 LOCAL_VIEWER_SOURCE_FORMAT = "VK_FORMAT_R8G8B8A8_SRGB"
 LOCAL_VIEWER_SRGB_SURFACE_FORMATS = (
@@ -2199,6 +2199,8 @@ class VulkanLocalViewer:
         parts = [
             f"present_fps={float(fps):.2f}",
             f"content_fps={self.content_fps():.2f}",
+            f"present_unique_fps={float(fps) * (1.0 - self.reuse_ratio()):.2f}",
+            f"present_repeat_fps={float(fps) * self.reuse_ratio():.2f}",
             f"reuse={self.reuse_ratio():.4f}",
             f"latency_ms={self.latency_ms():.2f}",
             f"avg_latency_ms={self.avg_latency_ms():.2f}",
@@ -2260,9 +2262,14 @@ class VulkanLocalViewer:
             "runtime_execution_ms",
             "runtime_gpu_wait_ms",
             "runtime_completion_ms",
+            "depth_total_ms",
             "depth_preprocess_ms",
             "depth_model_ms",
             "depth_postprocess_ms",
+            "synthesis_ms",
+            "pack_ms",
+            "openxr_render_ms",
+            "depth_age_ms",
             "metal_synthesis_gpu_ms",
             "metal_handoff_copy_ms",
             "viewer_queue_ms",
@@ -2377,9 +2384,14 @@ class VulkanLocalViewer:
                 "runtime_execution_ms",
                 "runtime_gpu_wait_ms",
                 "runtime_completion_ms",
+                "depth_total_ms",
                 "depth_preprocess_ms",
                 "depth_model_ms",
                 "depth_postprocess_ms",
+                "synthesis_ms",
+                "pack_ms",
+                "openxr_render_ms",
+                "depth_age_ms",
                 "metal_synthesis_gpu_ms",
                 "metal_handoff_copy_ms",
                 "metal_warp_threads",
