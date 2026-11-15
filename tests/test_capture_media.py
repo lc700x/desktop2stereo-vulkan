@@ -53,6 +53,29 @@ def _source_for_decode_start():
     return source
 
 
+def test_media_runtime_metrics_report_pipe_read_and_buffer_pressure():
+    source = object.__new__(MediaCaptureSource)
+    source._frame_pump_metrics_lock = threading.Lock()
+    source._frame_pump_read_ms = deque((10.0, 20.0, 30.0, 40.0, 50.0))
+    source._frame_pump_frame_times = deque((1.0, 2.0, 3.0, 4.0, 5.0))
+    source._frame_buffer_condition = threading.Condition()
+    source._frame_buffer = deque((1, 2, 3))
+    source._frame_buffer_capacity = 8
+    source._frame_pump_done = False
+    source._decode_backend = "ffmpeg-amf"
+    source.decode_fallback_reason = ""
+
+    metrics = source.runtime_metrics()
+
+    assert metrics["decode_fps"] == pytest.approx(1.0)
+    assert metrics["read_ms_p50"] == pytest.approx(30.0)
+    assert metrics["read_ms_p95"] == pytest.approx(50.0)
+    assert metrics["read_ms_max"] == pytest.approx(50.0)
+    assert metrics["buffer_depth"] == 3
+    assert metrics["buffer_capacity"] == 8
+    assert metrics["decode_backend"] == "ffmpeg-amf"
+
+
 def test_ffmpeg_decoder_keeps_realtime_pacing_after_nvdec_is_disabled(monkeypatch):
     source = object.__new__(MediaCaptureSource)
     source._video_process = None

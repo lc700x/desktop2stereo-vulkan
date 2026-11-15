@@ -1,12 +1,10 @@
-from pathlib import Path
-
-from path_config import APP_ROOT
-from types import SimpleNamespace
 import sys
 import threading
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-
+from path_config import APP_ROOT
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
@@ -39,9 +37,37 @@ def _callbacks(depth_strength: float = 0.75) -> RuntimeCallbacks:
         fps_breakdown=SimpleNamespace(
             inc=lambda *_args, **_kwargs: None,
             add_runtime_timing=lambda *_args, **_kwargs: None,
+            set_latest=lambda *_args, **_kwargs: None,
         ),
     )
     return RuntimeCallbacks(context)
+
+
+def test_publish_media_metrics_forwards_bounded_reader_health() -> None:
+    callbacks = _callbacks()
+    published = {}
+    callbacks.context.fps_breakdown.set_latest = (
+        lambda key, value: published.__setitem__(key, value)
+    )
+    callbacks.capture_session = SimpleNamespace(
+        runtime_metrics=lambda: {
+            "decode_fps": 34.5,
+            "read_ms_p50": 26.0,
+            "read_ms_p95": 34.0,
+            "read_ms_max": 90.0,
+            "buffer_depth": 8,
+            "buffer_capacity": 8,
+            "decode_backend": "ffmpeg-amf",
+            "fallback_reason": "",
+        }
+    )
+
+    callbacks._publish_media_metrics()
+
+    assert published["media_decode_fps"] == 34.5
+    assert published["media_read_p95"] == 34.0
+    assert published["media_buffer_depth"] == 8
+    assert published["media_decode_backend"] == "ffmpeg-amf"
 
 
 def test_capture_window_registers_before_initial_wgc_session() -> None:

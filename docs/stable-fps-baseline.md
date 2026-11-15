@@ -53,70 +53,110 @@ Interpretation:
 - media playback itself remains 1.0x wall-clock speed while the 3D pipeline
   consumes a lower unique-frame rate.
 
-The current logs do not expose a complete per-stage depth/synthesis breakdown,
-so this baseline cannot yet distinguish model execution from depth transport or
-synthesis wait with sufficient precision.
+That earlier local-viewer run predates the completion-latency and media-pump
+expansion below. Its values remain a valid presentation/content baseline, while
+the new OpenXR section records the end-to-end completion measurements.
 
-## OpenXR Baseline
+## OpenXR Simulator Observe-Only Baseline
 
-Historical OpenXR Simulator evidence on the same ROCm machine:
+Measured on 2026-11-15 with:
 
-- PICO 4 profile, 1280x1400 per eye;
-- simulator selected 72 Hz;
-- 4K HDR HEVC source through FFmpeg AMF host-backed decode;
-- MIGraphX depth and Triton synthesis;
-- active media processing observed around 45-51 FPS;
-- XR presentation around 89 FPS in the simulator, which is not the media
-  content-processing rate.
+- Windows 11 and AMD Radeon RX 9060 XT / ROCm 7;
+- OpenXR Simulator 1.7.1, `1280x1400` per-eye source swapchain;
+- D2S `Pico 4 / 4 Ultra` headset profile, MIGraphX depth at 518,
+  `Distill-Any-Depth-Base`, Triton synthesis;
+- source `3840x1920` HEVC Main10, 120 fps, PQ / BT.2020;
+- the 4K HDR sample under `F:\Videos\` starting at 12 seconds.
 
-This is a preliminary profile, not a final 72/60 cadence comparison. It should be
-re-run with the exact frame identity, skip/repeat reasons, and stage breakdown
-added by Phases 1 and 4.
+The simulator runtime reported `target_fps=90` and fresh left/right swapchain
+images. Setting the simulator preview preference to 72 did not change the
+compositor submission rate, so these runs measure a 90 Hz repeated display with
+the D2S cadence target set independently to 72 or 30. This is not a true 72 Hz
+panel-refresh test.
 
-## Required Next Measurements
+### App target 72 Hz
 
-The following are still missing from the rolling status output and must be added
-before the cadence governor is enabled:
+| Setting | Stable content FPS | XR submissions | `rt_total` p95 |
+| --- | ---: | ---: | ---: |
+| XR Render 1.0 | 24.4-26.2 | 90.0-90.2 | 4.9-5.7 ms |
+| XR Render 2.0 | 26.0-26.4 | 89.9-90.2 | 5.5-6.0 ms |
 
-- source capture timestamp and source PTS;
-- depth source PTS, capture frame ID, and depth age;
-- depth cache hit/miss reason;
-- raw queue and depth queue depth;
-- in-flight depth slots;
-- `depth_total_ms`;
-- `synthesis_ms`;
-- `openxr_render_ms`;
-- `pack_ms`;
-- unique content FPS separated from repeated presentation FPS;
-- dropped and repeated counters with reason codes.
+Render scale did not materially change content rate. The XR compositor kept
+submitting old eye frames near 90 Hz while D2S produced about 26 unique frames
+per second.
 
-## Candidate Cadence Ladder
+### App target 30 Hz with completion timing
 
-The governor will start in observe-only mode and evaluate:
+| Metric | Observed stable range |
+| --- | ---: |
+| Content FPS | 22.0-25.4 |
+| Media frame-pump FPS | 22.4-28.5 |
+| Media raw-read p50 | 39.2-44.1 ms |
+| Media raw-read p95 | 42.7-52.8 ms |
+| Frame execution p95 | 6.8-8.7 ms |
+| GPU wait p95 | 27.1-27.7 ms |
+| Runtime completion p95 | 32.9-33.4 ms |
+| Capture-to-runtime-ready p95 | 52.2-54.3 ms |
+| Media buffer | `0/8` |
 
-- requested headset cadence;
-- 72 Hz;
-- 60 Hz;
-- 45 Hz;
-- 30 Hz.
+At 30 Hz, published-frame periods still alternate around the 33.3 ms budget
+(observed 33.3-46.1 ms). Overloaded windows therefore report
+`proposed=30 cadence_reason=floor_over_budget`. The governor no longer mistakes
+the short enqueue segment for end-to-end cadence.
 
-It must step down only after sustained over-budget evidence and step up only
-after a sustained headroom window. A lower stable cadence is preferred over an
-unstable higher cadence.
+## Dominant Bottleneck
 
-## Observe-Only Governor
+The current limiter is the host-backed P010 raw-video pipe, not depth or synthesis:
 
-The governor policy is available behind:
+- direct FFmpeg with `hevc_amf` or software `hevc` completed 1440 frames at the
+  72 fps filter rate when writing raw P010 to `NUL`;
+- a Python `stdout.readinto` reader using the same 22 MB frame size averaged
+  only about 35 FPS outside the application;
+- inside D2S, the bounded pump records 39-44 ms median raw reads and 22-28 FPS;
+- the media buffer stays empty, so inference is not accumulating a backlog;
+- GPU depth/synthesis execution is only 6.8-8.7 ms p95, while asynchronous GPU
+  wait and OpenXR presentation raise completion latency to about 33 ms p95.
+
+AMF completed the decode workload but crashed during forced process teardown in
+the standalone benchmark. This is a harness teardown issue, not a decode-rate
+shortfall.
+
+Artifact-free options remain:
+
+1. keep a GPU-resident AMF/NVDEC surface and import it into the compute/present
+   path instead of materializing every P010 frame through a Python byte pipe;
+2. pool and pipeline host buffers as an intermediate fallback, preserving exact
+   frame identity and the existing image-quality settings;
+3. accept a stable lower unique-content cadence while the compositor repeats the
+   last valid stereo frame.
+
+## Cadence Governor
+
+The observe-only policy is enabled with:
 
 ```text
 D2S_CADENCE_GOVERNOR_OBSERVE=1
 D2S_CADENCE_TARGET_HZ=72
 ```
 
-In this mode it records `stable_cadence_active_hz`,
-`stable_cadence_proposed_hz`, `stable_cadence_reason`,
-`stable_cadence_depth_queue`, and `stable_cadence_dropped` in runtime debug
-metadata. It does not change presentation or content cadence.
+The governor observes the interval between successfully published runtime frames,
+not just the enqueue slice. Its ladder is `72 -> 60 -> 45 -> 30`; a sustained
+over-budget period steps down, and the lowest rung reports `floor_over_budget`
+instead of claiming stability.
+
+Rolling metadata now includes:
+
+- `stable_cadence_frame_ms` and `stable_cadence_budget_ms`;
+- over-budget and headroom streaks;
+- depth age, queue depth, and dropped-depth count;
+- whether the sample came from the published-frame period or completion fallback;
+- independent media pump FPS, raw-read p50/p95, buffer depth, and decode backend.
+
+Control mode remains disabled by default. The 4K HDR profile cannot sustain the
+30 Hz floor on this host decode path, so enabling control would only codify a
+lower content cadence without removing the host-pipe bottleneck.
+
+## Local Viewer Observe-Only Result
 
 Observed local-viewer run (about 40 seconds, target 59 Hz):
 
@@ -130,7 +170,12 @@ runtime_gpu_wait_p95=18.15-18.68ms
 media_gen=0 source_frame=751 source_pts=24.52 depth_cache=no_cache
 ```
 
-The live run confirms that changed video frames do not reuse an unrelated
-cached depth profile. The missing cache is expected on continuous motion when
-no exact duplicate frame is available; the pipeline reports a skip/miss instead
-of silently substituting stale depth.
+Changed video frames do not reuse an unrelated depth profile. A cache miss is
+reported instead of silently substituting stale depth.
+
+## Next Gate
+
+Before enabling governor control, collect the same metrics on a runtime that can
+actually select 72/60 Hz, then repeat the A/B after moving 10-bit media frames to
+a GPU-resident decode/import path. Acceptance still requires no stale-depth reuse,
+no hidden scaling, source-time 1.0x playback, and no depth or stereo math changes.

@@ -54,6 +54,11 @@ LATEST_KEYS = {
     "rt_metal_vulkan_gpu_copy_count",
     "rt_synthesis_ms",
     "rt_total_ms",
+    "rt_frame_execution_ms",
+    "rt_frame_gpu_wait_ms",
+    "rt_frame_completion_ms",
+    "rt_capture_to_start_ms",
+    "rt_capture_ready_ms",
     "openxr_async_effects_enabled",
     "parallel_inference_enabled",
     "parallel_inference_pending_limit",
@@ -63,6 +68,26 @@ LATEST_KEYS = {
     "parallel_inference_adaptive_backoff",
     "parallel_inference_pending",
     "parallel_inference_dropped",
+    "stable_cadence_active_hz",
+    "stable_cadence_proposed_hz",
+    "stable_cadence_reason",
+    "stable_cadence_changed",
+    "stable_cadence_depth_queue",
+    "stable_cadence_dropped",
+    "stable_cadence_frame_ms",
+    "stable_cadence_budget_ms",
+    "stable_cadence_over_budget_streak",
+    "stable_cadence_headroom_streak",
+    "stable_cadence_age_ms",
+    "stable_cadence_source",
+    "media_decode_fps",
+    "media_read_p50",
+    "media_read_p95",
+    "media_read_max",
+    "media_buffer_depth",
+    "media_buffer_capacity",
+    "media_decode_backend",
+    "media_fallback_reason",
     "openxr_vulkan_projection_quality_chain_requested",
     "openxr_vulkan_projection_quality_chain_active",
     "sys_gpu",
@@ -237,6 +262,44 @@ class FPSBreakdown:
                         self._timing_samples.setdefault(
                             sample_name, deque(maxlen=_TIMING_SAMPLE_LIMIT)
                         ).append(float(value))
+            for debug_key, stat_key, sample_name in (
+                (
+                    "runtime_execution_ms",
+                    "rt_frame_execution_ms",
+                    "frame_execution",
+                ),
+                (
+                    "runtime_gpu_wait_ms",
+                    "rt_frame_gpu_wait_ms",
+                    "frame_gpu_wait",
+                ),
+                (
+                    "runtime_completion_ms",
+                    "rt_frame_completion_ms",
+                    "frame_completion",
+                ),
+                (
+                    "capture_to_runtime_start_ms",
+                    "rt_capture_to_start_ms",
+                    "capture_to_start",
+                ),
+                (
+                    "capture_to_runtime_ready_ms",
+                    "rt_capture_ready_ms",
+                    "capture_ready",
+                ),
+            ):
+                value = debug.get(debug_key)
+                if value is None:
+                    continue
+                try:
+                    value = max(0.0, float(value))
+                except (TypeError, ValueError):
+                    continue
+                self.stats[stat_key] = value
+                self._timing_samples.setdefault(
+                    sample_name, deque(maxlen=_TIMING_SAMPLE_LIMIT)
+                ).append(value)
             self.stats["rt_backend"] = str(debug.get("backend", "unknown"))
             self.stats["rt_depth_backend"] = str(debug.get("runtime_depth_backend", "unknown"))
             self.stats["rt_depth_nonfinite_count"] = int(
@@ -333,6 +396,12 @@ class FPSBreakdown:
                 "stable_cadence_changed",
                 "stable_cadence_depth_queue",
                 "stable_cadence_dropped",
+                "stable_cadence_frame_ms",
+                "stable_cadence_budget_ms",
+                "stable_cadence_over_budget_streak",
+                "stable_cadence_headroom_streak",
+                "stable_cadence_age_ms",
+                "stable_cadence_source",
             ):
                 if key in debug:
                     value = debug.get(key)
@@ -718,12 +787,27 @@ class FPSBreakdown:
             f"rt_slot_wait_p50={timing_stat('rt_slot_wait', 0.50):.2f}ms "
             f"rt_slot_wait_p95={timing_stat('rt_slot_wait', 0.95):.2f}ms "
             f"rt_slot_wait_max={timing_max('rt_slot_wait'):.2f}ms "
+            f"frame_exec={stats.get('rt_frame_execution_ms', 0.0):.2f}ms "
+            f"frame_exec_p95={timing_stat('frame_execution', 0.95):.2f}ms "
+            f"frame_gpu_wait={stats.get('rt_frame_gpu_wait_ms', 0.0):.2f}ms "
+            f"frame_gpu_wait_p95={timing_stat('frame_gpu_wait', 0.95):.2f}ms "
+            f"frame_completion={stats.get('rt_frame_completion_ms', 0.0):.2f}ms "
+            f"frame_completion_p95={timing_stat('frame_completion', 0.95):.2f}ms "
+            f"capture_to_start={stats.get('rt_capture_to_start_ms', 0.0):.2f}ms "
+            f"capture_to_start_p95={timing_stat('capture_to_start', 0.95):.2f}ms "
+            f"capture_ready={stats.get('rt_capture_ready_ms', 0.0):.2f}ms "
+            f"capture_ready_p95={timing_stat('capture_ready', 0.95):.2f}ms "
             f"rt_sbs_host={stats.get('rt_sbs_host_ms', 0.0):.2f}ms "
             f"rt_sbs_host_copy={stats.get('rt_sbs_host_copy_ms', 0.0):.2f}ms "
             f"rt_sbs_host_numpy={stats.get('rt_sbs_host_numpy_ms', 0.0):.2f}ms "
             f"rt_sbs_host_presync={stats.get('rt_sbs_host_presync_ms', 0.0):.2f}ms "
             f"packer={stats.get('packer_ms', 0.0):.2f}ms "
             f"fused_pack={stats.get('rt_fused_pack_ms', 0.0):.2f}ms "
+            f"media_decode_fps={float(stats.get('media_decode_fps', 0.0) or 0.0):.2f} "
+            f"media_read_p50={float(stats.get('media_read_p50', 0.0) or 0.0):.2f}ms "
+            f"media_read_p95={float(stats.get('media_read_p95', 0.0) or 0.0):.2f}ms "
+            f"media_buffer={int(stats.get('media_buffer_depth', 0) or 0)}/{int(stats.get('media_buffer_capacity', 0) or 0)} "
+            f"media_decode={stats.get('media_decode_backend', 'n/a')} "
             f"media_gen={stats.get('media_generation', 'n/a')} "
             f"source_frame={stats.get('source_frame_index', 'n/a')} "
             f"source_pts={stats.get('source_pts', 'n/a')} "
@@ -735,6 +819,12 @@ class FPSBreakdown:
             f"cadence_reason={stats.get('stable_cadence_reason', 'n/a')} "
             f"cadence_depth_queue={stats.get('stable_cadence_depth_queue', 'n/a')} "
             f"cadence_dropped={stats.get('stable_cadence_dropped', 'n/a')} "
+            f"cadence_frame={float(stats.get('stable_cadence_frame_ms', 0.0) or 0.0):.2f}ms "
+            f"cadence_budget={float(stats.get('stable_cadence_budget_ms', 0.0) or 0.0):.2f}ms "
+            f"cadence_over={int(stats.get('stable_cadence_over_budget_streak', 0) or 0)} "
+            f"cadence_headroom={int(stats.get('stable_cadence_headroom_streak', 0) or 0)} "
+            f"cadence_age={float(stats.get('stable_cadence_age_ms', 0.0) or 0.0):.2f}ms "
+            f"cadence_source={stats.get('stable_cadence_source', 'n/a')} "
             f"rt_depth_backend={stats.get('rt_depth_backend', 'unknown')} "
             f"rt_depth_slot={stats.get('rt_depth_slot', 'n/a')}/{stats.get('rt_depth_slot_count', 1)} "
             f"rt_out={stats.get('rt_output_dtype', 'unknown')} "

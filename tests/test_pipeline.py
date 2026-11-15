@@ -701,7 +701,7 @@ def test_publish_runtime_item_marks_inference_pipeline_ready():
 
 @pytest.mark.parametrize("run_mode", ["Viewer", "Local Viewer", "OpenXR"])
 @pytest.mark.parametrize("pending_since", [None, 1.03])
-def test_local_publication_reports_gpu_completion_time(monkeypatch, run_mode, pending_since):
+def test_publication_reports_gpu_completion_time_in_every_run_mode(monkeypatch, run_mode, pending_since):
     monkeypatch.setattr(pipeline_module.time, "perf_counter", lambda: 1.08)
     runtime_q = queue.Queue(maxsize=1)
     loop = object.__new__(RuntimePipelineLoop)
@@ -724,17 +724,11 @@ def test_local_publication_reports_gpu_completion_time(monkeypatch, run_mode, pe
     assert runtime_q.get_nowait()[0] is result
     assert result.debug_info["viewer_ready_at"] == 1.08
     assert result.debug_info["runtime_execution_ms"] == 20.0
-    if run_mode == "OpenXR":
-        assert result.debug_info["runtime_ready_at"] == 1.03
-        assert result.debug_info["capture_to_runtime_ready_ms"] == 30.0
-        assert "runtime_gpu_wait_ms" not in result.debug_info
-        assert "runtime_completion_ms" not in result.debug_info
-    else:
-        wait_ms = 0.0 if pending_since is None else 50.0
-        assert result.debug_info["runtime_ready_at"] == 1.08
-        assert result.debug_info["capture_to_runtime_ready_ms"] == pytest.approx(80.0)
-        assert result.debug_info["runtime_gpu_wait_ms"] == pytest.approx(wait_ms)
-        assert result.debug_info["runtime_completion_ms"] == pytest.approx(20.0 + wait_ms)
+    wait_ms = 0.0 if pending_since is None else 50.0
+    assert result.debug_info["runtime_ready_at"] == 1.08
+    assert result.debug_info["capture_to_runtime_ready_ms"] == pytest.approx(80.0)
+    assert result.debug_info["runtime_gpu_wait_ms"] == pytest.approx(wait_ms)
+    assert result.debug_info["runtime_completion_ms"] == pytest.approx(20.0 + wait_ms)
 
 
 def test_cuda_timing_events_are_recorded_after_gpu_completion():

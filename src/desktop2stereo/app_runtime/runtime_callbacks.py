@@ -118,8 +118,38 @@ class RuntimeCallbacks:
         render_active = getattr(openxr_state, "render_active", None)
         return render_active is None or render_active.is_set()
 
+    def _publish_media_metrics(self):
+        session = getattr(self, "capture_session", None)
+        metrics = getattr(session, "runtime_metrics", None)
+        if not callable(metrics):
+            return
+        try:
+            values = metrics()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return
+        if not isinstance(values, dict):
+            return
+        for key in (
+            "decode_fps",
+            "read_ms_p50",
+            "read_ms_p95",
+            "read_ms_max",
+            "buffer_depth",
+            "buffer_capacity",
+            "decode_backend",
+            "fallback_reason",
+        ):
+            if key in values:
+                stat_key = {
+                    "read_ms_p50": "media_read_p50",
+                    "read_ms_p95": "media_read_p95",
+                    "read_ms_max": "media_read_max",
+                }.get(key, f"media_{key}")
+                self.context.fps_breakdown.set_latest(stat_key, values[key])
+
     def log_fps_breakdown(self, now=None):
         if self._render_active_for_breakdown():
+            self._publish_media_metrics()
             if self._system_load_sampler is not None:
                 for key, value in self._system_load_sampler.snapshot().items():
                     if key == "gpu":
@@ -137,6 +167,7 @@ class RuntimeCallbacks:
     def log_source_health(self, now=None, force=False):
         self.context.source_health.log(now, force)
         if self._render_active_for_breakdown():
+            self._publish_media_metrics()
             if self._system_load_sampler is not None:
                 for key, value in self._system_load_sampler.snapshot().items():
                     if key == "gpu":

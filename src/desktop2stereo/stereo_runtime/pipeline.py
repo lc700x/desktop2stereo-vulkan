@@ -1374,6 +1374,7 @@ class RuntimePipelineLoop:
         self._parallel_depth_scheduler = None
         self._parallel_mps_serial_notice_emitted = False
         self._cadence_governor = None
+        self._last_cadence_publish_at = None
         if _env_flag("D2S_CADENCE_GOVERNOR_OBSERVE"):
             try:
                 cadence_target_hz = int(
@@ -1391,6 +1392,67 @@ class RuntimePipelineLoop:
         self._preprocess_diagnostic_saved = False
         self._preprocess_diagnostic_first_frame_time = None
         self._backend_status_emitted = False
+
+    def _observe_cadence_governor(self, debug_info, published_at: float) -> None:
+        if getattr(self, "_cadence_governor", None) is None or not isinstance(debug_info, dict):
+            return
+        previous_publish_at = getattr(self, "_last_cadence_publish_at", None)
+        self._last_cadence_publish_at = published_at
+        frame_time_ms = 0.0
+        source = "completion"
+        if previous_publish_at is not None:
+            period_ms = max(0.0, (published_at - previous_publish_at) * 1000.0)
+            if 0.0 < period_ms <= 2000.0:
+                frame_time_ms = period_ms
+                source = "period"
+            else:
+                debug_info["stable_cadence_publish_gap"] = 1
+        if frame_time_ms <= 0.0:
+            try:
+                frame_time_ms = max(
+                    0.0, float(debug_info.get("runtime_completion_ms", 0.0) or 0.0)
+                )
+            except (TypeError, ValueError):
+                frame_time_ms = 0.0
+        pending_depth = (
+            len(self._parallel_depth_scheduler.pending)
+            if getattr(self, "_parallel_depth_scheduler", None) is not None
+            else 0
+        )
+        dropped_depth = (
+            int(self._parallel_depth_scheduler.dropped)
+            if getattr(self, "_parallel_depth_scheduler", None) is not None
+            else 0
+        )
+        try:
+            depth_age_ms = max(
+                0.0,
+                float(debug_info.get("capture_to_runtime_ready_ms", 0.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            depth_age_ms = 0.0
+        cadence_decision = self._cadence_governor.observe(
+            frame_time_ms,
+            queue_depth=pending_depth,
+            depth_age_ms=depth_age_ms,
+            dropped_frames=dropped_depth,
+        )
+        debug_info["stable_cadence_active_hz"] = int(cadence_decision.active_hz)
+        debug_info["stable_cadence_proposed_hz"] = int(cadence_decision.proposed_hz)
+        debug_info["stable_cadence_reason"] = cadence_decision.reason
+        debug_info["stable_cadence_changed"] = int(cadence_decision.changed)
+        debug_info["stable_cadence_depth_queue"] = int(pending_depth)
+        debug_info["stable_cadence_dropped"] = int(dropped_depth)
+        debug_info["stable_cadence_frame_ms"] = float(cadence_decision.frame_time_ms)
+        debug_info["stable_cadence_budget_ms"] = float(cadence_decision.budget_ms)
+        debug_info["stable_cadence_over_budget_streak"] = int(
+            cadence_decision.over_budget_streak
+        )
+        debug_info["stable_cadence_headroom_streak"] = int(
+            cadence_decision.headroom_streak
+        )
+        debug_info["stable_cadence_age_ms"] = float(cadence_decision.depth_age_ms)
+        debug_info["stable_cadence_source"] = source
 
     def _clear_cursor_depth_cache(self) -> None:
         self._cursor_depth_profile = None
@@ -2058,20 +2120,28 @@ class RuntimePipelineLoop:
         if isinstance(debug_info, dict):
             published_at = time.perf_counter()
             debug_info["viewer_ready_at"] = published_at
-            if str(getattr(ctx, "run_mode", "")).strip().casefold() in {"viewer", "local viewer"}:
-                # Dispatch time alone excludes asynchronous CUDA execution. The
-                # local completion gate has now observed the ready event, so
-                # record that wait separately and stamp actual availability.
-                gpu_wait_ms = (
-                    max(0.0, (published_at - pending_since) * 1000.0)
-                    if pending_since is not None else 0.0
-                )
-                debug_info["runtime_gpu_wait_ms"] = gpu_wait_ms
-                debug_info["runtime_completion_ms"] = max(0.0, runtime_latency * 1000.0) + gpu_wait_ms
-                debug_info["capture_to_runtime_ready_ms"] = max(
-                    0.0, (published_at - capture_start_time) * 1000.0
-                )
-                debug_info["runtime_ready_at"] = published_at
+            # Dispatch time alone excludes asynchronous CUDA execution. The
+            # completion gate has now observed the ready event, so record that
+            # wait separately and stamp actual availability in every run mode.
+            # OpenXR previously omitted these fields, which made cadence-policy
+            # input look like the short enqueue segment instead of end-to-end
+            # frame latency.
+            gpu_wait_ms = (
+                max(0.0, (published_at - pending_since) * 1000.0)
+                if pending_since is not None else 0.0
+            )
+            debug_info["runtime_gpu_wait_ms"] = gpu_wait_ms
+            debug_info["runtime_completion_ms"] = max(0.0, runtime_latency * 1000.0) + gpu_wait_ms
+            debug_info["capture_to_runtime_ready_ms"] = max(
+                0.0, (published_at - capture_start_time) * 1000.0
+            )
+            debug_info["runtime_ready_at"] = published_at
+            self._observe_cadence_governor(debug_info, published_at)
+            breakdown_add_runtime_timing = getattr(
+                ctx, "breakdown_add_runtime_timing", None
+            )
+            if callable(breakdown_add_runtime_timing):
+                breakdown_add_runtime_timing(runtime_result)
         try:
             runtime_q_was_full = ctx.runtime_q.full()
         except Exception:
@@ -2784,37 +2854,6 @@ class RuntimePipelineLoop:
                     depth_backend=depth_backend,
                 )
                 debug_info = getattr(runtime_result, "debug_info", None)
-                if isinstance(debug_info, dict) and self._cadence_governor is not None:
-                    pending_depth = (
-                        len(self._parallel_depth_scheduler.pending)
-                        if self._parallel_depth_scheduler is not None
-                        else 0
-                    )
-                    dropped_depth = (
-                        int(self._parallel_depth_scheduler.dropped)
-                        if self._parallel_depth_scheduler is not None
-                        else 0
-                    )
-                    cadence_decision = self._cadence_governor.observe(
-                        (time.perf_counter() - loop_start_time) * 1000.0,
-                        queue_depth=pending_depth,
-                        depth_age_ms=float(
-                            debug_info.get("capture_to_runtime_ready_ms", 0.0) or 0.0
-                        ),
-                        dropped_frames=dropped_depth,
-                    )
-                    debug_info["stable_cadence_active_hz"] = int(
-                        cadence_decision.active_hz
-                    )
-                    debug_info["stable_cadence_proposed_hz"] = int(
-                        cadence_decision.proposed_hz
-                    )
-                    debug_info["stable_cadence_reason"] = cadence_decision.reason
-                    debug_info["stable_cadence_changed"] = int(
-                        cadence_decision.changed
-                    )
-                    debug_info["stable_cadence_depth_queue"] = int(pending_depth)
-                    debug_info["stable_cadence_dropped"] = int(dropped_depth)
                 if isinstance(debug_info, dict):
                     debug_info["parallel_inference_enabled"] = int(
                         _runtime_pending_depth_limit(ctx) > 1
@@ -2899,7 +2938,6 @@ class RuntimePipelineLoop:
                                 bool(native_debug.get("zero_copy", False))
                             )
                 self._emit_backend_status_once(debug_info)
-                ctx.breakdown_add_runtime_timing(runtime_result)
                 ctx.log_fast_plus_fused_runtime_state(runtime_result)
                 if runtime_result.depth is None:
                     ctx.queue_clear(ctx.runtime_q)

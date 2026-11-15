@@ -167,11 +167,22 @@ def test_fps_breakdown_reports_stable_cadence_and_media_depth_identity(capsys):
                 "media_depth_reused": 1,
                 "media_depth_age_ms": 12.5,
                 "media_depth_cache_reason": "exact_match",
+                "runtime_execution_ms": 11.0,
+                "runtime_gpu_wait_ms": 21.0,
+                "runtime_completion_ms": 32.0,
+                "capture_to_runtime_start_ms": 4.0,
+                "capture_to_runtime_ready_ms": 36.0,
                 "stable_cadence_active_hz": 72,
                 "stable_cadence_proposed_hz": 60,
                 "stable_cadence_reason": "sustained_over_budget",
                 "stable_cadence_depth_queue": 2,
                 "stable_cadence_dropped": 3,
+                "stable_cadence_frame_ms": 40.0,
+                "stable_cadence_budget_ms": 33.333,
+                "stable_cadence_over_budget_streak": 2,
+                "stable_cadence_headroom_streak": 0,
+                "stable_cadence_age_ms": 52.0,
+                "stable_cadence_source": "period",
             },
         },
     )()
@@ -188,9 +199,22 @@ def test_fps_breakdown_reports_stable_cadence_and_media_depth_identity(capsys):
     assert "depth_reused=1" in output
     assert "depth_age_ms=12.50" in output
     assert "depth_cache=exact_match" in output
+    assert "frame_exec=11.00ms" in output
+    assert "frame_exec_p95=11.00ms" in output
+    assert "frame_gpu_wait=21.00ms" in output
+    assert "frame_completion=32.00ms" in output
+    assert "capture_to_start=4.00ms" in output
+    assert "capture_ready=36.00ms" in output
+    assert "capture_ready_p95=36.00ms" in output
     assert "cadence_active=72" in output
     assert "cadence_proposed=60" in output
     assert "cadence_reason=sustained_over_budget" in output
+    assert "cadence_frame=40.00ms" in output
+    assert "cadence_budget=33.33ms" in output
+    assert "cadence_over=2" in output
+    assert "cadence_headroom=0" in output
+    assert "cadence_age=52.00ms" in output
+    assert "cadence_source=period" in output
 
 
 def test_fps_breakdown_reports_gc_and_optional_gpu_metrics(capsys):

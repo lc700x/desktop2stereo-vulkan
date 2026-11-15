@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -681,6 +682,9 @@ class MediaCaptureSource:
         self._frame_pump_done = False
         self._frame_pump_error = ""
         self._frame_pump_position = self.position
+        self._frame_pump_metrics_lock = threading.Lock()
+        self._frame_pump_read_ms = deque(maxlen=120)
+        self._frame_pump_frame_times = deque(maxlen=120)
         self._decode_lock = threading.RLock()
         try:
             self._open()
@@ -719,6 +723,58 @@ class MediaCaptureSource:
     @property
     def current_source_frame_identity(self):
         return getattr(self, "_current_source_frame_identity", None)
+
+    def _ensure_frame_pump_metrics(self):
+        metrics_lock = getattr(self, "_frame_pump_metrics_lock", None)
+        if metrics_lock is None:
+            metrics_lock = threading.Lock()
+            self._frame_pump_metrics_lock = metrics_lock
+        read_values = getattr(self, "_frame_pump_read_ms", None)
+        if read_values is None:
+            read_values = deque(maxlen=120)
+            self._frame_pump_read_ms = read_values
+        frame_times = getattr(self, "_frame_pump_frame_times", None)
+        if frame_times is None:
+            frame_times = deque(maxlen=120)
+            self._frame_pump_frame_times = frame_times
+        return metrics_lock, read_values, frame_times
+
+    def runtime_metrics(self) -> dict[str, object]:
+        """Return bounded producer metrics without touching the frame queue."""
+        metrics_lock, read_values, frame_times_value = self._ensure_frame_pump_metrics()
+        with metrics_lock:
+            read_times = tuple(read_values)
+            frame_times = tuple(frame_times_value)
+        with self._frame_buffer_condition:
+            buffer_depth = len(self._frame_buffer)
+            pump_done = bool(self._frame_pump_done)
+        ordered = sorted(read_times)
+
+        def percentile(quantile: float) -> float:
+            if not ordered:
+                return 0.0
+            index = min(
+                len(ordered) - 1,
+                max(0, math.ceil((len(ordered) - 1) * quantile)),
+            )
+            return float(ordered[index])
+
+        decode_fps = 0.0
+        if len(frame_times) >= 2:
+            span = frame_times[-1] - frame_times[0]
+            if span > 0.0:
+                decode_fps = (len(frame_times) - 1) / span
+        return {
+            "decode_fps": decode_fps,
+            "read_ms_p50": percentile(0.50),
+            "read_ms_p95": percentile(0.95),
+            "read_ms_max": max(ordered) if ordered else 0.0,
+            "buffer_depth": buffer_depth,
+            "buffer_capacity": self._frame_buffer_capacity,
+            "pump_done": pump_done,
+            "decode_backend": str(getattr(self, "_decode_backend", "") or ""),
+            "fallback_reason": str(getattr(self, "decode_fallback_reason", "") or ""),
+        }
 
     def _open(self) -> None:
         if not self.path:
@@ -1164,6 +1220,10 @@ class MediaCaptureSource:
             self._frame_pump_error = ""
             self._frame_pump_position = max(0.0, float(position))
             self._current_source_frame_identity = None
+            if hasattr(self, "_frame_pump_metrics_lock"):
+                with self._frame_pump_metrics_lock:
+                    self._frame_pump_read_ms.clear()
+                    self._frame_pump_frame_times.clear()
             self._frame_buffer_condition.notify_all()
 
     def _start_frame_pump(self) -> None:
@@ -1217,7 +1277,15 @@ class MediaCaptureSource:
                 if self._frame_pump_stop.is_set():
                     break
                 with self._decode_lock:
+                    read_started_at = time.perf_counter()
                     frame = self._read_video_frame()
+                    read_ms = max(0.0, (time.perf_counter() - read_started_at) * 1000.0)
+                now = time.perf_counter()
+                metrics_lock, read_values, frame_times = self._ensure_frame_pump_metrics()
+                with metrics_lock:
+                    read_values.append(read_ms)
+                    if frame is not None:
+                        frame_times.append(now)
                 if frame is None:
                     with self._frame_buffer_condition:
                         self._frame_pump_done = True

@@ -63,3 +63,17 @@ def test_control_mode_steps_active_cadence_without_touching_quality_inputs():
 
     assert decision.active_hz == 60
     assert decision.proposed_hz == 60
+
+
+def test_floor_reports_over_budget_without_changing_quality_inputs():
+    governor = StableCadenceGovernor(72, observe_only=False)
+
+    for _ in range(12):
+        decision = governor.observe(40.0, depth_age_ms=52.0)
+
+    assert decision.active_hz == 30
+    assert decision.proposed_hz == 30
+    assert decision.reason == "floor_over_budget"
+    assert decision.frame_time_ms == 40.0
+    assert decision.budget_ms == 1000.0 / 30.0
+    assert decision.depth_age_ms == 52.0

@@ -11,6 +11,10 @@ class CadenceDecision:
     changed: bool
     over_budget_streak: int
     headroom_streak: int
+    frame_time_ms: float = 0.0
+    budget_ms: float = 0.0
+    queue_depth: int = 0
+    depth_age_ms: float = 0.0
 
 
 class StableCadenceGovernor:
@@ -53,6 +57,9 @@ class StableCadenceGovernor:
         self._over_budget_streak = 0
         self._headroom_streak = 0
         self._last_reason = "startup"
+        self._last_frame_time_ms = 0.0
+        self._last_queue_depth = 0
+        self._last_depth_age_ms = 0.0
         self._history: list[CadenceDecision] = []
 
     @property
@@ -68,6 +75,7 @@ class StableCadenceGovernor:
         return tuple(self._history)
 
     def _decision(self, *, changed: bool) -> CadenceDecision:
+        budget_ms = 1000.0 / max(1, self.selected_hz)
         return CadenceDecision(
             active_hz=self.active_hz,
             proposed_hz=self.selected_hz,
@@ -75,6 +83,10 @@ class StableCadenceGovernor:
             changed=bool(changed),
             over_budget_streak=self._over_budget_streak,
             headroom_streak=self._headroom_streak,
+            frame_time_ms=self._last_frame_time_ms,
+            budget_ms=budget_ms,
+            queue_depth=self._last_queue_depth,
+            depth_age_ms=self._last_depth_age_ms,
         )
 
     def observe(
@@ -94,6 +106,10 @@ class StableCadenceGovernor:
         except (TypeError, ValueError):
             return self._decision(changed=False)
 
+        self._last_frame_time_ms = frame_time_ms
+        self._last_queue_depth = queue_depth
+        self._last_depth_age_ms = depth_age_ms
+
         budget_ms = 1000.0 / max(1, self.selected_hz)
         over_budget = frame_time_ms > budget_ms * self._over_budget_ratio
         if over_budget:
@@ -112,6 +128,9 @@ class StableCadenceGovernor:
             self._headroom_streak = 0
             self._last_reason = "sustained_over_budget"
             changed = True
+        elif over_budget and self._index + 1 >= len(self._ladder):
+            self._headroom_streak = 0
+            self._last_reason = "floor_over_budget"
         elif queue_depth > self._queue_limit or depth_age_ms > self._depth_age_limit_ms:
             self._headroom_streak = 0
             self._last_reason = (
