@@ -111,8 +111,10 @@ The current limiter is the host-backed P010 raw-video pipe, not depth or synthes
 - direct FFmpeg with `hevc_amf` or software `hevc` completed 1440 frames at the
   72 fps filter rate when writing raw P010 to `NUL`;
 - a Python `stdout.readinto` reader using the same 22 MB frame size averaged
-  only about 35 FPS outside the application;
-- inside D2S, the bounded pump records 39-44 ms median raw reads and 22-28 FPS;
+  about 39 FPS outside the application;
+- preallocating 12 reusable P010 buffers raised the standalone reader only to
+  about 44 FPS, still below 60/72, so pooling alone cannot close the gap;
+ - inside D2S, the bounded pump records 39-44 ms median raw reads and 22-28 FPS;
 - the media buffer stays empty, so inference is not accumulating a backlog;
 - GPU depth/synthesis execution is only 6.8-8.7 ms p95, while asynchronous GPU
   wait and OpenXR presentation raise completion latency to about 33 ms p95.
