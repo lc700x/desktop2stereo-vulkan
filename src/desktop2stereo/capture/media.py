@@ -689,6 +689,7 @@ class MediaCaptureSource:
         self._frame_pump_metrics_lock = threading.Lock()
         self._frame_pump_read_ms = deque(maxlen=120)
         self._frame_pump_frame_times = deque(maxlen=120)
+        self._last_source_frame_duration = 0.0
         self._decode_lock = threading.RLock()
         try:
             self._open()
@@ -1161,7 +1162,7 @@ class MediaCaptureSource:
             self._audio_stream.start()
             self._audio_stop.clear()
             self._audio_position_anchor = max(0.0, float(position))
-            self._audio_started_at = time.monotonic()
+            self._audio_started_at = time.perf_counter()
             self._audio_thread = threading.Thread(
                 target=self._audio_loop, name="MediaAudioOutput", daemon=True
             )
@@ -1219,12 +1220,32 @@ class MediaCaptureSource:
 
     def _current_position(self) -> float:
         if self.playing and self._position_anchor_time is not None:
-            value = self._position_anchor + time.monotonic() - self._position_anchor_time
+            value = (
+                self._position_anchor
+                + time.perf_counter()
+                - self._position_anchor_time
+            )
             return min(value, self.duration) if self.duration > 0 else value
         return self.position
 
     def _frame_duration(self) -> float:
         return 1.0 / max(1.0, float(getattr(self, "_playback_fps", 1.0) or 1.0))
+
+    def _source_frame_duration(self) -> float:
+        """Return the period of frames actually emitted by the decoder.
+
+        FFmpeg's fps filter already reduces 120 fps input to the configured
+        playback cadence, while the native D3D11 ring emits every source frame.
+        The pump records that real cadence so stale-frame rejection uses the
+        correct interval in both paths.
+        """
+        try:
+            duration = float(getattr(self, "_last_source_frame_duration", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        if math.isfinite(duration) and duration > 0.0:
+            return duration
+        return self._frame_duration()
 
     def _close_native_decoder(self) -> None:
         importer = getattr(self, "_native_frame_importer", None)
@@ -1305,6 +1326,7 @@ class MediaCaptureSource:
             self._frame_pump_position = max(0.0, float(position))
             self._native_frame_pts = None
             self._native_frame_duration = 0.0
+            self._last_source_frame_duration = 0.0
             self._current_source_frame_identity = None
             if hasattr(self, "_frame_pump_metrics_lock"):
                 with self._frame_pump_metrics_lock:
@@ -1388,6 +1410,9 @@ class MediaCaptureSource:
                         ) or frame_duration
                         self._native_frame_pts = None
                         self._native_frame_duration = 0.0
+                    self._last_source_frame_duration = max(
+                        0.0, float(frame_duration)
+                    )
                     self._frame_buffer.append(
                         (
                             source_pts,
@@ -1410,29 +1435,61 @@ class MediaCaptureSource:
         *,
         allow_first: bool = False,
     ):
-        deadline = time.monotonic() + min(0.01, max(0.001, self._frame_duration()))
+        playback_period = self._frame_duration()
+        source_period = self._source_frame_duration()
+        tolerance = 0.5 * min(playback_period, source_period)
+        wait_budget = min(0.02, max(0.002, source_period * 1.5))
+        deadline = time.perf_counter() + wait_budget
         with self._frame_buffer_condition:
             while True:
                 if self._frame_buffer and allow_first:
                     item = self._frame_buffer.popleft()
                     self._frame_buffer_condition.notify_all()
                     return item
-                tolerance = self._frame_duration() * 0.5
+
+                # Keep exactly the newest source frame whose PTS has reached
+                # the wall-clock media position. Do not consume a previous
+                # frame merely because the next source frame is a few
+                # milliseconds late: that is what creates alternating 1/2/3
+                # source-frame jumps on 120 fps media at 60/72 Hz.
                 while (
                     len(self._frame_buffer) > 1
                     and self._frame_buffer[1][0] <= target_position
                 ):
                     self._frame_buffer.popleft()
-                if (
-                    self._frame_buffer
-                    and self._frame_buffer[0][0] <= target_position + tolerance
-                ):
-                    item = self._frame_buffer.popleft()
-                    self._frame_buffer_condition.notify_all()
-                    return item
-                if self._frame_pump_done or time.monotonic() >= deadline:
+
+                if self._frame_buffer:
+                    candidate = self._frame_buffer[0]
+                    candidate_pts = float(candidate[0])
+                    latest_is_proven = (
+                        len(self._frame_buffer) > 1
+                        and float(self._frame_buffer[1][0]) > target_position
+                    )
+                    close_enough = (
+                        candidate_pts <= target_position
+                        and target_position - candidate_pts <= tolerance
+                    )
+                    if candidate_pts <= target_position and (
+                        latest_is_proven or close_enough
+                    ):
+                        item = self._frame_buffer.popleft()
+                        self._frame_buffer_condition.notify_all()
+                        return item
+                    if self._frame_pump_done:
+                        if candidate_pts <= target_position:
+                            item = self._frame_buffer.popleft()
+                            self._frame_buffer_condition.notify_all()
+                            return item
+                        return None
+                elif self._frame_pump_done:
                     return None
-                self._frame_buffer_condition.wait(timeout=0.005)
+
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    # Hold the last valid presented frame and retry on the
+                    # next consumer tick rather than advancing to stale media.
+                    return None
+                self._frame_buffer_condition.wait(timeout=min(0.005, remaining))
 
     def _has_open_video_decoder(self) -> bool:
         if str(getattr(self, "_decode_backend", "")).startswith("nvdec"):
@@ -1878,7 +1935,7 @@ class MediaCaptureSource:
                                     )
                                 )
                                 fallback_position = audio_anchor + max(
-                                    0.0, time.monotonic() - self._audio_started_at
+                                    0.0, time.perf_counter() - self._audio_started_at
                                 )
                             else:
                                 fallback_position = float(
@@ -1975,11 +2032,11 @@ class MediaCaptureSource:
         capture = self._opencv_capture
         if capture is None:
             return None
-        deadline = time.monotonic()
+        deadline = time.perf_counter()
         interval = 1.0 / max(1.0, self._playback_fps)
         if self._opencv_realtime:
             deadline = self._opencv_next_frame_at or deadline
-            delay = deadline - time.monotonic()
+            delay = deadline - time.perf_counter()
             if delay > 0:
                 time.sleep(delay)
         ok, frame = capture.read()
@@ -1992,7 +2049,7 @@ class MediaCaptureSource:
                     break
                 self._opencv_skip_fraction -= 1.0
         if self._opencv_realtime:
-            self._opencv_next_frame_at = max(deadline + interval, time.monotonic())
+            self._opencv_next_frame_at = max(deadline + interval, time.perf_counter())
         self._frame = frame
         return frame
 
@@ -2006,11 +2063,11 @@ class MediaCaptureSource:
     def _read_nvdec_frame(self):
         if self._nvdec_first_frame_pending:
             self._nvdec_first_frame_pending = False
-            self._nvdec_next_frame_at = time.monotonic() + 1.0 / max(1.0, self._playback_fps)
+            self._nvdec_next_frame_at = time.perf_counter() + 1.0 / max(1.0, self._playback_fps)
             return self._frame
         interval = 1.0 / max(1.0, self._playback_fps)
-        deadline = self._nvdec_next_frame_at or time.monotonic()
-        delay = deadline - time.monotonic()
+        deadline = self._nvdec_next_frame_at or time.perf_counter()
+        delay = deadline - time.perf_counter()
         if delay > 0:
             time.sleep(delay)
         try:
@@ -2044,7 +2101,7 @@ class MediaCaptureSource:
             if restart_audio:
                 self._start_audio(position)
             return self._read_video_frame()
-        self._nvdec_next_frame_at = max(deadline + interval, time.monotonic())
+        self._nvdec_next_frame_at = max(deadline + interval, time.perf_counter())
         self._frame = frame
         return frame
 
@@ -2203,7 +2260,7 @@ class MediaCaptureSource:
                     source_pts, frame, source_index = item
                     if first_frame:
                         self._position_anchor = self._current_position()
-                        self._position_anchor_time = time.monotonic()
+                        self._position_anchor_time = time.perf_counter()
                     self._current_source_frame_identity = (
                         self.media_generation,
                         int(source_index),

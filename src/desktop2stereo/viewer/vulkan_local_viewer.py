@@ -2902,6 +2902,19 @@ class VulkanLocalViewer:
             vsync=self.config.vsync,
             full_screen_exclusive=self._full_screen_exclusive_requested,
         )
+        present_mode_name = {
+            int(getattr(vk, "VK_PRESENT_MODE_FIFO_KHR", -1)): "FIFO",
+            int(getattr(vk, "VK_PRESENT_MODE_FIFO_RELAXED_KHR", -1)): "FIFO_RELAXED",
+            int(getattr(vk, "VK_PRESENT_MODE_MAILBOX_KHR", -1)): "MAILBOX",
+            int(getattr(vk, "VK_PRESENT_MODE_IMMEDIATE_KHR", -1)): "IMMEDIATE",
+            int(getattr(vk, "VK_PRESENT_MODE_FIFO_LATEST_READY_KHR", VK_PRESENT_MODE_FIFO_LATEST_READY)):
+                "FIFO_LATEST_READY",
+        }.get(int(present_mode), str(int(present_mode)))
+        print(
+            "[VulkanLocalViewer] Present mode: "
+            f"{present_mode_name} vsync={bool(self.config.vsync)}",
+            flush=True,
+        )
         if caps.currentExtent.width != 0xFFFFFFFF:
             extent = caps.currentExtent
         else:

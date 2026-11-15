@@ -600,6 +600,12 @@ def _wait_for_runtime_ready(
     return False
 
 
+def _local_viewer_vsync_enabled(configured_vsync: bool, capture_mode: object) -> bool:
+    """Media playback must never use immediate/mailbox WSI presentation."""
+    mode = str(capture_mode or "").strip().casefold()
+    return bool(configured_vsync) or mode in {"file", "video", "image"}
+
+
 def _resolve_local_viewer_render_size_config(settings, run_mode, device):
     """Honor Quality Scale unless the explicit legacy source override is set."""
     if platform.system() == "Darwin" or run_mode not in {"Local Viewer", "Viewer"}:
@@ -1575,6 +1581,14 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                         f"external GPU interop will use the safe host path ({identity_error})",
                         flush=True,
                     )
+            local_viewer_vsync = _local_viewer_vsync_enabled(
+                LOCAL_VSYNC, settings.get("Capture Mode")
+            )
+            if local_viewer_vsync and not bool(LOCAL_VSYNC):
+                print(
+                    "[VulkanLocalViewer] VSync forced for tear-free media playback",
+                    flush=True,
+                )
             local_viewer_config = VulkanLocalViewerConfig(
                 title=f"{WINDOW_TITLE or 'Desktop2Stereo'} Vulkan Viewer",
                 monitor_index=max(0, selected_monitor),
@@ -1614,7 +1628,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     and int(input_monitor_index) != int(effective_output_monitor_index)
                 ),
                 locale=str(os.environ.get("DESKTOP2STEREO_LOCALE", "EN")),
-                vsync=bool(LOCAL_VSYNC),
+                vsync=local_viewer_vsync,
                 show_fps=bool(SHOW_FPS),
                 show_fps_provider=callbacks.show_fps,
                 display_mode=str(DISPLAY_MODE),

@@ -563,3 +563,28 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   `ROCm Vulkan compute glow pre-warm skipped: configured mode off`; SteamVR
   without an active HMD entered standby and exited 0. A headset-connected
   SteamVR retest is still required for final end-to-end confirmation.
+
+## Media playback timing and tearing (2026-11-15)
+
+- Root cause of 120 fps judder: Windows `time.monotonic()` on the tested host
+  advanced only in ~15.6 ms quanta, while a 120 fps source frame is 8.33 ms.
+  Media position, frame-pump pacing, OpenCV/NVDEC deadlines and the playback
+  anchor now use `time.perf_counter()` (QPC). Do not use `monotonic()` for media
+  timestamps or pacing.
+- Buffered source selection now uses the decoder's actual emitted frame period
+  (`_last_source_frame_duration`) and waits for the newest source frame whose PTS
+  has reached the media clock. It no longer consumes an older frame merely
+  because the exact next sample is a few milliseconds late. This removes
+  alternating 1/2/3-source-frame jumps when 120 fps input is sampled at 59/60/72
+  fps. Timeout holds the last valid frame and retries on the next consumer tick.
+- Local Viewer media playback now forces VSync even when the general `VSync`
+  setting is false. File/Video/Image capture resolves to
+  `FIFO_LATEST_READY`/`FIFO`; `Present ASAP` may reduce queue latency but cannot
+  switch a tear-free swapchain to `IMMEDIATE` or `MAILBOX`. OpenXR presentation
+  continues through the runtime compositor, which is already tear-free.
+- Verified with the 4K 120 fps HDR10 sample from 60 s: QPC clock ratio was
+  0.999736 over 27.01 s in Local Viewer and 1.000114 over 21.00 s in OpenXR
+  (errors -7.1 ms and +2.4 ms respectively). Local Viewer logged
+  `Present mode: FIFO_LATEST_READY vsync=True`. Source-PTS tick tests cover
+  59/60/72/90/120 Hz output against 120 fps input. Full suite:
+  `2816 passed, 70 skipped`.

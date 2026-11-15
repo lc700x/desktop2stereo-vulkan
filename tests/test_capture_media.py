@@ -1467,6 +1467,92 @@ def test_unknown_duration_play_after_eof_restarts_from_zero(tmp_path):
     assert restarts == [(0.0, True)]
 
 
+def test_media_playback_clock_uses_high_resolution_perf_counter(monkeypatch):
+    source = object.__new__(MediaCaptureSource)
+    source.playing = True
+    source.position = 0.0
+    source.duration = 0.0
+    source._position_anchor = 10.0
+    source._position_anchor_time = 100.0
+
+    monkeypatch.setattr("capture.media.time.perf_counter", lambda: 100.25)
+    monkeypatch.setattr(
+        "capture.media.time.monotonic",
+        lambda: (_ for _ in ()).throw(AssertionError("media clock must use QPC")),
+    )
+
+    assert source._current_position() == pytest.approx(10.25)
+
+
+def test_120fps_buffer_yields_deterministic_60hz_source_frames():
+    source = object.__new__(MediaCaptureSource)
+    source._playback_fps = 60.0
+    source._source_fps = 120.0
+    source._last_source_frame_duration = 1.0 / 120.0
+    source._frame_buffer = deque(
+        (index / 120.0, f"frame-{index}", index)
+        for index in range(20)
+    )
+    source._frame_buffer_condition = threading.Condition()
+    source._frame_pump_done = False
+
+    first = source._take_buffered_frame(0.0, allow_first=True)
+    selected = [first[2]]
+    for tick in range(1, 8):
+        item = source._take_buffered_frame(tick / 60.0)
+        assert item is not None
+        selected.append(item[2])
+
+    assert selected == [0, 2, 4, 6, 8, 10, 12, 14]
+
+
+@pytest.mark.parametrize("playback_fps", [59, 60, 72, 90, 120])
+def test_120fps_selection_tracks_source_pts_at_output_tick(playback_fps):
+    source = object.__new__(MediaCaptureSource)
+    source._playback_fps = float(playback_fps)
+    source._source_fps = 120.0
+    source._last_source_frame_duration = 1.0 / 120.0
+    source._frame_buffer = deque(
+        (index / 120.0, f"frame-{index}", index)
+        for index in range(400)
+    )
+    source._frame_buffer_condition = threading.Condition()
+    source._frame_pump_done = False
+
+    first = source._take_buffered_frame(0.0, allow_first=True)
+    assert first[2] == 0
+    for tick in range(1, 80):
+        item = source._take_buffered_frame(tick / playback_fps)
+        assert item is not None
+        assert item[2] == (tick * 120) // playback_fps
+
+
+def test_120fps_buffer_waits_for_exact_sample_instead_of_returning_stale_frame():
+    source = object.__new__(MediaCaptureSource)
+    source._playback_fps = 60.0
+    source._source_fps = 120.0
+    source._last_source_frame_duration = 1.0 / 120.0
+    source._frame_buffer_condition = threading.Condition()
+    source._frame_buffer = deque([(1.0 / 120.0, "frame-1", 1)])
+    source._frame_pump_done = False
+
+    def append_exact_frame() -> None:
+        time.sleep(0.002)
+        with source._frame_buffer_condition:
+            source._frame_buffer.append((2.0 / 120.0, "frame-2", 2))
+            source._frame_buffer_condition.notify_all()
+
+    producer = threading.Thread(target=append_exact_frame)
+    producer.start()
+    try:
+        item = source._take_buffered_frame(2.0 / 120.0)
+    finally:
+        producer.join(timeout=1.0)
+
+    assert item is not None
+    assert item[2] == 2
+
+
 def test_buffered_playback_uses_wall_clock_target_and_drops_stale_frames():
     source = object.__new__(MediaCaptureSource)
     source._playback_fps = 60.0

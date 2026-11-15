@@ -28,6 +28,17 @@ def _load_environment_resolver():
     return namespace["_resolve_filament_environment_paths"]
 
 
+def test_media_player_forces_local_viewer_vsync() -> None:
+    from app_runtime.runtime_entry import _local_viewer_vsync_enabled
+
+    assert _local_viewer_vsync_enabled(False, "File") is True
+    assert _local_viewer_vsync_enabled(False, "file") is True
+    assert _local_viewer_vsync_enabled(False, "Video") is True
+    assert _local_viewer_vsync_enabled(False, "Image") is True
+    assert _local_viewer_vsync_enabled(False, "Monitor") is False
+    assert _local_viewer_vsync_enabled(True, "Window") is True
+
+
 def test_media_capture_options_restore_saved_settings_without_gui_env(monkeypatch) -> None:
     from app_runtime.runtime_context import _media_capture_options_from_environment
 
