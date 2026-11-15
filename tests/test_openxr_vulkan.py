@@ -4982,11 +4982,49 @@ def test_projection_glow_is_absent_when_mode_is_off() -> None:
     assert presenter._projection_glow_state() is None
 
 
+def test_configured_glow_mode_reads_persisted_off_before_profile_load() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_screen_state_environment = "Default"
+    presenter.config = replace(
+        presenter.config,
+        filament_glow_modes={"Default": "off"},
+    )
+
+    assert presenter._configured_filament_glow_mode() == "off"
+
+
+def test_configured_glow_mode_honors_environment_override(monkeypatch) -> None:
+    monkeypatch.setenv("D2S_OPENXR_GLOW_MODE", "glow")
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_screen_state_environment = "Default"
+    presenter.config = replace(
+        presenter.config,
+        filament_glow_modes={"Default": "off"},
+    )
+
+    assert presenter._configured_filament_glow_mode() == "glow"
+
+
+def test_rocm_glow_prewarm_skips_when_configured_off(monkeypatch) -> None:
+    monkeypatch.setenv("D2S_ROCM_GLOW_VULKAN_COMPUTE", "1")
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_screen_state_environment = "Default"
+    presenter.config = replace(
+        presenter.config,
+        filament_glow_modes={"Default": "off"},
+    )
+    presenter.vulkan = SimpleNamespace(compute_queue_index=1)
+
+    presenter._prewarm_vulkan_glow_source()
+
+    assert presenter._prewarmed_glow_backend is None
+
+
 def test_rocm_glow_prewarm_does_not_auto_enable_visual_glow() -> None:
     source = (APP_ROOT / "xr_viewer" / "core_openxr_vulkan.py").read_text(
         encoding="utf-8"
     )
-    marker = "# AMD ROCm: pre-create"
+    marker = "    def _prewarm_vulkan_glow_source(self) -> None:"
     start = source.index(marker)
     end = source.index("    def _create_session_and_swapchains", start)
     prewarm = source[start:end]
@@ -4994,7 +5032,12 @@ def test_rocm_glow_prewarm_does_not_auto_enable_visual_glow() -> None:
     assert "VulkanGlowSourceComputeBackend" in prewarm
     assert "prewarm_backend.submit" in prewarm
     assert "Filament glow state preserved" in prewarm
+    assert "_configured_filament_glow_mode() == \"off\"" in prewarm
     assert '_set_filament_glow_mode("glow")' not in prewarm
+    initialize = source[source.index("    def initialize(self)") :]
+    session_index = initialize.index("_create_session_and_swapchains()")
+    prewarm_index = initialize.index("_prewarm_vulkan_glow_source()")
+    assert session_index < prewarm_index
 
 
 @pytest.mark.parametrize(

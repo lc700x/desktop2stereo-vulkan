@@ -543,3 +543,23 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
 - Monitor and Window `WindowsCaptureROCm` Local Viewer smoke runs exit 0.
   The native WGC-only 4K desktop probe measured ~38 fps, so do not attribute
   that ceiling to a CPU readback in the D2S capture path.
+
+## SteamVR OpenXR startup crash follow-up (2026-11-15)
+
+- Bug report: AMD RX 9060 XT, OpenXR Link, Monitor capture, system default
+  SteamVR/OpenXR crashed with `0xC0000005` immediately after
+  `Vulkan queue topology`, before reference-space/session logs.
+- Stabilization: ROCm Vulkan Glow prewarm now runs only after
+  `_create_session_and_swapchains()`, and it is skipped when the persisted/
+  environment Glow mode is explicitly `off`. Do not move this prewarm back
+  before the XR session exists.
+- Stabilization: keep the bundled `wc_rocm` capture copy on the shared current
+  CUDA/HIP stream. The experimental dedicated HIP capture stream was reverted
+  because concurrent HIP capture during SteamVR Vulkan initialization is an
+  unnecessary AMD driver risk. Keep the six-slot tensor pool and shared-stream
+  ordering.
+- Verified after the change: OpenXR Simulator + Monitor capture reached
+  `Reference space selected: STAGE` and logged
+  `ROCm Vulkan compute glow pre-warm skipped: configured mode off`; SteamVR
+  without an active HMD entered standby and exited 0. A headset-connected
+  SteamVR retest is still required for final end-to-end confirmation.

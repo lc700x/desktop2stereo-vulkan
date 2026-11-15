@@ -1813,6 +1813,7 @@ class OpenXrVulkanPresenter(
             )
             self._create_vulkan_objects(api_version)
             self._create_session_and_swapchains()
+            self._prewarm_vulkan_glow_source()
             self._report_projection_composer_boundary()
             self._xr_instance = self.instance
             self._xr_session = self.session
@@ -2322,6 +2323,21 @@ class OpenXrVulkanPresenter(
             # ColorGrading and force the multiview room View back to PP=true.
             return
         bridge.set_scene_exposure(self._filament_scene_exposure)
+
+    def _configured_filament_glow_mode(self) -> str | None:
+        """Return an explicit configured Glow mode before a profile is loaded."""
+        env_glow_mode = os.environ.get("D2S_OPENXR_GLOW_MODE")
+        if env_glow_mode:
+            return self._normalize_filament_glow_mode(env_glow_mode)
+        persisted_modes = getattr(self.config, "filament_glow_modes", {})
+        if (
+            isinstance(persisted_modes, dict)
+            and self._filament_screen_state_environment in persisted_modes
+        ):
+            return self._normalize_filament_glow_mode(
+                persisted_modes.get(self._filament_screen_state_environment)
+            )
+        return None
 
     @staticmethod
     def _normalize_filament_glow_mode(value: Any) -> str:
@@ -7468,60 +7484,66 @@ class OpenXrVulkanPresenter(
             queue_family_index=queue_family_index,
             queue_index=0,
         )
-        # AMD ROCm: pre-create and warm the Vulkan compute glow source before
-        # the session presents. HIP writes only exported staging buffers;
-        # Vulkan compute produces the sampled glow image.
+    def _prewarm_vulkan_glow_source(self) -> None:
+        """Warm ROCm Glow after the XR session exists and only when enabled."""
         self._prewarmed_glow_backend = None
         vulkan_compute_glow = bool(
             os.environ.get("D2S_ROCM_GLOW_VULKAN_COMPUTE", "1").strip().lower()
             not in {"0", "false", "off", "no", "disabled"}
             and int(getattr(self.vulkan, "compute_queue_index", 0) or 0) != 0
         )
-        if vulkan_compute_glow:
-            try:
-                import torch
+        if not vulkan_compute_glow:
+            return
+        if self._configured_filament_glow_mode() == "off":
+            print(
+                "[OpenXRViewer] ROCm Vulkan compute glow pre-warm skipped: "
+                "configured mode off",
+                flush=True,
+            )
+            return
+        try:
+            import torch
 
-                if getattr(torch.version, "hip", None):
-                    from stereo_runtime.vulkan_glow_source import (
-                        VulkanGlowSourceComputeBackend,
-                    )
+            if getattr(torch.version, "hip", None):
+                from stereo_runtime.vulkan_glow_source import (
+                    VulkanGlowSourceComputeBackend,
+                )
 
-                    prewarm_backend = VulkanGlowSourceComputeBackend(self.vulkan)
-                    self._prewarmed_glow_backend = prewarm_backend
-                    warm = torch.zeros(
-                        (1, 3, 288, 512), dtype=torch.float32, device="cuda"
-                    )
-                    prewarm_backend.submit(
-                        warm,
-                        mode="glow",
-                        screen_light_only=False,
-                        temporal_smoothing_seconds=1.0,
-                    )
-                    prewarm_backend.acquire(0)
-                    prewarm_backend.release_frame(0)
-                    # Prewarming only initializes the GPU producer. It must
-                    # not change the user's visual effect state: HDR and
-                    # Default both start with Glow Off unless the profile,
-                    # environment override, or user explicitly enables it.
-                    print(
-                        "[OpenXRViewer] ROCm "
-                        + "Vulkan compute glow pre-warmed"
-                        + "; Filament glow state preserved",
-                        flush=True,
-                    )
-            except Exception as exc:
-                prewarm_backend = self._prewarmed_glow_backend
-                if prewarm_backend is not None:
-                    try:
-                        prewarm_backend.close()
-                    except Exception:
-                        pass
-                self._prewarmed_glow_backend = None
+                prewarm_backend = VulkanGlowSourceComputeBackend(self.vulkan)
+                self._prewarmed_glow_backend = prewarm_backend
+                warm = torch.zeros(
+                    (1, 3, 288, 512), dtype=torch.float32, device="cuda"
+                )
+                prewarm_backend.submit(
+                    warm,
+                    mode="glow",
+                    screen_light_only=False,
+                    temporal_smoothing_seconds=1.0,
+                )
+                prewarm_backend.acquire(0)
+                prewarm_backend.release_frame(0)
+                # Prewarming only initializes the GPU producer. It must
+                # not change the user's visual effect state: HDR and
+                # Default both start with Glow Off unless the profile,
+                # environment override, or user explicitly enables it.
                 print(
-                    "[OpenXRViewer] ROCm Vulkan glow pre-warm skipped: "
-                    f"{type(exc).__name__}: {exc}",
+                    "[OpenXRViewer] ROCm Vulkan compute glow pre-warmed; "
+                    "Filament glow state preserved",
                     flush=True,
                 )
+        except Exception as exc:
+            prewarm_backend = self._prewarmed_glow_backend
+            if prewarm_backend is not None:
+                try:
+                    prewarm_backend.close()
+                except Exception:
+                    pass
+            self._prewarmed_glow_backend = None
+            print(
+                "[OpenXRViewer] ROCm Vulkan glow pre-warm skipped: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     def _create_session_and_swapchains(self) -> None:
         xr = self.xr

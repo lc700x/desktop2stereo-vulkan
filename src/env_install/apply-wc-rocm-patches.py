@@ -290,21 +290,6 @@ def patched_source(source: str) -> str:
             f"                    continue{newline}",
         ),
         (
-            (
-                f"                tensor = self._bridges[buf_idx].update({newline}"
-                f"                    self._stream, synchronize=self.synchronize_copy{newline}"
-                f"                ){newline}"
-            ),
-            (
-                f"                tensor = self._bridges[buf_idx].update({newline}"
-                f"                    self._stream, synchronize=self.synchronize_copy{newline}"
-                f"                ){newline}"
-                f"                # Hand the tensor to the runtime only after its GPU copy is{newline}"
-                f"                # ordered on the consumer stream; no host synchronization.{newline}"
-                f"                self._consumer_stream.wait_stream(self._stream){newline}"
-            ),
-        ),
-        (
             f"                self.frame_handler(Frame(tensor[:oh, :ow], ow, oh), self._control){newline}",
             f"                self.frame_handler(Frame({newline}"
             f"                    tensor[:oh, :ow], ow, oh,{newline}"
@@ -316,13 +301,6 @@ def patched_source(source: str) -> str:
             (
                 f"        self._stream        = None{newline}"
                 f"        self._minimum_update_interval_s = max(0.0, float(minimum_update_interval or 0) / 1000.0){newline}"
-            ),
-        ),
-        (
-            f"        self._stream   = torch.cuda.current_stream(self.device_id){newline}",
-            (
-                f"        self._consumer_stream = torch.cuda.current_stream(self.device_id){newline}"
-                f"        self._stream = torch.cuda.Stream(device=self.device_id){newline}"
             ),
         ),
         (
