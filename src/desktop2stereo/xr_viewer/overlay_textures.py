@@ -584,10 +584,10 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
             fill = colors["card"]
         elif pressed:
             fill = colors["blue"]
-        elif hovered:
-            fill = colors["blue_hover"]
         elif active:
             fill = colors["selection_container"]
+        elif hovered:
+            fill = colors["blue_hover"]
         else:
             fill = colors["card_alt"]
         if control.kind == "toggle":

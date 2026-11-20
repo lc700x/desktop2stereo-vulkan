@@ -28,6 +28,90 @@ from .devices import DEVICES
 logger = logging.getLogger(__name__)
 
 
+def _main_menu_action_style(variant: str) -> ft.ButtonStyle:
+    state = ft.ControlState
+    neutral_background = ft.Colors.SURFACE_CONTAINER_LOW
+    disabled_side = ft.BorderSide(1, ft.Colors.OUTLINE_VARIANT)
+
+    if variant == "primary":
+        backgrounds = {
+            state.DEFAULT: ft.Colors.PRIMARY,
+            state.HOVERED: ft.Colors.PRIMARY_CONTAINER,
+            state.PRESSED: ft.Colors.PRIMARY,
+            state.FOCUSED: ft.Colors.PRIMARY,
+            state.DISABLED: neutral_background,
+        }
+        foregrounds = {
+            state.DEFAULT: ft.Colors.ON_PRIMARY,
+            state.HOVERED: ft.Colors.ON_PRIMARY_CONTAINER,
+            state.PRESSED: ft.Colors.ON_PRIMARY,
+            state.FOCUSED: ft.Colors.ON_PRIMARY,
+            state.DISABLED: ft.Colors.ON_SURFACE_VARIANT,
+        }
+        borders = {
+            state.DEFAULT: ft.BorderSide(1, ft.Colors.PRIMARY),
+            state.HOVERED: ft.BorderSide(1, ft.Colors.PRIMARY_CONTAINER),
+            state.PRESSED: ft.BorderSide(1, ft.Colors.PRIMARY),
+            state.FOCUSED: ft.BorderSide(2, ft.Colors.ON_PRIMARY),
+            state.DISABLED: disabled_side,
+        }
+    elif variant == "danger":
+        backgrounds = {
+            state.DEFAULT: ft.Colors.ERROR,
+            state.HOVERED: ft.Colors.ERROR_CONTAINER,
+            state.PRESSED: ft.Colors.ERROR,
+            state.FOCUSED: ft.Colors.ERROR,
+            state.DISABLED: neutral_background,
+        }
+        foregrounds = {
+            state.DEFAULT: ft.Colors.ON_ERROR,
+            state.HOVERED: ft.Colors.ON_ERROR_CONTAINER,
+            state.PRESSED: ft.Colors.ON_ERROR,
+            state.FOCUSED: ft.Colors.ON_ERROR,
+            state.DISABLED: ft.Colors.ON_SURFACE_VARIANT,
+        }
+        borders = {
+            state.DEFAULT: ft.BorderSide(1, ft.Colors.ERROR),
+            state.HOVERED: ft.BorderSide(1, ft.Colors.ERROR_CONTAINER),
+            state.PRESSED: ft.BorderSide(1, ft.Colors.ERROR),
+            state.FOCUSED: ft.BorderSide(2, ft.Colors.ON_ERROR),
+            state.DISABLED: disabled_side,
+        }
+    elif variant == "secondary":
+        backgrounds = {
+            state.DEFAULT: ft.Colors.SURFACE_CONTAINER_LOW,
+            state.HOVERED: ft.Colors.SURFACE_CONTAINER_HIGH,
+            state.PRESSED: ft.Colors.SURFACE_CONTAINER_HIGHEST,
+            state.FOCUSED: ft.Colors.SURFACE_CONTAINER_LOW,
+            state.DISABLED: neutral_background,
+        }
+        foregrounds = {
+            state.DEFAULT: ft.Colors.ON_SURFACE,
+            state.HOVERED: ft.Colors.ON_SURFACE,
+            state.PRESSED: ft.Colors.ON_SURFACE,
+            state.FOCUSED: ft.Colors.ON_SURFACE,
+            state.DISABLED: ft.Colors.ON_SURFACE_VARIANT,
+        }
+        borders = {
+            state.DEFAULT: ft.BorderSide(1, ft.Colors.OUTLINE),
+            state.HOVERED: ft.BorderSide(1, ft.Colors.OUTLINE),
+            state.PRESSED: ft.BorderSide(1, ft.Colors.OUTLINE),
+            state.FOCUSED: ft.BorderSide(2, ft.Colors.PRIMARY),
+            state.DISABLED: disabled_side,
+        }
+    else:
+        raise ValueError(f"Unknown main-menu button variant: {variant}")
+
+    return ft.ButtonStyle(
+        bgcolor=backgrounds,
+        color=foregrounds,
+        side=borders,
+        elevation=0,
+        shape=ft.RoundedRectangleBorder(radius=6),
+        animation_duration=120,
+    )
+
+
 class GUIBuilderMixin:
     """Mixin providing UI construction and layout sizing for Desktop2StereoGUI."""
 
@@ -1003,11 +1087,14 @@ class GUIBuilderMixin:
             options=["system", "blue", "green", "red", "purple", "orange", "teal", "pink", "grey"],
             value="system", on_select=self.on_theme_change, width=S(130))
         self.reset_btn = ft.Button(content=ft.Text("Reset", size=FONT_SIZE),
-            width=S(110), height=S(32), on_click=self.reset_defaults)
+            width=S(110), height=S(32), on_click=self.reset_defaults,
+            style=_main_menu_action_style("secondary"))
         self.stop_btn = ft.Button(content=ft.Text("Stop", size=FONT_SIZE),
-            width=S(110), height=S(32), on_click=self.stop_process)
+            width=S(110), height=S(32), on_click=self.stop_process,
+            style=_main_menu_action_style("danger"))
         self.run_btn = ft.Button(content=ft.Text("Run", size=FONT_SIZE),
-            width=S(110), height=S(32), on_click=self.save_and_run, disabled=True)
+            width=S(110), height=S(32), on_click=self.save_and_run, disabled=True,
+            style=_main_menu_action_style("primary"))
         lang_row = ft.Row([self.lang_label, self.lang_dd, ft.Container(width=S(40)),
             self.theme_label, self.theme_dd], spacing=1)
 
@@ -1028,8 +1115,14 @@ class GUIBuilderMixin:
         )
 
         # Assembly
+        self._depth_stereo_group_heading = ft.Text(
+            UI_MESSAGES[self.locale]["Depth & Stereo"],
+            size=FONT_SIZE + 1,
+            weight=ft.FontWeight.BOLD,
+            color=ft.Colors.ON_SURFACE,
+        )
         depth_group = ft.Container(
-            ft.Column([row0, row1, stereo_row0, hole_fill_row, advanced_stereo_row,
+            ft.Column([self._depth_stereo_group_heading, row0, row1, stereo_row0, hole_fill_row, advanced_stereo_row,
                        convergence_depth_row, depth_strength_row, row2b, stereo_row1, stereo_row3,
                        stereo_row3b, stereo_row3c, stereo_row4, self.row4a, self.row4b, self.row4c], spacing=S(6)),
             margin=ft.Margin(0, 0, 0, S(6)),
@@ -1040,7 +1133,13 @@ class GUIBuilderMixin:
         # Device group is OUTSIDE the scroll area so it can stretch to fill the
         # leftover height (like the log panel). Its own content scrolls when the
         # window is shorter than the rows.
-        device_content = ft.Column([row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, self.row6b, self.row6d, self.row6g, self.row6e, self.row6f,
+        self._devices_output_group_heading = ft.Text(
+            UI_MESSAGES[self.locale]["Devices & Output"],
+            size=FONT_SIZE + 1,
+            weight=ft.FontWeight.BOLD,
+            color=ft.Colors.ON_SURFACE,
+        )
+        device_content = ft.Column([self._devices_output_group_heading, row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, self.row6b, self.row6d, self.row6g, self.row6e, self.row6f,
                        self.row7a, self.xr_headset_row, self.row7b, row8, self.media_controls_row,
                        self.row6c, self.row9,
                        self.moonlight_controls_row,
@@ -1056,8 +1155,14 @@ class GUIBuilderMixin:
         )
         self.device_group = device_group
 
+        self._appearance_group_heading = ft.Text(
+            UI_MESSAGES[self.locale]["Appearance & Language"],
+            size=FONT_SIZE + 1,
+            weight=ft.FontWeight.BOLD,
+            color=ft.Colors.ON_SURFACE,
+        )
         lang_group = ft.Container(
-            ft.Column([lang_row], spacing=S(6)),
+            ft.Column([self._appearance_group_heading, lang_row], spacing=S(6)),
             margin=ft.Margin(0, 0, 0, S(6)),
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),

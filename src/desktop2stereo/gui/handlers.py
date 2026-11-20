@@ -2049,6 +2049,9 @@ class GUIHandlerMixin:
         self.environment_label.value = t["Environment:"]
         self._refresh_environment_options()
         self.lang_label.value = t["Set Language:"]
+        self._appearance_group_heading.value = t["Appearance & Language"]
+        self._depth_stereo_group_heading.value = t["Depth & Stereo"]
+        self._devices_output_group_heading.value = t["Devices & Output"]
         run_mode_texts = {}
         if OS_NAME == "Darwin":
             run_mode_texts = {

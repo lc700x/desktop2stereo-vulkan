@@ -358,6 +358,18 @@ def test_openxr_slider_icon_buttons_show_meta_hover_press_and_disabled_states():
     assert tuple(at_limit[center_y - 12, center_x, :3]) == (48, 48, 48)
 
 
+def test_openxr_hover_keeps_the_selected_option_visual():
+    menu = OpenXrSettingsMenu()
+    selected = next(control for control in menu.controls() if control.key == "screen:type:flat")
+    normal = build_settings_menu_rgba(menu, {})
+    hovered = build_settings_menu_rgba(menu, {}, hover_key=selected.key)
+    sample_x = round((selected.rect[0] + selected.rect[2]) * 1024 / 2)
+    sample_y = round(selected.rect[1] * 832) + 8
+
+    assert tuple(normal[sample_y, sample_x]) == (22, 95, 194, 255)
+    assert tuple(hovered[sample_y, sample_x]) == (22, 95, 194, 255)
+
+
 def test_openxr_boolean_settings_render_as_borderless_meta_switches():
     menu = OpenXrSettingsMenu()
     menu.set_tab("depth")

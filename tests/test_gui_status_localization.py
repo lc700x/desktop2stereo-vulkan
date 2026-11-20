@@ -1,13 +1,14 @@
+import inspect
 import json
 import logging
-from types import SimpleNamespace
 from string import Formatter
+from types import SimpleNamespace
 
-import pytest
 import flet as ft
-
-from gui.localization import MESSAGE_CATALOGS, _STATUS_MESSAGES, translate_status
+import pytest
+from gui.builders import GUIBuilderMixin, _main_menu_action_style
 from gui.handlers import GUIHandlerMixin
+from gui.localization import _STATUS_MESSAGES, MESSAGE_CATALOGS, translate_status
 from gui.process import GUIProcessMixin
 
 
@@ -20,6 +21,67 @@ def test_media_controls_have_translations_for_every_locale():
     assert MESSAGE_CATALOGS["CN"]["Recent"] == "最近打开"
     assert MESSAGE_CATALOGS["EN"]["Open File"] == "Open File"
     assert MESSAGE_CATALOGS["CN"]["Open File"] == "打开文件"
+
+
+def test_main_menu_group_titles_are_localized_and_refreshed():
+    titles = {
+        "Appearance & Language": ("Appearance & Language", "外观与语言"),
+        "Depth & Stereo": ("Depth & Stereo", "深度与立体"),
+        "Devices & Output": ("Devices & Output", "设备与输出"),
+    }
+    for key, expected in titles.items():
+        assert tuple(MESSAGE_CATALOGS[locale][key] for locale in ("EN", "CN")) == expected
+
+    builder_source = inspect.getsource(GUIBuilderMixin.build_ui)
+    handler_source = inspect.getsource(GUIHandlerMixin.update_ui_texts)
+    assert "self._appearance_group_heading, lang_row" in builder_source
+    assert "self._depth_stereo_group_heading, row0" in builder_source
+    assert "self._devices_output_group_heading, row5" in builder_source
+    for field, key in (
+        ("_appearance_group_heading", "Appearance & Language"),
+        ("_depth_stereo_group_heading", "Depth & Stereo"),
+        ("_devices_output_group_heading", "Devices & Output"),
+    ):
+        assert f"self.{field}.value = t[\"{key}\"]" in handler_source
+
+
+def test_main_menu_actions_use_theme_colors_for_all_interaction_states():
+    states = ft.ControlState
+    primary = _main_menu_action_style("primary")
+    danger = _main_menu_action_style("danger")
+    secondary = _main_menu_action_style("secondary")
+    expected_states = {
+        states.DEFAULT,
+        states.HOVERED,
+        states.PRESSED,
+        states.FOCUSED,
+        states.DISABLED,
+    }
+
+    for style in (primary, danger, secondary):
+        assert set(style.bgcolor) == expected_states
+        assert set(style.color) == expected_states
+        assert set(style.side) == expected_states
+        assert style.elevation == 0
+
+    assert primary.bgcolor[states.DEFAULT] == ft.Colors.PRIMARY
+    assert primary.bgcolor[states.HOVERED] == ft.Colors.PRIMARY_CONTAINER
+    assert primary.color[states.DEFAULT] == ft.Colors.ON_PRIMARY
+    assert danger.bgcolor[states.DEFAULT] == ft.Colors.ERROR
+    assert danger.bgcolor[states.HOVERED] == ft.Colors.ERROR_CONTAINER
+    assert secondary.bgcolor[states.HOVERED] == ft.Colors.SURFACE_CONTAINER_HIGH
+    assert secondary.side[states.FOCUSED].width == 2
+
+    builder_source = inspect.getsource(GUIBuilderMixin.build_ui)
+    for button_name, variant in (
+        ("reset_btn", "secondary"),
+        ("stop_btn", "danger"),
+        ("run_btn", "primary"),
+    ):
+        start = builder_source.index(f"self.{button_name} = ft.Button(")
+        end = builder_source.find("\n        self.", start + 1)
+        button_source = builder_source[start:end if end >= 0 else None]
+        assert f'_main_menu_action_style("{variant}")' in button_source
 
 
 def test_capture_tool_change_keeps_capture_mode_locked_while_runtime_runs():
