@@ -1,6 +1,5 @@
 import pytest
 import torch
-
 from stereo_runtime.baseline_shift import ShiftParams, compute_shift_px
 from stereo_runtime.depth_provider import (
     DepthProfileResult,
@@ -33,6 +32,45 @@ from stereo_runtime.model_registry import ModelRegistry
 def test_registry_declares_official_depth_output_semantics(model_name, semantics):
     assert ModelRegistry.default().get(model_name).output_semantics == semantics
     assert _model_output_semantics(model_name) == semantics
+
+
+@pytest.mark.parametrize(
+    "model_spec",
+    ModelRegistry.default().list(),
+    ids=lambda spec: spec.name,
+)
+def test_each_registered_model_semantics_sanitizes_depth_and_preserves_dibr_direction(model_spec):
+    width = 64
+    semantics = model_spec.output_semantics
+    if semantics in {"relative_z_depth", "metric_z_depth"}:
+        raw_depth = torch.full((1, 1, 8, width), 1.6)
+        raw_depth[..., :16] = 1.0
+        raw_depth[..., 48:] = 4.0
+    else:
+        raw_depth = torch.full((1, 1, 8, width), 0.625)
+        raw_depth[..., :16] = 1.0
+        raw_depth[..., 48:] = 0.25
+
+    # Keep malformed model samples in the input so every registered semantic
+    # path exercises the shared finite-value sanitization before DIBR.
+    raw_depth[..., 0, 0] = torch.nan
+    raw_depth[..., 0, 1] = torch.inf
+    raw_depth[..., 0, 2] = -torch.inf
+
+    depth = _postprocess_model_depth(raw_depth, model_spec.name)
+    shift = compute_shift_px(
+        depth,
+        width,
+        ShiftParams(depth_strength=1.0, convergence=0.5, max_disparity_px=40.0),
+    )
+
+    assert torch.isfinite(depth).all(), model_spec.name
+    assert float(depth.min()) >= 0.0, model_spec.name
+    assert float(depth.max()) <= 1.0, model_spec.name
+    assert torch.isfinite(shift).all(), model_spec.name
+    assert shift[0, 0, 4, 8] < 0, model_spec.name
+    assert abs(float(shift[0, 0, 4, 32])) < 1e-5, model_spec.name
+    assert shift[0, 0, 4, 56] > 0, model_spec.name
 
 
 def test_unknown_model_does_not_use_identifier_substring_heuristics():
