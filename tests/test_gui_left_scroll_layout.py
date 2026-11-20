@@ -1,3 +1,4 @@
+import ast
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
@@ -567,3 +568,59 @@ def test_media_timeline_has_its_own_row_and_volume_shares_transport_row():
     visibility = handlers[visibility_start:visibility_end]
     assert '("media_seek_row", video_controls_visible)' in visibility
     assert '("media_volume_row", video_controls_visible)' not in visibility
+
+
+def test_capture_source_refresh_gap_preserves_label_alignment_and_mode_visibility() -> None:
+    tree = ast.parse(BUILDERS_SOURCE.read_text(encoding="utf-8"))
+    assignment = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "row8" for target in node.targets)
+    )
+    gui = SimpleNamespace(
+        capture_mode_dd=CompactDropdown(options=["输入屏幕"], value="输入屏幕", dyna_width=True),
+        monitor_dd=CompactDropdown(options=["1: D270H 3840x2160"], value="1: D270H 3840x2160"),
+        window_dd=CompactDropdown(),
+        media_path_text=ft.Text(visible=False),
+        refresh_btn=ft.Button(content="刷新", width=S(130)),
+    )
+    gui.window_dd.visible = False
+    scope = {"self": gui, "ft": ft, "S": S}
+    exec(compile(ast.Module(body=[assignment], type_ignores=[]), str(BUILDERS_SOURCE), "exec"), scope)
+    row = scope["row8"]
+    source_group = row.controls[-1]
+    assert row.controls[:-1] == [gui.capture_mode_dd]
+    assert row.spacing == 1
+    assert source_group.controls == [gui.monitor_dd, gui.window_dd, gui.media_path_text, gui.refresh_btn]
+    assert source_group.spacing == S(12)
+    assert source_group.vertical_alignment == ft.CrossAxisAlignment.CENTER
+    assert gui.refresh_btn.width == S(130)
+    for monitor_visible, window_visible in ((True, False), (False, True)):
+        gui.monitor_dd.visible = monitor_visible
+        gui.window_dd.visible = window_visible
+        visible_controls = [control for control in source_group.controls if control.visible]
+        assert visible_controls[-1] is gui.refresh_btn
+        assert len(visible_controls) == 2
+    gui.window_dd.visible = gui.refresh_btn.visible = False
+    assert not any(control.visible for control in source_group.controls)
+
+
+
+def test_capture_mode_dropdown_uses_the_same_dynamic_width_as_labels(monkeypatch):
+    import gui.controls as controls
+
+    tree = ast.parse(BUILDERS_SOURCE.read_text(encoding="utf-8"))
+    constructor = next(
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Attribute) and target.attr == "capture_mode_dd" for target in node.targets)
+    )
+    assert next(keyword.value.value for keyword in constructor.keywords if keyword.arg == "dyna_width") is True
+    assert not any(keyword.arg == "width" for keyword in constructor.keywords)
+    dropdown = CompactDropdown(options=["Input Screen", "Media Player"], value="Input Screen", dyna_width=True)
+    for label_width in (S(96), S(130), S(160)):
+        monkeypatch.setattr(controls, "LABEL_ALIGN_WIDTH", label_width)
+        dropdown.reapply_width()
+        assert dropdown.width == label_width
+        dropdown.value = "Media Player"
+        assert dropdown.width == label_width

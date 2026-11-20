@@ -676,7 +676,7 @@ def test_win32_full_screen_exclusive_requires_both_extension_scopes() -> None:
 
 
 def test_full_screen_exclusive_loss_recreates_swapchain() -> None:
-    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig(vsync=False))
     viewer.vk = SimpleNamespace(
         VK_ERROR_OUT_OF_DATE_KHR=-1000001004,
         VK_SUBOPTIMAL_KHR=1000001003,
@@ -1731,6 +1731,83 @@ def test_asap_without_vsync_keeps_reuse_paced_and_fresh_frames_immediate(monkeyp
     assert reuse_at[-1] - reuse_at[-2] == pytest.approx(1.0 / refresh_hz)
 
 
+def test_media_capture_defaults_to_display_paced_handoff(monkeypatch):
+    clock = [1.0]
+    timeouts = []
+    cached = []
+
+    class Shutdown:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
+
+        def wait(self, seconds):
+            clock[0] += seconds
+            return self.stopped
+
+    shutdown = Shutdown()
+
+    class FrameQueue:
+        def get(self, *, timeout):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                return SimpleNamespace(sbs=object()), clock[0]
+            clock[0] += timeout
+            raise queue.Empty
+
+        def get_nowait(self):
+            raise queue.Empty
+
+    class FakeViewer:
+        _output_refresh_hz = 60.0
+
+        def __init__(self, _config):
+            pass
+
+        def initialize(self):
+            pass
+
+        def present(self, _frame):
+            clock[0] += 0.003
+            return True
+
+        def _present_cached(self):
+            cached.append(clock[0])
+            shutdown.set()
+            return True
+
+        def poll_events(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.delenv("D2S_PRESENT_ASAP", raising=False)
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    monkeypatch.setattr(
+        local_viewer_module,
+        "time",
+        SimpleNamespace(
+            perf_counter=lambda: clock[0],
+            sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        ),
+    )
+    run_vulkan_local_viewer(
+        runtime_q=FrameQueue(),
+        shutdown_event=shutdown,
+        config=VulkanLocalViewerConfig(capture_mode="Video", vsync=False),
+    )
+
+    assert len(timeouts) == 2
+    assert timeouts[0] == pytest.approx(0.05)
+    assert timeouts[1] <= 0.001
+    assert len(cached) == 1
+
+
 def test_viewer_loop_logs_vulkan_present_stage_percentiles(monkeypatch, capsys):
     import utils.sys_load as sys_load
 
@@ -1933,3 +2010,145 @@ def test_viewer_event_poll_updates_monitor_scoped_cursor_hiding(monkeypatch):
     viewer.poll_events()
 
     assert calls == ["events", "fullscreen", "cursor"]
+
+
+def test_local_media_cadence_publishes_display_rate_without_fixed_global_target():
+    from capture.media import get_media_playback_cadence_target, reset_media_playback_cadence_target
+
+    reset_media_playback_cadence_target()
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig(vsync=False))
+    viewer._output_refresh_hz = 60
+    result = SimpleNamespace(debug_info={"media_generation": 1, "source_frame_index": 0,
+                                        "source_pts": 0.0, "media_source_fps": 120.0,
+                                        "media_playback_fps": 40.0})
+    viewer.observe_media_presentation(result)
+    assert result.debug_info["media_display_fps"] == 60.0
+    assert result.debug_info["media_display_vsync"] is False
+    assert get_media_playback_cadence_target() is None
+
+
+def test_ordered_media_never_uses_fifo_latest_ready_to_discard_selected_wsi_frames():
+    vk = SimpleNamespace(VK_PRESENT_MODE_FIFO_KHR=2, VK_PRESENT_MODE_FIFO_LATEST_READY_KHR=1000361000)
+    modes = [2, 1000361000]
+    assert choose_present_mode(modes, vk, vsync=True, full_screen_exclusive=False, ordered=True) == 2
+    assert choose_present_mode(modes, vk, vsync=True, full_screen_exclusive=False) == 1000361000
+
+
+@pytest.mark.parametrize("cancel_wait", [False, True])
+def test_media_prepared_frames_wait_for_absolute_pts_deadline_without_dequeue_drop(monkeypatch, cancel_wait):
+    clock = [100.0]
+    presents = []
+    released = []
+    class Shutdown:
+        stopped = False
+        def is_set(self):
+            return self.stopped
+        def set(self):
+            self.stopped = True
+        def wait(self, duration):
+            clock[0] += duration
+            if cancel_wait:
+                self.stopped = True
+            return self.stopped
+    shutdown = Shutdown()
+    frames = queue.Queue()
+    frames._d2s_ordered = True
+    for name, deadline in (("first", None), ("second", 100.05), ("third", 100.10)):
+        frames.put((SimpleNamespace(sbs=name, debug_info={"media_presentation_deadline": deadline},
+                                    native_resource=SimpleNamespace(release=lambda name=name: released.append(name))),
+                    100.0))
+    class FakeViewer:
+        _output_refresh_hz = 60.0
+        def __init__(self, _config):
+            pass
+        def initialize(self):
+            pass
+        def present(self, image):
+            presents.append((image, clock[0]))
+            clock[0] += 0.001
+            if image == "third":
+                shutdown.set()
+            return True
+        def poll_events(self):
+            pass
+        def close(self):
+            pass
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    monkeypatch.setattr(local_viewer_module, "time", SimpleNamespace(
+        perf_counter=lambda: clock[0], sleep=lambda duration: clock.__setitem__(0, clock[0] + duration)))
+    run_vulkan_local_viewer(runtime_q=frames, shutdown_event=shutdown,
+                           config=VulkanLocalViewerConfig(capture_mode="Video"))
+    if cancel_wait:
+        assert [name for name, _at in presents] == ["first"]
+        assert "second" in released
+        assert frames.qsize() == 1
+    else:
+        assert [name for name, _at in presents] == ["first", "second", "third"]
+        assert presents[1][1] == pytest.approx(100.05 - 0.5 / 60.0)
+        assert presents[2][1] == pytest.approx(100.10 - 0.5 / 60.0)
+        assert not frames.qsize()
+
+
+def test_local_media_pause_holds_prepared_fifo_outputs_and_resume_rebases_deadlines(monkeypatch):
+    clock = [100.0]
+    presents, cached = [], []
+    shutdown = threading.Event()
+    class Owner:
+        playing = True
+        anchor_at = None
+        anchor_pts = 0.0
+        def media_presentation_clock(self):
+            return {"generation": 1, "playing": self.playing,
+                    "anchor_at": self.anchor_at, "anchor_pts": self.anchor_pts}
+        def on_media_presented(self, metadata, at):
+            if self.anchor_at is None:
+                self.anchor_at, self.anchor_pts = at, metadata["source_pts"]
+            if metadata["source_frame_index"] == 0:
+                self.playing = False
+            if metadata["source_frame_index"] == 2:
+                shutdown.set()
+    owner = Owner()
+    frames = queue.Queue()
+    frames._d2s_ordered = True
+    for index in range(3):
+        frames.put((SimpleNamespace(sbs=index, debug_info={
+            "media_generation": 1, "source_frame_index": index, "source_pts": index * 0.05,
+            "media_presentation_deadline": 100.0 + index * 0.05}), 100.0))
+    class FakeViewer:
+        _output_refresh_hz = 60.0
+        def __init__(self, _config):
+            pass
+        def initialize(self):
+            pass
+        def present(self, image):
+            presents.append((image, clock[0]))
+            clock[0] += 0.001
+            return True
+        def _present_cached(self):
+            cached.append(clock[0])
+            clock[0] += 0.002
+            if len(cached) == 3:
+                owner.playing = True
+                owner.anchor_at = None
+            return True
+        def poll_events(self):
+            pass
+        def close(self):
+            pass
+    def advance(seconds):
+        clock[0] += seconds
+    # Do not monkeypatch global time, which live keyboard watchers also use.
+    monkeypatch.setattr(local_viewer_module, "time", SimpleNamespace(perf_counter=lambda: clock[0], sleep=advance))
+    original_wait = shutdown.wait
+    shutdown.wait = lambda seconds: advance(seconds) or shutdown.is_set()
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    try:
+        run_vulkan_local_viewer(runtime_q=frames, shutdown_event=shutdown,
+                               config=VulkanLocalViewerConfig(capture_mode="Video", on_media_presented=owner.on_media_presented))
+    finally:
+        shutdown.wait = original_wait
+    assert [index for index, _at in presents] == [0, 1, 2]
+    assert len(cached) == 3
+    assert presents[1][1] > cached[-1]
+    assert presents[2][1] == pytest.approx(owner.anchor_at + 0.05 - 0.5 / 60.0)
+    assert frames.empty()

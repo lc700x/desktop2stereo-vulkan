@@ -136,6 +136,8 @@ int filament_bridge_begin_background_frame(FilamentBridge* bridge) {
     return bridge_eye_begin_background_frame(bridge); }
 int filament_bridge_render_controller_overlay(FilamentBridge* bridge) {
     return bridge_eye_render_controller_overlay(bridge); }
+int filament_bridge_render_controller_overlay_deferred(FilamentBridge* bridge) {
+    return bridge_eye_render_controller_overlay_deferred(bridge); }
 int filament_bridge_end_frame(FilamentBridge* bridge) {
     return bridge_eye_end_frame(bridge); }
 

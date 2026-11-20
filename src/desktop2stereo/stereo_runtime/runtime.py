@@ -327,6 +327,7 @@ class StereoRuntimeResult:
     depth_frame_id: int | None = None
     depth_complete: bool = False
     depth_finite: bool = True
+    depth_profile: "DepthProfileResult | None" = None
     active_settings_version: int | None = None
     hot_reload_class: str | None = None
     hot_reload_changed_fields: tuple[str, ...] = ()
@@ -444,6 +445,7 @@ def openxr_result_from_stereo_result(
         provider_info=dict(stereo_result.provider_info or {}),
         cuda_ready_event=getattr(stereo_result, "cuda_ready_event", None),
         cuda_timing_events=cuda_events,
+        depth_profile=getattr(stereo_result, "depth_profile", None),
     )
 
 
@@ -2040,6 +2042,7 @@ class StereoRuntime:
             cuda_ready_event=None,
             cuda_timing_events=cuda_events,
             vulkan_compute_request=deferred_vulkan_request,
+            depth_profile=profile,
         )
 
     def process_openxr_frame(

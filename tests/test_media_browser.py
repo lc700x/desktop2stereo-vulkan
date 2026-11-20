@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from capture.media_browser import (
     IMAGE_EXTENSIONS,
@@ -144,3 +145,58 @@ def test_recent_media_history_persists_and_can_be_removed(tmp_path):
         ]
     finally:
         reloaded.close_and_join()
+
+
+def test_managed_playlist_add_sort_move_remove_preserves_active_item(tmp_path):
+    paths = []
+    for name in ("a.mp4", "b.mp4", "c.mp4", "d.mp4", "e.mp4"):
+        path = tmp_path / name
+        path.write_bytes(b"media")
+        paths.append(str(path.resolve()))
+    browser = MediaBrowser(initial_directory=str(tmp_path))
+    try:
+        for path in paths:
+            assert browser.playlist_add(path)
+        assert not browser.playlist_add(paths[0])
+        assert not browser.playlist_add(str(tmp_path))
+        assert not browser.playlist_add(str(tmp_path / "missing.mp4"))
+        assert browser.playlist_select(paths[1]) == paths[1]
+        browser.playlist_sort(descending=True)
+        state = browser.snapshot()
+        assert [item["path"] for item in state["playlist_entries"]] == paths[::-1]
+        assert state["playlist_entries"][state["playlist_index"]]["path"] == paths[1]
+        assert browser.playlist_move(paths[1], -1)
+        assert browser.snapshot()["playlist_index"] == 2
+        assert not browser.playlist_move(paths[0], 1)
+        browser.playlist_page(4)
+        assert browser.snapshot()["playlist_offset"] == 4
+        assert browser.playlist_remove(paths[4])
+        state = browser.snapshot()
+        assert state["playlist_entries"][state["playlist_index"]]["path"] == paths[1]
+        browser.prime_media_playlist(paths[1])
+        assert len(browser.snapshot()["playlist_entries"]) == 4
+        assert browser.open_path(paths[1])[0] == "media"
+        assert len(browser.snapshot()["playlist_entries"]) == 4
+        browser.playlist_clear()
+        browser.prime_media_playlist(paths[0])
+        assert browser.snapshot()["playlist_entries"] == []
+        assert all(Path(path).exists() for path in paths)
+    finally:
+        browser.close_and_join()
+
+
+def test_remove_before_current_preserves_next_playlist_item(tmp_path):
+    browser = MediaBrowser(initial_directory=str(tmp_path))
+    try:
+        paths = []
+        for index in range(3):
+            path = tmp_path / f"{index}.mp4"
+            path.write_bytes(b"media")
+            paths.append(str(path.resolve()))
+            browser.playlist_add(paths[-1])
+        browser.playlist_select(paths[1])
+        assert browser.playlist_remove(paths[0])
+        assert browser.snapshot()["playlist_index"] == 0
+        assert browser.playlist_step(1) == paths[2]
+    finally:
+        browser.close_and_join()

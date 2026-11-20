@@ -216,6 +216,7 @@ class FilamentVulkanBridge:
         self._finished_drawing_semaphore_abi_available = False
         self._image_ready_semaphore_abi_available = False
         self._controller_overlay_abi_available = False
+        self._controller_overlay_batch_abi_available = False
         self._controller_composition_layer_abi_available = False
         self._background_frame_abi_available = False
         self._async_submit_abi_available = False
@@ -290,6 +291,10 @@ class FilamentVulkanBridge:
     @property
     def controller_overlay_abi_available(self) -> bool:
         return self._controller_overlay_abi_available
+
+    @property
+    def controller_overlay_batch_abi_available(self) -> bool:
+        return self._controller_overlay_batch_abi_available
 
     @property
     def controller_composition_layer_abi_available(self) -> bool:
@@ -690,6 +695,17 @@ class FilamentVulkanBridge:
         self._check_result(
             self._library.filament_bridge_render_controller_overlay(self._handle),
             "render_controller_overlay",
+        )
+
+    def render_controller_overlay_deferred(self) -> None:
+        self._ensure_loaded()
+        if not self._controller_overlay_batch_abi_available:
+            raise FilamentBridgeError("deferred controller overlay ABI is unavailable")
+        self._check_result(
+            self._library.filament_bridge_render_controller_overlay_deferred(
+                self._handle
+            ),
+            "render_controller_overlay_deferred",
         )
 
     def end_frame(self) -> None:
@@ -1368,6 +1384,9 @@ class FilamentVulkanBridge:
             controller_overlay.argtypes = [ctypes.c_void_p]
             controller_overlay.restype = ctypes.c_int
             self._controller_overlay_abi_available = True
+        deferred_controller_overlay = getattr(
+            library, "filament_bridge_render_controller_overlay_deferred", None
+        )
         background_frame = getattr(
             library, "filament_bridge_begin_background_frame", None
         )
@@ -1387,6 +1406,13 @@ class FilamentVulkanBridge:
             finish_frame_batch.argtypes = [ctypes.c_void_p]
             finish_frame_batch.restype = ctypes.c_int
             self._stereo_batch_submit_abi_available = True
+        if (
+            deferred_controller_overlay is not None
+            and self._stereo_batch_submit_abi_available
+        ):
+            deferred_controller_overlay.argtypes = [ctypes.c_void_p]
+            deferred_controller_overlay.restype = ctypes.c_int
+            self._controller_overlay_batch_abi_available = True
         wait_for_idle = getattr(library, "filament_bridge_wait_for_idle", None)
         if wait_for_idle is not None:
             wait_for_idle.argtypes = [ctypes.c_void_p]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.errors import TritonError
 
 from .triton_runtime import triton_runtime_available
 
@@ -224,4 +225,52 @@ def apply_rcas(image: torch.Tensor, sharpness: float) -> torch.Tensor:
         image, output, total, int(width), int(height), total,
         max(0.0, min(1.0, float(sharpness))), block,
     )
+    return output
+
+
+@triton.jit
+def _horizontal_area_srgb_kernel(
+    source, output, total: tl.constexpr, width: tl.constexpr, height: tl.constexpr,
+    target: tl.constexpr, channels: tl.constexpr, sb: tl.constexpr, sc: tl.constexpr,
+    sy: tl.constexpr, sx: tl.constexpr, ratio: tl.constexpr, block: tl.constexpr,
+):
+    offsets = tl.program_id(0) * block + tl.arange(0, block)
+    active = offsets < total
+    x = offsets % target
+    row = offsets // target
+    y = row % height
+    plane = row // height
+    channel = plane % channels
+    batch = plane // channels
+    base = batch * sb + channel * sc + y * sy + x * ratio * sx
+    reduced = tl.full((block,), 0.0, tl.float32)
+    for tap in range(ratio):
+        value = tl.load(source + base + tap * sx, mask=active, other=0.0).to(tl.float32)
+        value = tl.minimum(tl.maximum(value, 0.0), 1.0)
+        linear = tl.where(value <= 0.04045, value / 12.92,
+                          tl.exp2(2.4 * tl.log2(tl.maximum((value + 0.055) / 1.055, 1.0e-20))))
+        reduced += linear / ratio
+    reduced = tl.minimum(tl.maximum(reduced, 0.0), 1.0)
+    encoded = tl.where(reduced <= 0.0031308, reduced * 12.92,
+                       1.055 * tl.exp2(tl.log2(tl.maximum(reduced, 1.0e-20)) / 2.4) - 0.055)
+    tl.store(output + offsets, tl.minimum(tl.maximum(encoded, 0.0), 1.0), mask=active)
+
+
+def horizontal_area_srgb(image: torch.Tensor, target_width: int) -> torch.Tensor | None:
+    """Fuse the existing integer box filter and exact sRGB transfer; no quality change."""
+    width = int(image.shape[-1])
+    if (not can_use_output_quality_triton(image) or image.dtype == torch.uint8
+            or target_width <= 0 or width % target_width != 0 or width // target_width not in (2, 3, 4)):
+        return None
+    batches, channels, height, _ = image.shape
+    output = torch.empty((batches, channels, height, target_width), device=image.device, dtype=image.dtype)
+    total = output.numel()
+    block = 256
+    try:
+        _horizontal_area_srgb_kernel[(triton.cdiv(total, block),)](
+            image, output, total, width, height, target_width, channels,
+            *image.stride(), width // target_width, block,
+        )
+    except TritonError:
+        return None
     return output

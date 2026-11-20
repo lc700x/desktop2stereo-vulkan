@@ -12,8 +12,16 @@ The bridge is used by `capture.media_d3d11`:
 3. The bridge writes BGRA8 into shared textures and signals a D3D11 fence.
 4. HIP imports the texture and fence, copies directly into a preallocated ROCm
    tensor, and signals the consumed fence. No CPU pixel readback is used.
-5. Python reuses one tensor per decoder slot and uses stream waits for
-   backpressure, so the decode thread never calls a per-frame CPU synchronize.
+5. Python reuses one tensor per decoder slot. Queued media keeps an owned GPU
+   copy completed on the import stream before publishing it, so decode-ahead
+   fences do not block unrelated inference on the default stream. No CPU pixel
+   readback is used.
+
+Hardware textures may be macroblock-aligned, such as 1920x1088 for a 1920x1080
+H.264 picture. The bridge validates the AVFrame's visible dimensions and uses
+its crop rectangle for the Video Processor, rather than treating surface
+padding as a resolution change. A real visible-resolution change is still
+reported explicitly; padded rows must never enter the displayed image.
 
 Unsupported codecs or hardware are reported to the caller. The Python media
 source then falls back to AMF or FFmpeg software decoding.

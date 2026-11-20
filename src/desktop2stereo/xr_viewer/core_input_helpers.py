@@ -143,6 +143,10 @@ class CoreInputHelpersMixin:
 
     def _handle_keyboard_input(self):
         """Send Windows keystrokes when a controller trigger fires on a keyboard key."""
+        media_mode = getattr(self, "_media_player_mode_active", None)
+        if callable(media_mode) and media_mode():
+            self._sync_media_controller_mode()
+            return
         if not self._keyboard_visible:
             self._kb_hover_l = None
             self._kb_hover_r = None

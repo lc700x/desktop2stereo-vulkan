@@ -496,7 +496,10 @@ int bridge_eye_begin_background_frame(FilamentBridge* bridge) {
     return bridge_eye_begin_frame_impl(bridge, false);
 }
 
-int bridge_eye_render_controller_overlay(FilamentBridge* bridge) {
+namespace {
+
+int bridge_eye_render_controller_overlay_impl(
+        FilamentBridge* bridge, bool wait_for_idle) {
     if (!bridge || !bridge->renderer || !bridge->engine || !bridge->swapchain ||
             bridge->frame_active || bridge->multiview_active) return 0;
     auto& eye = bridge->eyes[bridge->active_eye];
@@ -514,7 +517,11 @@ int bridge_eye_render_controller_overlay(FilamentBridge* bridge) {
         bridge->renderer->endFrame();
         bridge->frame_active = false;
         eye.frame_active = false;
-        bridge->engine->flushAndWait();
+        if (wait_for_idle) {
+            bridge->engine->flushAndWait();
+        } else {
+            bridge->engine->flush();
+        }
     }
     filament::Renderer::ClearOptions clear_options;
     // Vulkan interprets sRGB attachment clear values as linear RGB. Convert
@@ -527,6 +534,16 @@ int bridge_eye_render_controller_overlay(FilamentBridge* bridge) {
     clear_options.discard = true;
     bridge->renderer->setClearOptions(clear_options);
     return rendered ? 1 : 0;
+}
+
+}  // namespace
+
+int bridge_eye_render_controller_overlay(FilamentBridge* bridge) {
+    return bridge_eye_render_controller_overlay_impl(bridge, true);
+}
+
+int bridge_eye_render_controller_overlay_deferred(FilamentBridge* bridge) {
+    return bridge_eye_render_controller_overlay_impl(bridge, false);
 }
 
 namespace {

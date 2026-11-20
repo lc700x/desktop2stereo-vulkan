@@ -253,3 +253,52 @@ def test_max_lod_changes_shared_output_without_raising_min_lod() -> None:
     assert default_lod == 0.0
     assert raised_lod == pytest.approx(0.05)
     assert strong_lod == pytest.approx(1.3)
+
+
+@pytest.mark.parametrize("ratio", [2, 3, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("transpose", [False, True])
+def test_fused_srgb_area_preserves_original_filter_on_gpu(ratio, dtype, transpose):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU unavailable")
+    from stereo_runtime.output import _horizontal_area_reduce
+    from stereo_runtime.output_quality_triton import horizontal_area_srgb
+
+    image = torch.rand((1, 3, 24, 36), device="cuda", dtype=dtype) * 1.2 - 0.1
+    if transpose:
+        image = image.transpose(-2, -1)
+    width = image.shape[-1] // ratio
+    rgb = image.float().clamp(0.0, 1.0)
+    linear = torch.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055).clamp_min(0).pow(2.4))
+    reduced = _horizontal_area_reduce(linear, width).clamp(0.0, 1.0)
+    expected = torch.where(reduced <= 0.0031308, reduced * 12.92,
+                           1.055 * reduced.pow(1.0 / 2.4) - 0.055).clamp(0.0, 1.0).to(dtype)
+    actual = horizontal_area_srgb(image, width)
+    assert actual is not None
+    torch.testing.assert_close(actual, expected, atol=1e-3 if dtype == torch.float16 else 3e-6, rtol=1e-5)
+
+
+def test_fused_srgb_area_preserves_cpu_and_noninteger_fallback():
+    from stereo_runtime.output import downsample_horizontal_area_srgb
+
+    image = torch.rand((1, 4, 5, 11))
+    assert downsample_horizontal_area_srgb(image, 7).shape == (1, 4, 5, 7)
+    with pytest.raises(ValueError):
+        downsample_horizontal_area_srgb(image, 0)
+
+
+def test_fused_srgb_area_compiler_failure_retains_torch_reference(monkeypatch):
+    from triton.errors import TritonError
+    import stereo_runtime.output_quality_triton as kernels
+    from stereo_runtime.output import downsample_horizontal_area_srgb
+
+    class FailedKernel:
+        def __getitem__(self, _grid):
+            def compile_failure(*_args):
+                raise TritonError("compiler unavailable")
+            return compile_failure
+    monkeypatch.setattr(kernels, "can_use_output_quality_triton", lambda _image: True)
+    monkeypatch.setattr(kernels, "_horizontal_area_srgb_kernel", FailedKernel())
+    image = torch.full((1, 3, 4, 8), 0.5)
+    assert kernels.horizontal_area_srgb(image, 4) is None
+    torch.testing.assert_close(downsample_horizontal_area_srgb(image, 4), image[..., :4])

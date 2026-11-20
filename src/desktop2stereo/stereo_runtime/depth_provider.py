@@ -1142,6 +1142,8 @@ def _postprocess_generic_depth(depth: torch.Tensor, model_id: str) -> torch.Tens
     depth = ensure_b1hw(depth).float()
     if _is_metric_model(model_id):
         depth = depth.clamp_min(5e-3).reciprocal()
+    # ZipDepth emits relative inverse depth: larger values are nearer, which
+    # is already the linear-disparity convention used by DIBR.
     return _normalize_depth(depth)
 
 

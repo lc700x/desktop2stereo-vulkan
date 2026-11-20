@@ -121,6 +121,10 @@ FILAMENT_BRIDGE_API int filament_bridge_begin_background_frame(
         FilamentBridge* bridge);
 FILAMENT_BRIDGE_API int filament_bridge_render_controller_overlay(
         FilamentBridge* bridge);
+// Queue a controller eye without waiting; finish_frame_batch synchronizes the
+// complete stereo pair before the OpenXR swapchain images are released.
+FILAMENT_BRIDGE_API int filament_bridge_render_controller_overlay_deferred(
+        FilamentBridge* bridge);
 FILAMENT_BRIDGE_API int filament_bridge_end_frame(FilamentBridge* bridge);
 // Queue one eye without blocking, then wait once after both eyes are queued.
 FILAMENT_BRIDGE_API int filament_bridge_end_frame_deferred(FilamentBridge* bridge);

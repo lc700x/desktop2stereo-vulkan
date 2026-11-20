@@ -92,6 +92,7 @@ def normalize_config(config: CaptureConfig | None = None) -> CaptureConfig:
         media_muted=bool(getattr(config, "media_muted", False)),
         media_browser_directory=getattr(config, "media_browser_directory", None),
         media_audio_enabled=bool(config.media_audio_enabled),
+        media_presentation_sync=bool(getattr(config, "media_presentation_sync", False)),
         render_size_config=getattr(config, "render_size_config", None),
         window_handle=getattr(config, "window_handle", None),
         window_rect=getattr(config, "window_rect", None),

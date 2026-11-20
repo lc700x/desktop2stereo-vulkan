@@ -1580,6 +1580,9 @@ def test_settings_menu_stop_requests_shared_shutdown_once_and_beats_device_loss(
 
 def test_right_stick_scroll_sign_changes_only_vertical_axis() -> None:
     presenter = OpenXrVulkanPresenter()
+    # Test the scroll sign, not user-local media state or live physical input.
+    presenter._media_player_mode_active = lambda: False
+    presenter._physical_input_has_priority = lambda **_kwargs: False
     calls = []
     presenter._accum_scroll = lambda x, y, dt: calls.append((x, y, dt))
 
@@ -2108,6 +2111,162 @@ def test_controller_only_pass_updates_both_cameras_and_consumes_completion(monke
         ("eye", 0), ("camera", "left"), ("image", 3), ("overlay", 0),
         ("eye", 1), ("camera", "right"), ("image", 5), ("overlay", 1),
         ("drain", "graphics", ("finished:0",) if fail_right else ("finished:0", "finished:1")),
+    ]
+
+
+def test_controller_only_pass_batches_deferred_eyes_and_waits_once(monkeypatch) -> None:
+    calls = []
+
+    class Bridge:
+        controller_overlay_abi_available = True
+        controller_overlay_batch_abi_available = True
+        finished_drawing_semaphore_abi_available = True
+
+        def set_active_eye(self, eye_index):
+            self.eye_index = eye_index
+            calls.append(("eye", eye_index))
+
+        def set_acquired_image(self, image_index):
+            calls.append(("image", image_index))
+
+        def render_controller_overlay(self):
+            pytest.fail("deferred batch must not use the synchronous ABI")
+
+        def render_controller_overlay_deferred(self):
+            calls.append(("overlay_deferred", self.eye_index))
+
+        def finish_frame_batch(self):
+            calls.append(("finish_batch", None))
+
+        def get_finished_drawing_semaphore(self):
+            calls.append(("semaphore", self.eye_index))
+            return f"finished:{self.eye_index}"
+
+    def submit(role, record, **kwargs):
+        record(None)
+        calls.append(("drain", role, kwargs["wait_semaphore"]))
+        return 29
+
+    presenter = OpenXrVulkanPresenter()
+    presenter.filament_bridge = Bridge()
+    presenter.vulkan = SimpleNamespace(submit_on=submit)
+
+    timeline = presenter._render_filament_controller_overlay(
+        [(object(), 3), (object(), 5)], lambda *_args: None
+    )
+
+    assert timeline == 29
+    assert calls == [
+        ("eye", 0), ("image", 3), ("overlay_deferred", 0),
+        ("eye", 1), ("image", 5), ("overlay_deferred", 1),
+        ("finish_batch", None),
+        ("eye", 0), ("semaphore", 0),
+        ("eye", 1), ("semaphore", 1),
+        ("drain", "graphics", ("finished:0", "finished:1")),
+    ]
+
+
+def test_controller_deferred_batch_finishes_and_drains_on_eye_failure() -> None:
+    calls = []
+
+    class Bridge:
+        controller_overlay_abi_available = True
+        controller_overlay_batch_abi_available = True
+        finished_drawing_semaphore_abi_available = True
+
+        def set_active_eye(self, eye_index):
+            self.eye_index = eye_index
+            calls.append(("eye", eye_index))
+
+        def set_acquired_image(self, _image_index):
+            pass
+
+        def render_controller_overlay(self):
+            pytest.fail("deferred batch must not use the synchronous ABI")
+
+        def render_controller_overlay_deferred(self):
+            calls.append(("overlay", self.eye_index))
+            if self.eye_index == 1:
+                raise RuntimeError("right eye failed")
+
+        def finish_frame_batch(self):
+            calls.append(("finish_batch", None))
+
+        def get_finished_drawing_semaphore(self):
+            calls.append(("semaphore", self.eye_index))
+            return f"finished:{self.eye_index}"
+
+    def submit(role, record, **kwargs):
+        record(None)
+        calls.append(("drain", role, kwargs["wait_semaphore"]))
+        return 31
+
+    presenter = OpenXrVulkanPresenter()
+    presenter.filament_bridge = Bridge()
+    presenter.vulkan = SimpleNamespace(submit_on=submit)
+
+    with pytest.raises(RuntimeError, match="right eye failed"):
+        presenter._render_filament_controller_overlay(
+            [(object(), 3), (object(), 5)], lambda *_args: None
+        )
+
+    assert calls == [
+        ("eye", 0), ("overlay", 0), ("eye", 1), ("overlay", 1),
+        ("finish_batch", None),
+        ("eye", 0), ("semaphore", 0),
+        ("drain", "graphics", ("finished:0",)),
+    ]
+
+
+def test_controller_deferred_batch_drain_runs_when_finish_wait_fails() -> None:
+    calls = []
+
+    class Bridge:
+        controller_overlay_abi_available = True
+        controller_overlay_batch_abi_available = True
+        finished_drawing_semaphore_abi_available = True
+
+        def set_active_eye(self, eye_index):
+            self.eye_index = eye_index
+            calls.append(("eye", eye_index))
+
+        def set_acquired_image(self, _image_index):
+            pass
+
+        def render_controller_overlay(self):
+            pytest.fail("deferred batch must not use the synchronous ABI")
+
+        def render_controller_overlay_deferred(self):
+            calls.append(("overlay", self.eye_index))
+
+        def finish_frame_batch(self):
+            calls.append(("finish_batch", None))
+            raise RuntimeError("batch wait failed")
+
+        def get_finished_drawing_semaphore(self):
+            calls.append(("semaphore", self.eye_index))
+            return f"finished:{self.eye_index}"
+
+    def submit(role, record, **kwargs):
+        record(None)
+        calls.append(("drain", role, kwargs["wait_semaphore"]))
+        return 37
+
+    presenter = OpenXrVulkanPresenter()
+    presenter.filament_bridge = Bridge()
+    presenter.vulkan = SimpleNamespace(submit_on=submit)
+
+    with pytest.raises(RuntimeError, match="batch wait failed"):
+        presenter._render_filament_controller_overlay(
+            [(object(), 3), (object(), 5)], lambda *_args: None
+        )
+
+    assert calls == [
+        ("eye", 0), ("overlay", 0), ("eye", 1), ("overlay", 1),
+        ("finish_batch", None),
+        ("eye", 0), ("semaphore", 0),
+        ("eye", 1), ("semaphore", 1),
+        ("drain", "graphics", ("finished:0", "finished:1")),
     ]
 
 
@@ -3528,6 +3687,8 @@ def test_right_grip_moves_screen_without_resizing_it() -> None:
 
 
 def _prepare_pointer_priority_presenter(monkeypatch):
+    monkeypatch.setattr(core_openxr_vulkan, "_physical_mouse_active", lambda **_kwargs: False)
+    monkeypatch.setattr(core_openxr_vulkan, "_physical_keyboard_active", lambda **_kwargs: False)
     generation = {"value": 0}
     monkeypatch.setattr(
         core_openxr_vulkan,
@@ -3535,6 +3696,8 @@ def _prepare_pointer_priority_presenter(monkeypatch):
         lambda: generation["value"],
     )
     presenter = OpenXrVulkanPresenter()
+    # Media-mode isolation is covered separately; this fixture tests desktop takeover.
+    presenter._media_player_mode_active = lambda: False
     presenter._controller_inputs = ({}, {"trigger": 0.0})
     presenter._screen_ray_hit_for_hand = lambda hand: (
         (0.5, 0.5) if hand == 1 else None
@@ -5449,7 +5612,11 @@ def test_presenter_skips_end_frame_after_vulkan_device_loss() -> None:
 
 
 @pytest.mark.parametrize("physical_override", [False, True])
-def test_presenter_keeps_latest_output_during_non_renderable_xr_tick(monkeypatch, physical_override) -> None:
+@pytest.mark.parametrize("predicted_period", [None, 0, -1, float("nan"), float("inf"), 13_888_889,
+                                             ctypes.c_int64(13_888_889)])
+def test_presenter_keeps_latest_output_during_non_renderable_xr_tick(
+    monkeypatch, physical_override, predicted_period
+) -> None:
     frame = object()
     ended_frames = []
     dropped_frames = []
@@ -5462,7 +5629,10 @@ def test_presenter_keeps_latest_output_during_non_renderable_xr_tick(monkeypatch
         FrameEndInfo = staticmethod(lambda **kwargs: kwargs)
 
         def wait_frame(self, _session):
-            return SimpleNamespace(should_render=False, predicted_display_time=123)
+            return SimpleNamespace(
+                should_render=False, predicted_display_time=123,
+                **({} if predicted_period is None else {"predicted_display_period": predicted_period}),
+            )
 
         def begin_frame(self, _session):
             pass
@@ -5476,6 +5646,9 @@ def test_presenter_keeps_latest_output_during_non_renderable_xr_tick(monkeypatch
     presenter.session = object()
     presenter.vulkan = SimpleNamespace(device_lost=False)
     presenter.xr = FakeXr()
+    presenter._display_period_s = 1.0 / 90.0
+    presenter._frame_now = 100.0
+    monkeypatch.setattr(core_openxr_vulkan.time, "perf_counter", lambda: 100.001)
     presenter._accept_output = True
     presenter._physical_input_override = physical_override
     presenter._physical_input_event_pending = lambda: False
@@ -5501,6 +5674,10 @@ def test_presenter_keeps_latest_output_during_non_renderable_xr_tick(monkeypatch
 
     assert presenter.run_frame() is True
 
+    period = getattr(predicted_period, "value", predicted_period)
+    expected_period = period * 1e-9 if period is not None and 0 < period < float("inf") else 1.0 / 90.0
+    assert presenter._display_period_s == pytest.approx(expected_period)
+    assert presenter._last_frame_dt == pytest.approx(0.001)
     assert presenter._accept_output is True
     assert presenter._pending_output is frame
     assert dropped_frames == []
@@ -5639,8 +5816,6 @@ def test_presenter_invalid_optional_layer_recovery_keeps_primary_layers() -> Non
     )
 
     assert calls == [[projection, optional_quad], [projection]]
-
-
 
 
 def test_presenter_waits_for_headset_and_retries_initialization(capsys) -> None:
@@ -5889,6 +6064,50 @@ def test_presenter_primes_two_media_frames_before_cadence_output(monkeypatch) ->
     assert presenter._select_presentable_output_frame(now[0]) is second
 
 
+def test_presenter_uses_float_deadline_without_integer_tick_state(monkeypatch) -> None:
+    now = [20.0]
+    monkeypatch.setattr(core_openxr_vulkan.time, "perf_counter", lambda: now[0])
+    presenter = OpenXrVulkanPresenter()
+    presenter._release_output_frame = lambda _frame: None
+    presenter._last_frame_dt = 1.0 / 72.0
+    first = _media_output_frame(1, 0, 0.0)
+    second = _media_output_frame(2, 5, 5.0 / 120.0)
+
+    presenter._submit_output_on_presenter(first)
+    now[0] += 1.0 / 24.0
+    presenter._submit_output_on_presenter(second)
+    assert presenter._select_presentable_output_frame(now[0]) is first
+    presenter._commit_output_frame(first)
+
+    assert presenter._media_source_period_s == pytest.approx(1.0 / 120.0)
+    assert presenter._media_playback_period_s == pytest.approx(1.0 / 24.0)
+    assert presenter._media_next_present_at == pytest.approx(now[0] + 1.0 / 24.0)
+    assert not hasattr(presenter, "_media_next_present_tick")
+    assert not hasattr(presenter, "_media_frame_tick")
+
+
+def test_presenter_uses_playback_period_for_source_decimation(monkeypatch) -> None:
+    now = [30.0]
+    monkeypatch.setattr(core_openxr_vulkan.time, "perf_counter", lambda: now[0])
+    presenter = OpenXrVulkanPresenter()
+    presenter._release_output_frame = lambda _frame: None
+    presenter._last_frame_dt = 1.0 / 72.0
+    first = _media_output_frame(1, 0, 0.0)
+    second = _media_output_frame(2, 5, 5.0 / 120.0)
+    for frame in (first, second):
+        frame.metadata.update(media_source_fps=120.0, media_playback_fps=24.0)
+
+    presenter._submit_output_on_presenter(first)
+    now[0] += 1.0 / 24.0
+    presenter._submit_output_on_presenter(second)
+    assert presenter._select_presentable_output_frame(now[0]) is first
+    presenter._commit_output_frame(first)
+
+    assert presenter._media_source_period_s == pytest.approx(1.0 / 120.0)
+    assert presenter._media_playback_period_s == pytest.approx(1.0 / 24.0)
+    assert presenter._media_next_present_at == pytest.approx(now[0] + 1.0 / 24.0)
+
+
 def test_presenter_does_not_replace_uncommitted_media_pending_frame() -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._release_output_frame = lambda _frame: None
@@ -5907,22 +6126,68 @@ def test_presenter_does_not_replace_uncommitted_media_pending_frame() -> None:
     assert list(presenter._media_output_queue) == [queued]
 
 
-def test_presenter_requests_120hz_for_120fps_media_when_supported() -> None:
+def test_presenter_unwraps_openxr_float_scalars() -> None:
+    assert OpenXrVulkanPresenter._openxr_float(ctypes.c_float(72.0)) == 72.0
+    assert OpenXrVulkanPresenter._openxr_float(90.0) == 90.0
+
+
+def test_presenter_requests_refresh_rate_from_openxr_scalar_wrappers() -> None:
     requested = []
     presenter = OpenXrVulkanPresenter()
     presenter.session = object()
+    presenter._display_refresh_rate_supported = True
     presenter.xr = SimpleNamespace(
-        enumerate_display_refresh_rates_fb=lambda _session: (72.0, 90.0, 120.0),
-        get_display_refresh_rate_fb=lambda _session: 90.0,
+        enumerate_display_refresh_rates_fb=lambda _session: (ctypes.c_float(72.0),),
+        get_display_refresh_rate_fb=lambda _session: ctypes.c_float(72.0),
         request_display_refresh_rate_fb=lambda _session, rate: requested.append(rate),
     )
-    presenter._display_refresh_rate_supported = True
 
     presenter._request_media_display_refresh_rate(1.0 / 120.0)
 
-    assert requested == [120.0]
-    assert presenter._display_refresh_rate_requested == 120.0
-    assert presenter._display_refresh_rate_actual == 90.0
+    assert requested == [72.0]
+    assert presenter._display_refresh_rate_requested == 72.0
+    assert presenter._display_refresh_rate_actual == 72.0
+    assert presenter._display_refresh_rate_error == ""
+    assert presenter._display_period_s == pytest.approx(1.0 / 72.0)
+
+
+def test_presenter_uses_output_cadence_for_60_to_24_pulldown(monkeypatch) -> None:
+    now = [0.0]
+    monkeypatch.setattr(core_openxr_vulkan.time, "perf_counter", lambda: now[0])
+    presenter = OpenXrVulkanPresenter()
+    presenter._release_output_frame = lambda _frame: None
+    presenter._last_frame_dt = 1.0 / 72.0
+    source_indices = []
+    index = 0
+    while len(source_indices) < 48:
+        source_indices.append(index)
+        index += 3 if len(source_indices) % 2 == 0 else 2
+    frames = [
+        _media_output_frame(i + 1, source_index, source_index / 60.0)
+        for i, source_index in enumerate(source_indices)
+    ]
+    for frame in frames:
+        frame.metadata.update(media_source_fps=60.0, media_playback_fps=24.0)
+
+    next_source = 0
+    presented_times = []
+    for tick in range(1, 145):
+        now[0] = tick / 72.0
+        if tick % 3 == 0 and next_source < len(frames):
+            presenter._submit_output_on_presenter(frames[next_source])
+            next_source += 1
+        frame = presenter._select_presentable_output_frame(now[0])
+        if frame is None:
+            continue
+        presenter._commit_output_frame(frame)
+        presented_times.append(now[0])
+
+    intervals = [
+        round((right - left) * 72.0)
+        for left, right in zip(presented_times, presented_times[1:])
+    ]
+    assert len(intervals) >= 30
+    assert set(intervals) == {3}
 
 
 def test_presenter_uses_3_4_tick_pulldown_for_24fps_on_90hz(monkeypatch) -> None:
@@ -6615,6 +6880,30 @@ def test_swapchain_image_is_released_after_wait_when_render_fails() -> None:
     with pytest.raises(RuntimeError, match="clear failed"):
         presenter._render_projection_layer([object()])
     assert calls == ["acquire", "wait", "release"]
+
+
+def test_media_swapchain_release_waits_for_final_vulkan_timeline() -> None:
+    waited = []
+    timing_names = []
+    presenter = OpenXrVulkanPresenter()
+    presenter.vulkan = SimpleNamespace(
+        last_submitted_timeline_value=41,
+        wait_for_timeline=lambda value: waited.append(value),
+    )
+    frame = VulkanStereoOutputFrame(
+        frame_id=7,
+        timestamp=0.0,
+        left_eye=object(),
+        right_eye=object(),
+        metadata={"media_generation": 0},
+    )
+
+    presenter._wait_for_media_swapchain_release(
+        frame, lambda name, _started: timing_names.append(name)
+    )
+
+    assert waited == [41]
+    assert timing_names == ["openxr_media_wait_before_release"]
 
 
 def test_projection_acquires_stereo_pair_before_waiting(monkeypatch) -> None:
@@ -9290,3 +9579,321 @@ def test_vulkan_timeline_timeout_is_recoverable_error() -> None:
     with pytest.raises(VulkanTimelineTimeout):
         context.wait_for_timeline(7)
     assert context.device_lost is False
+
+
+def test_ordered_media_runtime_commands_are_not_coalesced_on_presenter():
+    presenter = OpenXrVulkanPresenter()
+    presenter._presenter_commands = queue.Queue(maxsize=3)
+    submitted = []
+    presenter._submit_runtime_result_on_presenter = lambda result, stamp: submitted.append((result, stamp))
+    items = [SimpleNamespace(debug_info={"media_generation": 0, "source_frame_index": index}) for index in (0, 5, 10)]
+    for index, result in enumerate(items):
+        presenter._presenter_commands.put(("submit_runtime_result", (result, float(index))))
+    presenter._drain_presenter_commands()
+    assert submitted == [(items[0], 0.0)]
+    assert presenter._presenter_commands.qsize() == 2
+    presenter._drain_presenter_commands()
+    presenter._drain_presenter_commands()
+    assert submitted == list(zip(items, (0.0, 1.0, 2.0)))
+
+
+def test_openxr_media_mount_action_dispatches_browse_on_trigger():
+    actions = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda action, **values: actions.append((action, values)) or True
+    )
+    presenter._media_overlay_state = {"ready": True, "browser_visible": True}
+    presenter._dispatch_media_overlay_hit("mount", "F:/")
+    assert actions == [("media_control", {"media_action": "browse", "value": "F:/"})]
+
+
+def test_openxr_different_file_clicks_do_not_become_an_accidental_double_click(monkeypatch):
+    monkeypatch.setattr(core_openxr_vulkan.time, "monotonic", lambda: 10.0)
+    actions = []
+    presenter = OpenXrVulkanPresenter(on_controller_shortcut=lambda action, **values: actions.append(values) or True)
+    presenter._media_overlay_state = {"ready": True}
+    presenter._dispatch_media_overlay_hit("entry", "F:/a.mp4")
+    presenter._dispatch_media_overlay_hit("entry", "F:/b.mp4")
+    assert [item["media_action"] for item in actions] == ["browse_select", "browse_select"]
+    presenter._dispatch_media_overlay_hit("entry", "F:/b.mp4")
+    assert actions[-1]["media_action"] == "browse_open"
+
+
+def test_openxr_playlist_controls_dispatch_shared_management_actions():
+    actions = []
+    presenter = OpenXrVulkanPresenter(on_controller_shortcut=lambda action, **values: actions.append(values) or True)
+    presenter._media_overlay_state = {"ready": True, "playlist_sort_descending": False}
+    presenter._dispatch_media_overlay_hit("playlist_move_down", "F:/a.mp4")
+    presenter._dispatch_media_overlay_hit("playlist_add", "F:/b.mp4")
+    presenter._dispatch_media_overlay_hit("playlist_remove", "F:/a.mp4")
+    presenter._dispatch_media_overlay_hit("playlist_sort")
+    assert actions == [
+        {"media_action": "playlist_move", "value": {"path": "F:/a.mp4", "offset": 1}},
+        {"media_action": "playlist_add", "value": {"path": "F:/b.mp4"}},
+        {"media_action": "playlist_remove", "value": {"path": "F:/a.mp4"}},
+        {"media_action": "playlist_sort", "value": {"descending": True}},
+    ]
+
+
+def test_openxr_disk_trigger_dispatches_complete_browser_hit_route():
+    from media_ui import MEDIA_BROWSER_TEXTURE_SIZE, _browser_layout
+
+    actions = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda action, **values: actions.append(values) or True
+    )
+    presenter._media_overlay_state = {"ready": True, "browser_visible": True,
+        "browser_mounts": [{"name": "媒体 (F:)", "path": "F:/", "kind": "drive"}]}
+    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    layout = _browser_layout(presenter._media_overlay_state, width, height)
+    uv = (160.0 / width, (layout["mount_top"] + layout["mount_row_height"] / 2) / height)
+    presenter._media_overlay_ray_hit = lambda hand, browser=False: uv if hand == 1 else None
+    presenter._controller_inputs = ({}, {"trigger": 1.0})
+    assert presenter._handle_media_overlay_input()
+    assert actions == [{"media_action": "browse", "value": "F:/"}]
+    presenter._controller_inputs = ({}, {"trigger": 0.0})
+    presenter._handle_media_overlay_input()
+    assert len(actions) == 1
+
+
+@pytest.mark.parametrize("mode", ["File", "Video", "Image"])
+def test_media_player_disables_desktop_shortcuts_before_state_arrives(mode, monkeypatch):
+    actions = []
+    owner = SimpleNamespace(context=SimpleNamespace(capture_config=SimpleNamespace(capture_mode=mode)))
+
+    class Callback:
+        __self__ = owner
+
+        def __call__(self, action, **values):
+            actions.append((action, values))
+            return True
+
+    presenter = OpenXrVulkanPresenter(on_controller_shortcut=Callback())
+    presenter._media_overlay_state = {}
+    monkeypatch.setattr(core_openxr_vulkan, "_send_key", lambda *_a, **_kw: pytest.fail("desktop key injected"))
+    presenter._send_arrow_impl = lambda *_a, **_kw: pytest.fail("desktop arrows injected")
+    presenter._accum_scroll = lambda *_a, **_kw: pytest.fail("desktop wheel injected")
+    for action in ("copy", "cut", "paste", "enter", "toggle_keyboard", "arrow_axes", "scroll_axes"):
+        presenter._dispatch_controller_shortcut(action, horizontal=1.0, vertical=1.0)
+    assert not presenter._keyboard_visible
+    assert not actions
+    presenter._dispatch_controller_shortcut("media_control", media_action="play")
+    assert actions == [("media_control", {"media_action": "play"})]
+
+
+def test_media_mode_releases_remote_holds_without_resetting_player_click(monkeypatch):
+    presenter = OpenXrVulkanPresenter()
+    presenter._media_overlay_state = {"mode": "Video"}
+    presenter._pointer_state["right"] = "down"
+    presenter._media_overlay_pending_selection = (1, "entry", "F:/video.mp4")
+    presenter._media_overlay_trigger_down = [False, True]
+    presenter._keyboard_visible = True
+    released = []
+    monkeypatch.setattr(core_openxr_vulkan, "_physical_key_down", lambda _key: False)
+    monkeypatch.setattr(core_openxr_vulkan, "_send_mouse_flags", released.append)
+    presenter._sync_media_controller_mode()
+    presenter._sync_media_controller_mode()
+    assert released == [core_openxr_vulkan._MOUSEEVENTF_LEFTUP]
+    assert presenter._pointer_state["right"] == "idle"
+    assert not presenter._keyboard_visible
+    assert presenter._media_overlay_pending_selection == (1, "entry", "F:/video.mp4")
+    assert presenter._media_overlay_trigger_down == [False, True]
+
+
+def test_media_mode_blocks_screen_mouse_and_touch_but_keeps_scene_controls(monkeypatch):
+    presenter = OpenXrVulkanPresenter()
+    presenter._media_overlay_state = {"mode": "Browser", "browser_visible": True}
+    presenter._controller_inputs = ({}, {"trigger": 1.0, "joystick_y": 1.0})
+    presenter._screen_ray_hit_for_hand = lambda _hand: (0.5, 0.5)
+    presenter._update_touch_contacts = lambda *_a: pytest.fail("desktop touch injected")
+    monkeypatch.setattr(core_openxr_vulkan, "_set_cursor_pos", lambda *_a: pytest.fail("desktop mouse moved"))
+    monkeypatch.setattr(core_openxr_vulkan, "_send_mouse_flags", lambda *_a: pytest.fail("desktop mouse clicked"))
+    presenter._handle_vulkan_pointer_input()
+    assert presenter._pointer_state == {"left": "idle", "right": "idle"}
+    presenter._dispatch_controller_shortcut("toggle_screen_shape")
+    assert presenter._screen_curved
+
+
+def test_media_mode_blocks_direct_virtual_keyboard_input(monkeypatch):
+    presenter = OpenXrVulkanPresenter()
+    presenter._media_overlay_state = {"mode": "Image"}
+    presenter._keyboard_visible = True
+    presenter._read_float_action = lambda *_a: pytest.fail("virtual keyboard trigger read")
+    presenter._handle_keyboard_input()
+    assert not presenter._keyboard_visible
+
+
+def test_media_mode_preserves_xr_settings_scroll_without_windows_wheel():
+    presenter = OpenXrVulkanPresenter()
+    presenter._media_overlay_state = {"mode": "Video"}
+    events = []
+    presenter._settings_menu.visible = True
+    presenter._settings_menu_ray_hit = lambda _hand: (0.5, 0.5)
+    presenter._settings_menu.scroll_viewport_contains = lambda _hit: True
+    presenter._settings_menu.scroll_by_wheel_axis = lambda *_args: events.append("menu_scroll")
+    presenter._accum_scroll = lambda *_a: pytest.fail("desktop scroll injected")
+    presenter._dispatch_controller_shortcut("scroll_axes", horizontal=1.0, vertical=1.0, dt=0.01)
+    assert events == ["menu_scroll"]
+
+
+def test_desktop_capture_keeps_remote_controls_when_media_state_is_stale(monkeypatch):
+    sent = []
+    class Callback:
+        context = SimpleNamespace(capture_config=SimpleNamespace(capture_mode="Monitor"))
+        def dispatch(self, *_a, **_kw):
+            return True
+    presenter = OpenXrVulkanPresenter(on_controller_shortcut=Callback().dispatch)
+    presenter._media_overlay_state = {"mode": "Video"}
+    monkeypatch.setattr(core_openxr_vulkan, "_physical_keyboard_active", lambda **_kw: False)
+    monkeypatch.setattr(core_openxr_vulkan, "_physical_mouse_active", lambda **_kw: False)
+    monkeypatch.setattr(core_openxr_vulkan, "_send_key", lambda key, **values: sent.append((key, values)))
+    assert not presenter._media_player_mode_active()
+    presenter._dispatch_controller_shortcut("copy")
+    assert sent == [(0x43, {"ctrl": True})]
+
+
+def test_duplicate_paused_media_is_rejected_before_gpu_ring_conversion():
+    presenter = OpenXrVulkanPresenter()
+    displayed = _media_output_frame(0, 10, 10.0 / 120.0, generation=1)
+    displayed.metadata["vulkan_output_ring_slot"] = 0
+    presenter._displayed_output = displayed
+    presenter._last_output_source_identity = (1, 10, 10.0 / 120.0)
+    presenter._next_output_frame_id = 4
+    converted = []
+    def convert(result, **kwargs):
+        converted.append(kwargs["frame_id"])
+        presenter.release_displayed_output_for_reuse(0)
+        return _media_output_frame(kwargs["frame_id"], 10, 10.0 / 120.0, generation=1)
+    presenter._output_adapter = SimpleNamespace(convert=convert)
+    presenter._vulkan_device_is_lost = lambda: False
+    result = SimpleNamespace(debug_info={"media_generation": 1, "source_frame_index": 10,
+        "source_pts": 10.0 / 120.0})
+    for _ in range(8):
+        presenter._submit_runtime_result_on_presenter(result, 1.0)
+    assert converted == []
+    assert presenter._displayed_output is displayed
+    assert presenter._next_output_frame_id == 4
+    assert not displayed.metadata.get("_vulkan_release_attempted", False)
+
+
+def test_out_of_order_media_is_rejected_before_gpu_ring_conversion():
+    presenter = OpenXrVulkanPresenter()
+    presenter._last_output_source_identity = (1, 20, 20.0 / 120.0)
+    presenter._vulkan_device_is_lost = lambda: False
+    presenter._output_adapter = SimpleNamespace(convert=lambda *_a, **_kw: pytest.fail("stale image touched GPU ring"))
+    result = SimpleNamespace(debug_info={"media_generation": 1, "source_frame_index": 15,
+        "source_pts": 15.0 / 120.0})
+    presenter._submit_runtime_result_on_presenter(result, 1.0)
+
+
+def test_new_media_generation_retries_after_conversion_failure_without_advancing_identity():
+    presenter = OpenXrVulkanPresenter()
+    presenter._last_output_source_identity = (1, 20, 20.0 / 120.0)
+    presenter._vulkan_device_is_lost = lambda: False
+    presenter._output_adapter = SimpleNamespace(convert=lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("retry")))
+    result = SimpleNamespace(debug_info={"media_generation": 2, "source_frame_index": 0, "source_pts": 0.0})
+    presenter._submit_runtime_result_on_presenter(result, 1.0)
+    assert presenter._last_output_source_identity == (1, 20, 20.0 / 120.0)
+    presenter._output_adapter.convert = lambda *_a, **_kw: _media_output_frame(0, 0, 0.0, generation=2)
+    presenter._submit_runtime_result_on_presenter(result, 1.0)
+    assert presenter._last_output_source_identity == (2, 0, 0.0)
+
+
+
+
+def test_display_audio_clock_converts_predicted_xr_time_to_host_clock(monkeypatch):
+    presenter = OpenXrVulkanPresenter()
+    presenter._performance_counter_time_supported = True
+    presenter._qpc_frequency = 10000000
+    presenter._qpc_to_perf_offset = -123.0
+    presenter.instance = "xr-instance"
+    presenter.xr = SimpleNamespace(
+        convert_time_to_win32_performance_counter_khr=lambda instance, stamp: ctypes.c_longlong(2000000000)
+    )
+    assert presenter._display_time_to_perf_counter(999) == pytest.approx(77.0)
+
+
+def test_display_audio_clock_fallback_is_explicit_and_does_not_guess_time_epoch(monkeypatch):
+    monkeypatch.setattr(core_openxr_vulkan.time, "perf_counter", lambda: 10.0)
+    presenter = OpenXrVulkanPresenter()
+    assert presenter._display_time_to_perf_counter(1000000000000) == 10.0
+
+
+def test_media_source_deadline_uses_predicted_display_clock_not_cpu_completion():
+    presenter = OpenXrVulkanPresenter()
+    clock = {"generation": 0, "playing": True, "anchor_at": 100.0, "anchor_pts": 0.0}
+    class Owner:
+        def media_presentation_clock(self):
+            return clock
+        def shortcut(self, *_a, **_k):
+            return True
+    owner = Owner()
+    presenter._on_controller_shortcut = owner.shortcut
+    presenter._display_period_s = 1.0 / 72.0
+    frame = _media_output_frame(1, 6, 0.1)
+    presenter._media_output_queue.append(frame)
+    presenter._media_output_queue_arrivals.append(99.0)
+    presenter._media_predicted_perf_time = 100.05
+    assert presenter._select_presentable_output_frame(999.0) is None
+    assert len(presenter._media_output_queue) == 1
+    presenter._media_predicted_perf_time = 100.095
+    assert presenter._select_presentable_output_frame(0.0) is frame
+    assert frame.metadata["media_presentation_deadline"] == pytest.approx(100.1)
+    assert not presenter._media_output_queue
+    clock["playing"] = False
+    assert presenter._select_presentable_output_frame(999.0) is None
+    assert presenter._pending_output is frame
+    clock.update(playing=True, anchor_at=104.0, anchor_pts=0.05)
+    presenter._media_predicted_perf_time = 104.03
+    assert presenter._select_presentable_output_frame(999.0) is None
+    presenter._media_predicted_perf_time = 104.05
+    assert presenter._select_presentable_output_frame(0.0) is frame
+    assert frame.metadata["media_presentation_deadline"] == pytest.approx(104.05)
+
+
+def test_media_first_frame_can_start_clock_without_waiting_for_a_second_capture():
+    presenter = OpenXrVulkanPresenter()
+    class Owner:
+        def media_presentation_clock(self):
+            return {"generation": 0, "playing": True, "anchor_at": None, "anchor_pts": 15.0}
+        def shortcut(self, *_a, **_k):
+            return True
+    owner = Owner()
+    presenter._on_controller_shortcut = owner.shortcut
+    frame = _media_output_frame(1, 0, 15.0)
+    presenter._media_output_queue.append(frame)
+    presenter._media_output_queue_arrivals.append(100.0)
+    assert presenter._select_presentable_output_frame(100.0) is frame
+    assert frame.metadata["media_presentation_deadline"] is None
+
+
+def test_seek_invalidates_queued_old_media_before_gpu_output_ring_conversion():
+    presenter = OpenXrVulkanPresenter()
+    class Owner:
+        def media_presentation_clock(self):
+            return {"generation": 2, "playing": True}
+        def shortcut(self, *_a, **_k):
+            return True
+    owner = Owner()
+    presenter._on_controller_shortcut = owner.shortcut
+    presenter.vulkan = SimpleNamespace(device_lost=False)
+    presenter._output_adapter = SimpleNamespace(convert=lambda *_a, **_k: pytest.fail("old media claimed a GPU slot"))
+    old = SimpleNamespace(debug_info={"media_generation": 1, "source_frame_index": 10, "source_pts": 1.0})
+    presenter._submit_runtime_result_on_presenter(old, 100.0)
+    assert presenter._last_output_source_identity is None
+    assert presenter._next_output_frame_id == 0
+
+
+def test_late_first_xr_submission_cannot_start_source_time_in_the_past():
+    presenter = OpenXrVulkanPresenter()
+    presenter._performance_counter_time_supported = True
+    presenter._display_period_s = 1.0 / 72.0
+    assert presenter._media_feedback_clock(100.0, 100.060, first_pending=True) == (
+        100.060, "late_first_submission_fallback")
+    assert presenter._media_feedback_clock(100.02, 100.0, first_pending=True) == (
+        100.02, "xr_predicted_display_qpc")
+    assert presenter._media_feedback_clock(100.0, 100.060, first_pending=False) == (
+        100.0, "xr_predicted_display_qpc")
+    presenter._performance_counter_time_supported = False
+    assert presenter._media_feedback_clock(100.0, 100.060, first_pending=False) == (
+        100.060, "submitted_frame_fallback")

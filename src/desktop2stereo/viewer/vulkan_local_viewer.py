@@ -22,6 +22,7 @@ from media_ui import (
     MEDIA_BROWSER_TEXTURE_ASPECT,
     MEDIA_BROWSER_TEXTURE_SIZE,
     MEDIA_BROWSER_VISIBLE_ROWS,
+    MediaHoverAnimation,
     build_media_bar_rgba,
     build_media_browser_rgba,
     build_pointer_rgba,
@@ -171,8 +172,9 @@ def choose_present_mode(
     *,
     vsync: bool,
     full_screen_exclusive: bool,
+    ordered: bool = False,
 ) -> Any:
-    """Choose a non-blocking Windows-exclusive mode without changing windowed WSI."""
+    """Keep selected media frames FIFO; desktop content can favor latest-ready."""
     available = set(modes)
     if vsync:
         latest_ready = getattr(
@@ -180,7 +182,7 @@ def choose_present_mode(
             "VK_PRESENT_MODE_FIFO_LATEST_READY_KHR",
             VK_PRESENT_MODE_FIFO_LATEST_READY,
         )
-        if latest_ready in available:
+        if latest_ready in available and not ordered:
             return latest_ready
         return vk.VK_PRESENT_MODE_FIFO_KHR
     preferred = (
@@ -871,6 +873,7 @@ class VulkanLocalViewerConfig:
     on_sbs_fps: Callable[[float, int], int] | None = None
     on_display_refresh_warning: Callable[[int, float], None] | None = None
     on_capture_refresh_warning: Callable[[int, int], None] | None = None
+    on_media_presented: Callable[[dict, float], None] | None = None
     on_breakdown_inc: Callable[[str, int | float], None] | None = None
     on_breakdown_add_time: Callable[[str, float], None] | None = None
     direct_staging: bool = True
@@ -1004,6 +1007,9 @@ class VulkanLocalViewer:
         self._media_last_activity = 0.0
         self._media_last_cursor_position: tuple[float, float] | None = None
         self._media_bar_hover: str | None = None
+        self._media_hover_animation = MediaHoverAnimation()
+        self._media_hover_hit: str | None = None
+        self._media_hover_progress = 0.0
         self._media_bar_rects: tuple[tuple[int, int, int, int], ...] = ()
         self._media_browser_rects: tuple[tuple[int, int, int, int], ...] = ()
         self._media_eye_rects: tuple[tuple[int, int, int, int], ...] = ()
@@ -1401,7 +1407,8 @@ class VulkanLocalViewer:
             int(float(state.get("duration", 0.0) or 0.0)),
             round(float(state.get("volume", 1.0) or 0.0), 2),
             state.get("audio_enabled"),
-            self._media_bar_hover,
+            self._media_hover_hit,
+            round(self._media_hover_progress * 8) / 8,
             getattr(self.config, "locale", "EN"),
         )
 
@@ -1413,7 +1420,8 @@ class VulkanLocalViewer:
             state.get("browser_path"),
             state.get("browser_parent"),
             state.get("browser_selection"),
-            self._media_bar_hover,
+            self._media_hover_hit,
+            round(self._media_hover_progress * 8) / 8,
             self._media_browser_scroll,
             tuple(
                 (entry.get("path"), entry.get("kind"))
@@ -1438,6 +1446,14 @@ class VulkanLocalViewer:
 
     def _refresh_media_textures(self) -> None:
         language = "CN" if getattr(self.config, "locale", "EN") == "CN" else "EN"
+        animator = getattr(self, "_media_hover_animation", None)
+        if animator is None:
+            self._media_hover_hit = getattr(self, "_media_bar_hover", None)
+            self._media_hover_progress = 1.0 if self._media_hover_hit else 0.0
+        else:
+            self._media_hover_hit, self._media_hover_progress = animator.update(
+                getattr(self, "_media_bar_hover", None), time.perf_counter()
+            )
         media_bar_overlay = getattr(self, "_media_bar_overlay", None)
         if media_bar_overlay is not None and self._media_bar_visible():
             key = self._media_bar_texture_key_value()
@@ -1446,7 +1462,8 @@ class VulkanLocalViewer:
                     self._media_state,
                     width=1024,
                     height=160,
-                    hover=self._media_bar_hover,
+                    hover=self._media_hover_hit,
+                    hover_progress=self._media_hover_progress,
                     lang=language,
                     collapsed=not self._media_bar_expanded(),
                 )
@@ -1460,7 +1477,8 @@ class VulkanLocalViewer:
                     self._media_state,
                     width=MEDIA_BROWSER_TEXTURE_SIZE[0],
                     height=MEDIA_BROWSER_TEXTURE_SIZE[1],
-                    hover=self._media_bar_hover,
+                    hover=self._media_hover_hit,
+                    hover_progress=self._media_hover_progress,
                     scroll_offset=self._media_browser_scroll,
                     lang=language,
                 )
@@ -1516,6 +1534,21 @@ class VulkanLocalViewer:
             return
         if hit.startswith("mount:"):
             self._media_action("browse", hit.split(":", 1)[1])
+            return
+        action, _, path = hit.partition(":")
+        if action in {"playlist_add", "playlist_remove"} and path:
+            self._media_action(action, {"path": path})
+            return
+        if action in {"playlist_move_up", "playlist_move_down"} and path:
+            self._media_action("playlist_move", {"path": path, "offset": -1 if action == "playlist_move_up" else 1})
+            return
+        if hit == "playlist_sort":
+            self._media_action(
+                "playlist_sort", {"descending": self._media_state.get("playlist_sort_descending") is False}
+            )
+            return
+        if hit in {"playlist_page_previous", "playlist_page_next"}:
+            self._media_action("playlist_page", -4 if hit == "playlist_page_previous" else 4)
             return
         if hit.startswith("playlist_select:"):
             self._media_action("playlist_select", {"path": hit.split(":", 1)[1]})
@@ -2929,6 +2962,7 @@ class VulkanLocalViewer:
             vk,
             vsync=self.config.vsync,
             full_screen_exclusive=self._full_screen_exclusive_requested,
+            ordered=str(self.config.capture_mode).casefold() in {"file", "video"},
         )
         present_mode_name = {
             int(getattr(vk, "VK_PRESENT_MODE_FIFO_KHR", -1)): "FIFO",
@@ -3188,6 +3222,13 @@ class VulkanLocalViewer:
             if source is not None:
                 source._complete_direct()
         return True
+
+    def observe_media_presentation(self, result: Any) -> None:
+        """Publish display cadence to the source's measured adaptive controller."""
+        metadata = getattr(result, "debug_info", None)
+        if isinstance(metadata, dict):
+            metadata["media_display_fps"] = float(self._output_refresh_hz)
+            metadata["media_display_vsync"] = bool(self.config.vsync)
 
     def present(self, frame: Any) -> bool:
         if self.window is None:
@@ -4526,6 +4567,9 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
     last_presented_at = 0.0
     vsync_handoff_stalled = False
     vsync_handoff_wait_logged = False
+    pending_media_item = None
+    media_owner = getattr(config.on_media_presented, "__self__", None)
+    media_clock_provider = getattr(media_owner, "media_presentation_clock", None)
 
     def _vsync_refresh_hz() -> float:
         try:
@@ -4661,8 +4705,12 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                 flush=True,
             )
 
+    media_capture = str(getattr(config, "capture_mode", "")).strip().casefold() in {
+        "file", "video"
+    }
+    present_asap_default = "0" if media_capture else "1"
     present_asap = (
-        os.environ.get("D2S_PRESENT_ASAP", "1").strip().lower()
+        os.environ.get("D2S_PRESENT_ASAP", present_asap_default).strip().lower()
         not in {"0", "false", "no", "off"}
     )
     if present_asap:
@@ -4763,11 +4811,15 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                         )
                 else:
                     queue_timeout = 0.05
-                result, _started = runtime_q.get(
-                    # This grace only catches a newly published result; an
-                    # empty queue reuses the cached frame at the next refresh.
-                    timeout=queue_timeout
-                )
+                if pending_media_item is not None:
+                    result, _started = pending_media_item
+                    pending_media_item = None
+                else:
+                    result, _started = runtime_q.get(
+                        # This grace only catches a newly published result; an
+                        # empty queue reuses the cached frame at the next refresh.
+                        timeout=queue_timeout
+                    )
                 vsync_handoff_stalled = False
             except queue.Empty:
                 if viewer is not None and cached_frame is not None:
@@ -4789,6 +4841,19 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                             preview_viewer = None
                             preview_disabled = True
                     continue
+            if not reused and callable(media_clock_provider):
+                clock = media_clock_provider() or {}
+                metadata = getattr(result, "debug_info", None) or {}
+                generation = metadata.get("media_generation")
+                if clock.get("generation") is not None and generation is not None and clock["generation"] != generation:
+                    _release_item(result)  # Seek/open invalidates only the old media generation.
+                    continue
+                if (cached_frame is not None and clock.get("generation") == generation
+                        and clock.get("playing") is False):
+                    # Pause keeps the last displayed GPU image. Hold the next
+                    # selected output without releasing or draining FIFO frames.
+                    pending_media_item = (result, _started)
+                    result, frame, reused = cached_result, cached_frame, True
             if not reused and paced:
                 remaining = scheduled_deadline - time.perf_counter()
                 if remaining > 0.0 and shutdown_event.wait(remaining):
@@ -4838,6 +4903,38 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                 _initialize_main_viewer()
             if preview_viewer is None and not preview_disabled:
                 _initialize_preview_viewer()
+            if not reused and str(config.capture_mode).casefold() in {"file", "video"}:
+                metadata = getattr(result, "debug_info", None) or {}
+                clock = media_clock_provider() if callable(media_clock_provider) else {}
+                if clock and clock.get("generation") == metadata.get("media_generation"):
+                    anchor_at, anchor_pts = clock.get("anchor_at"), clock.get("anchor_pts")
+                    deadline = (anchor_at + float(metadata["source_pts"]) - anchor_pts
+                                if anchor_at is not None and metadata.get("source_pts") is not None else None)
+                    metadata["media_presentation_deadline"] = deadline
+                try:
+                    media_deadline = float(metadata.get("media_presentation_deadline"))
+                except (TypeError, ValueError):
+                    media_deadline = 0.0
+                if math.isfinite(media_deadline) and media_deadline > 0.0:
+                    # Keep every selected GPU image, but do not display a
+                    # prepared future frame early. The absolute source epoch
+                    # survives a brief stall or a cadence change.
+                    submit_at = media_deadline - 0.5 / _vsync_refresh_hz()
+                    while not shutdown_event.is_set():
+                        remaining = submit_at - time.perf_counter()
+                        if remaining <= 0.0:
+                            break
+                        viewer.poll_events()
+                        clock = media_clock_provider() if callable(media_clock_provider) else {}
+                        if clock.get("playing") is False and clock.get("generation") == metadata.get("media_generation"):
+                            pending_media_item = (result, _started)
+                            break
+                        shutdown_event.wait(min(0.01, remaining))
+                    if pending_media_item is not None:
+                        continue
+                    if shutdown_event.is_set():
+                        _release_item(result)
+                        break
             present_started = time.perf_counter()
             frame_path = (
                 cached_path if reused else
@@ -4953,6 +5050,12 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             # Older fallback viewers returned None for success. The Vulkan
             # viewer returns an explicit bool, so failed submissions are not
             # counted as presented frames.
+            if presented is not False and not reused and str(config.capture_mode).casefold() in {"file", "video"}:
+                observe_media = getattr(viewer, "observe_media_presentation", None)
+                if callable(observe_media):
+                    observe_media(result)
+                if config.on_media_presented is not None:
+                    config.on_media_presented(getattr(result, "debug_info", None) or {}, presented_at)
             if presented is not False and config.on_breakdown_inc is not None:
                 config.on_breakdown_inc("local_presented_frame", 1)
                 if not reused and bool(getattr(result, "depth_complete", False)):
@@ -5037,6 +5140,8 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             from utils.queue_utils import clear_nonblocking
 
             clear_nonblocking(runtime_q)
+        if pending_media_item is not None:
+            _release_item(pending_media_item)
         if cached_result is not None:
             _release_item(cached_result)
         if preview_viewer is not None:

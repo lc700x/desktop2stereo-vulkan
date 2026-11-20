@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import threading
 import time
 from collections import deque
 from dataclasses import replace
 
 from utils.gc_tuning import install_pause_watch, tune_gc_for_realtime
-from utils.queue_utils import clear_nonblocking, drain_latest, put_latest
+from utils.queue_utils import _release_item, clear_nonblocking, drain_latest, put_latest
 from utils.sys_load import install_system_load_sampler
 from xr_viewer.settings_menu import OPENXR_RENDER_SCALE_MAX, OPENXR_RENDER_SCALE_MIN
 
@@ -20,9 +21,11 @@ class RuntimeCallbacks:
         context,
         *,
         show_fps: bool = False,
+        shutdown_event: threading.Event | None = None,
         display_fit_mode: str = "contain",
     ):
         self.context = context
+        self._shutdown_event = shutdown_event
         self.capture_control = None
         self.capture_session = None
         self._capture_window_handles: set[int] = set()
@@ -63,6 +66,34 @@ class RuntimeCallbacks:
 
     def warmup_stereo_once_for_frame(self, rgb_frame):
         self.context.stereo_warmup_tracker.warmup_once_for_frame(rgb_frame)
+        source = self.capture_session
+        calibrate = getattr(source, "calibrate_media_cadence", None)
+        if (not callable(calibrate) or not getattr(source, "_presentation_clock_pending", False)
+                or getattr(source, "_media_cadence_calibrated", True)
+                or not getattr(source, "_ready", True) or getattr(source, "_source_fps", 1.0) <= 0.0):
+            return
+        import torch
+
+        if not isinstance(rgb_frame, torch.Tensor) or rgb_frame.device.type != "cuda":
+            return
+        runtime = self.context.stereo_runtime
+        openxr = self.context.stereo_warmup_tracker.run_mode == "OpenXR"
+        samples = []
+        with torch.inference_mode():
+            for _ in range(4):
+                torch.cuda.synchronize(rgb_frame.device)
+                started = time.perf_counter()
+                result = (runtime.process_openxr_frame(rgb_frame, self.current_openxr_render_config())
+                          if openxr else runtime.process_rgb_frame(rgb_frame))
+                torch.cuda.synchronize(rgb_frame.device)
+                samples.append((time.perf_counter() - started) * 1000.0)
+                release = getattr(result, "release", None)
+                if callable(release):
+                    release()
+                del result
+        runtime.reset_temporal()
+        # The first model execution can still initialize its engine/context.
+        calibrate(max(samples[1:]))
 
     def breakdown_inc(self, name, amount=1):
         self.context.fps_breakdown.inc(name, amount)
@@ -660,12 +691,28 @@ class RuntimeCallbacks:
         return True
 
     def queue_put_latest(self, q, item):
-        put_latest(q, item)
+        if not bool(getattr(q, "_d2s_ordered", False)):
+            put_latest(q, item)
+            return
+        # File playback is an ordered timeline, not a live latest-frame feed.
+        # Bounded backpressure avoids startup overwrites and GPU-jitter gaps.
+        while self._shutdown_event is None or not self._shutdown_event.is_set():
+            if self.openxr_source_paused():
+                break
+            try:
+                q.put(item, timeout=0.01)
+                return
+            except queue.Full:
+                pass
+        _release_item(item)
 
     def queue_clear_nonblocking(self, q):
         clear_nonblocking(q)
 
     def queue_drain_latest(self, q, first_item):
+        if bool(getattr(q, "_d2s_ordered", False)):
+            return first_item
+
         def on_drop():
             self.source_stat_inc("raw_dropped_stale")
             self.breakdown_inc("raw_dropped_stale")
@@ -750,6 +797,25 @@ class RuntimeCallbacks:
 
     def log_fast_plus_fused_runtime_state(self, runtime_result):
         self.context.stereo_runtime_logger.log_fast_plus_fused_runtime_state(runtime_result)
+
+    def media_presentation_clock(self) -> dict:
+        provider = getattr(self.capture_session, "media_presentation_clock", None)
+        return provider() if callable(provider) else {}
+
+    def on_media_presented(self, metadata: dict, presented_at: float) -> None:
+        observer = getattr(self.capture_session, "observe_video_presentation", None)
+        if not callable(observer):
+            return
+        try:
+            generation = int(metadata["media_generation"])
+            index = int(metadata["source_frame_index"])
+            pts = float(metadata["source_pts"])
+        except (KeyError, TypeError, ValueError):
+            return
+        observer(generation, index, pts, float(presented_at))
+        timing_observer = getattr(self.capture_session, "observe_media_timing", None)
+        if callable(timing_observer):
+            timing_observer(metadata, float(presented_at))
 
     def capture_session_update(self, session, control):
         self.capture_session = session
@@ -887,7 +953,7 @@ class RuntimeCallbacks:
     def put_raw_latest(self, item):
         was_full = self.context.raw_q.full()
         self.queue_put_latest(self.context.raw_q, item)
-        return was_full
+        return was_full and not bool(getattr(self.context.raw_q, "_d2s_ordered", False))
 
     def set_runtime_preprocess_backend(self, backend):
         if self.context.fps_breakdown_log:

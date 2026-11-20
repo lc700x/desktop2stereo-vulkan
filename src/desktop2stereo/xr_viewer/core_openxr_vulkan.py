@@ -48,6 +48,7 @@ from media_ui import (
     MEDIA_BROWSER_TEXTURE_ASPECT,
     MEDIA_BROWSER_TEXTURE_SIZE,
     MEDIA_BROWSER_VISIBLE_ROWS,
+    MediaHoverAnimation,
     build_media_bar_rgba,
     build_media_browser_rgba,
     media_bar_hit,
@@ -810,6 +811,11 @@ class OpenXrVulkanPresenter(
         self._display_refresh_rate_requested = 0.0
         self._display_refresh_rate_actual = 0.0
         self._display_refresh_rate_error = ""
+        self._display_refresh_rate_last_probe: tuple[float, tuple[float, ...]] | None = None
+        self._media_cadence_target_logged = 0.0
+        self._performance_counter_time_supported = False
+        self._qpc_frequency = 0
+        self._qpc_to_perf_offset = 0.0
         self._panorama_skip_logged = False
         self._panorama_failed = False
         self._vulkan_panorama_image = None
@@ -1204,6 +1210,7 @@ class OpenXrVulkanPresenter(
         self._ray_filter_l = OneEuroFilter3D(8.0, 8.0, 8.0)
         self._ray_filter_r = OneEuroFilter3D(8.0, 8.0, 8.0)
         self._last_frame_dt = 1.0 / 90.0
+        self._display_period_s = 0.0
         self._initialized = False
         self._presenter_thread_id: int | None = None
         # A lost VkDevice cannot be recovered by recreating only the OpenXR
@@ -1221,11 +1228,19 @@ class OpenXrVulkanPresenter(
         self._rendering_output: VulkanStereoOutputFrame | None = None
         self._last_output_source_identity: tuple[int, int, float] | None = None
         self._last_output_source_order_log_t = 0.0
-        self._media_output_queue = deque(maxlen=2)
-        self._media_output_queue_arrivals = deque(maxlen=2)
+        # Keep enough exact output frames buffered to absorb the 2/3 source
+        # steps of a 60 -> 24 FPS selection. Two frames cannot bridge a
+        # source cadence transition and repeatedly turns one late arrival into
+        # a 2/4-tick presentation pattern.
+        self._media_output_queue = deque(maxlen=4)
+        self._media_output_queue_arrivals = deque(maxlen=4)
         self._media_output_generation: int | None = None
         self._media_source_period_s = 0.0
+        self._media_playback_period_s = 0.0
         self._media_next_present_at = 0.0
+        self._media_scheduled_playback_period_s = 0.0
+        self._media_present_time_s: float | None = None
+        self._media_predicted_perf_time: float | None = None
         self._media_present_generation: int | None = None
         self._projection_busy = threading.Event()
         self._output_lock = threading.Lock()
@@ -1283,6 +1298,7 @@ class OpenXrVulkanPresenter(
         self._media_overlay_last_poll = 0.0
         self._media_overlay_last_activity = 0.0
         self._media_overlay_hover: str | None = None
+        self._media_overlay_hover_animation = MediaHoverAnimation()
         self._media_overlay_scroll = 0
         self._media_overlay_scroll_next_at = 0.0
         self._media_overlay_trigger_down = [False, False]
@@ -1479,7 +1495,7 @@ class OpenXrVulkanPresenter(
             return (
                 self._pending_output is not None
                 or self._rendering_output is not None
-                or len(self._media_output_queue) > 1
+                or len(self._media_output_queue) > 2
             )
 
     @property
@@ -1783,6 +1799,21 @@ class OpenXrVulkanPresenter(
             xr, "FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME", None
         )
         enabled_extensions = [self._VULKAN_EXTENSION]
+        time_extension = "XR_KHR_win32_convert_performance_counter_time"
+        self._performance_counter_time_supported = bool(
+            os.name == "nt" and time_extension in available_extensions
+            and hasattr(xr, "convert_time_to_win32_performance_counter_khr")
+        )
+        if self._performance_counter_time_supported:
+            enabled_extensions.append(time_extension)
+        print(
+            "[OpenXRViewer] Media presentation clock: "
+            + (
+                "OpenXR predicted display -> QPC"
+                if self._performance_counter_time_supported else "submitted-frame fallback"
+            ),
+            flush=True,
+        )
         if optional_equirect and optional_equirect in available_extensions:
             enabled_extensions.append(optional_equirect)
             self._openxr_equirect_supported = hasattr(
@@ -2014,6 +2045,18 @@ class OpenXrVulkanPresenter(
                 "openxr_should_render" if frame_state.should_render else "openxr_no_render",
                 1,
             )
+        # The runtime display period, not CPU/GPU workload, owns the media
+        # half-tick tolerance even when no refresh-rate request was needed.
+        predicted_period = self._openxr_float(getattr(frame_state, "predicted_display_period", 0)) * 1e-9
+        if math.isfinite(predicted_period) and predicted_period > 0.0:
+            self._display_period_s = predicted_period
+        predicted_time = self._openxr_float(getattr(frame_state, "predicted_display_time", 0)) * 1e-9
+        previous_present_time = self._media_present_time_s
+        self._media_present_time_s = predicted_time if math.isfinite(predicted_time) and predicted_time > 0.0 else None
+        self._media_predicted_perf_time = self._display_time_to_perf_counter(frame_state.predicted_display_time)
+        if previous_present_time is not None and self._media_present_time_s is not None:
+            if self._media_present_time_s < previous_present_time:
+                self._media_next_present_at = 0.0
         previous_frame_now = self._frame_now
         self._frame_now = time.perf_counter()
         if previous_frame_now > 0.0:
@@ -2059,6 +2102,7 @@ class OpenXrVulkanPresenter(
             )
             if not controller_chord_consumed:
                 self._refresh_openxr_media_state()
+                self._sync_media_controller_mode()
                 media_consumed = self._handle_media_overlay_input()
                 menu_consumed = media_consumed or self._handle_settings_menu_input()
                 if menu_consumed:
@@ -2277,6 +2321,22 @@ class OpenXrVulkanPresenter(
                     fallback_layer_pointers=primary_layer_pointers,
                 )
                 if layer_pointers:
+                    if self._displayed_output is not None:
+                        owner = getattr(self._on_controller_shortcut, "__self__", None)
+                        feedback = getattr(owner, "on_media_presented", None)
+                        if callable(feedback):
+                            clock_provider = getattr(owner, "media_presentation_clock", None)
+                            clock = clock_provider() if callable(clock_provider) else {}
+                            feedback_at, feedback_clock = self._media_feedback_clock(
+                                self._media_predicted_perf_time, time.perf_counter(),
+                                first_pending=clock.get("anchor_at") is None,
+                            )
+                            feedback(
+                                {**(self._displayed_output.metadata or {}),
+                                 "media_display_fps": 1.0 / self._display_period_s if self._display_period_s else 0.0,
+                                 "media_feedback_clock": feedback_clock},
+                                feedback_at,
+                            )
                     self._record_xr_presented_frame()
                 if self._on_breakdown_add_time is not None:
                     self._on_breakdown_add_time(
@@ -2288,6 +2348,40 @@ class OpenXrVulkanPresenter(
                 "openxr_frame_total", time.perf_counter() - frame_started
             )
         return not self.exit_requested
+
+    def _media_feedback_clock(self, predicted_at: float | None, submitted_at: float, *, first_pending: bool):
+        """Do not anchor playback before a late first image was even submitted."""
+        if not self._performance_counter_time_supported or predicted_at is None:
+            return submitted_at, "submitted_frame_fallback"
+        period = float(self._display_period_s or self._last_frame_dt)
+        if first_pending and predicted_at < submitted_at - 0.5 * period:
+            # Shader/WSI initialization can miss the first predicted tick.
+            # Its physical scanout time is unknown; report a submission epoch
+            # rather than advancing source time during that initialization.
+            return submitted_at, "late_first_submission_fallback"
+        return predicted_at, "xr_predicted_display_qpc"
+
+    def _display_time_to_perf_counter(self, display_time: Any) -> float:
+        """Map runtime display XrTime to the audio callback's host clock."""
+        if not self._performance_counter_time_supported:
+            return time.perf_counter()
+        try:
+            if not self._qpc_frequency:
+                frequency = ctypes.c_longlong()
+                counter = ctypes.c_longlong()
+                kernel = ctypes.windll.kernel32
+                if not kernel.QueryPerformanceFrequency(ctypes.byref(frequency)):
+                    raise OSError("QueryPerformanceFrequency failed")
+                if not kernel.QueryPerformanceCounter(ctypes.byref(counter)):
+                    raise OSError("QueryPerformanceCounter failed")
+                self._qpc_frequency = int(frequency.value)
+                self._qpc_to_perf_offset = time.perf_counter() - counter.value / self._qpc_frequency
+            counter = self.xr.convert_time_to_win32_performance_counter_khr(self.instance, display_time)
+            return self._openxr_float(counter) / self._qpc_frequency + self._qpc_to_perf_offset
+        except Exception as exc:
+            self._performance_counter_time_supported = False
+            print(f"[OpenXRViewer] Display/audio time conversion unavailable: {exc}", flush=True)
+            return time.perf_counter()
 
     def _end_openxr_frame(
         self,
@@ -2914,8 +3008,38 @@ class OpenXrVulkanPresenter(
         self._guide_calibration_fired = False
         self._guide_calibration_b_last = False
 
+    def _media_player_mode_active(self) -> bool:
+        """Disable desktop forwarding for file playback, including before state arrives."""
+        owner = getattr(self._on_controller_shortcut, "__self__", None)
+        context = getattr(owner, "context", None)
+        capture_config = getattr(context, "capture_config", None)
+        capture_mode = str(getattr(capture_config, "capture_mode", "")).strip().casefold()
+        if capture_mode:
+            return capture_mode in {"file", "video", "image"}
+        return str(self._media_overlay_state.get("mode", "")).strip().casefold() in {
+            "video", "image", "browser",
+        }
+
+    def _sync_media_controller_mode(self) -> None:
+        media_mode = self._media_player_mode_active()
+        if media_mode and not getattr(self, "_media_remote_input_blocked", False):
+            # Release only injected desktop holds, not player/menu trigger state.
+            self._reset_controller_interaction_state(desktop_only=True)
+            self._release_locked_modifiers()
+            self._keyboard_visible = False
+            self._kb_hover_l = None
+            self._kb_hover_r = None
+            self._scroll_accum_x = 0.0
+            self._scroll_accum_y = 0.0
+            print("[OpenXRViewer] Media player: controller desktop forwarding disabled", flush=True)
+        self._media_remote_input_blocked = media_mode
+
     def _dispatch_controller_shortcut(self, action: str, **values) -> None:
         """Apply shared shortcut actions to Vulkan-owned presentation state."""
+        if self._media_player_mode_active() and action in {
+            "toggle_keyboard", "arrow_axes", "copy", "cut", "paste", "enter",
+        }:
+            return
         if action == "cycle_status_panel":
             self._status_panel_cycle = (self._status_panel_cycle + 1) % 3
             self._set_shortcut_panel(
@@ -3059,7 +3183,8 @@ class OpenXrVulkanPresenter(
             )
         elif action == "scroll_axes":
             desktop_input_blocked = (
-                self._physical_input_override
+                self._media_player_mode_active()
+                or self._physical_input_override
                 or _physical_mouse_active(timeout=0.0)
                 or _physical_keyboard_active(timeout=0.0)
             )
@@ -4454,7 +4579,8 @@ class OpenXrVulkanPresenter(
     def _handle_vulkan_pointer_input(self) -> None:
         """Reuse legacy trigger hold/drag semantics for the Vulkan screen."""
         self._right_grip_screen_pointer_applied = False
-        desktop_input_blocked = self._physical_input_has_priority()
+        self._sync_media_controller_mode()
+        desktop_input_blocked = self._media_player_mode_active() or self._physical_input_has_priority()
         now = time.perf_counter()
         inputs = (self._controller_input(0), self._controller_input(1))
         hits = (self._screen_ray_hit_for_hand(0), self._screen_ray_hit_for_hand(1))
@@ -6092,6 +6218,8 @@ class OpenXrVulkanPresenter(
                 media_action="browse",
                 value=hit.split(":", 1)[1],
             )
+        elif hit == "mount" and value:
+            self._dispatch_controller_shortcut("media_control", media_action="browse", value=str(value))
         elif hit == "browser_up":
             self._dispatch_controller_shortcut("media_control", media_action="browse_up")
         elif hit == "browser_refresh":
@@ -6126,6 +6254,17 @@ class OpenXrVulkanPresenter(
                 media_action="browse_open",
                 value={"path": str(value)},
             )
+        elif hit in {"playlist_add", "playlist_remove"} and value:
+            self._dispatch_controller_shortcut("media_control", media_action=hit, value={"path": str(value)})
+        elif hit in {"playlist_move_up", "playlist_move_down"} and value:
+            self._dispatch_controller_shortcut("media_control", media_action="playlist_move",
+                value={"path": str(value), "offset": -1 if hit == "playlist_move_up" else 1})
+        elif hit == "playlist_sort":
+            self._dispatch_controller_shortcut("media_control", media_action="playlist_sort",
+                value={"descending": state.get("playlist_sort_descending") is False})
+        elif hit in {"playlist_page_previous", "playlist_page_next"}:
+            self._dispatch_controller_shortcut("media_control", media_action="playlist_page",
+                value=-4 if hit == "playlist_page_previous" else 4)
         elif hit == "playlist_previous":
             self._dispatch_controller_shortcut(
                 "media_control", media_action="playlist_previous"
@@ -6140,12 +6279,13 @@ class OpenXrVulkanPresenter(
             )
         elif hit == "entry" and value:
             path = str(value)
+            click_key = f"entry:{path}"
             now = time.monotonic()
             double_click = (
-                hit == self._media_overlay_last_click_hit
+                click_key == self._media_overlay_last_click_hit
                 and now - self._media_overlay_last_click_at <= 0.45
             )
-            self._media_overlay_last_click_hit = hit
+            self._media_overlay_last_click_hit = click_key
             self._media_overlay_last_click_at = now
             self._dispatch_controller_shortcut(
                 "media_control",
@@ -8435,6 +8575,25 @@ class OpenXrVulkanPresenter(
             return
 
         debug_info = dict(getattr(runtime_result, "debug_info", None) or {})
+        identity = self._output_source_identity(runtime_result)
+        owner = getattr(self._on_controller_shortcut, "__self__", None)
+        clock_provider = getattr(owner, "media_presentation_clock", None)
+        clock = clock_provider() if callable(clock_provider) else {}
+        if identity is not None and clock.get("generation") is not None and clock["generation"] != identity[0]:
+            if self._on_breakdown_inc is not None:
+                self._on_breakdown_inc("openxr_output_stale_generation_drop", 1)
+            return  # Seek/open invalidates old outputs before they can claim a GPU ring slot.
+        previous = self._last_output_source_identity
+        if identity is not None and previous is not None and identity[0] == previous[0]:
+            newer = identity[1] > previous[1] or (
+                identity[1] == previous[1] and identity[2] > previous[2] + 1e-6
+            )
+            if not newer:
+                # Conversion claims a ring slot and can release the displayed
+                # image before duplicate rejection. A paused/repeated frame must
+                # never touch that ring: retain the last completed eye images.
+                self._accept_output_source_order(runtime_result)
+                return
         requested_backend = (
             "vulkan_zero_copy"
             if getattr(runtime_result, "vulkan_compute_request", None) is not None
@@ -8548,9 +8707,12 @@ class OpenXrVulkanPresenter(
 
     @staticmethod
     def _output_source_identity(
-        frame: VulkanStereoOutputFrame,
+        frame: Any,
     ) -> tuple[int, int, float] | None:
-        metadata = frame.metadata if isinstance(frame.metadata, dict) else {}
+        metadata = getattr(frame, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = getattr(frame, "debug_info", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
         if bool(metadata.get("replayed_static_frame", False)):
             return None
         generation = metadata.get("media_generation")
@@ -8568,6 +8730,12 @@ class OpenXrVulkanPresenter(
             return None
         return generation, frame_index, source_pts
 
+    @staticmethod
+    def _openxr_float(value: Any) -> float:
+        """Coerce pyopenxr scalar wrappers (ctypes.c_float) to Python float."""
+        raw = getattr(value, "value", value)
+        return float(raw)
+
     def _request_media_display_refresh_rate(self, source_period_s: float) -> None:
         """Match high-rate media to a supported headset refresh mode."""
         if (
@@ -8582,9 +8750,9 @@ class OpenXrVulkanPresenter(
         xr = self.xr
         try:
             rates = tuple(
-                float(rate)
+                self._openxr_float(rate)
                 for rate in xr.enumerate_display_refresh_rates_fb(self.session)
-                if float(rate) > 0.0
+                if self._openxr_float(rate) > 0.0
             )
         except Exception as exc:
             if not self._display_refresh_rate_error:
@@ -8605,12 +8773,12 @@ class OpenXrVulkanPresenter(
         if abs(self._display_refresh_rate_requested - desired) < 0.01:
             return
         try:
-            previous = float(xr.get_display_refresh_rate_fb(self.session))
+            previous = self._openxr_float(xr.get_display_refresh_rate_fb(self.session))
         except Exception:
             previous = 0.0
         try:
             xr.request_display_refresh_rate_fb(self.session, desired)
-            actual = float(xr.get_display_refresh_rate_fb(self.session))
+            actual = self._openxr_float(xr.get_display_refresh_rate_fb(self.session))
         except Exception as exc:
             self._display_refresh_rate_requested = desired
             self._display_refresh_rate_error = f"request: {type(exc).__name__}: {exc}"
@@ -8622,6 +8790,8 @@ class OpenXrVulkanPresenter(
             return
         self._display_refresh_rate_requested = desired
         self._display_refresh_rate_actual = actual
+        if math.isfinite(actual) and actual > 0.0:
+            self._display_period_s = 1.0 / float(actual)
         self._display_refresh_rate_error = ""
         print(
             "[OpenXRViewer] Media display refresh rate: "
@@ -8640,6 +8810,7 @@ class OpenXrVulkanPresenter(
         if previous is None or generation != previous[0]:
             self._last_output_source_identity = identity
             self._media_source_period_s = 0.0
+            self._media_playback_period_s = 0.0
             return True
         _, previous_index, previous_pts = previous
         newer = frame_index > previous_index or (
@@ -8649,9 +8820,23 @@ class OpenXrVulkanPresenter(
             index_delta = frame_index - previous_index
             pts_delta = source_pts - previous_pts
             if index_delta > 0 and pts_delta > 0.0:
-                period = pts_delta / float(index_delta)
+                source_fps = float((frame.metadata or {}).get("media_source_fps") or 0.0)
+                period = 1.0 / source_fps if math.isfinite(source_fps) and source_fps > 0.0 else pts_delta / index_delta
                 if 0.001 <= period <= 1.0:
                     self._media_source_period_s = period
+                    try:
+                        playback_fps = float(
+                            (frame.metadata or {}).get("media_playback_fps")
+                        )
+                    except (TypeError, ValueError):
+                        playback_fps = 0.0
+                    content_fps = (
+                        playback_fps
+                        if playback_fps > 0.0
+                        else 1.0 / max(1e-6, pts_delta)
+                    )
+                    if math.isfinite(content_fps) and content_fps > 0.0:
+                        self._media_playback_period_s = 1.0 / content_fps
                     self._request_media_display_refresh_rate(period)
             self._last_output_source_identity = identity
             return True
@@ -8685,6 +8870,8 @@ class OpenXrVulkanPresenter(
                 self._media_output_generation = None
                 self._media_next_present_at = 0.0
                 self._media_present_generation = None
+                self._media_source_period_s = 0.0
+                self._media_playback_period_s = 0.0
                 previous = self._pending_output
                 self._pending_output = frame
             if previous is not None and previous is not frame:
@@ -8699,6 +8886,7 @@ class OpenXrVulkanPresenter(
             if self._media_output_generation != generation:
                 self._media_output_generation = generation
                 self._media_next_present_at = 0.0
+                self._media_scheduled_playback_period_s = 0.0
                 released.extend(self._media_output_queue)
                 self._media_output_queue.clear()
                 self._media_output_queue_arrivals.clear()
@@ -8739,8 +8927,45 @@ class OpenXrVulkanPresenter(
     def _select_presentable_output_frame(
         self, now: float
     ) -> VulkanStereoOutputFrame | None:
-        """Release one buffered media frame on a stable XR cadence."""
+        """Release one selected frame on the nearest predicted source-time deadline."""
+        owner = getattr(self._on_controller_shortcut, "__self__", None)
+        provider = getattr(owner, "media_presentation_clock", None)
+        clock = provider() if callable(provider) else {}
         with self._output_lock:
+            candidate = self._pending_output or (self._media_output_queue[0] if self._media_output_queue else None)
+            identity = self._output_source_identity(candidate) if candidate is not None else None
+            if identity is not None and clock.get("generation") == identity[0]:
+                if clock.get("playing") is False:
+                    return None  # Render the retained image; never consume selected media while paused.
+                anchor_at, anchor_pts = clock.get("anchor_at"), clock.get("anchor_pts")
+                if anchor_at is not None:
+                    # Keep the source-time deadline for metrics and A/V
+                    # synchronization, but do not use it to choose a display
+                    # tick. Source-frame steps may alternate (60 -> 24 uses
+                    # 2/3 source frames); that would turn into a 2/4-tick
+                    # presentation pattern and visible judder. The output
+                    # playback period owns the display phase below.
+                    deadline = float(anchor_at) + float(identity[2]) - float(anchor_pts)
+                    candidate.metadata["media_presentation_deadline"] = deadline
+                    # The first frame after a generation change has no
+                    # output phase yet; do not present it before its source
+                    # deadline. Once committed, the output cadence phase owns
+                    # subsequent display ticks and the deadline remains
+                    # telemetry for A/V sync.
+                    if self._media_next_present_at <= 0.0:
+                        display_at = self._media_predicted_perf_time
+                        display_at = float(display_at) if display_at is not None else now
+                        xr_period = max(
+                            0.001, float(self._display_period_s or self._last_frame_dt)
+                        )
+                        if display_at + 0.5 * xr_period < deadline:
+                            return None
+                else:
+                    candidate.metadata["media_presentation_deadline"] = None
+                if self._pending_output is None:
+                    self._pending_output = self._media_output_queue.popleft()
+                    self._media_output_queue_arrivals.popleft()
+                return self._pending_output
             if self._pending_output is not None:
                 # A render tick can legitimately leave the selected frame
                 # pending (for example while the quad reprojection path owns
@@ -8764,7 +8989,7 @@ class OpenXrVulkanPresenter(
                 # the bounded queue overflow and look like skipped frames.
                 # Allowing at most half a tick early produces the required
                 # 3/4/4/4 pulldown while keeping source-time average exact.
-                xr_period = max(0.001, float(self._last_frame_dt))
+                xr_period = max(0.001, float(self._display_period_s or self._last_frame_dt))
                 if now + 0.5 * xr_period < self._media_next_present_at:
                     return None
             frame = self._media_output_queue.popleft()
@@ -8774,6 +8999,22 @@ class OpenXrVulkanPresenter(
 
     def _enqueue_presenter_command(self, kind: str, payload: Any) -> None:
         command = (str(kind), payload)
+        media_command = (
+            kind == "submit_output" and self._output_source_identity(payload) is not None
+        ) or (
+            kind == "submit_runtime_result"
+            and (getattr(payload[0], "debug_info", None) or {}).get("media_generation") is not None
+        )
+        if media_command:
+            while self._accept_output:
+                try:
+                    self._presenter_commands.put(command, timeout=0.01)
+                    return
+                except queue.Full:
+                    pass
+            if kind == "submit_output":
+                self._release_output_frame(payload)
+            return
         while True:
             try:
                 self._presenter_commands.put_nowait(command)
@@ -8789,6 +9030,11 @@ class OpenXrVulkanPresenter(
     def _drain_presenter_commands(self) -> None:
         latest_runtime_result = None
         while True:
+            # Leave ordered media commands upstream until a presentation slot
+            # is free; draining the whole batch into a two-frame deque skips.
+            with self._output_lock:
+                if len(self._media_output_queue) >= self._media_output_queue.maxlen:
+                    break
             try:
                 kind, payload = self._presenter_commands.get_nowait()
             except queue.Empty:
@@ -8796,6 +9042,11 @@ class OpenXrVulkanPresenter(
             if kind == "submit_output":
                 self._submit_output_on_presenter(payload)
             elif kind == "submit_runtime_result":
+                if (getattr(payload[0], "debug_info", None) or {}).get("media_generation") is not None:
+                    # Native media reaches this raw-result path, not submit_output.
+                    # Never coalesce its source identities as if it were live capture.
+                    self._submit_runtime_result_on_presenter(*payload)
+                    break
                 # Convert at most one raw result per XR tick. Processing a
                 # burst here can exhaust the output ring before the previous
                 # frame reaches commit/release, causing the owner thread to
@@ -8914,15 +9165,31 @@ class OpenXrVulkanPresenter(
                 )
             if identity is None:
                 self._media_next_present_at = 0.0
+                self._media_scheduled_playback_period_s = 0.0
                 self._media_present_generation = None
             else:
                 generation = identity[0]
+                # Pace selected media frames by the presentation cadence, not
+                # the original source cadence. A 120 FPS source decimated to
+                # 24 FPS must advance one selected frame every 1/24 s; using
+                # the 1/120 source period here creates a needless catch-up
+                # burst when a display tick is missed.
+                playback_period = max(0.0, float(self._media_playback_period_s))
                 source_period = max(0.0, float(self._media_source_period_s))
-                xr_period = max(0.001, float(self._last_frame_dt))
-                present_period = max(source_period, xr_period)
+                content_period = playback_period if playback_period > 0.0 else source_period
+                xr_period = max(0.001, float(self._display_period_s or self._last_frame_dt))
+                present_period = max(content_period, xr_period)
+                period_changed = (
+                    abs(
+                        float(self._media_scheduled_playback_period_s)
+                        - float(playback_period)
+                    )
+                    > 1e-4
+                )
                 if (
                     self._media_present_generation != generation
                     or self._media_next_present_at <= 0.0
+                    or period_changed
                 ):
                     next_present_at = now + present_period
                 else:
@@ -8931,6 +9198,7 @@ class OpenXrVulkanPresenter(
                         # A producer stall must not create a catch-up burst.
                         next_present_at = now + present_period
                 self._media_next_present_at = next_present_at
+                self._media_scheduled_playback_period_s = playback_period
                 self._media_present_generation = generation
         if previous is not None and previous is not frame:
             release_started = time.perf_counter()
@@ -11838,6 +12106,17 @@ class OpenXrVulkanPresenter(
             return
         semaphores: list[Any] = []
         completion_timeline = None
+        deferred_batch = bool(
+            len(acquired_images) == 2
+            and getattr(bridge, "controller_overlay_batch_abi_available", False)
+            and getattr(bridge, "finished_drawing_semaphore_abi_available", False)
+            and callable(getattr(bridge, "render_controller_overlay_deferred", None))
+            and callable(getattr(bridge, "finish_frame_batch", None))
+            and callable(getattr(bridge, "get_finished_drawing_semaphore", None))
+            and callable(getattr(self.vulkan, "submit_on", None))
+        )
+        deferred_batch_started = False
+        deferred_eye_indices: list[int] = []
         try:
             for eye_index, (_eye, image_index) in enumerate(acquired_images):
                 started = time.perf_counter()
@@ -11850,24 +12129,73 @@ class OpenXrVulkanPresenter(
                         far_plane=self._profile_far_plane,
                     )
                 bridge.set_acquired_image(image_index)
-                bridge.render_controller_overlay()
-                record_time(f"openxr_filament_controller_overlay_eye{eye_index}", started)
-                if bool(getattr(bridge, "finished_drawing_semaphore_abi_available", False)):
+                if deferred_batch:
+                    deferred_batch_started = True
+                    bridge.render_controller_overlay_deferred()
+                    deferred_eye_indices.append(eye_index)
+                    record_time(
+                        f"openxr_filament_controller_overlay_submit_eye{eye_index}",
+                        started,
+                    )
+                else:
+                    bridge.render_controller_overlay()
+                    record_time(
+                        f"openxr_filament_controller_overlay_eye{eye_index}", started
+                    )
+                if (
+                    not deferred_batch
+                    and bool(
+                        getattr(
+                            bridge, "finished_drawing_semaphore_abi_available", False
+                        )
+                    )
+                ):
                     semaphore = bridge.get_finished_drawing_semaphore()
                     if semaphore is not None:
                         semaphores.append(semaphore)
         finally:
-            # flushAndWait completes drawing but does not consume the binary
-            # completion signal. Drain the overlay's signals before their reuse,
-            # just as Composer consumes the background pass's signals.
+            active_exception = sys.exc_info()[1]
+            cleanup_error: Exception | None = None
+            if deferred_batch_started:
+                started = time.perf_counter()
+                try:
+                    bridge.finish_frame_batch()
+                except Exception as exc:
+                    cleanup_error = exc
+                finally:
+                    record_time(
+                        "openxr_filament_controller_overlay_batch_wait", started
+                    )
+                for eye_index in deferred_eye_indices:
+                    try:
+                        bridge.set_active_eye(eye_index)
+                        semaphore = bridge.get_finished_drawing_semaphore()
+                        if semaphore is not None:
+                            semaphores.append(semaphore)
+                    except Exception as exc:
+                        cleanup_error = cleanup_error or exc
+            # Synchronizing Filament does not consume its binary signals.
+            # Drain both eye signals before the swapchain slots are reused.
             if semaphores:
                 started = time.perf_counter()
-                completion_timeline = self.vulkan.submit_on(
-                    "graphics",
-                    lambda _command_buffer: None,
-                    wait_semaphore=tuple(semaphores),
+                try:
+                    completion_timeline = self.vulkan.submit_on(
+                        "graphics",
+                        lambda _command_buffer: None,
+                        wait_semaphore=tuple(semaphores),
+                    )
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
+                finally:
+                    record_time("openxr_filament_completion_drain", started)
+            if cleanup_error is not None:
+                if active_exception is None:
+                    raise cleanup_error
+                print(
+                    "[OpenXRViewer] Filament controller overlay cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
+                    flush=True,
                 )
-                record_time("openxr_filament_completion_drain", started)
         if not getattr(self, "_filament_controller_overlay_logged", False):
             self._filament_controller_overlay_logged = True
             print(
@@ -12036,6 +12364,34 @@ class OpenXrVulkanPresenter(
             swapchains,
             layer_flags=self.xr.CompositionLayerFlags.BLEND_TEXTURE_SOURCE_ALPHA_BIT,
         )
+
+    def _wait_for_media_swapchain_release(
+        self,
+        output_frame: VulkanStereoOutputFrame | None,
+        record_time: Callable[[str, float], None],
+    ) -> None:
+        """Keep a released VDXR image from racing unfinished media draws."""
+        if not isinstance(output_frame, VulkanStereoOutputFrame):
+            return
+        if (output_frame.metadata or {}).get("media_generation") is None:
+            return
+        if os.environ.get("D2S_OPENXR_WAIT_MEDIA_BEFORE_RELEASE", "1").strip().lower() in {
+            "0", "false", "off", "no"
+        }:
+            return
+        if bool(getattr(self.vulkan, "device_lost", False)):
+            return
+        wait_for_timeline = getattr(self.vulkan, "wait_for_timeline", None)
+        try:
+            wait_value = int(
+                getattr(self.vulkan, "last_submitted_timeline_value", 0) or 0
+            )
+        except (AttributeError, TypeError, ValueError):
+            wait_value = 0
+        if callable(wait_for_timeline) and wait_value > 0:
+            wait_started = time.perf_counter()
+            wait_for_timeline(wait_value)
+            record_time("openxr_media_wait_before_release", wait_started)
 
     def _render_projection_layer(
         self,
@@ -12664,6 +13020,7 @@ class OpenXrVulkanPresenter(
                 filament_queue_lock.release()
                 filament_queue_locked = False
             release_started = time.perf_counter()
+            self._wait_for_media_swapchain_release(output_frame, record_time)
             for eye, _image_index in waited_images:
                 with getattr(self.vulkan, "_lock", nullcontext()):
                     xr.release_swapchain_image(eye.handle)
@@ -14446,13 +14803,22 @@ class OpenXrVulkanPresenter(
         if media_state and self._media_overlay_visible():
             browser_visible = bool(media_state.get("browser_visible"))
             expanded = self._media_overlay_expanded()
+            animator = getattr(self, "_media_overlay_hover_animation", None)
+            if animator is None:
+                hover_visual = self._media_overlay_hover
+                hover_progress = 1.0 if hover_visual else 0.0
+            else:
+                hover_visual, hover_progress = animator.update(
+                    self._media_overlay_hover, time.perf_counter()
+                )
             browser_key = (
                 media_state.get("browser_revision"),
                 browser_visible,
                 media_state.get("browser_path"),
                 media_state.get("browser_parent"),
                 media_state.get("browser_selection"),
-                self._media_overlay_hover,
+                hover_visual,
+                round(hover_progress * 8) / 8,
                 self._media_overlay_scroll,
                 tuple(
                     (entry.get("path"), entry.get("kind"))
@@ -14484,7 +14850,8 @@ class OpenXrVulkanPresenter(
                 int(float(media_state.get("duration", 0.0) or 0.0)),
                 round(float(media_state.get("volume", 1.0) or 0.0), 2),
                 media_state.get("audio_enabled"),
-                self._media_overlay_hover,
+                hover_visual,
+                round(hover_progress * 8) / 8,
                 language,
             )
             if browser_visible:
@@ -14497,7 +14864,8 @@ class OpenXrVulkanPresenter(
                             media_state,
                             width=MEDIA_BROWSER_TEXTURE_SIZE[0],
                             height=MEDIA_BROWSER_TEXTURE_SIZE[1],
-                            hover=self._media_overlay_hover,
+                            hover=hover_visual,
+                            hover_progress=hover_progress,
                             scroll_offset=self._media_overlay_scroll,
                             lang=language,
                         )
@@ -14514,7 +14882,8 @@ class OpenXrVulkanPresenter(
                         media_state,
                         width=1024,
                         height=160,
-                        hover=self._media_overlay_hover,
+                        hover=hover_visual,
+                        hover_progress=hover_progress,
                         lang=language,
                         collapsed=not expanded,
                     )

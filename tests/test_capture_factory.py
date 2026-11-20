@@ -142,10 +142,12 @@ def test_normalize_config_preserves_media_runtime_fields():
         media_session_id="session-123",
         media_resume_position=12.5,
         media_audio_enabled=False,
+        media_presentation_sync=True,
         render_size_config=render_size_config,
     )
 
     normalized = normalize_config(config)
+    assert normalized.media_presentation_sync is True
 
     assert (
         normalized.media_path,
@@ -276,3 +278,30 @@ def test_polling_runner_uses_current_media_mode_after_source_switch():
     runner.run(shutdown_event=shutdown, on_frame=on_frame)
 
     assert captured[0].capture_mode == "Image"
+
+
+def test_media_controls_progress_while_ordered_frame_publication_is_blocked():
+    import threading
+    import numpy as np
+
+    shutdown = threading.Event()
+    blocked = threading.Event()
+    command_applied = threading.Event()
+    source_stopped = []
+    class Source:
+        mode = "video"
+        frame_format = "bgr24"
+        def grab(self):
+            return np.zeros((2, 2, 3), dtype=np.uint8), (2, 2)
+        def poll_control(self):
+            if blocked.is_set():
+                command_applied.set()
+        def stop(self):
+            source_stopped.append(True)
+    runner = PollingCaptureRunner(CaptureConfig(capture_mode="Video"), Source)
+    def publish(_frame):
+        blocked.set()
+        assert command_applied.wait(1.0), "Resume must not depend on a paused FIFO consumer"
+        shutdown.set()
+    runner.run(shutdown_event=shutdown, on_frame=publish)
+    assert source_stopped == [True]

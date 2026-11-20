@@ -521,11 +521,32 @@ private:
             reinterpret_cast<intptr_t>(frame->data[1]));
         D3D11_TEXTURE2D_DESC input_desc{};
         input_texture->GetDesc(&input_desc);
-        if (input_desc.Width != output_width_ ||
-            input_desc.Height != output_height_) {
-            set_error(error, "decoded frame dimensions changed");
+        // Hardware decode surfaces are often macroblock-aligned (1088 rows
+        // for a 1080p H.264 frame). Validate the visible AVFrame, not padding.
+        const int64_t visible_width = static_cast<int64_t>(frame->width) -
+            static_cast<int64_t>(frame->crop_left + frame->crop_right);
+        const int64_t visible_height = static_cast<int64_t>(frame->height) -
+            static_cast<int64_t>(frame->crop_top + frame->crop_bottom);
+        if (visible_width != output_width_ || visible_height != output_height_ ||
+            frame->width <= 0 || frame->height <= 0 ||
+            input_desc.Width < static_cast<UINT>(frame->width) ||
+            input_desc.Height < static_cast<UINT>(frame->height)) {
+            set_error(error, "decoded visible frame dimensions changed");
             return false;
         }
+        const RECT source_rect{
+            static_cast<LONG>(frame->crop_left),
+            static_cast<LONG>(frame->crop_top),
+            static_cast<LONG>(frame->width - frame->crop_right),
+            static_cast<LONG>(frame->height - frame->crop_bottom)};
+        const RECT output_rect{
+            0, 0, static_cast<LONG>(output_width_), static_cast<LONG>(output_height_)};
+        video_context_->VideoProcessorSetStreamSourceRect(
+            processor_.Get(), 0, TRUE, &source_rect);
+        video_context_->VideoProcessorSetStreamDestRect(
+            processor_.Get(), 0, TRUE, &output_rect);
+        video_context_->VideoProcessorSetOutputTargetRect(
+            processor_.Get(), TRUE, &output_rect);
 
         if (slots_.empty()) {
             set_error(error, "output slots are not initialized");

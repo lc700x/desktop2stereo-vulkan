@@ -484,3 +484,91 @@ def test_settings_menu_rejects_invalid_room_settings(tmp_path) -> None:
         },
     ) is False
     assert "OpenXR Room Settings" not in settings_path.read_text(encoding="utf-8")
+
+
+def test_ordered_media_queue_never_overwrites_or_drains_next_frame():
+    import queue
+
+    callbacks = _callbacks()
+    callbacks._shutdown_event = threading.Event()
+    callbacks.openxr_source_paused = lambda: False
+    raw_q = queue.Queue(maxsize=1)
+    raw_q._d2s_ordered = True
+    callbacks.context.raw_q = raw_q
+    first, second = object(), object()
+    raw_q.put(first)
+    done = threading.Event()
+    worker = threading.Thread(target=lambda: (callbacks.put_raw_latest(second), done.set()))
+    worker.start()
+    try:
+        assert not done.wait(0.03)
+        assert raw_q.get_nowait() is first
+        assert done.wait(1.0)
+        assert callbacks.queue_drain_latest(raw_q, first) is first
+        assert raw_q.get_nowait() is second
+    finally:
+        callbacks._shutdown_event.set()
+        worker.join(timeout=1.0)
+
+
+def test_ordered_media_queue_releases_blocked_resource_on_shutdown():
+    import queue
+
+    callbacks = _callbacks()
+    callbacks._shutdown_event = threading.Event()
+    callbacks.openxr_source_paused = lambda: False
+    raw_q = queue.Queue(maxsize=1)
+    raw_q._d2s_ordered = True
+    raw_q.put("retained")
+    released = threading.Event()
+    item = SimpleNamespace(native_resource=SimpleNamespace(release=released.set))
+    worker = threading.Thread(target=lambda: callbacks.queue_put_latest(raw_q, item))
+    worker.start()
+    callbacks._shutdown_event.set()
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert released.is_set()
+    assert raw_q.get_nowait() == "retained"
+
+
+def test_media_presentation_feedback_forwards_source_pts_not_capture_time():
+    callbacks = _callbacks()
+    observations = []
+    callbacks.capture_session = SimpleNamespace(observe_video_presentation=lambda *args: observations.append(args))
+    callbacks.on_media_presented({"media_generation": 2, "source_frame_index": 5,
+        "source_pts": 20.0, "capture_timestamp": 99.0}, 100.0)
+    assert observations == [(2, 5, 20.0, 100.0)]
+    callbacks.on_media_presented({"media_generation": 2}, 100.0)
+    assert len(observations) == 1
+
+
+@pytest.mark.parametrize("mode", ["Local Viewer", "OpenXR"])
+def test_media_preroll_measures_actual_pipeline_without_starting_source_clock(monkeypatch, mode):
+    from contextlib import nullcontext
+    calls = []
+    source = SimpleNamespace(_presentation_clock_pending=True, _media_cadence_calibrated=False,
+                             calibrate_media_cadence=lambda cost: calls.append(("calibrate", cost)))
+    runtime = SimpleNamespace(
+        process_rgb_frame=lambda _rgb: calls.append("local") or SimpleNamespace(),
+        process_openxr_frame=lambda _rgb, _config: calls.append("openxr") or SimpleNamespace(),
+        reset_temporal=lambda: calls.append("reset_temporal"),
+    )
+    callbacks = object.__new__(RuntimeCallbacks)
+    callbacks.capture_session = source
+    callbacks.context = SimpleNamespace(
+        stereo_runtime=runtime,
+        stereo_warmup_tracker=SimpleNamespace(run_mode=mode, warmup_once_for_frame=lambda _rgb: calls.append("warmup")),
+    )
+    callbacks.current_openxr_render_config = lambda: None
+    class Tensor:
+        device = SimpleNamespace(type="cuda")
+    fake_torch = SimpleNamespace(Tensor=Tensor, inference_mode=nullcontext,
+                                 cuda=SimpleNamespace(synchronize=lambda _device: calls.append("gpu_complete")))
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    ticks = iter([100.0, 100.100, 100.200, 100.207, 100.300, 100.309, 100.400, 100.408])
+    monkeypatch.setattr("app_runtime.runtime_callbacks.time.perf_counter", lambda: next(ticks))
+    callbacks.warmup_stereo_once_for_frame(Tensor())
+    assert calls.count("openxr" if mode == "OpenXR" else "local") == 4
+    assert calls[-2] == "reset_temporal"
+    assert calls[-1] == ("calibrate", pytest.approx(9.0))
+    assert source._presentation_clock_pending is True

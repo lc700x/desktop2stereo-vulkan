@@ -151,6 +151,9 @@ def _media_capture_options_from_environment(
             or None
         ),
         "media_audio_enabled": str(run_mode or "").strip().casefold() != "mjpeg streamer",
+        "media_presentation_sync": str(run_mode or "").strip().casefold() in {
+            "viewer", "local viewer", "openxr", "openxr link",
+        },
         "window_handle": _env_int("D2S_WINDOW_HANDLE"),
     }
 
@@ -216,6 +219,9 @@ def create_runtime_context(
 
     raw_q = queue.Queue(maxsize=1)
     runtime_q = queue.Queue(maxsize=1)
+    if str(settings.get("Capture Mode", "")).casefold() in {"file", "video"}:
+        raw_q._d2s_ordered = True
+        runtime_q._d2s_ordered = True
     presentation_q = queue.Queue(maxsize=6)
     # Consumers must preserve generated frame ordering instead of coalescing.
     presentation_q._d2s_ordered = True
@@ -421,4 +427,8 @@ def build_runtime_pipeline_context(
             else None
         ),
         gpu_required=bool(app_context.capture_config.gpu_required),
+        media_depth_reuse_disabled=str(
+            app_context.capture_config.capture_mode or ""
+        ).strip().casefold() in {"file", "video"},
+        capture_mode=str(app_context.capture_config.capture_mode or ""),
     )

@@ -1,6 +1,6 @@
 import pytest
 import torch
-
+from stereo_runtime.baseline_shift import ShiftParams, compute_shift_px
 from stereo_runtime.depth_provider import (
     ZipDepthProvider,
     _model_input_size_for_model,
@@ -71,6 +71,32 @@ def test_zipdepth_inverse_depth_is_preserved_and_non_finite_values_are_removed()
     assert depth.max() <= 1.0
 
 
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_zipdepth_inverse_depth_maps_directly_to_linear_dibr_shift(device, monkeypatch):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("accelerator is not available")
+
+    width = 64
+    inverse_depth = torch.full((1, 1, 24, width), 0.5, device=device)
+    inverse_depth[..., :16] = 0.0
+    inverse_depth[..., 32:] = 1.0
+    depth = _postprocess_generic_depth(inverse_depth, "pablovela5620/zipdepth")
+    params = ShiftParams(depth_strength=0.48, convergence=0.5, max_disparity_px=96.0)
+
+    optimized_shift = compute_shift_px(depth, width, params)
+
+    assert depth[0, 0, 12, 8].item() == pytest.approx(0.0)
+    assert depth[0, 0, 12, 24].item() == pytest.approx(0.5)
+    assert depth[0, 0, 12, 48].item() == pytest.approx(1.0)
+    assert optimized_shift[0, 0, 12, 8].item() == pytest.approx(11.52)
+    assert optimized_shift[0, 0, 12, 24].item() == pytest.approx(0.0)
+    assert optimized_shift[0, 0, 12, 48].item() == pytest.approx(-11.52)
+
+    monkeypatch.setenv("STEREO_RUNTIME_DISABLE_TRITON", "1")
+    torch_shift = compute_shift_px(depth, width, params)
+    assert torch.allclose(optimized_shift, torch_shift, atol=2e-5, rtol=2e-5)
 
 
 class _FirstChannelDepth(torch.nn.Module):

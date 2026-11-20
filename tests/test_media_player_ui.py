@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 from media_ui import (
     MEDIA_BROWSER_TEXTURE_SIZE,
+    MediaHoverAnimation,
     _browser_button_rects,
     _browser_layout,
     _button_rects,
@@ -50,6 +51,25 @@ def _state():
     }
 
 
+def test_media_hover_animation_has_enter_and_exit_transitions():
+    animation = MediaHoverAnimation(duration_s=0.16)
+
+    assert animation.update("play", 100.0) == ("play", 0.0)
+    _, progress = animation.update("play", 100.08)
+    assert 0.4 < progress < 0.7
+    visual_hit, progress = animation.update(None, 100.14)
+    assert visual_hit == "play"
+    assert progress > 0.0
+    assert animation.update(None, 100.40) == (None, 0.0)
+
+    scrub = MediaHoverAnimation(duration_s=0.16)
+    assert scrub.update("seek:0.10", 200.0) == ("seek:0.10", 0.0)
+    _, progress = scrub.update("seek:0.10", 200.08)
+    visual_hit, moved_progress = scrub.update("seek:0.30", 200.12)
+    assert visual_hit == "seek:0.30"
+    assert moved_progress > progress
+
+
 def test_media_bar_controls_keep_large_touch_targets():
     rects = _button_rects(1024, 160)
     for key in ("previous", "seek-10", "seek+10", "next", "mute"):
@@ -61,6 +81,21 @@ def test_media_bar_controls_keep_large_touch_targets():
     assert bottom - top >= 80
 
 
+def test_media_bar_hover_changes_pixels_and_keeps_timeline_end_knob_visible():
+    idle = build_media_bar_rgba(_state())
+    hovered = build_media_bar_rgba(
+        _state(),
+        hover="seek:1.000000",
+        hover_progress=1.0,
+    )
+    assert np.any(idle != hovered)
+    # The preview knob at the far end must stay inside the texture and alter
+    # the right-hand track region rather than being clipped by its edge.
+    right_edge = hovered[28:52, 940:1020, 3]
+    assert right_edge.max() > 0
+    assert np.any(right_edge != idle[28:52, 940:1020, 3])
+
+
 def test_media_bar_texture_and_hit_targets_are_stable():
     rgba = build_media_bar_rgba(_state(), width=1024, height=160)
     assert rgba.shape == (160, 1024, 4)
@@ -70,6 +105,7 @@ def test_media_bar_texture_and_hit_targets_are_stable():
     assert media_bar_hit(0.08, 0.72, state) == "browse"
     assert media_bar_hit(0.22, 0.72, state) == "browse_disc"
     assert media_bar_hit(0.5, 0.25, state).startswith("seek:")
+    assert media_bar_hit(1000 / 1024, 0.25, state) == "seek:1.000000"
 
 
 def test_media_bar_previous_next_and_volume_hit_targets():
@@ -108,6 +144,23 @@ def test_disabled_media_controls_are_not_actionable():
 def _browser_uv(x: float, y: float) -> tuple[float, float]:
     width, height = MEDIA_BROWSER_TEXTURE_SIZE
     return x / width, y / height
+
+
+def test_browser_hover_progress_changes_hovered_row_and_button_surfaces():
+    idle = build_media_browser_rgba(_state())
+    hovered = build_media_browser_rgba(
+        _state(),
+        hover="entry:C:/Videos/movie.mp4",
+        hover_progress=1.0,
+    )
+    assert hovered.shape == idle.shape
+    assert np.any(hovered != idle)
+    open_hovered = build_media_browser_rgba(
+        _state(),
+        hover="browse_open:C:/Videos/movie.mp4",
+        hover_progress=0.5,
+    )
+    assert np.any(open_hovered != idle)
 
 
 def test_browser_texture_and_playlist_hit_targets():
@@ -413,3 +466,55 @@ def test_local_viewer_registers_media_overlays_in_swapchain_lifecycle():
     destroy_source = getsource(VulkanLocalViewer._destroy_swapchain)
     assert "*self._media_overlay_instances()" in create_source
     assert "media_overlay.on_swapchain_destroyed()" in destroy_source
+
+
+def test_playlist_controls_share_painted_geometry_and_page_offset():
+    state = {**_state(), "playlist_entries": [
+        {"name": f"movie-{index}.mp4", "path": f"F:/movie-{index}.mp4", "kind": "video"}
+        for index in range(8)
+    ], "playlist_offset": 4, "playlist_index": 5}
+    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    layout = _browser_layout(state, width, height)
+    y = layout["playlist_rows_y"] + layout["playlist_row_height"] / 2
+    right = layout["sidebar_right"]
+    for action, x in (("playlist_move_up", right - 140), ("playlist_move_down", right - 88),
+                      ("playlist_remove", right - 36), ("playlist_select", 160)):
+        assert media_browser_hit(*_browser_uv(x, y), state) == (action, "F:/movie-4.mp4")
+    for action in ("playlist_add", "playlist_sort", "browse_open", "playlist_clear"):
+        rect = _browser_button_rects(width, height)[action]
+        u, v = _browser_uv((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
+        hit = media_browser_hit(u, v, state)
+        assert hit is not None and hit[0] == action
+    assert layout["playlist_row_height"] >= 72
+    image = build_media_browser_rgba(state, lang="CN")
+    assert image.shape == (height, width, 4)
+
+
+def test_add_button_does_not_open_selected_file():
+    state = {**_state(), "browser_entries": [
+        {"name": "movie.mp4", "path": "F:/movie.mp4", "kind": "video"}
+    ]}
+    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    layout = _browser_layout(state, width, height)
+    x = width - 70
+    y = layout["file_rows_y"] + (layout["file_row_height"] - 4) / 2
+    assert media_browser_hit(*_browser_uv(x, y), state) == ("playlist_add", "F:/movie.mp4")
+
+
+def test_local_playlist_controls_dispatch_shared_commands():
+    actions = []
+    viewer = object.__new__(VulkanLocalViewer)
+    viewer._media_state = {"playlist_sort_descending": False}
+    viewer.config = SimpleNamespace(media_action_callback=lambda action, value: actions.append((action, value)) or True)
+    viewer._dispatch_media_hit("playlist_move_up:F:/movie.mp4")
+    viewer._dispatch_media_hit("playlist_remove:F:/movie.mp4")
+    viewer._dispatch_media_hit("playlist_add:F:/new.mp4")
+    viewer._dispatch_media_hit("playlist_sort")
+    viewer._dispatch_media_hit("playlist_page_next")
+    assert actions == [
+        ("playlist_move", {"path": "F:/movie.mp4", "offset": -1}),
+        ("playlist_remove", {"path": "F:/movie.mp4"}),
+        ("playlist_add", {"path": "F:/new.mp4"}),
+        ("playlist_sort", {"descending": True}),
+        ("playlist_page", 4),
+    ]

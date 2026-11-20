@@ -132,6 +132,9 @@ class MediaBrowser:
         self._selected = ""
         self._playlist: list[MediaBrowserEntry] = []
         self._playlist_index = -1
+        self._playlist_managed = False
+        self._playlist_offset = 0
+        self._playlist_sort_descending: bool | None = None
         self._recent: list[MediaBrowserEntry] = []
         self._history_path = str(history_path or "").strip()
         self._recent = self._load_recent()
@@ -312,6 +315,13 @@ class MediaBrowser:
     def prime_media_playlist(self, path: str) -> None:
         """Build a lightweight playlist from the selected media's folder."""
         candidate = Path(path)
+        with self._lock:
+            if self._playlist_managed:
+                self._playlist_index = next(
+                    (index for index, entry in enumerate(self._playlist) if self._same_path(entry.path, path)), -1
+                )
+                self._revision += 1
+                return
         try:
             if candidate.is_dir():
                 entries = [
@@ -372,15 +382,68 @@ class MediaBrowser:
                     return entry.path
         return None
 
+    def playlist_add(self, path: str) -> bool:
+        candidate = Path(str(path or "")).expanduser()
+        try:
+            if not str(path or "").strip() or not candidate.exists():
+                return False
+            resolved = str(candidate.resolve())
+            kind = media_kind_for_path(resolved)
+            if kind not in {"video", "image", "disc"}:
+                return False
+        except OSError:
+            return False
+        with self._lock:
+            if any(self._same_path(entry.path, resolved) for entry in self._playlist):
+                return False
+            self._playlist.append(MediaBrowserEntry(candidate.name, resolved, kind))
+            self._playlist_managed = True
+            self._playlist_sort_descending = None
+            self._revision += 1
+        return True
+
+    def playlist_move(self, path: str, offset: int) -> bool:
+        with self._lock:
+            index = next((i for i, entry in enumerate(self._playlist) if self._same_path(entry.path, path)), -1)
+            target = index + int(offset)
+            if index < 0 or target < 0 or target >= len(self._playlist) or target == index:
+                return False
+            current = self._playlist[self._playlist_index] if self._playlist_index >= 0 else None
+            self._playlist.insert(target, self._playlist.pop(index))
+            self._playlist_index = self._playlist.index(current) if current is not None else -1
+            self._playlist_offset = (target // 4) * 4
+            self._playlist_managed = True
+            self._playlist_sort_descending = None
+            self._revision += 1
+        return True
+
+    def playlist_sort(self, *, descending: bool = False) -> None:
+        with self._lock:
+            current = self._playlist[self._playlist_index] if self._playlist_index >= 0 else None
+            self._playlist.sort(key=lambda entry: (entry.name.casefold(), entry.path.casefold()), reverse=descending)
+            self._playlist_index = self._playlist.index(current) if current is not None else -1
+            self._playlist_offset = 0
+            self._playlist_sort_descending = bool(descending)
+            self._playlist_managed = True
+            self._revision += 1
+
+    def playlist_page(self, offset: int) -> None:
+        with self._lock:
+            self._playlist_offset = max(0, min(max(0, ((len(self._playlist) - 1) // 4) * 4),
+                self._playlist_offset + int(offset)))
+            self._revision += 1
+
     def playlist_remove(self, path: str) -> bool:
+        """Remove a queue entry only; never delete a media file or stop playback."""
         with self._lock:
             for index, entry in enumerate(self._playlist):
-                if os.path.normcase(entry.path) != os.path.normcase(str(path)):
+                if not self._same_path(entry.path, str(path)):
                     continue
                 self._playlist.pop(index)
-                self._playlist_index = min(
-                    self._playlist_index, len(self._playlist) - 1
-                )
+                if index <= self._playlist_index:
+                    self._playlist_index -= 1
+                self._playlist_offset = min(self._playlist_offset, max(0, ((len(self._playlist) - 1) // 4) * 4))
+                self._playlist_managed = True
                 self._revision += 1
                 return True
         return False
@@ -389,6 +452,8 @@ class MediaBrowser:
         with self._lock:
             self._playlist.clear()
             self._playlist_index = -1
+            self._playlist_offset = 0
+            self._playlist_managed = True
             self._revision += 1
 
     def open_path(self, path: str) -> tuple[str, str]:
@@ -406,10 +471,11 @@ class MediaBrowser:
             if is_disc_directory(resolved):
                 with self._lock:
                     self._selected = resolved
-                    self._playlist = [
-                        MediaBrowserEntry(Path(resolved).name, resolved, "disc")
-                    ]
-                    self._playlist_index = 0
+                    if self._playlist_managed:
+                        self.playlist_select(resolved)
+                    else:
+                        self._playlist = [MediaBrowserEntry(Path(resolved).name, resolved, "disc")]
+                        self._playlist_index = 0
                     self._revision += 1
                 return "media", resolved
             self._begin_navigate(resolved, selected="")
@@ -424,16 +490,15 @@ class MediaBrowser:
                 for entry in self._entries
                 if entry.kind in {"video", "image", "disc"}
             ]
-            self._playlist = queued or [
-                MediaBrowserEntry(Path(resolved).name, resolved, kind)
-            ]
+            if not self._playlist_managed:
+                self._playlist = queued or [MediaBrowserEntry(Path(resolved).name, resolved, kind)]
             self._playlist_index = next(
                 (
                     index
                     for index, entry in enumerate(self._playlist)
                     if os.path.normcase(entry.path) == os.path.normcase(resolved)
                 ),
-                0,
+                -1 if self._playlist_managed else 0,
             )
             self._revision += 1
         return "media", resolved
@@ -465,6 +530,8 @@ class MediaBrowser:
                     for entry in self._playlist
                 ],
                 "playlist_index": self._playlist_index,
+                "playlist_offset": self._playlist_offset,
+                "playlist_sort_descending": self._playlist_sort_descending,
                 "playlist_visible": bool(self._playlist),
                 "recent_entries": [
                     {"name": entry.name, "path": entry.path, "kind": entry.kind}

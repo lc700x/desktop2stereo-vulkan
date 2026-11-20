@@ -601,9 +601,8 @@ def _wait_for_runtime_ready(
 
 
 def _local_viewer_vsync_enabled(configured_vsync: bool, capture_mode: object) -> bool:
-    """Media playback must never use immediate/mailbox WSI presentation."""
-    mode = str(capture_mode or "").strip().casefold()
-    return bool(configured_vsync) or mode in {"file", "video", "image"}
+    """Use one configured local presentation policy for desktop and media."""
+    return bool(configured_vsync)
 
 
 def _resolve_local_viewer_render_size_config(settings, run_mode, device):
@@ -656,6 +655,9 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         set_per_monitor_dpi_v2()
 
     shutdown_event.clear()
+    from capture.media import reset_media_playback_cadence_target
+
+    reset_media_playback_cadence_target()
     stop_request_thread = None
     stop_request_path = os.environ.get("D2S_STOP_REQUEST_FILE", "").strip()
     if stop_request_path:
@@ -904,6 +906,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
 
     callbacks = RuntimeCallbacks(
         context,
+        shutdown_event=shutdown_event,
         show_fps=bool(SHOW_FPS),
         display_fit_mode=settings.get("Display Fit Mode", "contain"),
     )
@@ -1584,11 +1587,6 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             local_viewer_vsync = _local_viewer_vsync_enabled(
                 LOCAL_VSYNC, settings.get("Capture Mode")
             )
-            if local_viewer_vsync and not bool(LOCAL_VSYNC):
-                print(
-                    "[VulkanLocalViewer] VSync forced for tear-free media playback",
-                    flush=True,
-                )
             local_viewer_config = VulkanLocalViewerConfig(
                 title=f"{WINDOW_TITLE or 'Desktop2Stereo'} Vulkan Viewer",
                 monitor_index=max(0, selected_monitor),
@@ -1637,6 +1635,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 on_sbs_fps=observe_sbs_fps if adaptive_capture_rate.enabled else None,
                 on_display_refresh_warning=report_display_refresh_warning,
                 on_capture_refresh_warning=report_capture_refresh_warning,
+                on_media_presented=callbacks.on_media_presented,
                 on_breakdown_inc=callbacks.breakdown_inc,
                 on_breakdown_add_time=callbacks.breakdown_add_time,
                 inference_gpu_name=inference_gpu_name,

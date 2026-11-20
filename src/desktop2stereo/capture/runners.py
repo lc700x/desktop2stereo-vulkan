@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from dataclasses import replace
 from typing import Callable
 
@@ -28,6 +29,10 @@ class PollingCaptureRunner:
     def source(self):
         return self._source
 
+    @property
+    def playback_fps(self) -> float:
+        return float(getattr(self._source, "_playback_fps", 0.0) or 0.0)
+
     def stop(self):
         if self._source is None or self._source_stopped:
             return
@@ -52,8 +57,24 @@ class PollingCaptureRunner:
         self._source = None
         self._source_stopped = False
         session_announced = False
+        control_stop = threading.Event()
+        control_thread = None
         try:
             self._source = self._source_factory()
+            poll_control = getattr(self._source, "poll_control", None)
+            if callable(poll_control) and str(getattr(self._source, "mode", "")).casefold() in {"video", "image"}:
+                def poll_media_controls():
+                    # Media FIFO can block on_frame while paused. Commands
+                    # must still be serviced without discarding queued pixels.
+                    while not control_stop.wait(0.02) and not shutdown_event.is_set():
+                        try:
+                            poll_control()
+                        except Exception as exc:
+                            if on_error is not None:
+                                on_error(exc)
+                            control_stop.set()
+                control_thread = threading.Thread(target=poll_media_controls, name="MediaControls", daemon=True)
+                control_thread.start()
             if on_session_update is not None:
                 session_announced = True
                 on_session_update(self._source, None)
@@ -182,6 +203,9 @@ class PollingCaptureRunner:
                                 ),
                                 "source_frame_index": source_frame_index,
                                 "source_pts": source_pts,
+                                "media_playback_fps": self.playback_fps or None,
+                                **dict(getattr(self._source, "_current_source_metadata", None) or {}),
+                                "media_source_fps": float(getattr(self._source, "_source_fps", 0.0) or 0.0) or None,
                                 **({
                                     "native_depth_profile": native_depth_profile,
                                     "native_depth_backend": "openvino_d3d11_remote",
@@ -196,6 +220,9 @@ class PollingCaptureRunner:
                     else:
                         raise
         finally:
+            control_stop.set()
+            if control_thread is not None:
+                control_thread.join(timeout=2.0)
             try:
                 self.stop()
             finally:

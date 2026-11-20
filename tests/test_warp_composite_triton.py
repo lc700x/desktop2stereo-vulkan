@@ -102,9 +102,16 @@ def test_edge_classification_is_continuous_near_depth_thresholds():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm is required")
-def test_source_projection_does_not_copy_foreground_into_disoccluded_background():
+@pytest.mark.parametrize(
+    ("normalize_zipdepth", "max_disparity_px"),
+    [(False, 40.0), (True, 24.0)],
+)
+def test_source_projection_does_not_copy_foreground_into_disoccluded_background(
+    normalize_zipdepth, max_disparity_px
+):
     pytest.importorskip("triton")
     from stereo_runtime.baseline_shift import ShiftParams, compute_shift_px
+    from stereo_runtime.depth_provider import _postprocess_generic_depth
     from stereo_runtime.warp_composite_triton import warp_composite2
 
     height, width = 32, 160
@@ -112,7 +119,17 @@ def test_source_projection_does_not_copy_foreground_into_disoccluded_background(
     rgb[..., 40:100] = 0.85
     depth = torch.full((1, 1, height, width), 0.2, device="cuda")
     depth[..., 40:100] = 0.8
-    shift = compute_shift_px(depth, width, ShiftParams(convergence=0.5, depth_strength=1.0, max_disparity_px=40))
+    if normalize_zipdepth:
+        depth = _postprocess_generic_depth(depth, "pablovela5620/zipdepth")
+    shift = compute_shift_px(
+        depth,
+        width,
+        ShiftParams(
+            convergence=0.5,
+            depth_strength=1.0,
+            max_disparity_px=max_disparity_px,
+        ),
+    )
 
     left, right = warp_composite2(rgb, depth, shift)
 

@@ -251,6 +251,7 @@ def runtime_config_from_d2s_settings(
         temporal_strength = 0.0
 
     headset_tier = _output_headset_tier_from_settings(settings)
+    run_mode_key = str(settings.get("Run Mode", "")).strip().casefold()
     cuda_graph_setting = settings.get(
         "Depth CUDA Graph", settings.get("CUDA Graph")
     )
@@ -262,7 +263,6 @@ def runtime_config_from_d2s_settings(
         # AMD Vulkan) rigs the measured rt_slot_wait dominates, and a short
         # live A/B was inconclusive, so keep the conservative default.
         # D2S_OPENXR_CUDA_GRAPH=1 enables it for a controlled A/B.
-        run_mode_key = str(settings.get("Run Mode", "")).strip().casefold()
         openxr_graph_opt_in = os.environ.get(
             "D2S_OPENXR_CUDA_GRAPH", "0"
         ).strip().lower() not in {"0", "false", "no", "off"}

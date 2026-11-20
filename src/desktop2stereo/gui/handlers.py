@@ -485,7 +485,7 @@ class GUIHandlerMixin:
         video_controls_visible = False
         self.monitor_dd.visible = mode == "Monitor"
         self.window_dd.visible = mode == "Window"
-        capture_tool_visible = OS_NAME in {"Windows", "Darwin"}
+        capture_tool_visible = OS_NAME in {"Windows", "Darwin"} and not is_media_player
         process = getattr(self, "process", None)
         process_running = bool(
             process is not None and getattr(process, "returncode", None) is None

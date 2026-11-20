@@ -54,6 +54,7 @@ int bridge_eye_set_stereo_camera(
 int bridge_eye_begin_frame(FilamentBridge* bridge);
 int bridge_eye_begin_background_frame(FilamentBridge* bridge);
 int bridge_eye_render_controller_overlay(FilamentBridge* bridge);
+int bridge_eye_render_controller_overlay_deferred(FilamentBridge* bridge);
 int bridge_eye_end_frame(FilamentBridge* bridge);
 int bridge_eye_end_frame_deferred(FilamentBridge* bridge);
 int bridge_eye_finish_frame_batch(FilamentBridge* bridge);

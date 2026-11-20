@@ -325,10 +325,6 @@ class GUIBuilderMixin:
         set_label_align_width(final_w)
         for inst in getattr(self, '_dropdowns', []):
             inst.reapply_width()
-        if hasattr(self, '_row8_spacer'):
-            capture_mode_w = self._ctrl_width(self.capture_mode_dd)
-            self._row8_spacer.width = max(0, final_w - capture_mode_w - 1)
-            self._safe_update(self._row8_spacer)
         if hasattr(self, '_accel_spacer'):
             self._accel_spacer.width = final_w
             self._safe_update(self._accel_spacer)
@@ -801,13 +797,12 @@ class GUIBuilderMixin:
             ],
             value=capture_mode_messages.get("Input Screen", "Input Screen"),
             on_select=self.on_capture_mode_change,
-            width=S(126),
+            dyna_width=True,
         )
         self.monitor_dd = CompactDropdown(on_select=self._on_monitor_change, max_width=S(300))
         self.window_dd = CompactDropdown(on_select=self.on_window_selected, max_width=S(300))
         self.refresh_btn = ft.Button(content=ft.Text("Refresh", size=FONT_SIZE),
             width=S(130), on_click=self.refresh_monitor_and_window)
-        self._row8_spacer = ft.Container(width=S(60))
 
         media_messages = UI_MESSAGES[self.locale]
         self.media_open_file_label = ft.Text(
@@ -859,11 +854,16 @@ class GUIBuilderMixin:
         row8 = ft.Row(
             [
                 self.capture_mode_dd,
-                self._row8_spacer,
-                self.monitor_dd,
-                self.window_dd,
-                self.media_path_text,
-                self.refresh_btn,
+                ft.Row(
+                    [
+                        self.monitor_dd,
+                        self.window_dd,
+                        self.media_path_text,
+                        self.refresh_btn,
+                    ],
+                    spacing=S(12),
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
             ],
             spacing=1,
         )

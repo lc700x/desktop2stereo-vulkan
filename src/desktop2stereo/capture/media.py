@@ -17,10 +17,13 @@ import numpy as np
 from PIL import Image
 
 from .media_browser import VIDEO_EXTENSIONS, MediaBrowser, media_kind_for_path
+from .media_cadence import SourceFrameSchedule, display_aligned_media_fps
 
 _HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 _VIDEO_EXTENSIONS = VIDEO_EXTENSIONS
 _NVDEC_DLL_DIRECTORY_HANDLES = []
+_MEDIA_CADENCE_TARGET_LOCK = threading.Lock()
+_MEDIA_CADENCE_TARGET_FPS: float | None = None
 _AMF_DECODERS = {
     "h264": "h264_amf",
     "hevc": "hevc_amf",
@@ -31,6 +34,28 @@ _AMF_DECODERS = {
 
 class _HardwareDecodeUnavailable(RuntimeError):
     pass
+
+
+def set_media_playback_cadence_target(fps: float | None) -> None:
+    """Publish a process-local cadence target for the active media source."""
+    global _MEDIA_CADENCE_TARGET_FPS
+    try:
+        value = float(fps) if fps is not None else None
+    except (TypeError, ValueError):
+        value = None
+    if value is not None and (not math.isfinite(value) or value <= 0.0):
+        value = None
+    with _MEDIA_CADENCE_TARGET_LOCK:
+        _MEDIA_CADENCE_TARGET_FPS = value
+
+
+def get_media_playback_cadence_target() -> float | None:
+    with _MEDIA_CADENCE_TARGET_LOCK:
+        return _MEDIA_CADENCE_TARGET_FPS
+
+
+def reset_media_playback_cadence_target() -> None:
+    set_media_playback_cadence_target(None)
 
 
 def _is_hardware_decode_unavailable(exc: Exception) -> bool:
@@ -159,23 +184,39 @@ def _resolve_media_playback_cadence(
     width: int,
     height: int,
     requested_fps: float,
+    *,
+    target_fps: float | None = None,
 ) -> tuple[float, int]:
-    """Choose deterministic source decimation for sustained 4K playback."""
-    source_fps = max(1.0, float(source_fps or 0.0))
-    requested = max(1.0, float(requested_fps or source_fps))
-    playback_fps = min(source_fps, requested)
-    pixels = max(0, int(width)) * max(0, int(height))
+    """Select a source divisor under the requested/measured ceiling, never slow time."""
+    source = max(1.0, float(source_fps or 0.0))
+    ceiling = min(source, max(1.0, float(requested_fps or source)))
+    for target in (get_media_playback_cadence_target(), target_fps):
+        if target is not None and math.isfinite(target) and target > 0.0:
+            ceiling = min(ceiling, target)
     try:
-        target = float(
-            os.environ.get("D2S_MEDIA_DECIMATION_TARGET_FPS", "40") or 40.0
-        )
-    except (TypeError, ValueError):
-        target = 40.0
-    if source_fps < 90.0 or pixels < 3840 * 1600 or target <= 0.0:
-        return playback_fps, 1
-    capped_fps = min(playback_fps, target)
-    step = max(1, int(round(source_fps / max(1.0, capped_fps))))
-    return source_fps / float(step), step
+        override = float(os.environ.get("D2S_MEDIA_DECIMATION_TARGET_FPS", "0") or 0.0)
+    except ValueError:
+        override = 0.0
+    if math.isfinite(override) and override > 0.0:
+        ceiling = min(ceiling, override)
+    step = max(1, math.ceil(source / ceiling - 1e-6))
+    return source / step, step
+
+
+def _select_media_cadence_fps_for_display(
+    source_fps: float,
+    display_fps: float,
+    max_fps: float,
+    *,
+    min_fps: float = 12.0,
+) -> float | None:
+    """Choose the highest source division that lands on integral display ticks."""
+    return display_aligned_media_fps(
+        float(source_fps or 0.0),
+        float(display_fps or 0.0),
+        float(max_fps or 0.0),
+        min_fps=float(min_fps),
+    )
 
 
 def _resolve_media_mode(path: str, configured_mode: str) -> str:
@@ -716,6 +757,16 @@ class MediaCaptureSource:
         self._audio_started_at = None
         self._audio_position_anchor = self.position
         self._audio_stop = threading.Event()
+        self._audio_sync = None
+        self._presented_media_identity = None
+        self._presentation_clock_pending = bool(getattr(config, "media_presentation_sync", False))
+        self._presentation_first_frame_taken = False
+        self._presentation_start_index = None
+        self._media_cadence_calibrated = False
+        self._resume_clock_at = None
+        self._paused_clock_pts = None
+        self._presentation_lock = threading.Lock()
+        self._media_control_lock = threading.RLock()
         self._last_control_revisions = {}
         self._last_publish_at = 0.0
         self._last_image_frame_at = 0.0
@@ -742,6 +793,7 @@ class MediaCaptureSource:
         self._frame_pump_frame_times = deque(maxlen=120)
         self._last_source_frame_duration = 0.0
         self._frame_pump_decimation_step = 1
+        self._source_selection_schedule = None
         self._last_decimated_emit_at = 0.0
         self._frame_buffer_stale_drops = 0
         self._frame_buffer_drop_log_at = 0.0
@@ -998,6 +1050,34 @@ class MediaCaptureSource:
         else:
             self._decode_width = int(getattr(self, "width", 0) or 0)
             self._decode_height = int(getattr(self, "height", 0) or 0)
+        # Sample source identities once, before host transfer. The frame pump
+        # must not decimate these already selected frames a second time.
+        source_fps = float(getattr(self, "_source_fps", 0.0) or 0.0)
+        playback_fps = float(getattr(self, "_playback_fps", 0.0) or 0.0)
+        step = max(1, int(getattr(self, "_frame_pump_decimation_step", 1) or 1))
+        selection_schedule = None
+        variable_selection = False
+        if source_fps > playback_fps + 1e-6:
+            selection_schedule = SourceFrameSchedule(source_fps, playback_fps)
+            ratio = source_fps / playback_fps
+            variable_selection = abs(ratio - round(ratio)) > 1e-6
+            step = max(1, int(round(ratio)))
+        self._ffmpeg_selection_schedule = selection_schedule
+        self._ffmpeg_selection_active = selection_schedule is not None
+        self._ffmpeg_decimation_step = step
+        self._ffmpeg_first_frame_pending = True
+        if selection_schedule is not None:
+            filters = [part for part in video_filter.split(",") if not part.startswith("fps=")]
+            expression = (
+                selection_schedule.ffmpeg_select_expression()
+                if variable_selection
+                else f"not(mod(n\\,{step}))"
+            )
+            video_filter = f"select='{expression}'," + ",".join(filters)
+        elif step > 1:
+            # Worker/unit callers may provide only the legacy decimation step.
+            filters = [part for part in video_filter.split(",") if not part.startswith("fps=")]
+            video_filter = f"select='not(mod(n\\,{step}))'," + ",".join(filters)
         command = [self._ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
         if decoder:
             command.extend(["-c:v", decoder])
@@ -1041,6 +1121,7 @@ class MediaCaptureSource:
         import PyNvVideoCodec as nvc
 
         gpu_id = int(torch.cuda.current_device())
+        self._nvdec_decode_stream = torch.cuda.Stream(device=gpu_id)
         output_color_type = nvc.OutputColorType.RGBP
         if native_hdr:
             output_color_type = getattr(nvc.OutputColorType, "NATIVE", None)
@@ -1051,6 +1132,7 @@ class MediaCaptureSource:
         decoder_options = {
             "encSource": self._nvdec_source_path,
             "gpuid": gpu_id,
+            "cudaStream": self._nvdec_decode_stream.cuda_stream,
             "useDeviceMemory": True,
             "outputColorType": output_color_type,
         }
@@ -1080,6 +1162,7 @@ class MediaCaptureSource:
                 self._nvdec_source_path,
                 buffer_size=buffer_size,
                 gpu_id=gpu_id,
+                cuda_stream=self._nvdec_decode_stream.cuda_stream,
                 use_device_memory=True,
                 output_color_type=output_color_type,
                 start_frame=frame_index,
@@ -1145,6 +1228,7 @@ class MediaCaptureSource:
             if decoder is None or torch is None:
                 return None
             remaining = max(1, int(batch_size))
+            requested_total = remaining
             buffer_size = max(1, int(getattr(self, "_nvdec_buffer_size", remaining)))
             frame = None
             while remaining > 0:
@@ -1154,11 +1238,15 @@ class MediaCaptureSource:
                     break
                 remaining -= len(decoded)
                 if remaining > 0 and len(decoded) >= requested:
+                    del decoded  # Release discarded decoder surfaces before the next ring fetch.
                     continue
                 copy_stream = getattr(self, "_nvdec_copy_stream", None)
                 if copy_stream is None:
                     copy_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                     self._nvdec_copy_stream = copy_stream
+                decode_stream = getattr(self, "_nvdec_decode_stream", None)
+                if decode_stream is not None:
+                    copy_stream.wait_stream(decode_stream)
                 with torch.cuda.stream(copy_stream):
                     decoded_frame = torch.from_dlpack(decoded[-1])
                     if decoded_frame.ndim == 4 and decoded_frame.shape[0] == 1:
@@ -1197,6 +1285,7 @@ class MediaCaptureSource:
                 copy_stream.synchronize()
                 if len(decoded) < requested:
                     break
+            self._nvdec_last_frame_advance = requested_total - remaining
             return frame
 
     def _close_nvdec(self) -> None:
@@ -1205,19 +1294,29 @@ class MediaCaptureSource:
             self._nvdec_decoder = None
             self._nvdec_torch = None
             self._nvdec_first_frame_pending = False
+            self._decoder_resampled = True
+            self._decoder_frame_advance = 1
             self._nvdec_next_frame_at = None
             if decoder is not None:
                 self._dispose_nvdec_decoder(decoder)
+            stream = getattr(self, "_nvdec_decode_stream", None)
+            if stream is not None:
+                stream.synchronize()
+                self._nvdec_decode_stream = None
 
     def _start_audio(self, position: float) -> None:
         try:
             import sounddevice as sd
 
-            command = [self._ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-re"]
+            sync_enabled = bool(getattr(self.config, "media_presentation_sync", False))
+            command = [self._ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
+            if not sync_enabled:
+                command.append("-re")
             if position > 0:
-                command.extend(["-ss", f"{position:.3f}"])
+                command.extend(["-ss", f"{position:.9f}"])
             command.extend([
                 *self._input_args, "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "48000",
+                "-af", "aresample=async=1:first_pts=0",
                 "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1",
             ])
             self._audio_process = subprocess.Popen(
@@ -1227,48 +1326,96 @@ class MediaCaptureSource:
                 stderr=subprocess.DEVNULL,
                 bufsize=0,
             )
-            stream_kwargs = {
-                "samplerate": 48000,
-                "channels": 2,
-                "dtype": "float32",
-                "blocksize": 0,
-            }
+            self._audio_stop = threading.Event()
+            sync = None
+            stream_type = sd.RawOutputStream
+            stream_kwargs = {"samplerate": 48000, "channels": 2, "dtype": "float32", "blocksize": 0}
+            if sync_enabled:
+                from .media_audio import MediaAudioSync
+
+                sync = MediaAudioSync(generation=self.media_generation, start_pts=float(position))
+                self._audio_sync = sync
+                stream_type = sd.OutputStream
+                def audio_callback(outdata, frames, time_info, status):
+                    if status.output_underflow:
+                        sync.note_device_underflow()
+                    callback_at = time.perf_counter()
+                    # Pa_GetStreamTime is calibrated once to perf_counter.
+                    # Mapping from callback entry/currentTime on every block
+                    # would add Python/GIL scheduling delay to the DAC PTS.
+                    dac_at = float(time_info.outputBufferDacTime) + audio_clock_offset
+                    sync.render(outdata, dac_at=dac_at, callback_at=callback_at, volume=self.volume, muted=self.muted)
+                stream_kwargs.update(blocksize=480, latency="low", callback=audio_callback)
+            else:
+                self._audio_sync = None
             preferred_device = _preferred_audio_output_device(sd)
             if preferred_device is not None:
                 stream_kwargs["device"] = preferred_device
             try:
-                self._audio_stream = sd.RawOutputStream(**stream_kwargs)
+                self._audio_stream = stream_type(**stream_kwargs)
             except Exception:
                 if preferred_device is None:
                     raise
                 stream_kwargs.pop("device", None)
-                self._audio_stream = sd.RawOutputStream(**stream_kwargs)
+                self._audio_stream = stream_type(**stream_kwargs)
+            audio_clock_offset = (
+                time.perf_counter() - float(self._audio_stream.time) if sync_enabled else 0.0
+            )
             self._audio_stream.start()
             self._audio_stop.clear()
             self._audio_position_anchor = max(0.0, float(position))
-            self._audio_started_at = time.perf_counter()
+            self._audio_started_at = None if sync_enabled else time.perf_counter()
             self._audio_thread = threading.Thread(
                 target=self._audio_loop, name="MediaAudioOutput", daemon=True
             )
             self._audio_thread.start()
+            self.audio_error = ""
         except Exception as exc:
             self.audio_error = f"{type(exc).__name__}: {exc}"
             self._close_audio()
             print(f"[media] audio output unavailable: {self.audio_error}", flush=True)
 
     def _audio_loop(self) -> None:
+        process, stream = self._audio_process, self._audio_stream
+        stop = self._audio_stop
+        sync = getattr(self, "_audio_sync", None)
         try:
-            while not self._audio_stop.is_set() and self._audio_process is not None:
-                data = self._audio_process.stdout.read(16 * 1024)
-                if not data:
+            while not stop.is_set() and process is not None:
+                # A pipe read may split a float or channel pair. Assemble exact
+                # 10 ms PCM blocks; never invent sample PTS from read timing.
+                data = bytearray()
+                block_bytes = 480 * 2 * 4 if sync is not None else 16 * 1024
+                while len(data) < block_bytes and not stop.is_set():
+                    chunk = process.stdout.read(block_bytes - len(data))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                complete_bytes = len(data) - len(data) % 8
+                if not complete_bytes or stop.is_set():
+                    if not stop.is_set() and sync is not None:
+                        status = process.poll() if callable(getattr(process, "poll", None)) else None
+                        wait = getattr(process, "wait", None)
+                        if status is None and callable(wait):
+                            status = wait(timeout=0.5)
+                        if status not in (None, 0):
+                            raise RuntimeError(f"FFmpeg audio decoder exited with status {status}")
+                        note_eof = getattr(sync, "note_source_eof", None)
+                        if callable(note_eof):
+                            note_eof()
                     break
-                samples = np.frombuffer(data, dtype=np.float32).copy()
+                samples = np.frombuffer(data, dtype=np.float32, count=complete_bytes // 4).copy()
+                if sync is not None:
+                    if not sync.enqueue(samples.reshape(-1, 2), stop):
+                        break
+                    continue
                 gain = 0.0 if self.muted else max(0.0, min(1.0, self.volume))
                 if gain != 1.0:
                     samples *= gain
-                if self._audio_stream is not None:
-                    self._audio_stream.write(samples)
+                if stream is not None:
+                    stream.write(samples)
         except Exception as exc:
+            if stop.is_set():
+                return
             self.audio_error = f"{type(exc).__name__}: {exc}"
             self._audio_stop.set()
             process, self._audio_process = self._audio_process, None
@@ -1299,19 +1446,144 @@ class MediaCaptureSource:
 
     def _close_audio(self) -> None:
         self._audio_stop.set()
+        sync, self._audio_sync = getattr(self, "_audio_sync", None), None
+        if sync is not None:
+            sync.close()
         self._audio_started_at = None
         process, self._audio_process = self._audio_process, None
         self._terminate(process)
         stream, self._audio_stream = self._audio_stream, None
         if stream is not None:
             try:
-                stream.stop()
+                abort = getattr(stream, "abort", stream.stop)
+                abort()
                 stream.close()
             except Exception:
                 pass
         thread, self._audio_thread = self._audio_thread, None
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=0.5)
+
+    def observe_video_presentation(self, generation: int, index: int, pts: float, at: float) -> None:
+        """Called after presentation; do not run decoder/audio setup on the XR thread."""
+        if generation != self.media_generation or not math.isfinite(pts) or not math.isfinite(at):
+            return
+        with self._presentation_lock:
+            if self.playing and getattr(self, "_presentation_clock_pending", False):
+                start_index = getattr(self, "_presentation_start_index", None)
+                if start_index is None or index < start_index:
+                    return  # A pre-pause queued output cannot start the new playback epoch.
+            previous = self._presented_media_identity
+            if previous is not None and previous[0] == generation and index <= previous[1]:
+                return
+            self._presented_media_identity = (int(generation), int(index), float(pts), float(at))
+            if self.playing and getattr(self, "_presentation_clock_pending", False):
+                # Loading, shader compilation and cadence preflight are preroll,
+                # not part of the source playback duration.
+                resume_at = getattr(self, "_resume_clock_at", None)
+                self._position_anchor = float(pts) if resume_at is None else float(self.position)
+                self._position_anchor_time = float(at) if resume_at is None else float(resume_at)
+                self._resume_clock_at = None
+                self._cadence_observe_after = float(at) + 2.0
+                self._presentation_clock_pending = False
+                with self._frame_buffer_condition:
+                    self._frame_buffer_condition.notify_all()
+            sync = self._audio_sync
+            if sync is not None and self.playing:
+                sync.observe_video(generation, index, pts, at, self._frame_duration())
+            if not self.playing:
+                self.position = float(pts)
+                self._position_anchor = self.position
+
+    def calibrate_media_cadence(self, service_ms: float) -> None:
+        """Select an initial measured divisor before any source clock advances."""
+        if (not getattr(self, "_presentation_clock_pending", False) or self._media_cadence_calibrated
+                or not getattr(self, "_ready", True) or self._source_fps <= 0.0):
+            return
+        if not math.isfinite(service_ms) or service_ms <= 0.0:
+            return
+        fps, step = _resolve_media_playback_cadence(
+            self._source_fps, self.width, self.height, float(self.config.fps),
+            target_fps=1000.0 / service_ms,
+        )
+        with self._frame_buffer_condition:
+            self._playback_fps = fps
+            self._frame_pump_decimation_step = step
+            self._last_source_frame_duration = 1.0 / fps
+            self._media_prepare_lead_s = service_ms * 0.001 + 1.0 / max(1.0, float(self.config.fps))
+            self._media_cadence_calibrated = True
+        print(f"[media] cadence preroll: service={service_ms:.2f}ms target={fps:.2f}fps step={step}", flush=True)
+
+    def observe_media_timing(self, metadata: dict, at: float) -> None:
+        if (not self.playing or getattr(self, "_browser_mode", False)
+                or getattr(self, "_presentation_clock_pending", False)):
+            return
+        if str(os.environ.get("D2S_MEDIA_CADENCE_ADAPTIVE", "1")).strip().lower() in {
+            "0", "false", "no", "off"
+        }:
+            return
+        generation = metadata.get("media_generation")
+        identity = (generation, metadata.get("source_frame_index"))
+        if generation == self.media_generation and identity != getattr(self, "_media_timing_identity", None):
+            previous = getattr(self, "_media_timing_identity", None)
+            self._media_timing_identity = identity
+            captured_at = metadata.get("capture_poll_returned_at")
+            if previous is not None and captured_at is not None:
+                latency = float(at) - float(captured_at)
+                if math.isfinite(latency) and 0.0 <= latency <= 0.25:
+                    samples = getattr(self, "_media_prepare_latency_samples", None)
+                    if samples is None:
+                        samples = self._media_prepare_latency_samples = deque(maxlen=17)
+                    samples.append(latency)
+                    self._media_prepare_lead_s = sorted(samples)[len(samples) // 2]
+        if (float(at) < float(getattr(self, "_cadence_observe_after", 0.0))
+                or abs(float(metadata.get("media_playback_fps") or self._playback_fps) - self._playback_fps) > 0.01):
+            return
+        if generation != self.media_generation or metadata.get("source_pts") is None:
+            return
+        from .media_cadence import MediaCadenceController
+
+        controller = getattr(self, "_media_cadence_controller", None)
+        if controller is None or getattr(self, "_media_cadence_generation", None) != generation:
+            ceiling, _step = _resolve_media_playback_cadence(
+                self._source_fps, self.width, self.height, float(self.config.fps)
+            )
+            controller = MediaCadenceController(self._source_fps, ceiling)
+            self._media_cadence_controller = controller
+            self._media_cadence_generation = generation
+            self._adaptive_cadence_target = None
+        metrics = self.runtime_metrics()
+        target = controller.observe(
+            pts=float(metadata["source_pts"]), at=float(at),
+            playback_fps=float(metadata.get("media_playback_fps") or self._playback_fps),
+            service_ms=max(float(metadata.get("runtime_completion_ms") or 0.0),
+                           float(metadata.get("vk_total_ms") or 0.0)),
+            decode_ms=float(metrics.get("read_ms_p95") or 0.0),
+            buffer_depth=int(metrics.get("buffer_depth") or 0),
+            display_fps=float(metadata.get("media_display_fps") or 0.0),
+            display_vsync=bool(metadata.get("media_display_vsync", True)),
+            lateness_ms=(max(0.0, (float(at) - float(metadata["media_presentation_deadline"])) * 1000.0)
+                         if metadata.get("media_presentation_deadline") is not None else 0.0),
+        )
+        if target is not None:
+            self._adaptive_cadence_target = target
+            print(f"[media] adaptive cadence: target={target:.2f}fps reason={controller.reason}", flush=True)
+
+    def media_presentation_clock(self) -> dict:
+        """Return the live presentation epoch, including pause/resume ownership."""
+        return {
+            "generation": self.media_generation,
+            "playing": bool(self.playing),
+            "anchor_at": self._position_anchor_time if self._position_anchor_time is not None
+            else getattr(self, "_resume_clock_at", None),
+            "anchor_pts": self._position_anchor,
+            "paused_at": getattr(self, "_paused_clock_at", None),
+            "resumed_at": getattr(self, "_last_resume_clock_at", None),
+        }
+
+    def audio_sync_metrics(self) -> dict:
+        sync = getattr(self, "_audio_sync", None)
+        return sync.snapshot(time.perf_counter()) if sync is not None else {}
 
     def _current_position(self) -> float:
         if self.playing and self._position_anchor_time is not None:
@@ -1342,6 +1614,20 @@ class MediaCaptureSource:
         if math.isfinite(duration) and duration > 0.0:
             return duration
         return self._frame_duration()
+
+    def _next_source_frame_advance(self) -> int:
+        """Return the next ordered source-frame step for the live cadence."""
+        source_fps = float(getattr(self, "_source_fps", 0.0) or 0.0)
+        playback_fps = float(getattr(self, "_playback_fps", 1.0) or 1.0)
+        schedule = getattr(self, "_source_selection_schedule", None)
+        if (
+            schedule is None
+            or abs(schedule.rates[0] - source_fps) > 1e-4
+            or abs(schedule.rates[1] - playback_fps) > 1e-4
+        ):
+            schedule = SourceFrameSchedule(source_fps, playback_fps)
+            self._source_selection_schedule = schedule
+        return schedule.next_advance()
 
     def _close_native_decoder(self) -> None:
         importer = getattr(self, "_native_frame_importer", None)
@@ -1415,6 +1701,18 @@ class MediaCaptureSource:
             return False
 
     def _reset_frame_buffer(self, position: float) -> None:
+        self._media_cadence_controller = None
+        self._adaptive_cadence_target = None
+        self._source_selection_schedule = None
+        self._presentation_clock_pending = bool(getattr(getattr(self, "config", None), "media_presentation_sync", False))
+        self._presentation_first_frame_taken = False
+        self._presentation_start_index = None
+        self._media_cadence_calibrated = False
+        self._resume_clock_at = None
+        self._paused_clock_pts = None
+        self._media_prepare_lead_s = 0.0
+        self._media_prepare_latency_samples = deque(maxlen=17)
+        self._media_timing_identity = None
         with self._frame_buffer_condition:
             self._frame_buffer.clear()
             self._frame_pump_done = False
@@ -1470,27 +1768,105 @@ class MediaCaptureSource:
                 )
         self._frame_pump_thread = None
 
+    def _apply_media_playback_cadence_target(self) -> None:
+        target = getattr(self, "_adaptive_cadence_target", None) or get_media_playback_cadence_target()
+        if target is None or self._source_fps <= 0.0:
+            return
+        # The adaptive controller has already selected a display-aligned rate.
+        # Keep that rate exactly; rounding it through an integer source divisor
+        # would turn 36 FPS into 30 FPS and reintroduce the 2/3-tick pattern.
+        playback_fps = min(float(self._source_fps), max(1.0, float(target)))
+        step = max(1, int(round(float(self._source_fps) / playback_fps)))
+        if (
+            abs(playback_fps - float(self._playback_fps)) < 0.01
+            and int(step) == int(self._frame_pump_decimation_step)
+        ):
+            return
+        with self._frame_buffer_condition:
+            if getattr(self, "_adaptive_cadence_target", None) is not None:
+                # Apply a new divisor prospectively. Drain every already
+                # selected source frame instead of jumping across a full queue.
+                while self._frame_buffer and not self._frame_pump_stop.is_set():
+                    self._frame_buffer_condition.wait(timeout=0.05)
+                if self._frame_pump_stop.is_set():
+                    return
+            previous_fps = float(self._playback_fps)
+            previous_step = int(self._frame_pump_decimation_step)
+            self._playback_fps = float(playback_fps)
+            self._frame_pump_decimation_step = int(step)
+            self._source_selection_schedule = None
+            self._nvdec_skip_fraction = 0.0
+            self._opencv_skip_fraction = 0.0
+            self._last_source_frame_duration = 1.0 / max(1.0, float(playback_fps))
+            self._last_decimated_emit_at = 0.0
+            # FFmpeg selects before the raw pipe. Rebuild that selector at the
+            # oldest unconsumed PTS, rather than silently dropping its queue.
+            restart_pipe = (
+                getattr(self, "_native_decoder", None) is None
+                and str(getattr(self, "_decode_backend", "")).startswith("ffmpeg")
+            )
+            if restart_pipe and self._frame_buffer:
+                self._frame_pump_position = float(self._frame_buffer[0][0])
+                self._source_frame_index = int(self._frame_buffer[0][2])
+            self._frame_buffer.clear()
+            controller = getattr(self, "_media_cadence_controller", None)
+            if controller is not None:
+                controller.reset_window()
+            self._frame_buffer_condition.notify_all()
+        if restart_pipe:
+            decoder = self._amf_decoder if self._decode_backend == "ffmpeg-amf" else None
+            self._start_ffmpeg_video(self._frame_pump_position, realtime=True, decoder=decoder)
+        print(
+            "[media] playback cadence retargeted: "
+            f"target={target:.2f}fps previous={previous_fps:.2f}fps/step{previous_step} "
+            f"playback={playback_fps:.2f}fps/step{step}",
+            flush=True,
+        )
+
+    def _read_buffered_video_frame(self):
+        importer = getattr(self, "_native_frame_importer", None)
+        if importer is None:
+            return self._read_video_frame()
+        import torch
+
+        # Future decode-ahead fences must not interleave with inference kernels.
+        # Publish an owned, completed GPU copy, without reading pixels to CPU.
+        stream = importer._stream
+        with torch.cuda.stream(stream):
+            frame = self._read_video_frame()
+            if frame is not None and getattr(self, "_native_decoder", None) is not None:
+                frame = frame.clone()
+        stream.synchronize()
+        return frame
+
     def _frame_pump_loop(self) -> None:
         try:
             while not self._frame_pump_stop.is_set():
                 with self._frame_buffer_condition:
                     while (
-                        len(self._frame_buffer) >= self._frame_buffer_capacity
+                        (len(self._frame_buffer) >= self._frame_buffer_capacity
+                         or (getattr(self, "_presentation_clock_pending", False) and self._source_frame_index > 0))
                         and not self._frame_pump_stop.is_set()
                     ):
                         self._frame_buffer_condition.wait(timeout=0.05)
                 if self._frame_pump_stop.is_set():
                     break
+                self._apply_media_playback_cadence_target()
                 with self._decode_lock:
                     read_started_at = time.perf_counter()
-                    frame = self._read_video_frame()
+                    self._decoder_frame_advance = 1
+                    self._decoder_resampled = False
+                    self._decoder_terminal_partial = False
+                    frame = self._read_buffered_video_frame()
                     read_ms = max(0.0, (time.perf_counter() - read_started_at) * 1000.0)
                 now = time.perf_counter()
-                source_index = int(self._source_frame_index)
+                advance = max(1, int(getattr(self, "_decoder_frame_advance", 1)))
+                source_index = int(self._source_frame_index) + advance - 1
+                decoder_resampled = bool(getattr(self, "_decoder_resampled", False))
                 decimation_step = max(
                     1, int(getattr(self, "_frame_pump_decimation_step", 1) or 1)
                 )
-                emit_frame = frame is not None and source_index % decimation_step == 0
+                emit_frame = frame is not None and (decoder_resampled or source_index % decimation_step == 0)
                 metrics_lock, read_values, frame_times = self._ensure_frame_pump_metrics()
                 with metrics_lock:
                     read_values.append(read_ms)
@@ -1502,8 +1878,15 @@ class MediaCaptureSource:
                         self._frame_buffer_condition.notify_all()
                     break
                 with self._frame_buffer_condition:
-                    source_pts = self._frame_pump_position
-                    frame_duration = self._frame_duration()
+                    # A raw decoder tick is a SOURCE period, not the slower
+                    # selected playback period. Batched readers report how many
+                    # original frames they consumed to produce this image.
+                    frame_duration = (
+                        1.0 / self._source_fps
+                        if getattr(self, "_source_fps", 0.0) > 0.0 and (decoder_resampled or decimation_step > 1)
+                        else self._frame_duration()
+                    )
+                    source_pts = self._frame_pump_position + (advance - 1) * frame_duration
                     native_pts = getattr(self, "_native_frame_pts", None)
                     if native_pts is not None:
                         source_pts = native_pts
@@ -1513,14 +1896,23 @@ class MediaCaptureSource:
                         self._native_frame_pts = None
                         self._native_frame_duration = 0.0
                     self._last_source_frame_duration = max(
-                        0.0, float(frame_duration) * decimation_step
+                        0.0, float(frame_duration) * (advance if decoder_resampled else decimation_step)
                     )
+                    duration = float(getattr(self, "duration", 0.0) or 0.0)
+                    if duration > 0.0 and source_pts >= duration:
+                        # A partial/VFR decoder tail must not leave an
+                        # unpresentable post-duration item blocking ordered EOF.
+                        self._frame_pump_done = True
+                        self._frame_buffer_condition.notify_all()
+                        break
                     if emit_frame:
                         self._frame_buffer.append(
                             (
                                 source_pts,
                                 frame,
                                 source_index,
+                                {"media_playback_fps": float(self._playback_fps),
+                                 "media_terminal_partial": bool(getattr(self, "_decoder_terminal_partial", False))},
                             )
                         )
                     self._source_frame_index = source_index + 1
@@ -1558,6 +1950,22 @@ class MediaCaptureSource:
                     self._frame_buffer_condition.notify_all()
                     return item
 
+                if bool(getattr(getattr(self, "config", None), "media_presentation_sync", False)):
+                    # Absolute source time already owns selection. A second
+                    # minimum-emit phase retains any temporary GPU stall as
+                    # permanent slow playback, even after the rate downshifts.
+                    if self._frame_buffer and float(self._frame_buffer[0][0]) <= target_position + tolerance:
+                        item = self._frame_buffer.popleft()
+                        self._frame_buffer_condition.notify_all()
+                        return item
+                    if self._frame_pump_done and not self._frame_buffer:
+                        return None
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0.0:
+                        return None
+                    self._frame_buffer_condition.wait(timeout=min(0.005, remaining))
+                    continue
+
                 if int(getattr(self, "_frame_pump_decimation_step", 1) or 1) > 1:
                     playback_period = self._frame_duration()
                     now = time.perf_counter()
@@ -1570,7 +1978,12 @@ class MediaCaptureSource:
                         candidate_pts = float(self._frame_buffer[0][0])
                         if candidate_pts <= target_position + tolerance:
                             item = self._frame_buffer.popleft()
-                            self._last_decimated_emit_at = now
+                            previous_deadline = self._last_decimated_emit_at
+                            self._last_decimated_emit_at = (
+                                previous_deadline + playback_period
+                                if previous_deadline > 0.0 and now - previous_deadline < 3.0 * playback_period
+                                else now
+                            )
                             self._frame_buffer_condition.notify_all()
                             return item
                     if self._frame_pump_done and not self._frame_buffer:
@@ -1654,6 +2067,8 @@ class MediaCaptureSource:
                 self._frame_buffer_condition.wait(timeout=min(0.005, remaining))
 
     def _has_open_video_decoder(self) -> bool:
+        if getattr(self, "_native_decoder", None) is not None:
+            return True
         if str(getattr(self, "_decode_backend", "")).startswith("nvdec"):
             return getattr(self, "_nvdec_decoder", None) is not None
         if str(getattr(self, "_decode_backend", "")) == "opencv-software":
@@ -1662,7 +2077,23 @@ class MediaCaptureSource:
         return process is not None and process.poll() is None
 
     def _pause_playback(self) -> None:
-        self.position = self._current_position()
+        # Freeze source time within the displayed frame interval. The visible
+        # image keeps its exact PTS; resuming must not skip the remaining part
+        # of that interval by rebasing to the next selected image's PTS.
+        self._paused_clock_pts = float(self._current_position())
+        self._paused_clock_at = (
+            float(self._position_anchor_time) + self._paused_clock_pts - float(self._position_anchor)
+            if self._position_anchor_time is not None else time.perf_counter()
+        )
+        controller = getattr(self, "_media_cadence_controller", None)
+        if controller is not None:
+            controller.reset_window()
+        presented = getattr(self, "_presented_media_identity", None)
+        self.position = (
+            presented[2]
+            if presented is not None and presented[0] == self.media_generation
+            else self._current_position()
+        )
         self._position_anchor = self.position
         self._position_anchor_time = None
         self.playing = False
@@ -1676,12 +2107,25 @@ class MediaCaptureSource:
     def _resume_playback(self, position: float) -> None:
         self._browser_mode = False
         self.playing = True
-        with self._frame_buffer_condition:
-            if self._frame_buffer:
-                position = max(position, self._frame_buffer[0][0])
+        synced = bool(getattr(self.config, "media_presentation_sync", False))
+        paused_pts = getattr(self, "_paused_clock_pts", None)
+        if synced and paused_pts is not None:
+            position = float(paused_pts)
+        elif not synced:
+            with self._frame_buffer_condition:
+                if self._frame_buffer:
+                    position = max(position, self._frame_buffer[0][0])
         self.position = max(0.0, float(position))
         self._position_anchor = self.position
         self._position_anchor_time = None
+        self._resume_clock_at = time.perf_counter() if synced else None
+        self._last_resume_clock_at = self._resume_clock_at
+        self._presentation_clock_pending = synced
+        self._presentation_first_frame_taken = False
+        presented = getattr(self, "_presented_media_identity", None)
+        self._presentation_start_index = (
+            int(presented[1]) + 1 if presented is not None and presented[0] == self.media_generation else None
+        )
         if getattr(self, "_has_audio", False):
             self._start_audio(self.position)
         self._start_frame_pump()
@@ -1952,6 +2396,22 @@ class MediaCaptureSource:
                 selected = self._browser.playlist_select(str(path or ""))
                 if selected:
                     self._open_playlist_path(selected)
+            elif action == "playlist_add":
+                path = value.get("path") if isinstance(value, dict) else value
+                self._browser.playlist_add(str(path or ""))
+            elif action == "playlist_move" and isinstance(value, dict):
+                try:
+                    self._browser.playlist_move(str(value.get("path") or ""), int(value.get("offset", 0)))
+                except (TypeError, ValueError):
+                    continue
+            elif action == "playlist_sort":
+                descending = bool(value.get("descending", False)) if isinstance(value, dict) else False
+                self._browser.playlist_sort(descending=descending)
+            elif action == "playlist_page":
+                try:
+                    self._browser.playlist_page(int(value))
+                except (TypeError, ValueError):
+                    continue
             elif action == "playlist_clear":
                 self._browser.playlist_clear()
             elif action == "playlist_remove":
@@ -1962,20 +2422,48 @@ class MediaCaptureSource:
             self._publish_state(force=True)
 
     def poll_control(self) -> None:
-        self._read_control()
-        self._publish_state()
+        with self._get_media_control_lock():
+            self._read_control()
+            self._publish_state()
+
+    def _get_media_control_lock(self):
+        lock = getattr(self, "_media_control_lock", None)
+        if lock is None:
+            lock = self._media_control_lock = threading.RLock()
+        return lock
 
     def _read_d3d11_frame(self):
         decoder = self._native_decoder
         importer = self._native_frame_importer
         if decoder is None or importer is None:
             return None
-        position = self._current_position()
+        pumping = getattr(self, "_frame_pump_thread", None) is threading.current_thread()
+        position = self._frame_pump_position if pumping else self._current_position()
+        source_fps = float(getattr(self, "_source_fps", 0.0))
+        playback_fps = float(getattr(self, "_playback_fps", 0.0) or 0.0)
+        legacy_step = max(1, int(getattr(self, "_frame_pump_decimation_step", 1) or 1))
+        selecting = pumping and source_fps > 0.0 and (
+            (playback_fps > 0.0 and source_fps > playback_fps + 1e-6)
+            or legacy_step > 1
+        )
+        advance = 1
+        if selecting:
+            if playback_fps > 0.0 and source_fps > playback_fps + 1e-6:
+                advance = self._next_source_frame_advance() if self._source_frame_index > 0 else 1
+            else:
+                advance = legacy_step if self._source_frame_index > 0 else 1
+            # Ask the decoder for an exact source slot, not wall-clock catch-up.
+            # The half-source-period offset excludes the preceding frame whose
+            # end timestamp equals the desired PTS. Discard before GPU VPP/HIP.
+            position += (advance - 0.5) / source_fps
         try:
             frame = decoder.next_frame(position)
             if frame is None:
                 return None
             tensor = importer.import_frame(frame)
+            if selecting:
+                self._decoder_resampled = True
+                self._decoder_frame_advance = advance
             self._native_frame_pts = float(frame.pts_seconds)
             self._native_frame_duration = max(
                 0.0, float(frame.duration_seconds)
@@ -2131,6 +2619,23 @@ class MediaCaptureSource:
                 else:
                     self.error = f"FFmpeg video decoder exited with status {return_code}"
             return None
+        ffmpeg_step = max(1, int(getattr(self, "_ffmpeg_decimation_step", 1)))
+        ffmpeg_selection = bool(getattr(self, "_ffmpeg_selection_active", False))
+        if ffmpeg_selection:
+            schedule = getattr(self, "_ffmpeg_selection_schedule", None)
+            self._decoder_resampled = True
+            self._decoder_frame_advance = (
+                1
+                if getattr(self, "_ffmpeg_first_frame_pending", False) or schedule is None
+                else schedule.next_advance()
+            )
+            self._ffmpeg_first_frame_pending = False
+        elif ffmpeg_step > 1:
+            self._decoder_resampled = True
+            self._decoder_frame_advance = (
+                1 if getattr(self, "_ffmpeg_first_frame_pending", False) else ffmpeg_step
+            )
+            self._ffmpeg_first_frame_pending = False
         if pixel_format in {"nv12", "p010le"}:
             dtype = np.dtype("<u2") if pixel_format == "p010le" else np.uint8
             self._frame = np.frombuffer(frame_buffer, dtype=dtype).reshape(
@@ -2179,6 +2684,7 @@ class MediaCaptureSource:
         self._opencv_realtime = bool(realtime)
         self._opencv_next_frame_at = None
         self._opencv_skip_fraction = 0.0
+        self._opencv_first_frame_pending = True
         self._decode_backend = "opencv-software"
         self._frame_pixel_format = "bgr24"
         if self.hdr:
@@ -2196,22 +2702,29 @@ class MediaCaptureSource:
             return None
         deadline = time.perf_counter()
         interval = 1.0 / max(1.0, self._playback_fps)
-        if self._opencv_realtime:
+        pumping = getattr(self, "_frame_pump_thread", None) is threading.current_thread()
+        if self._opencv_realtime and not pumping:
             deadline = self._opencv_next_frame_at or deadline
             delay = deadline - time.perf_counter()
             if delay > 0:
                 time.sleep(delay)
-        ok, frame = capture.read()
-        if not ok:
-            return None
-        if self._source_fps > self._playback_fps > 0:
+        skipped_frames = 0
+        if getattr(self, "_opencv_first_frame_pending", False):
+            self._opencv_first_frame_pending = False
+        elif self._source_fps > self._playback_fps > 0:
             self._opencv_skip_fraction += self._source_fps / self._playback_fps - 1.0
             while self._opencv_skip_fraction >= 1.0:
                 if not capture.grab():
-                    break
+                    return None
                 self._opencv_skip_fraction -= 1.0
+                skipped_frames += 1
+        ok, frame = capture.read()
+        if not ok:
+            return None
         if self._opencv_realtime:
             self._opencv_next_frame_at = max(deadline + interval, time.perf_counter())
+        self._decoder_resampled = True
+        self._decoder_frame_advance = 1 + skipped_frames
         self._frame = frame
         return frame
 
@@ -2230,7 +2743,8 @@ class MediaCaptureSource:
         interval = 1.0 / max(1.0, self._playback_fps)
         deadline = self._nvdec_next_frame_at or time.perf_counter()
         delay = deadline - time.perf_counter()
-        if delay > 0:
+        pumping = getattr(self, "_frame_pump_thread", None) is threading.current_thread()
+        if delay > 0 and not pumping:
             time.sleep(delay)
         try:
             frame_count = 1
@@ -2263,6 +2777,9 @@ class MediaCaptureSource:
             if restart_audio:
                 self._start_audio(position)
             return self._read_video_frame()
+        self._decoder_frame_advance = max(1, int(getattr(self, "_nvdec_last_frame_advance", frame_count)))
+        self._decoder_terminal_partial = self._decoder_frame_advance < frame_count
+        self._decoder_resampled = True
         self._nvdec_next_frame_at = max(deadline + interval, time.perf_counter())
         self._frame = frame
         return frame
@@ -2297,6 +2814,7 @@ class MediaCaptureSource:
             ),
             "position": self._current_position(),
             "duration": self.duration,
+            "audio_sync": self.audio_sync_metrics(),
             "playing": self.playing,
             "ready": bool(getattr(self, "_ready", False)),
             "volume": self.volume,
@@ -2306,6 +2824,9 @@ class MediaCaptureSource:
             "buffered_frames": buffered_frames,
             "frame_buffer_capacity": frame_buffer_capacity,
             "playback_fps": getattr(self, "_playback_fps", 0.0),
+            "source_fps": getattr(self, "_source_fps", 0.0),
+            "cadence_mode": "adaptive",
+            "cadence_reason": getattr(getattr(self, "_media_cadence_controller", None), "reason", "warming_up"),
             "decode_backend": self._decode_backend,
             "decode_fallback_reason": self.decode_fallback_reason,
             "audio_enabled": bool(getattr(self, "_has_audio", False)),
@@ -2369,6 +2890,10 @@ class MediaCaptureSource:
         return frame
 
     def grab(self):
+        with self._get_media_control_lock():
+            return self._grab_media_frame()
+
+    def _grab_media_frame(self):
         self._read_control()
         if not self._ready:
             time.sleep(0.1)
@@ -2414,21 +2939,45 @@ class MediaCaptureSource:
             else:
                 if self._frame_pump_thread is None or not self._frame_pump_thread.is_alive():
                     self._start_frame_pump()
+                if (getattr(self, "_presentation_clock_pending", False)
+                        and getattr(self, "_presentation_first_frame_taken", False)):
+                    with self._frame_buffer_condition:
+                        self._frame_buffer_condition.wait(timeout=0.02)
+                    return None, (self.width, self.height)
                 first_frame = self._position_anchor_time is None
                 item = self._take_buffered_frame(
-                    self._current_position(),
+                    self._current_position() + float(getattr(self, "_media_prepare_lead_s", 0.0)),
                     allow_first=first_frame,
                 )
                 if item is not None:
-                    source_pts, frame, source_index = item
+                    source_pts, frame, source_index = item[:3]
+                    self._current_source_metadata = dict(item[3]) if len(item) > 3 else {}
                     if first_frame:
-                        self._position_anchor = self._current_position()
-                        self._position_anchor_time = time.perf_counter()
+                        if getattr(self, "_resume_clock_at", None) is None:
+                            self._position_anchor = float(source_pts)
+                        if getattr(self, "_presentation_start_index", None) is None:
+                            self._presentation_start_index = int(source_index)
+                        self._presentation_first_frame_taken = True
+                        if not getattr(self, "_presentation_clock_pending", False):
+                            self._position_anchor_time = time.perf_counter()
                     self._current_source_frame_identity = (
                         self.media_generation,
                         int(source_index),
                         float(source_pts),
                     )
+                    self._current_source_metadata["media_presentation_clock_pending"] = bool(
+                        getattr(self, "_presentation_clock_pending", False)
+                    )
+                    anchor_at = self._position_anchor_time
+                    self._current_source_metadata["media_presentation_deadline"] = (
+                        float(anchor_at) + float(source_pts) - float(self._position_anchor)
+                        if anchor_at is not None and bool(getattr(self.config, "media_presentation_sync", False))
+                        else None
+                    )
+                    if str(getattr(getattr(frame, "device", None), "type", "")) == "cuda":
+                        import torch
+
+                        frame.record_stream(torch.cuda.current_stream(frame.device))
                     self._displayed_frame = frame
                     self._frame = frame
                 else:
@@ -2440,7 +2989,13 @@ class MediaCaptureSource:
                         self.error = f"Media frame pump failed: {pump_error}"
                         print(f"[media] {self.error}", flush=True)
                     if pump_done and buffer_empty:
-                        frame = self._finish_video_stream()
+                        if self.duration > 0.0 and self._current_position() < self.duration:
+                            # Decode-ahead/prepare lead may reach EOF before
+                            # the last visible frame's source-time interval ends.
+                            with self._frame_buffer_condition:
+                                self._frame_buffer_condition.wait(timeout=0.01)
+                        else:
+                            frame = self._finish_video_stream()
         else:
             time.sleep(0.05)
             displayed_frame = getattr(self, "_displayed_frame", None)

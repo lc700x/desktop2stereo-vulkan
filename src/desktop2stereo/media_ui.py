@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -16,11 +17,154 @@ MEDIA_BROWSER_TEXTURE_ASPECT = (
 _MEDIA_BROWSER_SIZE = MEDIA_BROWSER_TEXTURE_SIZE
 MEDIA_BROWSER_VISIBLE_ROWS = 10
 _BROWSER_VISIBLE_ROWS = MEDIA_BROWSER_VISIBLE_ROWS
+MEDIA_HOVER_DURATION_S = 0.16
+_MEDIA_HOVER_BUTTON_SCALE = 0.035
+_MEDIA_HOVER_ROW_SCALE = 0.010
+
+
+@dataclass
+class MediaHoverAnimation:
+    """Shared hover timing for Local Viewer and OpenXR media surfaces."""
+
+    duration_s: float = MEDIA_HOVER_DURATION_S
+    target_hit: str | None = None
+    visual_hit: str | None = None
+    progress: float = 0.0
+    last_at: float | None = None
+
+    def update(self, hover: str | None, now: float) -> tuple[str | None, float]:
+        hover = str(hover) if hover else None
+        previous_identity = _hover_animation_identity(self.target_hit)
+        next_identity = _hover_animation_identity(hover)
+        if hover != self.target_hit:
+            self.target_hit = hover
+            if hover is not None:
+                self.visual_hit = hover
+                if next_identity != previous_identity:
+                    self.progress = 0.0
+        if self.last_at is None:
+            self.last_at = float(now)
+        dt = max(0.0, min(0.1, float(now) - self.last_at))
+        self.last_at = float(now)
+        target = 1.0 if self.target_hit is not None else 0.0
+        duration = max(0.001, float(self.duration_s))
+        if target > self.progress:
+            self.progress = min(target, self.progress + dt / duration)
+        elif target < self.progress:
+            self.progress = max(target, self.progress - dt / (duration * 0.82))
+        if self.progress <= 0.0 and self.target_hit is None:
+            self.visual_hit = None
+        return self.visual_hit, max(0.0, min(1.0, self.progress))
 
 
 def _rgba(token: str, alpha: int = 255) -> tuple[int, int, int, int]:
     value = OPENXR_MENU_COLORS[token].lstrip("#")
     return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4)) + (int(alpha),)
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _ease_out_cubic(value: float) -> float:
+    value = _clamp01(value)
+    return 1.0 - (1.0 - value) ** 3
+
+
+def _mix_rgba(
+    start: tuple[int, int, int, int],
+    end: tuple[int, int, int, int],
+    amount: float,
+) -> tuple[int, int, int, int]:
+    amount = _ease_out_cubic(amount)
+    return tuple(
+        int(round(a + (b - a) * amount)) for a, b in zip(start, end)
+    )
+
+
+def _scaled_rect(
+    rect: tuple[int, int, int, int],
+    progress: float,
+    *,
+    scale: float,
+    lift: float = 0.0,
+) -> tuple[int, int, int, int]:
+    amount = _ease_out_cubic(progress)
+    x0, y0, x1, y1 = (float(value) for value in rect)
+    cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5 - lift * amount
+    half_w = (x1 - x0) * 0.5 * (1.0 + float(scale) * amount)
+    half_h = (y1 - y0) * 0.5 * (1.0 + float(scale) * amount)
+    return (
+        int(round(cx - half_w)),
+        int(round(cy - half_h)),
+        int(round(cx + half_w)),
+        int(round(cy + half_h)),
+    )
+
+
+def _hover_parts(hover: str | None) -> tuple[str, str]:
+    value = str(hover or "")
+    action, separator, target = value.partition(":")
+    return (action.casefold(), target if separator else "")
+
+
+def _hover_animation_identity(hover: str | None) -> str | None:
+    if not hover:
+        return None
+    action, _target = _hover_parts(hover)
+    if action in {"seek", "volume"}:
+        return action
+    return str(hover)
+
+
+def _hover_amount(hover: str | None, action: str, progress: float) -> float:
+    return _clamp01(progress) if _hover_parts(hover)[0] == str(action).casefold() else 0.0
+
+
+def _draw_control_surface(
+    draw,
+    rect: tuple[int, int, int, int],
+    *,
+    enabled: bool,
+    hovered: bool,
+    progress: float,
+    primary: bool = False,
+    idle_alpha: int = 220,
+    disabled_alpha: int = 105,
+    radius: int = OPENXR_MENU_RADII["control"],
+) -> tuple[int, int, int, int]:
+    amount = _clamp01(progress) if hovered and enabled else 0.0
+    target = _scaled_rect(
+        rect,
+        amount,
+        scale=_MEDIA_HOVER_BUTTON_SCALE,
+        lift=1.5,
+    )
+    base = _rgba(
+        "primary_container" if primary else "surface_container_high",
+        idle_alpha if enabled else disabled_alpha,
+    )
+    hover = _rgba("primary_hover", 230 if enabled else disabled_alpha)
+    fill = _mix_rgba(base, hover, amount)
+    outline = _rgba(
+        "primary_hover" if primary else "outline",
+        int(28 + 72 * _ease_out_cubic(amount)) if enabled else 20,
+    )
+    if primary and amount > 0.0 and enabled:
+        halo = (
+            target[0] - 2,
+            target[1] - 2,
+            target[2] + 2,
+            target[3] + 2,
+        )
+        draw.rounded_rectangle(
+            halo,
+            radius=radius + 2,
+            outline=_rgba("primary_hover", int(35 + 95 * _ease_out_cubic(amount))),
+            width=2,
+        )
+    draw.rounded_rectangle(target, radius=radius, fill=fill, outline=outline, width=1)
+    return target
 
 
 def _font(size: int, *, bold: bool = False):
@@ -224,8 +368,16 @@ def media_control_enabled(action: str, state: dict) -> bool:
         return ready and playlist_size > 1
     if action == "playlist_clear":
         return ready and playlist_size > 0
-    if action == "playlist_select":
+    if action in {"playlist_select", "playlist_remove", "playlist_move_up", "playlist_move_down"}:
         return ready and playlist_size > 0
+    if action == "playlist_sort":
+        return ready and playlist_size > 1
+    if action == "playlist_add":
+        return ready and bool(state.get("browser_selection"))
+    if action == "playlist_page_previous":
+        return ready and int(state.get("playlist_offset", 0) or 0) > 0
+    if action == "playlist_page_next":
+        return ready and int(state.get("playlist_offset", 0) or 0) + 4 < playlist_size
     if action in {"entry", "mount"}:
         return ready
     if action == "wake":
@@ -243,20 +395,21 @@ def _browser_layout(state: dict, width: int, height: int) -> dict[str, int]:
     mounts = list(state.get("browser_mounts") or [])
     recent = list(state.get("recent_entries") or [])
     playlist = list(state.get("playlist_entries") or [])
-    sidebar_right = max(360, min(420, int(width * 0.25)))
+    sidebar_right = max(480, min(520, int(width * 0.31)))
     mount_count = min(3, len(mounts))
-    recent_count = min(4, len(recent))
-    playlist_count = min(4, len(playlist))
+    recent_count = min(2, len(recent))
+    playlist_offset = max(0, min(int(state.get("playlist_offset", 0) or 0), max(0, len(playlist) - 1)))
+    playlist_count = min(4, len(playlist) - playlist_offset)
     mount_top = max(150, int(height * 0.125))
-    mount_row_height = 60
+    mount_row_height = 72
     recent_heading_y = mount_top + mount_count * mount_row_height + 34
     recent_rows_y = recent_heading_y + 36
-    recent_row_height = 56
+    recent_row_height = 72
     playlist_heading_y = (
         recent_rows_y + max(1, recent_count) * recent_row_height + 34
     )
     playlist_rows_y = playlist_heading_y + 36
-    playlist_row_height = 52
+    playlist_row_height = 72
     file_rows_y = max(164, int(height * 0.14))
     return {
         "sidebar_right": sidebar_right,
@@ -270,6 +423,7 @@ def _browser_layout(state: dict, width: int, height: int) -> dict[str, int]:
         "playlist_heading_y": playlist_heading_y,
         "playlist_rows_y": playlist_rows_y,
         "playlist_count": playlist_count,
+        "playlist_offset": playlist_offset,
         "playlist_row_height": playlist_row_height,
         "file_rows_y": file_rows_y,
         "file_row_height": max(
@@ -333,12 +487,11 @@ def _browser_button_rects(
             next_x + footer_button_w,
             footer_y + button_h,
         ),
-        "playlist_clear": (
-            clear_x,
-            footer_y,
-            clear_x + footer_button_w,
-            footer_y + button_h,
-        ),
+        "playlist_clear": (clear_x, footer_y, clear_x + footer_button_w, footer_y + button_h),
+        "playlist_add": (clear_x + footer_button_w + footer_gap, footer_y,
+                         clear_x + 2 * footer_button_w + footer_gap, footer_y + button_h),
+        "playlist_sort": (clear_x + 2 * (footer_button_w + footer_gap), footer_y,
+                          clear_x + 3 * footer_button_w + 2 * footer_gap, footer_y + button_h),
     }
 
 
@@ -401,7 +554,12 @@ def _button_rects(width: int, height: int) -> dict[str, tuple[int, int, int, int
         "mute": (mute_left, y0, mute_left + mute_w, bottom),
         "volume": (volume_left, y0, volume_left + volume_w, bottom),
         "browser_up": (browser_up_x, browser_button_y, browser_up_x + browser_button_w, browser_button_bottom),
-        "browser_refresh": (browser_refresh_x, browser_button_y, browser_refresh_x + browser_button_w, browser_button_bottom),
+        "browser_refresh": (
+            browser_refresh_x,
+            browser_button_y,
+            browser_refresh_x + browser_button_w,
+            browser_button_bottom,
+        ),
         "browser_close": (browser_close_x, browser_button_y, browser_close_x + browser_button_w, browser_button_bottom),
         "browse_open": (width - margin - 132, footer_y, width - margin, footer_y + 48),
         "playlist_previous": (margin, footer_y, margin + 82, footer_y + 48),
@@ -416,6 +574,7 @@ def build_media_bar_rgba(
     width: int = 1024,
     height: int = 160,
     hover: str | None = None,
+    hover_progress: float = 1.0,
     alpha: int = 188,
     lang: str = "EN",
     collapsed: bool = False,
@@ -441,37 +600,79 @@ def build_media_bar_rgba(
         width=2,
     )
     rects = _button_rects(width, height)
+    hover_action, hover_target = _hover_parts(hover)
+    hover_amount = _clamp01(hover_progress)
     duration = max(0.0, float(state.get("duration", 0.0) or 0.0))
     position = max(0.0, min(float(state.get("position", 0.0) or 0.0), duration or 1e12))
     fraction = position / duration if duration > 0 else 0.0
     track_left, track_right = 24, width - 24
     track_y = max(26, int(height * 0.20))
+    # Keep endpoint thumb/glow inside a label gutter so hover scaling never
+    # crowds the elapsed/duration timecodes at either end of the timeline.
+    time_label_inset = 22
     seek_enabled = media_control_enabled("seek", state)
-    _text(draw, (track_left, 10), _format_time(position), 16, fill=_rgba("text_secondary"))
+    _text(draw, (track_left + time_label_inset, 10), _format_time(position), 16, fill=_rgba("text_secondary"))
     _text(
         draw,
-        (track_right, 10),
+        (track_right - time_label_inset, 10),
         _format_time(duration),
         16,
         fill=_rgba("text_secondary"),
         anchor="ra",
     )
+    seek_hovered = bool(seek_enabled and hover_action == "seek")
+    seek_progress = hover_amount if seek_hovered else 0.0
+    track_height = 8 + int(round(4 * _ease_out_cubic(seek_progress)))
+    track_top = track_y - (track_height - 8) // 2
     draw.rounded_rectangle(
-        (track_left, track_y, track_right, track_y + 8),
-        radius=4,
-        fill=_rgba("track", 210 if seek_enabled else 120),
+        (track_left, track_top, track_right, track_top + track_height),
+        radius=max(4, track_height // 2),
+        fill=_mix_rgba(
+            _rgba("track", 210 if seek_enabled else 120),
+            _rgba("primary", 230),
+            seek_progress * 0.35,
+        ),
     )
     fill_x = int(track_left + (track_right - track_left) * fraction)
     if seek_enabled and fill_x > track_left:
         draw.rounded_rectangle(
-            (track_left, track_y, fill_x, track_y + 8),
-            radius=4,
-            fill=_rgba("primary"),
+            (track_left, track_top, fill_x, track_top + track_height),
+            radius=max(4, track_height // 2),
+            fill=_mix_rgba(_rgba("primary"), _rgba("primary_hover"), seek_progress),
         )
     if duration > 0 and seek_enabled:
         draw.ellipse(
             (fill_x - 8, track_y - 4, fill_x + 8, track_y + 12),
             fill=_rgba("text_primary"),
+        )
+    if seek_hovered:
+        try:
+            preview_fraction = _clamp01(float(hover_target))
+        except (TypeError, ValueError):
+            preview_fraction = fraction
+        preview_x = int(track_left + (track_right - track_left) * preview_fraction)
+        preview_radius = 8 + int(round(4 * _ease_out_cubic(seek_progress)))
+        glow_radius = preview_radius + 5
+        draw.ellipse(
+            (
+                preview_x - glow_radius,
+                track_y + 4 - glow_radius,
+                preview_x + glow_radius,
+                track_y + 4 + glow_radius,
+            ),
+            outline=_rgba("primary_hover", int(70 + 80 * seek_progress)),
+            width=2,
+        )
+        draw.ellipse(
+            (
+                preview_x - preview_radius,
+                track_y + 4 - preview_radius,
+                preview_x + preview_radius,
+                track_y + 4 + preview_radius,
+            ),
+            fill=_rgba("text_primary"),
+            outline=_rgba("primary_hover"),
+            width=2,
         )
 
     def button(
@@ -481,33 +682,66 @@ def build_media_bar_rgba(
         icon: str | None = None,
         icon_kind: str | None = None,
     ):
-        x0, y0, x1, y1 = rects[key]
+        source = rects[key]
         enabled = media_control_enabled(key, state)
-        active = enabled and hover == key
+        mapped_hover = key
+        if key == "seek-10":
+            active_hover = hover_action == "seek_relative" and hover_target == "-10"
+        elif key == "seek+10":
+            active_hover = hover_action == "seek_relative" and hover_target == "10"
+        elif key == "previous":
+            active_hover = hover_action == "playlist_previous"
+        elif key == "next":
+            active_hover = hover_action == "playlist_next"
+        else:
+            active_hover = hover_action == mapped_hover.casefold()
+        active = bool(enabled and active_hover)
+        progress = hover_amount if active else 0.0
         color = _rgba("text_primary", 255 if enabled else 104)
-        center_y = (y0 + y1) // 2
         if key == "play":
-            ring = _rgba("primary_hover" if active else "primary", 255 if enabled else 105)
-            draw.ellipse((x0, y0, x1, y1), fill=ring)
-            draw.ellipse(
+            draw_rect = _scaled_rect(
+                source,
+                progress,
+                scale=_MEDIA_HOVER_BUTTON_SCALE,
+                lift=1.5,
+            )
+            x0, y0, x1, y1 = draw_rect
+            ring = _mix_rgba(
+                _rgba("primary", 255 if enabled else 105),
+                _rgba("primary_hover", 255 if enabled else 105),
+                progress,
+            )
+            if progress > 0.0 and enabled:
+                halo = (x0 - 2, y0 - 2, x1 + 2, y1 + 2)
+                draw.ellipse(
+                    halo,
+                    outline=_rgba("primary_hover", int(35 + 95 * _ease_out_cubic(progress))),
+                    width=2,
+                )
+            draw.ellipse(draw_rect, fill=ring)
+            inner = _scaled_rect(
                 (x0 + 4, y0 + 4, x1 - 4, y1 - 4),
+                progress,
+                scale=_MEDIA_HOVER_BUTTON_SCALE,
+            )
+            draw.ellipse(
+                inner,
                 fill=_rgba("surface_container_high", 245 if enabled else 130),
             )
-        elif key in {"browse", "browse_disc"}:
-            fill = _rgba(
-                "primary_hover" if active else "surface_container_high",
-                220 if enabled else 105,
-            )
-            draw.rounded_rectangle((x0, y0, x1, y1), radius=12, fill=fill)
         else:
-            draw.rounded_rectangle(
-                (x0, y0, x1, y1),
-                radius=12,
-                fill=_rgba(
-                    "surface_container_high",
-                    (210 if active else 74) if enabled else 34,
-                ),
+            draw_rect = _draw_control_surface(
+                draw,
+                source,
+                enabled=enabled,
+                hovered=active,
+                progress=progress,
+                idle_alpha=220 if key in {"browse", "browse_disc"} else 74,
+                disabled_alpha=34,
+                radius=OPENXR_MENU_RADII["control"],
             )
+            x0, y0, x1, y1 = draw_rect
+        x0, y0, x1, y1 = draw_rect
+        center_y = (y0 + y1) // 2
         if icon_kind == "file":
             _draw_file_icon(draw, x0 + 22, center_y, color)
             _text(draw, (x0 + 44, center_y), label, 14, fill=color, anchor="lm")
@@ -571,33 +805,43 @@ def build_media_bar_rgba(
     )
     volume = max(0.0, min(1.0, float(state.get("volume", 1.0) or 0.0)))
     volume_enabled = media_control_enabled("volume", state)
-    x0, y0, x1, y1 = rects["volume"]
-    center_y = (y0 + y1) // 2
-    volume_active = bool(hover and str(hover).startswith("volume:"))
-    draw.rounded_rectangle(
-        (x0, y0, x1, y1),
-        radius=12,
-        fill=_rgba(
-            "surface_container_high",
-            (210 if volume_active else 74) if volume_enabled else 34,
-        ),
+    volume_active = bool(hover_action == "volume" and volume_enabled)
+    volume_progress = hover_amount if volume_active else 0.0
+    x0, y0, x1, y1 = _draw_control_surface(
+        draw,
+        rects["volume"],
+        enabled=volume_enabled,
+        hovered=volume_active,
+        progress=volume_progress,
+        idle_alpha=74,
+        disabled_alpha=34,
+        radius=OPENXR_MENU_RADII["control"],
     )
+    center_y = (y0 + y1) // 2
+    track_height = 8 + int(round(2 * _ease_out_cubic(volume_progress)))
     track_x0, track_x1 = x0 + 12, x1 - 12
     draw.rounded_rectangle(
-        (track_x0, center_y - 4, track_x1, center_y + 4),
-        radius=4,
-        fill=_rgba("track", 220 if volume_enabled else 105),
+        (track_x0, center_y - track_height // 2, track_x1, center_y + track_height // 2),
+        radius=max(4, track_height // 2),
+        fill=_mix_rgba(
+            _rgba("track", 220 if volume_enabled else 105),
+            _rgba("primary", 230),
+            volume_progress * 0.28,
+        ),
     )
     vx = int(track_x0 + (track_x1 - track_x0) * volume)
+    knob_radius = 7 + int(round(2 * _ease_out_cubic(volume_progress)))
     if volume_enabled:
         draw.rounded_rectangle(
-            (track_x0, center_y - 4, vx, center_y + 4),
-            radius=4,
-            fill=_rgba("primary"),
+            (track_x0, center_y - track_height // 2, vx, center_y + track_height // 2),
+            radius=max(4, track_height // 2),
+            fill=_mix_rgba(_rgba("primary"), _rgba("primary_hover"), volume_progress),
         )
     draw.ellipse(
-        (vx - 7, center_y - 7, vx + 7, center_y + 7),
+        (vx - knob_radius, center_y - knob_radius, vx + knob_radius, center_y + knob_radius),
         fill=_rgba("text_primary", 255 if volume_enabled else 104),
+        outline=_rgba("primary_hover", int(255 * volume_progress)) if volume_active else None,
+        width=2 if volume_active else 1,
     )
     return np.asarray(image, dtype=np.uint8)
 
@@ -709,6 +953,7 @@ def build_media_browser_rgba(
     width: int = MEDIA_BROWSER_TEXTURE_SIZE[0],
     height: int = MEDIA_BROWSER_TEXTURE_SIZE[1],
     hover: str | None = None,
+    hover_progress: float = 1.0,
     scroll_offset: int = 0,
     lang: str = "EN",
 ) -> np.ndarray:
@@ -737,19 +982,29 @@ def build_media_browser_rgba(
         fill=_rgba("text_secondary"),
     )
     mounts = list(state.get("browser_mounts") or [])
-    hover_path = str(hover or "")
-    if hover_path.startswith(("entry:", "mount:", "recent:")):
-        hover_path = hover_path.split(":", 1)[1]
+    hover_action, hover_target = _hover_parts(hover)
+    hover_amount = _clamp01(hover_progress)
+    hover_path = hover_target
     for index, mount in enumerate(mounts[:layout["mount_count"]]):
-        center_y = layout["mount_top"] + index * layout["mount_row_height"] + 18
+        center_y = layout["mount_top"] + index * layout["mount_row_height"] + layout["mount_row_height"] // 2
         path = str(mount.get("path", ""))
         selected = path == str(state.get("browser_path", ""))
-        active = path == hover_path
+        active = hover_action == "mount" and path == hover_path
         if selected or active:
+            row = _scaled_rect(
+                (40, center_y - 32, sidebar_right - 14, center_y + 32),
+                hover_amount if active else 0.0,
+                scale=_MEDIA_HOVER_ROW_SCALE,
+                lift=0.8,
+            )
             draw.rounded_rectangle(
-                (40, center_y - 18, sidebar_right - 14, center_y + 18),
+                row,
                 radius=8,
-                fill=_rgba("primary_hover" if active else "primary_container", 225),
+                fill=_mix_rgba(
+                    _rgba("primary_container", 225),
+                    _rgba("primary_hover", 235),
+                    hover_amount if active else 0.0,
+                ),
             )
         _draw_kind_icon(
             draw,
@@ -764,10 +1019,10 @@ def build_media_browser_rgba(
             _fit_text(
                 draw,
                 str(mount.get("name") or mount.get("path") or ""),
-                16,
+                21,
                 sidebar_right - 120,
             ),
-            16,
+            21,
             fill=_rgba("text_primary"),
             anchor="lm",
         )
@@ -787,13 +1042,23 @@ def build_media_browser_rgba(
                 + layout["recent_row_height"] // 2
             )
             path = str(entry.get("path", ""))
-            hovered = path == hover_path
-            active = path == str(state.get("browser_selection", "")) or hovered
-            if active:
-                draw.rounded_rectangle(
+            hovered = hover_action == "recent" and path == hover_path
+            selected = path == str(state.get("browser_selection", ""))
+            if hovered or selected:
+                row = _scaled_rect(
                     (40, center_y - 18, sidebar_right - 14, center_y + 18),
+                    hover_amount if hovered else 0.0,
+                    scale=_MEDIA_HOVER_ROW_SCALE,
+                    lift=0.8,
+                )
+                draw.rounded_rectangle(
+                    row,
                     radius=8,
-                    fill=_rgba("primary_hover" if hovered else "primary_container", 190),
+                    fill=_mix_rgba(
+                        _rgba("primary_container", 190),
+                        _rgba("primary_hover", 220),
+                        hover_amount if hovered else 0.0,
+                    ),
                 )
             _draw_kind_icon(
                 draw,
@@ -808,25 +1073,37 @@ def build_media_browser_rgba(
                 _fit_text(
                     draw,
                     str(entry.get("name") or Path(path).name or path),
-                    15,
+                    21,
                     sidebar_right - 164,
                 ),
-                15,
+                21,
                 fill=_rgba("text_primary"),
                 anchor="lm",
             )
+            remove_hover = hover_action == "recent_remove" and path == hover_path
+            if remove_hover:
+                radius = 16 + int(round(3 * _ease_out_cubic(hover_amount)))
+                draw.ellipse(
+                    (
+                        sidebar_right - 30 - radius,
+                        center_y - radius,
+                        sidebar_right - 30 + radius,
+                        center_y + radius,
+                    ),
+                    fill=_rgba("primary_hover", 190),
+                )
             _draw_close_x(
                 draw,
                 sidebar_right - 30,
                 center_y,
-                _rgba("text_secondary"),
+                _rgba("text_primary" if remove_hover else "text_secondary"),
             )
     else:
         _text(
             draw,
             (84, layout["recent_rows_y"] + 18),
             translate("No recent media"),
-            15,
+            21,
             fill=_rgba("text_secondary"),
             anchor="lm",
         )
@@ -838,24 +1115,37 @@ def build_media_browser_rgba(
         font=_font(22, bold=True),
         fill=_rgba("text_secondary"),
     )
-    playlist_index = int(state.get("playlist_index", -1) or -1)
-    for index, item in enumerate(playlist[:layout["playlist_count"]]):
+    playlist_index = int(state.get("playlist_index", -1) if state.get("playlist_index") is not None else -1)
+    playlist_offset = layout["playlist_offset"]
+    for index, item in enumerate(playlist[playlist_offset:playlist_offset + layout["playlist_count"]]):
         center_y = (
             layout["playlist_rows_y"]
             + index * layout["playlist_row_height"]
             + layout["playlist_row_height"] // 2
         )
-        if index == playlist_index:
+        item_path = str(item.get("path", ""))
+        row_hovered = hover_action == "playlist_select" and hover_target == item_path
+        if index + playlist_offset == playlist_index or row_hovered:
+            row = _scaled_rect(
+                (40, center_y - 32, sidebar_right - 14, center_y + 32),
+                hover_amount if row_hovered else 0.0,
+                scale=_MEDIA_HOVER_ROW_SCALE,
+                lift=0.8,
+            )
             draw.rounded_rectangle(
-                (40, center_y - 15, sidebar_right - 14, center_y + 15),
+                row,
                 radius=6,
-                fill=_rgba("primary_container", 190),
+                fill=_mix_rgba(
+                    _rgba("primary_container", 190),
+                    _rgba("primary_hover", 225),
+                    hover_amount if row_hovered else 0.0,
+                ),
             )
         _text(
             draw,
             (52, center_y),
-            f"{index + 1:02d}",
-            14,
+            f"{index + playlist_offset + 1:02d}",
+            18,
             fill=_rgba("text_secondary"),
             anchor="lm",
         )
@@ -865,50 +1155,101 @@ def build_media_browser_rgba(
             _fit_text(
                 draw,
                 Path(item.get("path", "")).name,
-                15,
-                sidebar_right - 122,
+                21,
+                sidebar_right - 242,
             ),
-            15,
+            21,
             fill=_rgba("text_primary"),
             anchor="lm",
         )
 
-    playlist_rects = _button_rects(width, height)
+        for action, label, left in (
+            ("playlist_move_up", "↑", sidebar_right - 164),
+            ("playlist_move_down", "↓", sidebar_right - 112),
+            ("playlist_remove", "×", sidebar_right - 60),
+        ):
+            enabled = action == "playlist_remove" or (
+                index + playlist_offset > 0 if action == "playlist_move_up"
+                else index + playlist_offset + 1 < len(playlist)
+            )
+            action_hovered = hover_action == action and hover_target == item_path
+            action_rect = _draw_control_surface(
+                draw,
+                (left, center_y - 24, left + 48, center_y + 24),
+                enabled=enabled,
+                hovered=action_hovered,
+                progress=hover_amount,
+                idle_alpha=220,
+                disabled_alpha=100,
+                radius=OPENXR_MENU_RADII["control"],
+            )
+            _text(draw, ((action_rect[0] + action_rect[2]) // 2, (action_rect[1] + action_rect[3]) // 2),
+                label, 22, fill=_rgba("text_primary", 255 if enabled else 104), anchor="mm")
+    for action, label, left in (
+        ("playlist_page_previous", "‹", sidebar_right - 112),
+        ("playlist_page_next", "›", sidebar_right - 60),
+    ):
+        y = layout["playlist_heading_y"] - 12
+        enabled = media_control_enabled(action, state)
+        action_hovered = hover_action == action
+        action_rect = _draw_control_surface(
+            draw,
+            (left, y, left + 48, y + 48),
+            enabled=enabled,
+            hovered=action_hovered,
+            progress=hover_amount,
+            idle_alpha=220,
+            disabled_alpha=100,
+            radius=OPENXR_MENU_RADII["control"],
+        )
+        _text(draw, ((action_rect[0] + action_rect[2]) // 2, (action_rect[1] + action_rect[3]) // 2),
+            label, 22, fill=_rgba("text_primary", 255 if enabled else 104), anchor="mm")
+
+    playlist_rects = rects
     for key, label in (
         ("playlist_previous", translate("Previous")),
         ("playlist_next", translate("Next")),
         ("playlist_clear", translate("Clear")),
+        ("playlist_add", translate("Add")),
+        ("playlist_sort", translate("Sort Z–A" if state.get("playlist_sort_descending") is False else "Sort A–Z")),
     ):
-        x0, y0, x1, y1 = playlist_rects[key]
         enabled = media_control_enabled(key, state)
-        draw.rounded_rectangle(
-            (x0, y0, x1, y1),
+        action_hovered = hover_action == key
+        action_rect = _draw_control_surface(
+            draw,
+            playlist_rects[key],
+            enabled=enabled,
+            hovered=action_hovered,
+            progress=hover_amount,
+            idle_alpha=220,
+            disabled_alpha=105,
             radius=8,
-            fill=_rgba("surface_container_high", 220 if enabled else 105),
         )
         _text(
             draw,
-            ((x0 + x1) // 2, (y0 + y1) // 2),
+            ((action_rect[0] + action_rect[2]) // 2, (action_rect[1] + action_rect[3]) // 2),
             label,
-            15,
+            21,
             fill=_rgba("text_primary", 255 if enabled else 104),
             anchor="mm",
         )
 
-    open_x0, open_y0, open_x1, open_y1 = playlist_rects["browse_open"]
     open_enabled = media_control_enabled("browse_open", state)
-    open_hovered = str(hover or "").startswith("browse_open")
-    draw.rounded_rectangle(
-        (open_x0, open_y0, open_x1, open_y1),
+    open_hovered = hover_action == "browse_open"
+    open_rect = _draw_control_surface(
+        draw,
+        playlist_rects["browse_open"],
+        enabled=open_enabled,
+        hovered=open_hovered,
+        progress=hover_amount,
+        primary=True,
+        idle_alpha=230,
+        disabled_alpha=105,
         radius=8,
-        fill=_rgba(
-            "primary_hover" if open_hovered else "primary_container",
-            230 if open_enabled else 105,
-        ),
     )
     _text(
         draw,
-        ((open_x0 + open_x1) // 2, (open_y0 + open_y1) // 2),
+        ((open_rect[0] + open_rect[2]) // 2, (open_rect[1] + open_rect[3]) // 2),
         translate("Open"),
         17,
         fill=_rgba("text_primary", 255 if open_enabled else 104),
@@ -937,16 +1278,21 @@ def build_media_browser_rgba(
         ("browser_up", translate("Up")),
         ("browser_refresh", translate("Refresh")),
     ):
-        x0, y0, x1, y1 = rects[key]
         enabled = media_control_enabled(key, state)
-        draw.rounded_rectangle(
-            (x0, y0, x1, y1),
+        action_hovered = hover_action == key
+        action_rect = _draw_control_surface(
+            draw,
+            rects[key],
+            enabled=enabled,
+            hovered=action_hovered,
+            progress=hover_amount,
+            idle_alpha=220,
+            disabled_alpha=105,
             radius=8,
-            fill=_rgba("surface_container_high", 220 if enabled else 105),
         )
         _text(
             draw,
-            ((x0 + x1) // 2, (y0 + y1) // 2),
+            ((action_rect[0] + action_rect[2]) // 2, (action_rect[1] + action_rect[3]) // 2),
             label,
             18,
             fill=_rgba("text_primary", 255 if enabled else 104),
@@ -962,13 +1308,22 @@ def build_media_browser_rgba(
         y0 = row_top + index * row_height
         y1 = y0 + row_height - 4
         path = str(entry.get("path", ""))
-        hovered = path == hover_path
-        active = path == selected_path or hovered
-        if active:
-            draw.rounded_rectangle(
+        hovered = hover_action == "entry" and path == hover_path
+        if path == selected_path or hovered:
+            row = _scaled_rect(
                 (sidebar_right + 18, y0, width - 38, y1),
+                hover_amount if hovered else 0.0,
+                scale=_MEDIA_HOVER_ROW_SCALE,
+                lift=0.8,
+            )
+            draw.rounded_rectangle(
+                row,
                 radius=8,
-                fill=_rgba("primary_hover" if hovered else "primary_container", 180),
+                fill=_mix_rgba(
+                    _rgba("primary_container", 180),
+                    _rgba("primary_hover", 220),
+                    hover_amount if hovered else 0.0,
+                ),
             )
         center_y = (y0 + y1) // 2
         _draw_kind_icon(
@@ -985,12 +1340,33 @@ def build_media_browser_rgba(
                 draw,
                 str(entry.get("name") or path),
                 21,
-                width - sidebar_right - 150,
+                width - sidebar_right - 204,
             ),
             21,
             fill=_rgba("text_primary"),
             anchor="lm",
         )
+        if entry.get("kind") in {"video", "image", "disc"}:
+            left = width - 94
+            add_hovered = hover_action == "playlist_add" and hover_target == path
+            add_rect = _draw_control_surface(
+                draw,
+                (left, center_y - 24, left + 48, center_y + 24),
+                enabled=True,
+                hovered=add_hovered,
+                progress=hover_amount,
+                idle_alpha=220,
+                disabled_alpha=105,
+                radius=OPENXR_MENU_RADII["control"],
+            )
+            _text(
+                draw,
+                ((add_rect[0] + add_rect[2]) // 2, (add_rect[1] + add_rect[3]) // 2),
+                "+",
+                24,
+                fill=_rgba("text_primary"),
+                anchor="mm",
+            )
     if not entries:
         _text(
             draw,
@@ -1039,13 +1415,15 @@ def media_browser_hit(
         "playlist_previous",
         "playlist_next",
         "playlist_clear",
+        "playlist_add",
+        "playlist_sort",
     ):
         x0, y0, x1, y1 = rects[key]
         if x0 <= x <= x1 and y0 <= y <= y1:
-            if key == "browse_open":
+            if key in {"browse_open", "playlist_add"}:
                 selected = str(state.get("browser_selection") or "")
                 return (
-                    ("browse_open", selected)
+                    (key, selected)
                     if media_control_enabled(key, state)
                     else None
                 )
@@ -1057,7 +1435,7 @@ def media_browser_hit(
     recent = list(state.get("recent_entries") or [])
     if 28 <= x <= sidebar_right - 14:
         for index, mount in enumerate(mounts[:layout["mount_count"]]):
-            center_y = layout["mount_top"] + index * layout["mount_row_height"] + 18
+            center_y = layout["mount_top"] + index * layout["mount_row_height"] + layout["mount_row_height"] // 2
             if abs(y - center_y) <= layout["mount_row_height"] // 2:
                 return "mount", mount.get("path")
         for index, entry in enumerate(recent[:layout["recent_count"]]):
@@ -1079,13 +1457,26 @@ def media_browser_hit(
                     if media_control_enabled("recent", state)
                     else None
                 )
-        for index, item in enumerate(playlist[:layout["playlist_count"]]):
+        for action, left in (("playlist_page_previous", sidebar_right - 112),
+                             ("playlist_page_next", sidebar_right - 60)):
+            if left <= x <= left + 48 and layout["playlist_heading_y"] - 12 <= y <= layout["playlist_heading_y"] + 36:
+                return (action, None) if media_control_enabled(action, state) else None
+        offset = layout["playlist_offset"]
+        for index, item in enumerate(playlist[offset:offset + layout["playlist_count"]]):
             center_y = (
                 layout["playlist_rows_y"]
                 + index * layout["playlist_row_height"]
                 + layout["playlist_row_height"] // 2
             )
-            if abs(y - center_y) <= layout["playlist_row_height"] // 2:
+            if abs(y - center_y) <= 24:
+                for action, left in (("playlist_move_up", sidebar_right - 164),
+                                     ("playlist_move_down", sidebar_right - 112),
+                                     ("playlist_remove", sidebar_right - 60)):
+                    if left <= x <= left + 48:
+                        enabled = action == "playlist_remove" or (
+                            index + offset > 0 if action == "playlist_move_up" else index + offset + 1 < len(playlist)
+                        )
+                        return (action, item.get("path")) if enabled else None
                 return (
                     ("playlist_select", item.get("path"))
                     if media_control_enabled("playlist_select", state)
@@ -1098,5 +1489,9 @@ def media_browser_hit(
         index = int((y - row_top) // row_height) + int(scroll_offset)
         entries = list(state.get("browser_entries") or [])
         if 0 <= index < len(entries):
+            if width - 94 <= x <= width - 46 and entries[index].get("kind") in {"video", "image", "disc"}:
+                center_y = row_top + (index - int(scroll_offset)) * row_height + (row_height - 4) // 2
+                if abs(y - center_y) <= 24:
+                    return "playlist_add", entries[index].get("path")
             return ("entry", entries[index].get("path"))
     return None

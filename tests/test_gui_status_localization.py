@@ -15,7 +15,7 @@ def test_media_controls_have_translations_for_every_locale():
     assert MESSAGE_CATALOGS["EN"]["OpenXR Controls"] == "XR Control"
     assert MESSAGE_CATALOGS["CN"]["OpenXR Controls"] == "XR 控件"
     assert MESSAGE_CATALOGS["EN"]["Media Player"] == "Media Player"
-    assert MESSAGE_CATALOGS["CN"]["Media Player"] == "媒体播放器"
+    assert MESSAGE_CATALOGS["CN"]["Media Player"] == "媒体播放"
     assert MESSAGE_CATALOGS["EN"]["Recent"] == "Recent"
     assert MESSAGE_CATALOGS["CN"]["Recent"] == "最近打开"
     assert MESSAGE_CATALOGS["EN"]["Open File"] == "Open File"

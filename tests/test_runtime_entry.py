@@ -28,13 +28,13 @@ def _load_environment_resolver():
     return namespace["_resolve_filament_environment_paths"]
 
 
-def test_media_player_forces_local_viewer_vsync() -> None:
+def test_local_viewer_uses_configured_vsync_for_media_and_desktop() -> None:
     from app_runtime.runtime_entry import _local_viewer_vsync_enabled
 
-    assert _local_viewer_vsync_enabled(False, "File") is True
-    assert _local_viewer_vsync_enabled(False, "file") is True
-    assert _local_viewer_vsync_enabled(False, "Video") is True
-    assert _local_viewer_vsync_enabled(False, "Image") is True
+    assert _local_viewer_vsync_enabled(False, "File") is False
+    assert _local_viewer_vsync_enabled(False, "file") is False
+    assert _local_viewer_vsync_enabled(False, "Video") is False
+    assert _local_viewer_vsync_enabled(False, "Image") is False
     assert _local_viewer_vsync_enabled(False, "Monitor") is False
     assert _local_viewer_vsync_enabled(True, "Window") is True
 
@@ -931,3 +931,15 @@ def test_media_capture_options_derive_stable_recent_history_path(
     )
 
     assert options["media_history_path"] == str(tmp_path / "media-recent.json")
+
+
+
+@pytest.mark.parametrize("mode, expected", [
+    ("OpenXR", True), ("OpenXR Link", True), ("Viewer", True), ("Local Viewer", True),
+    ("RTMP Streamer", False), ("MJPEG Streamer", False),
+])
+def test_media_presentation_audio_sync_is_enabled_only_for_measured_viewers(mode, expected):
+    from app_runtime.runtime_context import _media_capture_options_from_environment
+
+    options = _media_capture_options_from_environment(mode)
+    assert options["media_presentation_sync"] is expected

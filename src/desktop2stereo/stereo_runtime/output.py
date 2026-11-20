@@ -188,6 +188,17 @@ def downsample_horizontal_area_srgb(
     image = ensure_bchw(image, name="image")
     if image.shape[1] not in (3, 4):
         raise ValueError("sRGB area sampling expects RGB or RGBA")
+    width = int(image.shape[-1])
+    target_width = width // 2 if target_width is None else int(target_width)
+    if image.device.type == "cuda":
+        try:
+            from .output_quality_triton import horizontal_area_srgb
+
+            reduced = horizontal_area_srgb(image, target_width)
+            if reduced is not None:
+                return reduced
+        except (ImportError, RuntimeError):
+            reduced = None  # Retain the established GPU Torch filter on unavailable/failed Triton.
     scale = 255.0 if image.dtype == torch.uint8 else 1.0
     source = image.float() / scale
     rgb = source[:, :3].clamp(0.0, 1.0)

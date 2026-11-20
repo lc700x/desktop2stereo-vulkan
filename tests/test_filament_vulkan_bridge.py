@@ -487,7 +487,7 @@ def test_native_controller_overlay_preserves_composer_color() -> None:
     eye_source = (root / "native/filament/bridge/bridge_eye.cpp").read_text(
         encoding="utf-8"
     )
-    overlay = eye_source[eye_source.index("int bridge_eye_render_controller_overlay"):]
+    overlay = eye_source[eye_source.index("int bridge_eye_render_controller_overlay_impl"):]
     overlay = overlay[:overlay.index("namespace {")]
 
     assert "overlay_options.clear = false;" in overlay
@@ -496,6 +496,9 @@ def test_native_controller_overlay_preserves_composer_color() -> None:
     assert "render(eye.controller_guide_view)" not in overlay
     assert "render(bridge->view)" not in overlay
     assert "render(eye.foreground_view)" not in overlay
+    assert "if (wait_for_idle)" in overlay
+    assert "bridge->engine->flush();" in overlay
+    assert "bridge_eye_render_controller_overlay_deferred" in eye_source
 
     context_source = (
         root / "native/filament/bridge/bridge_context.cpp"
@@ -513,6 +516,15 @@ def test_native_controller_overlay_preserves_composer_color() -> None:
         "bridge->multiview_active ? bridge->scene : bridge->foreground_scene"
         not in guide_source
     )
+
+    facade = (root / "native/filament/bridge/filament_bridge.cpp").read_text(
+        encoding="utf-8"
+    )
+    public_header = (root / "native/filament/bridge/filament_bridge.h").read_text(
+        encoding="utf-8"
+    )
+    assert "filament_bridge_render_controller_overlay_deferred" in facade
+    assert "filament_bridge_render_controller_overlay_deferred" in public_header
 
 
 def test_native_background_frame_defers_controller_layers_to_overlay() -> None:

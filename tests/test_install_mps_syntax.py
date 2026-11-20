@@ -32,9 +32,9 @@ def test_install_mps_shell_syntax() -> None:
         script = ROOT / "src" / "env_install" / name
         assert script.is_file()
         result = subprocess.run(
-            ["bash", "-n", str(script)],
+            ["bash", "-n"],
+            input=script.read_text(encoding="utf-8").encode("utf-8"),
             capture_output=True,
-            text=True,
         )
         assert result.returncode == 0, result.stderr
 

@@ -36,6 +36,7 @@ class CaptureConfig:
     media_muted: bool = False
     media_browser_directory: str | None = None
     media_audio_enabled: bool = True
+    media_presentation_sync: bool = False
     render_size_config: Any | None = None
     window_handle: int | None = None
     window_rect: tuple[int, int, int, int] | None = None

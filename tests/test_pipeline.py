@@ -18,6 +18,7 @@ from stereo_runtime.pipeline import (
     _cursor_only_rgb_change,
     _enable_openxr_depth_cuda_graph_if_needed,
     _gpu_capture_input_requires_device_residency,
+    _media_presentation_preroll_pending,
     _motion_sample,
     _motion_score,
     _native_coreml_capture_enabled,
@@ -68,6 +69,48 @@ def test_gpu_required_allows_host_media_input_for_gpu_preprocessing(capture_mode
     )
 
 
+def test_media_presentation_preroll_wait_is_limited_to_pending_video_frames():
+    captured = SimpleNamespace(
+        metadata={"media_presentation_clock_pending": True},
+    )
+
+    assert _media_presentation_preroll_pending(
+        SimpleNamespace(capture_mode="File"), captured
+    )
+    assert not _media_presentation_preroll_pending(
+        SimpleNamespace(capture_mode="Window"), captured
+    )
+    assert not _media_presentation_preroll_pending(
+        SimpleNamespace(capture_mode="File"),
+        SimpleNamespace(metadata={"media_presentation_clock_pending": False}),
+    )
+
+
+def test_parallel_depth_scheduler_can_wait_for_the_current_preroll_job():
+    class Future:
+        def __init__(self):
+            self.ready = threading.Event()
+
+        def done(self):
+            return self.ready.is_set()
+
+        def result(self):
+            assert self.ready.wait(timeout=1.0)
+            return "depth-profile"
+
+    scheduler = object.__new__(_ParallelDepthScheduler)
+    scheduler.pending = [SimpleNamespace(future=Future(), depth_profile=None)]
+    job = scheduler.pending[0]
+    worker = threading.Thread(target=lambda: (time.sleep(0.02), job.future.ready.set()))
+    worker.start()
+    try:
+        assert scheduler.pop_ready(block=True) is job
+        assert job.depth_profile == "depth-profile"
+        assert scheduler.pending == []
+    finally:
+        worker.join(timeout=1.0)
+
+
 def test_media_depth_reuse_is_bounded_to_media_generation_and_age():
     import time
 
@@ -81,7 +124,7 @@ def test_media_depth_reuse_is_bounded_to_media_generation_and_age():
         depth_config=SimpleNamespace(model_name="depth", resolution=518, backend="tensorrt"),
         config=SimpleNamespace(depth_model="depth", depth_resolution=518, backend="tensorrt"),
     )
-    ctx = SimpleNamespace(stereo_runtime=runtime)
+    ctx = SimpleNamespace(stereo_runtime=runtime, run_mode="OpenXR")
     captured = CapturedFrame(
         frame=np.zeros((2, 2, 3), dtype=np.uint8),
         target_height=2,
@@ -111,6 +154,25 @@ def test_media_depth_reuse_is_bounded_to_media_generation_and_age():
     assert reuse[1] == 11
     assert loop._media_depth_cache_reason == "exact_match"
 
+    next_source_frame = CapturedFrame(
+        frame=np.ones((2, 2, 3), dtype=np.uint8),
+        target_height=2,
+        timestamp=1.0,
+        capture_mode="Video",
+        metadata={
+            "capture_frame_id": 12,
+            "media_generation": 4,
+            "source_frame_index": 101,
+            "source_pts": 4.033333,
+        },
+    )
+    temporal = loop._media_depth_reuse_candidate(
+        ctx, next_source_frame, frame_rgb, (2, 2), target_key
+    )
+    assert temporal is not None
+    assert temporal[0] is loop._media_depth_profile
+    assert loop._media_depth_cache_reason == "temporal_reuse"
+
     changed_generation = CapturedFrame(
         frame=captured.frame,
         target_height=2,
@@ -131,7 +193,62 @@ def test_media_depth_reuse_is_bounded_to_media_generation_and_age():
         pipeline_module._source_target_key(changed_generation),
     ) is None
     assert loop._media_depth_profile is None
-    assert loop._media_depth_cache_reason == "identity_mismatch"
+    assert loop._media_depth_cache_reason == "generation_mismatch"
+
+
+def test_media_depth_reuse_is_disabled_for_media_frames():
+    loop = object.__new__(RuntimePipelineLoop)
+    loop._media_depth_profile = object()
+    loop._media_depth_source_frame_id = 11
+    loop._media_depth_cached_at = time.perf_counter()
+    frame_rgb = SimpleNamespace(device="cuda:0")
+    runtime = SimpleNamespace(
+        active_settings_version=3,
+        depth_config=SimpleNamespace(model_name="depth", resolution=518, backend="tensorrt"),
+        config=SimpleNamespace(
+            depth_model="depth",
+            depth_resolution=518,
+            backend="tensorrt",
+        ),
+    )
+    ctx = SimpleNamespace(
+        stereo_runtime=runtime,
+        run_mode="OpenXR",
+        media_depth_reuse_disabled=True,
+    )
+    first = CapturedFrame(
+        frame=np.zeros((2, 2, 3), dtype=np.uint8),
+        target_height=2,
+        timestamp=1.0,
+        capture_mode="Video",
+        metadata={"capture_frame_id": 11, "media_generation": 4,
+                  "source_frame_index": 100, "source_pts": 4.0},
+    )
+    target_key = ("captured", "Video", 0, "", (("media_generation", "4"),))
+    loop._media_depth_identity = loop._exact_video_frame_identity(first)
+    loop._media_depth_cache_key = (
+        loop._build_cursor_depth_cache_key(ctx, first, frame_rgb, (2, 2), target_key),
+        loop._media_depth_identity,
+    )
+    second = CapturedFrame(
+        frame=np.ones((2, 2, 3), dtype=np.uint8),
+        target_height=2,
+        timestamp=1.0,
+        capture_mode="Video",
+        metadata={"capture_frame_id": 12, "media_generation": 4,
+                  "source_frame_index": 101, "source_pts": 4.033333},
+    )
+
+    assert loop._media_depth_reuse_candidate(
+        ctx, second, frame_rgb, (2, 2), target_key
+    ) is None
+    assert loop._media_depth_cache_reason == "fresh_only"
+
+
+
+def test_media_depth_reuse_default_age_tolerates_low_rate_depth_updates(monkeypatch):
+    monkeypatch.delenv("D2S_MEDIA_DEPTH_REUSE_MAX_AGE_MS", raising=False)
+    assert RuntimePipelineLoop._media_depth_reuse_max_age_s() == pytest.approx(0.5)
 
 
 def test_media_depth_reuse_rejects_changed_or_ambiguous_frames():
@@ -186,6 +303,47 @@ def test_media_depth_reuse_rejects_changed_or_ambiguous_frames():
     ) is None
     assert loop._media_depth_cache_reason == "identity_mismatch"
 
+
+def test_media_depth_cache_accepts_profile_when_packed_result_has_no_depth():
+    import time
+
+    loop = object.__new__(RuntimePipelineLoop)
+    frame_rgb = SimpleNamespace(device="cuda:0")
+    runtime = SimpleNamespace(
+        active_settings_version=7,
+        depth_config=SimpleNamespace(model_name="depth", resolution=518, backend="migraphx"),
+        config=SimpleNamespace(depth_model="depth", depth_resolution=518, backend="migraphx"),
+    )
+    ctx = SimpleNamespace(stereo_runtime=runtime, run_mode="Local Viewer")
+    captured = CapturedFrame(
+        frame=np.zeros((2, 2, 3), dtype=np.uint8),
+        target_height=2,
+        timestamp=1.0,
+        capture_mode="Video",
+        metadata={
+            "capture_frame_id": 40,
+            "media_generation": 8,
+            "source_frame_index": 12,
+            "source_pts": 0.5,
+        },
+    )
+    target_key = pipeline_module._source_target_key(captured)
+    profile = object()
+
+    loop._commit_media_depth_cache(
+        ctx,
+        captured,
+        frame_rgb,
+        (2, 2),
+        target_key,
+        SimpleNamespace(depth=None, depth_profile=None),
+        reused=False,
+        depth_profile=profile,
+    )
+
+    assert loop._media_depth_profile is profile
+    assert loop._media_depth_cached_at > 0.0
+
     ambiguous = CapturedFrame(
         frame=captured.frame,
         target_height=2,
@@ -219,6 +377,8 @@ def test_attach_capture_debug_marks_depth_complete_for_current_frame():
             "media_generation": 3,
             "source_frame_index": 17,
             "source_pts": 2.5,
+            "media_terminal_partial": True,
+            "media_presentation_deadline": 100.25,
             "gpu_to_cpu": True,
             "gpu_copy_count": 2,
         },
@@ -240,6 +400,8 @@ def test_attach_capture_debug_marks_depth_complete_for_current_frame():
     assert result.debug_info["media_generation"] == 3
     assert result.debug_info["source_frame_index"] == 17
     assert result.debug_info["source_pts"] == 2.5
+    assert result.debug_info["media_terminal_partial"] is True
+    assert result.debug_info["media_presentation_deadline"] == 100.25
 
 
 def test_attach_capture_debug_keeps_cursor_reused_depth_source_frame_id():
@@ -548,6 +710,25 @@ def test_coreml_viewer_parallel_enables_adaptive_backoff_by_default(monkeypatch)
     )
 
     assert _runtime_parallel_adaptive_backoff_enabled(context) is True
+
+
+def test_media_depth_prefetch_enables_adaptive_backoff_by_default(monkeypatch):
+    monkeypatch.delenv("D2S_RUNTIME_PARALLEL_ADAPTIVE_BACKOFF", raising=False)
+    context = SimpleNamespace(
+        run_mode="OpenXR",
+        capture_mode="File",
+        runtime_config=SimpleNamespace(
+            parallel_inference=True,
+            parallel_inference_workers=2,
+            use_coreml=False,
+        ),
+        stereo_runtime=SimpleNamespace(
+            depth_provider=SimpleNamespace(pipeline_slot_count=2)
+        ),
+    )
+
+    assert _runtime_parallel_adaptive_backoff_enabled(context) is True
+
 
 
 def test_coreml_viewer_parallel_adaptive_backoff_can_be_disabled(monkeypatch):
@@ -900,6 +1081,26 @@ def test_openxr_safe_dual_slot_defaults_to_two_pending(monkeypatch):
     monkeypatch.delenv("D2S_RUNTIME_PENDING_CUDA_DEPTH", raising=False)
 
     assert _runtime_pending_depth_limit(_dual_pending_context()) == 2
+
+
+def test_media_playback_auto_enables_exact_depth_prefetch_with_safe_slots(monkeypatch):
+    monkeypatch.setenv("D2S_MEDIA_DEPTH_PREFETCH", "1")
+    events = []
+    context = _dual_pending_context()
+    context.capture_mode = "File"
+    context.runtime_config = SimpleNamespace(
+        parallel_inference=False,
+        parallel_inference_workers=1,
+    )
+    context.source_stat_inc = lambda name, **values: events.append((name, values))
+    loop = RuntimePipelineLoop(context)
+
+    loop._ensure_parallel_depth_scheduler()
+
+    assert loop._parallel_depth_scheduler is not None
+    assert loop._parallel_depth_scheduler.worker_count == 2
+    assert events == [("runtime_parallel_workers", {"active_workers": 2})]
+    loop._parallel_depth_scheduler.close()
 
 
 @pytest.mark.parametrize(
@@ -1507,3 +1708,29 @@ def test_quality_scale_gpu_preprocess_matches_final_pipeline_size(monkeypatch, c
     assert runtime_rgb.is_cuda and tuple(runtime_rgb.shape) == (1, 3, target[1], target[0])
     expected_rgb = torch.tensor([240, 64, 8], dtype=torch.float32, device="cuda").view(1, 3, 1, 1) / 255.0
     assert torch.allclose(runtime_rgb, expected_rgb.expand_as(runtime_rgb), atol=1e-6, rtol=0.0)
+
+
+@pytest.mark.parametrize("older_complete", [False, True])
+def test_ordered_media_pending_queue_keeps_oldest_identity(monkeypatch, older_complete):
+    older = SimpleNamespace(cuda_ready_event=SimpleNamespace(ready=older_complete))
+    newest = SimpleNamespace(cuda_ready_event=SimpleNamespace(ready=True))
+    monkeypatch.setattr(pipeline_module, "_cuda_event_ready", lambda event, **kwargs: event.ready)
+    loop = RuntimePipelineLoop.__new__(RuntimePipelineLoop)
+    raw_q = queue.Queue(maxsize=1)
+    raw_q._d2s_ordered = True
+    loop.context = SimpleNamespace(runtime_q=raw_q)
+    loop._pending_runtime_items = [(older,), (newest,)]
+    loop._pending_depth_limit = lambda: 1
+    published = []
+    loop._publish_runtime_item = published.append
+    assert loop._publish_ready_pending_items() == int(older_complete)
+    assert published == ([(older,)] if older_complete else [])
+    assert (newest,) in loop._pending_runtime_items
+    if not older_complete:
+        assert loop._pending_runtime_items == [(older,), (newest,)]
+        older.cuda_ready_event.ready = True
+        assert loop._publish_ready_pending_items() == 1
+        assert published == [(older,)]
+    assert loop._publish_ready_pending_items() == 1
+    assert published[-1] == (newest,)
+    assert loop._pending_runtime_items == []
