@@ -13,10 +13,11 @@ from stereo_runtime.depth_provider import (
     DepthProfileResult,
     DepthProviderInfo,
     _is_zipdepth_model,
+    _model_output_semantics,
     ZipDepthProvider,
     _postprocess_generic_depth,
 )
-from stereo_runtime.depth_upsample import DepthUpsampleMode, upsample_depth
+from stereo_runtime.depth_upsample import DepthUpsampleMode, _upsample_depth_canonical
 from stereo_runtime.output import ensure_bchw
 from stereo_runtime.progress import activity_progress
 
@@ -415,7 +416,7 @@ class MIGraphXDepthProvider:
         depth = _postprocess_generic_depth(predicted, self.model_id)
         record("depth_norm_end")
         record("depth_upsample_start")
-        depth = upsample_depth(
+        depth = _upsample_depth_canonical(
             depth,
             height,
             width,
@@ -436,6 +437,7 @@ class MIGraphXDepthProvider:
             model_ms,
             postprocess_ms,
             cuda_timing_events=cuda_events,
+            raw_output_semantics=_model_output_semantics(self.model_id),
         )
         if self.model_name.strip().casefold() != "zipdepth-small" or self._zipdepth_parity_checked:
             return result

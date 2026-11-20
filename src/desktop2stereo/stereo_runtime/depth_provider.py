@@ -12,8 +12,13 @@ from typing import Any, Callable
 import torch
 import torch.nn.functional as F
 
-from .depth_upsample import DepthUpsampleMode, upsample_depth
-from .output import ensure_bchw, ensure_b1hw, match_depth
+from .depth_upsample import DepthUpsampleMode, _upsample_depth_canonical
+from .model_registry import (
+    DEFAULT_DEPTH_OUTPUT_SEMANTICS,
+    DepthOutputSemantics,
+    resolve_output_semantics,
+)
+from .output import ensure_bchw, ensure_b1hw
 from .progress import DownloadProgress, progress_write, status_write
 from utils.network import huggingface_endpoint_candidates
 
@@ -42,6 +47,10 @@ def _onnxruntime_available() -> bool:
     return importlib.util.find_spec("onnxruntime") is not None
 
 
+def _model_output_semantics(model_id: str) -> DepthOutputSemantics:
+    return resolve_output_semantics(str(model_id))
+
+
 @dataclass(frozen=True)
 class DepthProviderInfo:
     provider: str
@@ -62,6 +71,16 @@ class DepthProviderInfo:
     native_io_reason: str | None = None
     output_device: str | None = None
     trt_lib_dirs: list[str] | None = None
+    raw_output_semantics: DepthOutputSemantics | None = None
+    dibr_output_semantics: DepthOutputSemantics = DEFAULT_DEPTH_OUTPUT_SEMANTICS
+
+    def __post_init__(self) -> None:
+        if self.raw_output_semantics is None:
+            object.__setattr__(
+                self,
+                "raw_output_semantics",
+                _model_output_semantics(self.model_id),
+            )
 
     def to_report(self) -> dict[str, Any]:
         return asdict(self)
@@ -87,12 +106,14 @@ class DepthProfileResult:
     # True when the runtime applied its shared model-grid depth filter before
     # provider upsampling. This prevents a second, output-resolution blur.
     model_depth_antialias_applied: bool = False
+    raw_output_semantics: DepthOutputSemantics = DEFAULT_DEPTH_OUTPUT_SEMANTICS
+    dibr_output_semantics: DepthOutputSemantics = DEFAULT_DEPTH_OUTPUT_SEMANTICS
 
     @property
     def total_ms(self) -> float:
         return self.preprocess_ms + self.model_ms + self.postprocess_ms
 
-    def to_report(self) -> dict[str, float]:
+    def to_report(self) -> dict[str, Any]:
         return {
             "preprocess_ms": float(self.preprocess_ms),
             "model_ms": float(self.model_ms),
@@ -103,6 +124,8 @@ class DepthProfileResult:
             "nonfinite_count": int(self.nonfinite_count),
             "native_io_binding": bool(self.native_depth is not None),
             "native_zero_copy": bool(self.native_zero_copy),
+            "raw_output_semantics": self.raw_output_semantics,
+            "dibr_output_semantics": self.dibr_output_semantics,
         }
 
 
@@ -200,8 +223,16 @@ def _model_input_size_for_model(
     )
 
 
-def _normalize_depth(depth: torch.Tensor, subsample_cap: int = 6_144) -> torch.Tensor:
-    depth = ensure_b1hw(depth).float()
+def _normalize_depth_canonical(
+    depth: torch.Tensor,
+    subsample_cap: int = 6_144,
+) -> torch.Tensor:
+    """Normalize an already canonical ``[B, 1, H, W]`` float tensor.
+
+    Model postprocessing calls this after shape/dtype conversion and optional
+    semantic conversion. Keeping the inner implementation separate avoids
+    running ``ensure_b1hw`` and ``.float()`` twice for every depth frame.
+    """
     # Sanitise every non-finite value before percentile selection. Replacing
     # +Inf after normalisation is too late: Inf wins the 98th-percentile bound
     # and collapses the otherwise valid frame to near-black.
@@ -229,6 +260,38 @@ def _normalize_depth(depth: torch.Tensor, subsample_cap: int = 6_144) -> torch.T
         # host-frame pack) only ever sees finite [0,1] depth.
         normalized = torch.nan_to_num(normalized, nan=1.0, posinf=1.0, neginf=0.0)
     return normalized.clamp(0, 1)
+
+
+def _normalize_depth(depth: torch.Tensor, subsample_cap: int = 6_144) -> torch.Tensor:
+    """Normalize arbitrary model-shaped depth while preserving compatibility."""
+    return _normalize_depth_canonical(ensure_b1hw(depth).float(), subsample_cap)
+
+
+def _convert_depth_output_to_dibr_response(
+    depth: torch.Tensor,
+    output_semantics: DepthOutputSemantics,
+) -> torch.Tensor:
+    """Convert a model output to D2S's near=1, far=0 response.
+
+    Relative inverse-depth and disparity outputs already have the response
+    direction required by the DIBR solver. Relative/metric Z-depth outputs
+    increase with distance, so they must be inverted before percentile
+    normalization. The conversion happens before normalization so it remains
+    independent of the model's arbitrary scale and offset.
+    """
+    depth = ensure_b1hw(depth).float()
+    if output_semantics in {"relative_z_depth", "metric_z_depth"}:
+        depth = depth.clamp_min(5e-3).reciprocal()
+    elif output_semantics not in {"relative_inverse_depth", "raw_disparity"}:
+        raise ValueError(f"unsupported depth output semantics: {output_semantics!r}")
+    return depth
+
+
+def _postprocess_model_depth(depth: torch.Tensor, model_id: str) -> torch.Tensor:
+    output_semantics = _model_output_semantics(model_id)
+    return _normalize_depth_canonical(
+        _convert_depth_output_to_dibr_response(depth, output_semantics)
+    )
 
 
 def _is_infinidepth_model(model_id: str) -> bool:
@@ -668,9 +731,8 @@ class DistillAnyDepthBase518:
         model_ms = (time.perf_counter() - start) * 1000.0
 
         start = time.perf_counter()
-        depth = ensure_b1hw(predicted)
-        depth = _normalize_depth(depth)
-        depth = upsample_depth(
+        depth = _postprocess_model_depth(predicted, DISTILL_ANY_DEPTH_BASE_MODEL_ID)
+        depth = _upsample_depth_canonical(
             depth,
             height,
             width,
@@ -680,7 +742,13 @@ class DistillAnyDepthBase518:
         )
         sync()
         postprocess_ms = (time.perf_counter() - start) * 1000.0
-        return DepthProfileResult(depth, preprocess_ms, model_ms, postprocess_ms)
+        return DepthProfileResult(
+            depth,
+            preprocess_ms,
+            model_ms,
+            postprocess_ms,
+            raw_output_semantics=_model_output_semantics(DISTILL_ANY_DEPTH_BASE_MODEL_ID),
+        )
 
     def _run_depth_model(self, tensor: torch.Tensor):
         """Model-call hook; override to route through an alternate engine.
@@ -846,11 +914,10 @@ class GenericAutoDepthProvider:
         start = time.perf_counter()
         record("depth_post_start")
         record("depth_norm_start")
-        depth = ensure_b1hw(predicted)
-        depth = _postprocess_generic_depth(depth, self.model_id)
+        depth = _postprocess_generic_depth(predicted, self.model_id)
         record("depth_norm_end")
         record("depth_upsample_start")
-        depth = upsample_depth(
+        depth = _upsample_depth_canonical(
             depth,
             height,
             width,
@@ -867,6 +934,7 @@ class GenericAutoDepthProvider:
             model_ms,
             postprocess_ms,
             cuda_timing_events=cuda_events,
+            raw_output_semantics=_model_output_semantics(self.model_id),
         )
 
 
@@ -958,14 +1026,13 @@ class InfiniDepthProvider:
         sync()
         start = time.perf_counter()
         with torch.inference_mode(), torch.autocast(device_type=self.device.type, enabled=use_autocast):
-            predicted = model.predict_depth(tensor, fp32=self.dtype != torch.float16)
+            predicted = model.predict_disparity(tensor, fp32=self.dtype != torch.float16)
         sync()
         model_ms = (time.perf_counter() - start) * 1000.0
 
         start = time.perf_counter()
-        depth = ensure_b1hw(predicted)
-        depth = _normalize_depth(depth)
-        depth = upsample_depth(
+        depth = _postprocess_model_depth(predicted, self.model_id)
+        depth = _upsample_depth_canonical(
             depth,
             height,
             width,
@@ -975,7 +1042,13 @@ class InfiniDepthProvider:
         )
         sync()
         postprocess_ms = (time.perf_counter() - start) * 1000.0
-        return DepthProfileResult(depth, preprocess_ms, model_ms, postprocess_ms)
+        return DepthProfileResult(
+            depth,
+            preprocess_ms,
+            model_ms,
+            postprocess_ms,
+            raw_output_semantics=_model_output_semantics(self.model_id),
+        )
 
 
 class ZipDepthProvider(GenericAutoDepthProvider):
@@ -1134,17 +1207,11 @@ def _extract_depth_output(output):
 
 
 def _is_metric_model(model_id: str) -> bool:
-    model_lower = model_id.lower()
-    return any(key in model_lower for key in ("metric", "kitti", "nyu", "depth-ai", "da3"))
+    return _model_output_semantics(model_id) == "metric_z_depth"
 
 
 def _postprocess_generic_depth(depth: torch.Tensor, model_id: str) -> torch.Tensor:
-    depth = ensure_b1hw(depth).float()
-    if _is_metric_model(model_id):
-        depth = depth.clamp_min(5e-3).reciprocal()
-    # ZipDepth emits relative inverse depth: larger values are nearer, which
-    # is already the linear-disparity convention used by DIBR.
-    return _normalize_depth(depth)
+    return _postprocess_model_depth(depth, model_id)
 
 
 def _prepare_accelerated_artifacts(

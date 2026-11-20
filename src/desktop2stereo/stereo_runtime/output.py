@@ -57,6 +57,23 @@ def ensure_b1hw(depth: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"depth must be HW, BHW, or B1HW, got shape {tuple(depth.shape)}")
 
 
+def _match_depth_canonical(
+    depth: torch.Tensor,
+    height: int,
+    width: int,
+    *,
+    rgb: torch.Tensor | None = None,
+    edge_aware: bool = False,
+) -> torch.Tensor:
+    if depth.shape[-2:] == (height, width):
+        return depth
+    if edge_aware and rgb is not None:
+        from .depth_upsample import _upsample_depth_canonical
+
+        return _upsample_depth_canonical(depth, height, width, rgb=rgb, mode="joint_bilateral")
+    return F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
+
+
 def match_depth(
     depth: torch.Tensor,
     height: int,
@@ -65,14 +82,14 @@ def match_depth(
     rgb: torch.Tensor | None = None,
     edge_aware: bool = False,
 ) -> torch.Tensor:
-    depth = ensure_b1hw(depth).float()
-    if depth.shape[-2:] == (height, width):
-        return depth
-    if edge_aware and rgb is not None:
-        from .depth_upsample import upsample_depth
-
-        return upsample_depth(depth, height, width, rgb=rgb, mode="joint_bilateral")
-    return F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)
+    """Match arbitrary depth input to a canonical float32 spatial shape."""
+    return _match_depth_canonical(
+        ensure_b1hw(depth).float(),
+        height,
+        width,
+        rgb=rgb,
+        edge_aware=edge_aware,
+    )
 
 
 def downsample_horizontal_lanczos2(

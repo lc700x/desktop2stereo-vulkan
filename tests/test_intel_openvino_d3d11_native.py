@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import torch
+
 from desktop2stereo.stereo_runtime.providers.intel.openvino_native_depth import (
     OpenVINOD3D11DepthProvider,
 )
@@ -29,6 +31,11 @@ class _WorkingNativeSession:
 
     def infer_output(self):
         return (1, 1, 2, 2), (0.0, 1.0, 2.0, 3.0)
+
+
+class _NonfiniteNativeSession(_WorkingNativeSession):
+    def infer_output(self):
+        return (1, 1, 2, 2), (1.0, float("nan"), float("inf"), 4.0)
 
 
 class _MatchingResource(_FakeResource):
@@ -115,6 +122,29 @@ def test_native_depth_provider_reports_shared_nv12_surface() -> None:
     assert result.cuda_timing_events["output_gpu_to_cpu"] is True
     assert result.cuda_timing_events["output_zero_copy"] is False
     assert result.cuda_timing_events["zero_copy"] is False
+
+
+def test_native_depth_provider_uses_declared_z_depth_semantics_once() -> None:
+    provider = OpenVINOD3D11DepthProvider.__new__(OpenVINOD3D11DepthProvider)
+    provider.session = _WorkingNativeSession()
+    provider.output_semantics = "relative_z_depth"
+    result = provider.predict_native(_MatchingResource())
+
+    assert result.raw_output_semantics == "relative_z_depth"
+    assert result.dibr_output_semantics == "relative_inverse_depth"
+    assert torch.isfinite(result.depth).all().item()
+    assert result.depth[0, 0, 0, 0] > result.depth[0, 0, 1, 1]
+
+
+def test_native_depth_provider_sanitizes_nonfinite_model_output() -> None:
+    provider = OpenVINOD3D11DepthProvider.__new__(OpenVINOD3D11DepthProvider)
+    provider.session = _NonfiniteNativeSession()
+    provider.output_semantics = "relative_inverse_depth"
+    result = provider.predict_native(_MatchingResource())
+
+    assert result.finite_depth is True
+    assert result.nonfinite_count == 2
+    assert torch.isfinite(result.depth).all().item()
 
 
 def test_session_requires_native_bridge() -> None:

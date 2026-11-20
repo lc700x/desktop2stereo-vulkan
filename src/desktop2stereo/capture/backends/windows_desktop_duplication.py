@@ -185,10 +185,15 @@ class DesktopGrabber:
         device = self._native.device
         if not device:
             raise DesktopDuplicationUnavailable("native Desktop Duplication device handle is unavailable")
+        output_semantics = os.environ.get(
+            "D2S_OPENVINO_OUTPUT_SEMANTICS",
+            "relative_inverse_depth",
+        ).strip().lower()
         return OpenVINOD3D11DepthProvider(
             model_path=model_path,
             d3d11_device=device,
             depth_resolution=depth_resolution,
+            output_semantics=output_semantics,
         )
 
     def grab(self):

@@ -12,8 +12,14 @@ from pathlib import Path
 
 import torch
 
-from stereo_runtime.depth_provider import DepthProfileResult, DepthProviderInfo
-from stereo_runtime.output import ensure_b1hw
+from stereo_runtime.depth_provider import (
+    DEFAULT_DEPTH_OUTPUT_SEMANTICS,
+    DepthOutputSemantics,
+    DepthProfileResult,
+    DepthProviderInfo,
+    _convert_depth_output_to_dibr_response,
+    _normalize_depth_canonical,
+)
 
 from .openvino_d3d11_native import OpenVINOD3D11Session, probe_openvino_d3d11_bridge
 
@@ -27,6 +33,7 @@ class OpenVINOD3D11DepthProvider:
         model_path: str | Path,
         d3d11_device: int,
         depth_resolution: int = 518,
+        output_semantics: DepthOutputSemantics = DEFAULT_DEPTH_OUTPUT_SEMANTICS,
     ) -> None:
         capability = probe_openvino_d3d11_bridge()
         if not capability.get("available"):
@@ -35,6 +42,14 @@ class OpenVINOD3D11DepthProvider:
             raise RuntimeError(str(capability.get("reason")))
         self.model_path = str(model_path)
         self.depth_resolution = int(depth_resolution)
+        if output_semantics not in {
+            "relative_inverse_depth",
+            "raw_disparity",
+            "relative_z_depth",
+            "metric_z_depth",
+        }:
+            raise ValueError(f"unsupported OpenVINO output semantics: {output_semantics!r}")
+        self.output_semantics = output_semantics
         self.session = OpenVINOD3D11Session(self.model_path, d3d11_device)
         self.info = DepthProviderInfo(
             provider="OpenVINOD3D11Session",
@@ -48,6 +63,7 @@ class OpenVINOD3D11DepthProvider:
             execution_provider="OpenVINO GPU RemoteTensor",
             fallback_reason=None,
             output_device="cpu",
+            raw_output_semantics=self.output_semantics,
         )
 
     def load(self):
@@ -86,16 +102,25 @@ class OpenVINOD3D11DepthProvider:
         infer_start = time.perf_counter()
         shape, values = self.session.infer_output()
         model_ms = (time.perf_counter() - infer_start) * 1000.0
-        depth = torch.tensor(values, dtype=torch.float32).reshape(shape)
-        depth = ensure_b1hw(depth)
-        lo = depth.amin(dim=(-2, -1), keepdim=True)
-        hi = depth.amax(dim=(-2, -1), keepdim=True)
-        depth = ((depth - lo) / (hi - lo).clamp_min(1e-6)).clamp(0.0, 1.0)
+        postprocess_start = time.perf_counter()
+        raw_depth = torch.tensor(values, dtype=torch.float32).reshape(shape)
+        nonfinite_count = int((~torch.isfinite(raw_depth)).sum().item())
+        output_semantics = getattr(
+            self,
+            "output_semantics",
+            DEFAULT_DEPTH_OUTPUT_SEMANTICS,
+        )
+        depth = _normalize_depth_canonical(
+            _convert_depth_output_to_dibr_response(raw_depth, output_semantics)
+        )
         return DepthProfileResult(
             depth=depth,
             preprocess_ms=preprocess_ms,
             model_ms=model_ms,
-            postprocess_ms=(time.perf_counter() - infer_start) * 1000.0 - model_ms,
+            postprocess_ms=(time.perf_counter() - postprocess_start) * 1000.0,
+            finite_depth=bool(torch.isfinite(depth).all().item()),
+            nonfinite_count=nonfinite_count,
+            raw_output_semantics=output_semantics,
             cuda_timing_events={
                 "input_resource_kind": getattr(resource, "resource_kind", "d3d11_texture"),
                 "capture_gpu": True,

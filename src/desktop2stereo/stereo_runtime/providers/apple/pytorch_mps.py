@@ -21,6 +21,7 @@ from stereo_runtime.depth_provider import (
     DepthProviderInfo,
     DistillAnyDepthBase518,
     GenericAutoDepthProvider,
+    _model_output_semantics,
     ZipDepthProvider,
 )
 from stereo_runtime.depth_upsample import DepthUpsampleMode
@@ -428,9 +429,8 @@ class _CoreMLMixin:
             _model_input_size_for_model,
             _normalization_tensors_for_model,
             _postprocess_generic_depth,
-            ensure_b1hw,
         )
-        from stereo_runtime.depth_upsample import upsample_depth
+        from stereo_runtime.depth_upsample import _upsample_depth_canonical
         from stereo_runtime.output import ensure_bchw
         import torch.nn.functional as F
 
@@ -504,8 +504,8 @@ class _CoreMLMixin:
         model_ms = (time.perf_counter() - start) * 1000.0
 
         start = time.perf_counter()
-        depth = _postprocess_generic_depth(ensure_b1hw(predicted), self.model_id)
-        depth = upsample_depth(
+        depth = _postprocess_generic_depth(predicted, self.model_id)
+        depth = _upsample_depth_canonical(
             depth,
             height,
             width,
@@ -513,8 +513,6 @@ class _CoreMLMixin:
             mode=self.depth_upsample,
             edge_strength=self.depth_upsample_edge_strength,
         )
-        if depth.is_floating_point():
-            depth = torch.nan_to_num(depth, nan=1.0, posinf=1.0, neginf=0.0).clamp_(0, 1)
         postprocess_ms = (time.perf_counter() - start) * 1000.0
         return DepthProfileResult(
             depth,
@@ -523,6 +521,7 @@ class _CoreMLMixin:
             postprocess_ms,
             finite_depth=True,
             nonfinite_count=int(getattr(predicted, "nonfinite_count", 0)),
+            raw_output_semantics=_model_output_semantics(self.model_id),
         )
 
     def predict_profile(self, rgb: torch.Tensor):
@@ -565,6 +564,7 @@ class _CoreMLMixin:
             postprocess_ms=float(native_frame.postprocess_ms),
             finite_depth=bool(native_frame.finite_depth),
             nonfinite_count=int(native_frame.nonfinite_count),
+            raw_output_semantics=_model_output_semantics(self.model_id),
             native_depth=native_frame,
             native_resource_handle=native_frame,
             native_zero_copy=bool(native_frame.output_zero_copy),
@@ -598,7 +598,6 @@ class _CoreMLMixin:
     def _coreml_engine_for_frame(self, rgb: torch.Tensor):
         from stereo_runtime.depth_provider import (
             DISTILL_ANY_DEPTH_BASE_RESOLUTION,
-            DISTILL_ANY_DEPTH_PATCH_SIZE,
             _model_input_size_for_model,
             ensure_bchw,
         )

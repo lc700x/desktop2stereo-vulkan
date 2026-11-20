@@ -20,7 +20,7 @@ from .depth_postprocess import (
     apply_depth_pop,
     model_depth_aa_applied,
     output_depth_gaussian_enabled,
-    postprocess_depth,
+    _postprocess_depth_canonical,
 )
 from .depth_provider import DepthProfileResult, create_depth_provider
 from .depth_upsample import filter_model_depth, model_depth_antialiasing
@@ -34,7 +34,7 @@ from .settings_snapshot import (
     SnapshotChangeClass,
 )
 from .compute_backend import probe_opengl_stereo_backend, resolve_stereo_compute_backend
-from .output import ensure_bchw, make_sbs, match_depth, output_edge_aa_enabled
+from .output import ensure_bchw, make_sbs, _match_depth_canonical, output_edge_aa_enabled
 from .output_quality import (
     apply_output_quality,
     output_quality_requires_eye_images,
@@ -573,8 +573,8 @@ def _try_openxr_no_fill_fused_rgba_u8(
     edge_supersampling_enabled = edge_smoothing_enabled and (
         torch.version.hip is not None or max(int(rgb.shape[-2]), int(rgb.shape[-1])) <= 1920
     )
-    processed_depth = postprocess_depth(
-        match_depth(
+    processed_depth = _postprocess_depth_canonical(
+        _match_depth_canonical(
             depth,
             rgb.shape[-2],
             rgb.shape[-1],
@@ -2509,8 +2509,8 @@ class StereoRuntime:
         if self._resolve_stereo_compute_backend(rgb_frame) != "vulkan":
             return None, f"selected={self._resolved_stereo_compute_backend}"
         try:
-            processed_depth = postprocess_depth(
-                match_depth(
+            processed_depth = _postprocess_depth_canonical(
+                _match_depth_canonical(
                     depth,
                     rgb_frame.shape[-2],
                     rgb_frame.shape[-1],
@@ -2578,7 +2578,7 @@ class StereoRuntime:
         gamma = _openxr_rgb_depth_gamma()
         if abs(gamma - 1.0) > 1e-4:
             depth = depth.pow(gamma)
-        depth = postprocess_depth(
+        depth = _postprocess_depth_canonical(
             depth,
             depth_pop=float(getattr(self.stereo_config, "depth_pop", 0.0)),
             antialias_strength=(
@@ -2812,10 +2812,10 @@ class StereoRuntime:
             return None, "dynamic_convergence_tensor"
         try:
             from .fast_plus_fused_triton import can_use_fast_plus_fused_half_sbs_uint8, make_fast_plus_fused_half_sbs_uint8
-            from .output import match_depth
+            from .output import _match_depth_canonical
         except Exception as exc:
             return None, f"import_failed:{type(exc).__name__}"
-        depth = match_depth(
+        depth = _match_depth_canonical(
             depth,
             rgb_frame.shape[-2],
             rgb_frame.shape[-1],
@@ -2952,8 +2952,8 @@ class StereoRuntime:
                 from .vulkan_backend import VulkanStereoComputeBackend
 
                 self._vulkan_stereo_backend = VulkanStereoComputeBackend()
-            processed_depth = postprocess_depth(
-                match_depth(
+            processed_depth = _postprocess_depth_canonical(
+                _match_depth_canonical(
                     depth,
                     rgb_frame.shape[-2],
                     rgb_frame.shape[-1],
@@ -3070,8 +3070,8 @@ class StereoRuntime:
                 from .vulkan_backend import VulkanStereoComputeBackend
 
                 self._vulkan_stereo_backend = VulkanStereoComputeBackend()
-            processed_depth = postprocess_depth(
-                match_depth(
+            processed_depth = _postprocess_depth_canonical(
+                _match_depth_canonical(
                     depth,
                     rgb_frame.shape[-2],
                     rgb_frame.shape[-1],
@@ -3774,20 +3774,20 @@ def _postprocess_depth_fast(
     exact full-res math. Kill switch: D2S_GUIDED_AA_HALFRES=0.
     """
     if guide is None:
-        return postprocess_depth(
+        return _postprocess_depth_canonical(
             depth, depth_pop=depth_pop, antialias_strength=antialias_strength,
             global_gaussian=output_edge_aa_enabled(),
             edge_threshold=edge_threshold,
         )
     if os.environ.get("D2S_GUIDED_AA_HALFRES", "1") in {"0", "false", "off"}:
-        return postprocess_depth(
+        return _postprocess_depth_canonical(
             depth, depth_pop=depth_pop, antialias_strength=antialias_strength,
             global_gaussian=output_edge_aa_enabled(),
             edge_threshold=edge_threshold,
         )
     h, w = int(depth.shape[-2]), int(depth.shape[-1])
     if min(h, w) < 256 or antialias_strength <= 0.0:
-        return postprocess_depth(
+        return _postprocess_depth_canonical(
             depth,
             depth_pop=depth_pop,
             antialias_strength=antialias_strength,

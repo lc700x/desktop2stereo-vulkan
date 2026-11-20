@@ -48,7 +48,8 @@ class InfiniDepthModel(nn.Module):
                    internal autocast that would otherwise override to fp16).
 
         Returns:
-            depth: (B, H, W) relative depth (1 / disparity).
+            disparity: (B, H, W) raw inverse-depth response from the model
+            head. The ONNX export intentionally preserves this raw output.
         """
         if pixel_values.dim() != 4:
             raise ValueError("Expected input shape (B, 3, H, W)")
@@ -69,15 +70,15 @@ class InfiniDepthModel(nn.Module):
         with torch.no_grad():
             pred = self.model.forward_dense(x=x, force_fp32=run_fp32)
 
-        depth = pred.reshape(B, 1, pred.shape[-2], pred.shape[-1]).squeeze(1)
-        if depth.dtype == torch.float16:
-            depth = depth.clamp(-65504.0, 65504.0)
+        disparity = pred.reshape(B, 1, pred.shape[-2], pred.shape[-1]).squeeze(1)
+        if disparity.dtype == torch.float16:
+            disparity = disparity.clamp(-65504.0, 65504.0)
         if not torch.onnx.is_in_onnx_export():
-            depth = torch.nan_to_num(depth, nan=0.0, posinf=65504.0, neginf=-65504.0)
-        return depth.to(input_dtype)
-    
-    def predict_depth(self, pixel_values: torch.Tensor, fp32: bool = False) -> torch.Tensor:
-        """High-level inference API with autocast.
+            disparity = torch.nan_to_num(disparity, nan=0.0, posinf=65504.0, neginf=-65504.0)
+        return disparity.to(input_dtype)
+
+    def predict_disparity(self, pixel_values: torch.Tensor, fp32: bool = False) -> torch.Tensor:
+        """Return raw model disparity using the high-level autocast policy.
 
         Uses dynamic device_type so it works on CUDA, MPS, XPU, etc.
         DirectML (privateuseone) skips autocast.
@@ -87,7 +88,7 @@ class InfiniDepthModel(nn.Module):
             fp32: If True, disable autocast (full FP32 inference).
 
         Returns:
-            depth: (B, H, W) relative depth map.
+            disparity: (B, H, W) raw inverse-depth response.
         """
         with torch.no_grad():
             if pixel_values.device.type != "privateuseone":
@@ -96,3 +97,8 @@ class InfiniDepthModel(nn.Module):
                     return self.forward(pixel_values, fp32=fp32)
             else:
                 return self.forward(pixel_values, fp32=fp32)
+
+    def predict_depth(self, pixel_values: torch.Tensor, fp32: bool = False) -> torch.Tensor:
+        """Return the official relative Z-depth convention (1 / disparity)."""
+        disparity = self.predict_disparity(pixel_values, fp32=fp32)
+        return disparity.clamp_min(5e-3).reciprocal()

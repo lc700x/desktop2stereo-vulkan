@@ -4,10 +4,21 @@ import torch
 import pytest
 
 from stereo_runtime.depth_upsample import (
+    _upsample_depth_canonical,
     filter_model_depth,
     model_depth_antialiasing,
     upsample_depth,
 )
+
+
+def test_canonical_upsample_matches_public_wrapper() -> None:
+    depth = torch.linspace(0.0, 1.0, 15, dtype=torch.float32).reshape(1, 1, 3, 5)
+    rgb = torch.rand((1, 3, 12, 20), dtype=torch.float32)
+
+    public = upsample_depth(depth, 12, 20, rgb=rgb, mode="guided")
+    canonical = _upsample_depth_canonical(depth, 12, 20, rgb=rgb, mode="guided")
+
+    assert torch.equal(public, canonical)
 
 
 @pytest.mark.parametrize("fail_kernel", [False, True])

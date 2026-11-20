@@ -356,7 +356,7 @@ def anti_alias_depth_guided(
     return (w * depth + (1.0 - w) * smooth).clamp(0.0, 1.0)
 
 
-def postprocess_depth(
+def _postprocess_depth_canonical(
     depth: torch.Tensor,
     *,
     depth_pop: float = 0.0,
@@ -365,7 +365,7 @@ def postprocess_depth(
     global_gaussian: bool = False,
     edge_threshold: float | None = None,
 ) -> torch.Tensor:
-    out = ensure_b1hw(depth).float().clamp(0.0, 1.0)
+    out = depth.clamp(0.0, 1.0)
     if abs(float(depth_pop)) >= 1e-6:
         out = apply_depth_pop(out, depth_pop)
     if guide is None:
@@ -386,3 +386,23 @@ def postprocess_depth(
         # filter keeps its depth-edge protection independently of this final pass.
         out = _anti_alias_depth_global_gaussian(out)
     return out
+
+
+def postprocess_depth(
+    depth: torch.Tensor,
+    *,
+    depth_pop: float = 0.0,
+    antialias_strength: float = 0.0,
+    guide: torch.Tensor | None = None,
+    global_gaussian: bool = False,
+    edge_threshold: float | None = None,
+) -> torch.Tensor:
+    """Apply depth pop and edge-aware postprocessing to arbitrary depth input."""
+    return _postprocess_depth_canonical(
+        ensure_b1hw(depth).float(),
+        depth_pop=depth_pop,
+        antialias_strength=antialias_strength,
+        guide=guide,
+        global_gaussian=global_gaussian,
+        edge_threshold=edge_threshold,
+    )

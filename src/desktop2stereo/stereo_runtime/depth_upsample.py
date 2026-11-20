@@ -215,7 +215,7 @@ def _joint_bilateral_upsample(
     return (bilinear + edge_weight * confidence * (guided - bilinear)).clamp(0.0, 1.0)
 
 
-def upsample_depth(
+def _upsample_depth_canonical(
     depth: torch.Tensor,
     height: int,
     width: int,
@@ -225,14 +225,17 @@ def upsample_depth(
     edge_strength: float = 0.35,
     depth_edge_threshold: float = 0.04,
 ) -> torch.Tensor:
-    """Upsample normalized depth to the RGB frame size.
+    """Upsample canonical normalized depth to the RGB frame size.
+
+    ``depth`` must already be ``[B, 1, H, W]`` ``float32``. Provider hot
+    paths use this form after model postprocessing, avoiding a repeated shape
+    check and dtype conversion before every resize.
 
     `bilinear` preserves current behavior. `guided` keeps the same output
     resolution but softly pulls high-gradient RGB edges from a nearest path to
     reduce bleeding around silhouettes without changing inference resolution.
     """
 
-    depth = ensure_b1hw(depth).float()
     antialias_state = _MODEL_DEPTH_ANTIALIAS_STATE.get()
     model_antialias_applied = False
     if antialias_state is not None and antialias_state.strength > 0.0:
@@ -321,3 +324,30 @@ def upsample_depth(
     edge = F.max_pool2d(edge, kernel_size=3, stride=1, padding=1)
     weight = (edge * float(edge_strength)).clamp(0, 1)
     return torch.lerp(bilinear, nearest, weight).clamp(0, 1)
+
+
+def upsample_depth(
+    depth: torch.Tensor,
+    height: int,
+    width: int,
+    *,
+    rgb: torch.Tensor | None = None,
+    mode: DepthUpsampleMode = "bilinear",
+    edge_strength: float = 0.35,
+    depth_edge_threshold: float = 0.04,
+) -> torch.Tensor:
+    """Upsample normalized depth to the RGB frame size.
+
+    This public wrapper accepts the historical flexible tensor shapes/dtypes;
+    provider hot paths use ``_upsample_depth_canonical`` directly.
+    """
+    depth = ensure_b1hw(depth).float()
+    return _upsample_depth_canonical(
+        depth,
+        height,
+        width,
+        rgb=rgb,
+        mode=mode,
+        edge_strength=edge_strength,
+        depth_edge_threshold=depth_edge_threshold,
+    )

@@ -21,12 +21,13 @@ from ...depth_provider import (
     DepthProviderConfig,
     DepthProviderInfo,
     TorchDepthProvider,
+    _model_output_semantics,
     _prepare_accelerated_artifacts,
-    _normalize_depth,
+    _postprocess_model_depth,
     default_lab_cache_dir,
 )
-from ...depth_upsample import DepthUpsampleMode, upsample_depth
-from ...output import ensure_b1hw, ensure_bchw, match_depth
+from ...depth_upsample import DepthUpsampleMode, _upsample_depth_canonical
+from ...output import ensure_bchw
 from .onnx_cuda import OnnxCudaDepthProvider
 from runtime_paths import python_site_packages
 from utils.cpu_warnings import describe_tensor, warn_cpu_fallback, warn_cpu_transfer
@@ -287,10 +288,8 @@ class DistillAnyDepthBaseTensorRtOrt:
         model_ms = (time.perf_counter() - start) * 1000.0
 
         start = time.perf_counter()
-        depth = torch.from_numpy(output_np).float()
-        depth = ensure_b1hw(depth)
-        depth = _normalize_depth(depth)
-        depth = upsample_depth(
+        depth = _postprocess_model_depth(torch.from_numpy(output_np), self.model_id)
+        depth = _upsample_depth_canonical(
             depth,
             height,
             width,
@@ -300,7 +299,13 @@ class DistillAnyDepthBaseTensorRtOrt:
         )
         sync()
         postprocess_ms = (time.perf_counter() - start) * 1000.0
-        return DepthProfileResult(depth, preprocess_ms, model_ms, postprocess_ms)
+        return DepthProfileResult(
+            depth,
+            preprocess_ms,
+            model_ms,
+            postprocess_ms,
+            raw_output_semantics=_model_output_semantics(self.model_id),
+        )
 
 
 TensorRtOrtDepthProvider = DistillAnyDepthBaseTensorRtOrt

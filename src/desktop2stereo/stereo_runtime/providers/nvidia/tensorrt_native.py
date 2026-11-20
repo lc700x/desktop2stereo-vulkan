@@ -20,12 +20,13 @@ from ...depth_provider import (
     DepthProfileResult,
     DepthProviderConfig,
     DepthProviderInfo,
+    _model_output_semantics,
     _prepare_accelerated_artifacts,
-    _normalize_depth,
+    _postprocess_model_depth,
     default_lab_cache_dir,
 )
-from ...depth_upsample import DepthUpsampleMode, upsample_depth
-from ...output import ensure_b1hw, ensure_bchw, match_depth
+from ...depth_upsample import DepthUpsampleMode, _upsample_depth_canonical
+from ...output import ensure_bchw
 from ...progress import activity_progress, emit_progress_event, status_write, write_bytes_with_progress
 from .tensorrt_ort import ensure_tensorrt_dll_path
 
@@ -882,11 +883,10 @@ class DistillAnyDepthBaseNativeTensorRt:
             start = time.perf_counter()
             _record_cuda_event(cuda_events, "depth_post_start", predicted)
             _record_cuda_event(cuda_events, "depth_norm_start", predicted)
-            depth = ensure_b1hw(predicted.float())
-            depth = _normalize_depth(depth)
+            depth = _postprocess_model_depth(predicted, self.model_id)
             _record_cuda_event(cuda_events, "depth_norm_end", depth)
             _record_cuda_event(cuda_events, "depth_upsample_start", depth)
-            depth = upsample_depth(
+            depth = _upsample_depth_canonical(
                 depth,
                 height,
                 width,
@@ -907,6 +907,7 @@ class DistillAnyDepthBaseNativeTensorRt:
                 execution_slot=execution_slot,
                 execution_slot_count=max(1, int(getattr(engine, "pipeline_slot_count", 1))),
                 slot_wait_ms=slot_wait_ms,
+                raw_output_semantics=_model_output_semantics(self.model_id),
             )
         finally:
             mark_slot_available = getattr(
