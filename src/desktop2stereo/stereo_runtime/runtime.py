@@ -2233,12 +2233,17 @@ class StereoRuntime:
                         no_fill_fused = None
                         no_fill_fused_reason = "common_output_quality_requires_eyes"
                     else:
-                        no_fill_fused, no_fill_fused_reason = _try_openxr_no_fill_fused_rgba_u8(
-                            output_rgb,
-                            depth,
-                            openxr_stereo_config,
-                            cuda_events,
-                        )
+                        # The provider may already have applied the model-grid
+                        # edge-aware depth AA during canonical upsampling. Keep
+                        # the same context around the fused path so it does not
+                        # add a second full-resolution Gaussian before DIBR.
+                        with model_depth_aa_applied(profile.model_depth_antialias_applied):
+                            no_fill_fused, no_fill_fused_reason = _try_openxr_no_fill_fused_rgba_u8(
+                                output_rgb,
+                                depth,
+                                openxr_stereo_config,
+                                cuda_events,
+                            )
                     if no_fill_fused is not None:
                         synthesis_left, synthesis_right, fused_debug = no_fill_fused
                         left_eye = synthesis_left

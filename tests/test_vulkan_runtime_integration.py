@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +28,12 @@ class _Provider:
 
     def close(self):
         return None
+
+
+class _ModelAaProvider(_Provider):
+    def predict_profile(self, rgb):
+        profile = super().predict_profile(rgb)
+        return replace(profile, model_depth_antialias_applied=True)
 
 
 class _FakeVulkanBackend:
@@ -177,6 +184,40 @@ def test_openxr_triton_no_fill_uses_fused_rgba_u8_output(monkeypatch):
     assert result.debug_info["occlusion_mask_backend"] == "skipped_no_consumer"
     assert result.debug_info["hole_fill_backend"] == "none"
     assert result.debug_info["runtime_output_pack_backend"] == "triton_warp_composite2_rgba_u8"
+    runtime.close()
+
+
+def test_openxr_triton_no_fill_preserves_model_depth_aa_context(monkeypatch):
+    config = StereoRuntimeConfig(
+        model_id="lc700x/Distill-Any-Depth-Base-hf",
+        stereo_quality="quality_4k",
+        stereo_compute_backend="triton",
+        temporal=False,
+        hole_fill_mode="none",
+    )
+    runtime = StereoRuntime(config, depth_provider=_ModelAaProvider(), collect_memory_stats=False)
+    monkeypatch.setattr(runtime, "_resolve_stereo_compute_backend", lambda _rgb: "cuda_triton")
+    runtime._resolved_stereo_compute_backend = "cuda_triton"
+
+    observed = []
+
+    def fake_no_fill(_rgb, _depth, _synthesis_config, _cuda_events):
+        observed.append(runtime_module.output_depth_gaussian_enabled())
+        return (
+            torch.zeros((8, 12, 4), dtype=torch.uint8),
+            torch.zeros((8, 12, 4), dtype=torch.uint8),
+            {"backend": "quality_4k", "hole_fill_backend": "none"},
+        ), "used"
+
+    monkeypatch.setattr(runtime_module, "_try_openxr_no_fill_fused_rgba_u8", fake_no_fill)
+
+    result = runtime.process_openxr_frame(
+        torch.rand(1, 3, 8, 12),
+        OpenXRRenderConfig(output_mode="full_synthesis_eyes"),
+    )
+
+    assert observed == [False]
+    assert result.debug_info["openxr_prewarp_backend"] == "triton_no_fill_fused_rgba_u8"
     runtime.close()
 
 
