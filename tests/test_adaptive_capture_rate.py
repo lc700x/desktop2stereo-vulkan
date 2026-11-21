@@ -47,6 +47,20 @@ def test_auto_capture_is_capped_by_base_refresh_rate() -> None:
     assert rate.observe_sbs_fps(90.0, frame_count=450, now=16.0) == 60
 
 
+def test_auto_capture_respects_a_runtime_minimum_fps() -> None:
+    rate = AdaptiveCaptureRate(60, enabled=True, minimum_fps=45)
+
+    rate.observe_sbs_fps(8.0, now=1.0)
+    assert rate.observe_sbs_fps(8.0, now=16.0) == 45
+
+
+def test_auto_capture_has_no_default_runtime_minimum_fps() -> None:
+    rate = AdaptiveCaptureRate(60, enabled=True)
+
+    rate.observe_sbs_fps(8.0, now=1.0)
+    assert rate.observe_sbs_fps(8.0, now=16.0) == 13
+
+
 def test_auto_capture_holds_target_when_no_frames_arrive() -> None:
     rate = AdaptiveCaptureRate(60, enabled=True)
 

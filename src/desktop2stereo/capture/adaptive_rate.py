@@ -29,12 +29,14 @@ class AdaptiveCaptureRate:
         evaluation_interval_s: float = 15.0,
         activity_guard_enabled: bool = False,
         minimum_sample_frames: int = 60,
+        minimum_fps: int = 0,
     ) -> None:
         self.base_fps = max(1, int(base_fps))
         self.enabled = bool(enabled and self.base_fps > 24)
         self.evaluation_interval_s = max(1.0, float(evaluation_interval_s))
         self.activity_guard_enabled = bool(activity_guard_enabled)
         self.minimum_sample_frames = max(1, int(minimum_sample_frames))
+        self.minimum_fps = min(self.base_fps, max(0, int(minimum_fps)))
         self._target_fps = self.base_fps
         self._calibration_limit: int | None = None
         self._stream_probe_active = False
@@ -120,9 +122,10 @@ class AdaptiveCaptureRate:
             ceiling = self.base_fps
             if self._calibration_limit is not None:
                 ceiling = min(ceiling, self._calibration_limit)
+            floor = min(self.minimum_fps, ceiling)
             self._target_fps = min(
                 ceiling,
-                max(1, int(math.ceil(peak_fps + 5.0))),
+                max(floor, max(1, int(math.ceil(peak_fps + 5.0)))),
             )
             self._window_started = timestamp
             self._window_samples.clear()

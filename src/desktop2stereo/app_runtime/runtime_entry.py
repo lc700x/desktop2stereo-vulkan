@@ -77,6 +77,15 @@ from stereo_runtime.nvfruc_calibration import (
 from stereo_runtime.nvfruc_stage import NvFrucStage
 
 
+def _openxr_auto_capture_floor(base_fps: int) -> int:
+    """Return an optional OpenXR Auto capture floor without changing defaults."""
+    try:
+        requested = int(os.environ.get("D2S_OPENXR_MIN_CAPTURE_FPS", "0"))
+    except (TypeError, ValueError):
+        requested = 0
+    return min(max(0, requested), max(1, int(base_fps)))
+
+
 def _inference_gpu_adapter_luid(device: Any) -> tuple[int | None, str | None]:
     """Return the selected CUDA/ROCm adapter LUID for local Vulkan interop."""
     if str(getattr(device, "type", device)).strip().casefold() != "cuda":
@@ -749,6 +758,14 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         base_runtime_fps,
         enabled=adaptive_capture_enabled_for_mode(
             configured_run_mode, configured_target_fps
+        ),
+        # A headset wake/focus handoff can produce a short low-SBS window.
+        # Keep the floor opt-in so Auto mode does not impose a default frame
+        # rate limit. D2S_OPENXR_MIN_CAPTURE_FPS enables an A/B floor only.
+        minimum_fps=(
+            _openxr_auto_capture_floor(base_runtime_fps)
+            if configured_run_mode == "OpenXR"
+            else 0
         ),
     )
     effective_render_size_config = _resolve_local_viewer_render_size_config(

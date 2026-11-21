@@ -39,6 +39,26 @@ def test_local_viewer_uses_configured_vsync_for_media_and_desktop() -> None:
     assert _local_viewer_vsync_enabled(True, "Window") is True
 
 
+def test_openxr_capture_floor_is_opt_in(monkeypatch) -> None:
+    from app_runtime.runtime_entry import _openxr_auto_capture_floor
+
+    monkeypatch.delenv("D2S_OPENXR_MIN_CAPTURE_FPS", raising=False)
+    assert _openxr_auto_capture_floor(72) == 0
+
+    monkeypatch.setenv("D2S_OPENXR_MIN_CAPTURE_FPS", "45")
+    assert _openxr_auto_capture_floor(72) == 45
+
+
+def test_openxr_capture_floor_rejects_invalid_or_oversized_values(monkeypatch) -> None:
+    from app_runtime.runtime_entry import _openxr_auto_capture_floor
+
+    monkeypatch.setenv("D2S_OPENXR_MIN_CAPTURE_FPS", "invalid")
+    assert _openxr_auto_capture_floor(72) == 0
+
+    monkeypatch.setenv("D2S_OPENXR_MIN_CAPTURE_FPS", "120")
+    assert _openxr_auto_capture_floor(72) == 72
+
+
 def test_media_capture_options_restore_saved_settings_without_gui_env(monkeypatch) -> None:
     from app_runtime.runtime_context import _media_capture_options_from_environment
 
