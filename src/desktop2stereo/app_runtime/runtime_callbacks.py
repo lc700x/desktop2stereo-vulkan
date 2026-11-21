@@ -4,6 +4,7 @@ import json
 import math
 import os
 import queue
+import sys
 import threading
 import time
 from collections import deque
@@ -849,11 +850,37 @@ class RuntimeCallbacks:
                 self._capture_window_handles.discard(handle)
                 self._capture_window_late_hidden_handles.discard(handle)
             if session is None:
-                # The initial exclusion list is applied when the WGC session
-                # starts. Keep the window hidden until its first presented frame.
+                # The initial exclusion list is applied when the capture
+                # session starts. Windows keeps the window hidden until its
+                # first presented frame; ScreenCaptureKit needs no visibility
+                # change because its filter is per session.
                 return True
-            if not included or already_registered:
+            if already_registered == bool(included):
                 return True
+
+        if sys.platform == "darwin":
+            update_filter = getattr(session, "update_excluded_window_handles", None)
+            try:
+                updated = callable(update_filter) and bool(
+                    update_filter(self.capture_window_handles())
+                )
+            except Exception as exc:
+                print(
+                    "[ScreenCaptureKit] Could not update Local Viewer window filter: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                updated = False
+            if not updated and included:
+                with self._capture_window_lock:
+                    self._capture_window_handles.discard(handle)
+                    if already_registered:
+                        self._capture_window_handles.add(handle)
+            return updated
+
+        if not included:
+            return True
+        with self._capture_window_lock:
             self._capture_window_late_hidden_handles.add(handle)
 
         # Updating this Windows build's live WGC exclusion list returns a new
@@ -879,6 +906,8 @@ class RuntimeCallbacks:
         return False
 
     def apply_global_capture_exclusion(self, reason: str) -> None:
+        if sys.platform == "darwin":
+            return
         from viewer.window_control import WDA_EXCLUDEFROMCAPTURE, set_hwnd_capture_affinity
 
         handles = self.capture_window_handles()
@@ -916,6 +945,8 @@ class RuntimeCallbacks:
             )
 
     def restore_capture_window_visibility(self) -> None:
+        if sys.platform == "darwin":
+            return
         from viewer.window_control import WDA_NONE, set_hwnd_capture_affinity
 
         with self._capture_window_lock:

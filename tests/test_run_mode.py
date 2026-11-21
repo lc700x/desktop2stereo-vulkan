@@ -39,7 +39,7 @@ def test_same_monitor_local_viewer_migrates_legacy_mode_and_enables_3d():
         monitor_count=1,
         capture_mode="Window",
     )
-    assert not is_local_same_monitor_3d_mode(
+    assert is_local_same_monitor_3d_mode(
         "Local Viewer",
         os_name="Darwin",
         monitor_count=1,

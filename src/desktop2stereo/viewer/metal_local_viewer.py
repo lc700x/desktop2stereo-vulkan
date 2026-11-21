@@ -13,6 +13,7 @@ OpenGL fallback.
 """
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -42,6 +43,8 @@ class MetalLocalViewer:
         self.glfw = None
         self.window = None
         self.device = None
+        self._ns_window = None
+        self._capture_window_registered = False
         self._initialized = False
 
     def initialize(self) -> None:
@@ -77,6 +80,18 @@ class MetalLocalViewer:
             import objc
             from Quartz import CoreVideo as CV  # noqa: F401
 
+            if sys.platform == "darwin":
+                ptr = glfw.get_cocoa_window(self.window)
+                self._ns_window = objc.objc_object(c_void_p=ptr)
+                callback = getattr(self.config, "on_capture_window_exclusion", None)
+                if callable(callback):
+                    window_id = int(self._ns_window.windowNumber())
+                    self._capture_window_registered = bool(callback(window_id, True))
+                    if not self._capture_window_registered:
+                        raise RuntimeError(
+                            "ScreenCaptureKit capture exclusion rejected the Cocoa window"
+                        )
+
             # Diagnostic: verify IOSurface-backed path is available
             print("[MetalLocalViewer] Metal device active, IOSurface zero-copy available", flush=True)
         except Exception as exc:
@@ -108,6 +123,14 @@ class MetalLocalViewer:
 
     def close(self) -> None:
         try:
+            if self._capture_window_registered and self._ns_window is not None:
+                callback = getattr(self.config, "on_capture_window_exclusion", None)
+                if callable(callback):
+                    try:
+                        callback(int(self._ns_window.windowNumber()), False)
+                    except Exception:
+                        pass
+                self._capture_window_registered = False
             if self.window and self.glfw:
                 self.glfw.destroy_window(self.window)
         finally:

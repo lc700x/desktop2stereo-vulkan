@@ -42,12 +42,19 @@ def is_local_same_monitor_3d_mode(
 ) -> bool:
     if not (
         normalize_run_mode(raw_run_mode) == "Local Viewer"
-        and str(os_name).strip().casefold() == "windows"
+        and str(os_name).strip().casefold() in {"windows", "darwin"}
         and str(capture_mode or "").strip().casefold() == "monitor"
     ):
         return False
-    if monitor_count == 1:
-        return True
+    # A single physical display is a supported same-monitor 3D target. Treat a
+    # zero count as the same case when GUI monitor enumeration temporarily
+    # fails; the selected input display is still validated separately.
+    if monitor_count is not None:
+        try:
+            if int(monitor_count) <= 1:
+                return True
+        except (TypeError, ValueError):
+            pass
     try:
         return (
             input_monitor_index is not None

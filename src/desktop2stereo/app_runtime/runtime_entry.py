@@ -502,10 +502,22 @@ def _local_viewer_cursor_passthrough(
     output_monitor_index: int,
     exclude_from_capture: bool,
 ) -> bool:
+    normalized_os = str(os_name).strip().casefold()
+    if normalized_os == "darwin":
+        display_mode = (
+            str(settings.get("Display Mode", ""))
+            .strip()
+            .casefold()
+            .replace("_", "-")
+        )
+        return bool(
+            int(input_monitor_index) == int(output_monitor_index)
+            and display_mode in {"half-sbs", "full-sbs"}
+        )
     if exclude_from_capture:
         return True
     return (
-        str(os_name).strip().casefold() == "windows"
+        normalized_os == "windows"
         and str(settings.get("Capture Mode", "")).strip().casefold() == "window"
         and int(input_monitor_index) == int(output_monitor_index)
     )
@@ -791,31 +803,43 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         input_monitor_index=input_monitor_index,
         output_monitor_index=effective_output_monitor_index,
     ):
-        try:
-            from gui.capture_sources import get_default_windows_capture_tool
-
-            runtime_capture_tool = get_default_windows_capture_tool()
-            if runtime_capture_tool not in {
-                "WindowsCaptureROCm",
-                "WindowsCaptureCUDA",
-            } and CAPTURE_TOOL in {"WindowsCaptureROCm", "WindowsCaptureCUDA"}:
-                runtime_capture_tool = CAPTURE_TOOL
-            window_capture_exclusion_active = runtime_capture_tool in {
-                "WindowsCaptureROCm",
-                "WindowsCaptureCUDA",
-            }
-            if window_capture_exclusion_active:
-                print(
-                    "[WindowCapture] Same-monitor Local Viewer uses "
-                    f"{runtime_capture_tool} with session window exclusion",
-                    flush=True,
-                )
-        except Exception as exc:
+        if OS_NAME == "Darwin":
+            # ScreenCaptureKit can exclude the Local Viewer window from this
+            # monitor stream without applying a global capture-affinity flag.
+            # OBS, Virtual Desktop, and other clients therefore still see SBS.
+            runtime_capture_tool = "ScreenCaptureKit"
+            window_capture_exclusion_active = True
             print(
-                "[WindowCapture] Could not resolve same-monitor GPU capture; "
-                f"using configured capture tool ({type(exc).__name__})",
+                "[ScreenCaptureKit] Same-monitor Local Viewer uses "
+                "per-session output-window exclusion",
                 flush=True,
             )
+        else:
+            try:
+                from gui.capture_sources import get_default_windows_capture_tool
+
+                runtime_capture_tool = get_default_windows_capture_tool()
+                if runtime_capture_tool not in {
+                    "WindowsCaptureROCm",
+                    "WindowsCaptureCUDA",
+                } and CAPTURE_TOOL in {"WindowsCaptureROCm", "WindowsCaptureCUDA"}:
+                    runtime_capture_tool = CAPTURE_TOOL
+                window_capture_exclusion_active = runtime_capture_tool in {
+                    "WindowsCaptureROCm",
+                    "WindowsCaptureCUDA",
+                }
+                if window_capture_exclusion_active:
+                    print(
+                        "[WindowCapture] Same-monitor Local Viewer uses "
+                        f"{runtime_capture_tool} with session window exclusion",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(
+                    "[WindowCapture] Could not resolve same-monitor GPU capture; "
+                    f"using configured capture tool ({type(exc).__name__})",
+                    flush=True,
+                )
     if effective_render_size_config is not RENDER_SIZE_CONFIG:
         print(
             "[Main] Local Viewer v2.5 source path: "
@@ -928,12 +952,15 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         display_fit_mode=settings.get("Display Fit Mode", "contain"),
     )
     if window_capture_exclusion_active:
-        context.capture_config = replace(
-            context.capture_config,
-            excluded_window_handles_provider=callbacks.capture_window_handles,
-            on_window_exclusion_ready=callbacks.restore_capture_window_visibility,
-            on_window_exclusion_fallback=callbacks.apply_global_capture_exclusion,
-        )
+        exclusion_config = {
+            "excluded_window_handles_provider": callbacks.capture_window_handles,
+        }
+        if OS_NAME == "Windows":
+            exclusion_config.update(
+                on_window_exclusion_ready=callbacks.restore_capture_window_visibility,
+                on_window_exclusion_fallback=callbacks.apply_global_capture_exclusion,
+            )
+        context.capture_config = replace(context.capture_config, **exclusion_config)
 
     low_sbs_report_count = 0
 
@@ -1082,7 +1109,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
 
     defer_capture_start_until_viewer_ready = bool(
         window_capture_exclusion_active
-        and OS_NAME == "Windows"
+        and OS_NAME in {"Windows", "Darwin"}
         and str(RUN_MODE).strip().casefold() == "viewer"
     )
     capture_windows_initialized = (
@@ -1091,6 +1118,14 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
     capture_start_gate = threading.Event()
     if not defer_capture_start_until_viewer_ready:
         capture_start_gate.set()
+
+    def _capture_windows_initialized() -> None:
+        if capture_windows_initialized is not None:
+            capture_windows_initialized.set()
+        # macOS owns the viewer on the process main thread, so there is no
+        # outer waiter that can release the capture gate after initialization.
+        if OS_NAME == "Darwin":
+            capture_start_gate.set()
 
     def _run_capture_session() -> None:
         while not capture_start_gate.wait(0.05):
@@ -1531,12 +1566,19 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     flush=True,
                 )
             if window_capture_exclusion_active:
-                fullscreen_policy = "capture_compatible"
-                print(
-                    "[VulkanLocalViewer] WGC exclusion on the captured monitor uses "
-                    "DWM-composited fullscreen for remote desktop visibility",
-                    flush=True,
-                )
+                if OS_NAME == "Darwin":
+                    print(
+                        "[VulkanLocalViewer] ScreenCaptureKit exclusion keeps the "
+                        "Cocoa SBS window visible to external capture clients",
+                        flush=True,
+                    )
+                else:
+                    fullscreen_policy = "capture_compatible"
+                    print(
+                        "[VulkanLocalViewer] WGC exclusion on the captured monitor uses "
+                        "DWM-composited fullscreen for remote desktop visibility",
+                        flush=True,
+                    )
             exclude_from_capture = _exclude_local_output_from_capture(
                 settings,
                 os_name=OS_NAME,
@@ -1620,7 +1662,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     else None
                 ),
                 on_capture_windows_initialized=(
-                    capture_windows_initialized.set
+                    _capture_windows_initialized
                     if capture_windows_initialized is not None
                     else None
                 ),
@@ -1707,7 +1749,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 # the CAMetalLayer path). D2S_MAC_VIEWER=metal selects the
                 # full CAMetalLayer deferred-warp path; on its failure this
                 # still falls back to run_vulkan_local_viewer, which chains
-                # Vulkan -> Metal stub -> OpenGL.
+                # Vulkan -> CAMetalLayer -> OpenGL.
                 use_metal_viewer = (
                     os.environ.get("D2S_MAC_VIEWER", "vulkan").strip().lower()
                     == "metal"
@@ -1767,7 +1809,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                         shutdown_event.set()
                         capture_start_gate.set()
                         raise RuntimeError(
-                            "Single-display Local Viewer output windows were not initialized before WGC capture"
+                            "Local Viewer output windows were not initialized before capture started"
                         )
                     print(
                         "[WindowCapture] Viewer HWNDs registered before initial WGC session",

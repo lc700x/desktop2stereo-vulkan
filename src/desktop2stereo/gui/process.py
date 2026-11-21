@@ -1527,13 +1527,10 @@ class GUIProcessMixin:
             output_monitor_index=output_monitor_index,
         )
         file_mode = self.capture_mode_key == "File"
-        if (
-            self.run_mode_key == "Local Viewer"
-            and monitor_count <= 1
-            and not same_monitor_local_3d
-            and not file_mode
-        ):
-            return False, UI_MESSAGES[self.locale]["Local Viewer requires a second display"]
+        # Local Viewer supports same-monitor SBS on Windows and macOS. The
+        # runtime excludes its output window from the monitor-capture session
+        # while keeping it visible to OBS and other capture clients. Do not
+        # block this mode when only one display exists.
         if self.capture_mode_key == "Monitor" and (
             getattr(self, "_missing_monitor_identity", False)
             or not self.monitor_dd.value

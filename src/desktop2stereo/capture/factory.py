@@ -153,6 +153,10 @@ def create_capture_source(config: CaptureConfig | None = None):
     if config.os_name == "Darwin" and config.capture_tool == "ScreenCaptureKit":
         kwargs["fps_provider"] = config.fps_provider
         kwargs["gpu_required"] = bool(config.gpu_required)
+        kwargs["with_cursor"] = bool(config.cursor_capture)
+        kwargs["excluded_window_handles_provider"] = (
+            config.excluded_window_handles_provider
+        )
     return source_cls(**kwargs)
 
 

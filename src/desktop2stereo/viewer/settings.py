@@ -100,7 +100,7 @@ def resolve_viewer_settings(settings: dict) -> ViewerSettings:
         )
     display_mode = settings["Display Mode"]
     capture_mode = settings["Capture Mode"]
-    single_display_local_3d = len(displays) == 1 and is_local_same_monitor_3d_mode(
+    same_monitor_local_3d = is_local_same_monitor_3d_mode(
         settings.get("Run Mode", "Local Viewer"),
         os_name=platform.system(),
         monitor_count=len(displays),
@@ -108,7 +108,7 @@ def resolve_viewer_settings(settings: dict) -> ViewerSettings:
         input_monitor_index=monitor_index,
         output_monitor_index=monitor_index,
     )
-    if single_display_local_3d:
+    if same_monitor_local_3d:
         stereo_display_index = monitor_index
         stereo_display_selection = True
     elif len(displays) == 1:

@@ -414,7 +414,26 @@ class GUIBuilderMixin:
             self._accel_spacer.width = final_w
             self._safe_update(self._accel_spacer)
         if hasattr(self, '_capture_mode_spacer'):
-            self._capture_mode_spacer.width = max(0, final_w - S(130) - 1)
+            # Keep the source selector compact while lining the display list
+            # up with the headset dropdown in the row above. Measuring the
+            # existing row keeps this stable when labels change visibility.
+            target_offset = None
+            headset_row = getattr(self, "xr_headset_row", None)
+            headset_dd = getattr(self, "xr_headset_dd", None)
+            row_controls = getattr(headset_row, "controls", ()) if headset_row else ()
+            headset_index = next(
+                (index for index, control in enumerate(row_controls) if control is headset_dd),
+                None,
+            )
+            if headset_index is not None:
+                preceding = row_controls[:headset_index]
+                target_offset = sum(
+                    self._estimate_control_width(control) for control in preceding
+                ) + self._spacing_width(preceding, getattr(headset_row, "spacing", 0))
+            if target_offset is None:
+                target_offset = final_w + S(40)
+            source_width = self._estimate_control_width(self.capture_mode_dd)
+            self._capture_mode_spacer.width = max(0, target_offset - source_width - 1)
             self._safe_update(self._capture_mode_spacer)
         self._labels_aligned = True
 
@@ -885,13 +904,19 @@ class GUIBuilderMixin:
             ],
             value=capture_mode_messages.get("Input Screen", "Input Screen"),
             on_select=self.on_capture_mode_change,
-            width=S(130),
+            # Source modes use the same aligned width as the labels above.
+            dyna_width=True,
         )
         self._capture_mode_spacer = ft.Container(width=0)
-        self.monitor_dd = CompactDropdown(on_select=self._on_monitor_change, max_width=S(300))
-        self.window_dd = CompactDropdown(on_select=self.on_window_selected, max_width=S(300))
-        self.refresh_btn = ft.Button(content=ft.Text("Refresh", size=FONT_SIZE),
-            width=S(130), on_click=self.refresh_monitor_and_window)
+        self.monitor_dd = CompactDropdown(on_select=self._on_monitor_change, max_width=S(230))
+        self.window_dd = CompactDropdown(on_select=self.on_window_selected, max_width=S(230))
+        self.refresh_btn = ft.Button(
+            content=ft.Text("Refresh", size=FONT_SIZE, max_lines=1, no_wrap=True),
+            width=S(130),
+            height=S(32),
+            on_click=self.refresh_monitor_and_window,
+            style=_main_menu_action_style("secondary"),
+        )
 
         media_messages = UI_MESSAGES[self.locale]
         self.media_open_file_label = ft.Text(
@@ -1211,15 +1236,25 @@ class GUIBuilderMixin:
             on_select=self.on_log_level_filter,
         )
         self.report_issue_btn = ft.Button(
-            content=ft.Text(UI_MESSAGES[self.locale].get("Report issue", "Report bug"), size=FONT_SIZE),
+            content=ft.Text(
+                UI_MESSAGES[self.locale].get("Report issue", "Report bug"),
+                size=FONT_SIZE,
+                max_lines=1,
+                no_wrap=True,
+            ),
             width=S(150),
             height=S(32),
             on_click=self.on_report_issue,
             style=_main_menu_action_style("secondary"),
         )
         self.open_log_file_btn = ft.Button(
-            content=ft.Text(UI_MESSAGES[self.locale].get("Open log file", "Open log"), size=FONT_SIZE),
-            width=S(150),
+            content=ft.Text(
+                UI_MESSAGES[self.locale].get("Open log file", "Open log folder"),
+                size=FONT_SIZE,
+                max_lines=1,
+                no_wrap=True,
+            ),
+            width=S(170),
             height=S(32),
             on_click=self.on_open_log_file,
             style=_main_menu_action_style("secondary"),
@@ -1687,14 +1722,28 @@ class GUIBuilderMixin:
             return
 
     def _apply_stereo_output(self, cfg):
+        import platform
+
+        same_monitor_local_viewer = (
+            platform.system() in {"Windows", "Darwin"}
+            and str(getattr(self, "run_mode_key", "")).strip().casefold()
+            in {"local viewer", "3d monitor"}
+            and str(getattr(self, "capture_mode_key", "")).strip().casefold()
+            == "monitor"
+        )
         mon_count = self._get_monitor_count()
+        input_label = self.monitor_dd.value
+        if same_monitor_local_viewer:
+            self.stereo_monitor_dd.value = (
+                input_label if input_label in self.monitor_label_to_index else ""
+            )
+            return
         if mon_count <= 1 or getattr(
             self, "_missing_stereo_output_identity", False
         ):
             self.stereo_monitor_dd.value = ""
             return
         output_labels = list(self.monitor_label_to_index)
-        input_label = self.monitor_dd.value
         saved = cfg.get("Stereo Output")
         if saved is not None:
             label = next(
@@ -1727,12 +1776,23 @@ class GUIBuilderMixin:
     def update_stereo_monitor_menu(self):
         if not hasattr(self, 'stereo_monitor_dd'):
             return
+        import platform
+
         opts = list(self.monitor_label_to_index)
         input_label = self.monitor_dd.value
         current = self.stereo_monitor_dd.value
         valid = current in opts
         self.stereo_monitor_dd.options = opts
-        if getattr(self, "_missing_stereo_output_identity", False):
+        same_monitor_local_viewer = (
+            platform.system() in {"Windows", "Darwin"}
+            and str(getattr(self, "run_mode_key", "")).strip().casefold()
+            in {"local viewer", "3d monitor"}
+            and str(getattr(self, "capture_mode_key", "")).strip().casefold()
+            == "monitor"
+        )
+        if same_monitor_local_viewer:
+            self.stereo_monitor_dd.value = input_label if input_label in opts else ""
+        elif getattr(self, "_missing_stereo_output_identity", False):
             self.stereo_monitor_dd.value = ""
         else:
             self.stereo_monitor_dd.value = current if valid else next(

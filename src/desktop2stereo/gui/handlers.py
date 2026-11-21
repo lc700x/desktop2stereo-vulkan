@@ -830,7 +830,18 @@ class GUIHandlerMixin:
         self.set_status(f"{UI_MESSAGES[self.locale]['Selected input monitor:']} {e.control.value}")
 
     def _on_stereo_monitor_change(self, _e):
+        import platform
+
         self._missing_stereo_output_identity = False
+        same_monitor_local_viewer = (
+            platform.system() in {"Windows", "Darwin"}
+            and str(getattr(self, "run_mode_key", "")).strip().casefold()
+            in {"local viewer", "3d monitor"}
+            and str(getattr(self, "capture_mode_key", "")).strip().casefold()
+            == "monitor"
+        )
+        if same_monitor_local_viewer:
+            self.stereo_monitor_dd.value = self.monitor_dd.value
         self._sync_visibility()
 
     # ── run mode / visibility handlers ──
@@ -1669,11 +1680,19 @@ class GUIHandlerMixin:
             self.showfps_cb.visible = True
         self.display_fit_dd.visible = display_fit_visible
         mon_count = self._get_monitor_count()
+        import platform
+
+        same_monitor_local_viewer = (
+            platform.system() in {"Windows", "Darwin"}
+            and mode.casefold() == "local viewer"
+            and str(getattr(self, "capture_mode_key", "")).strip().casefold()
+            == "monitor"
+        )
         self.display_mode_dd.options = [
             "Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB",
             "Depth Map", "Anaglyph", "Interleaved", "Mono", "Leia",
         ]
-        stereo_full = mode == "Local Viewer" and mon_count > 1
+        stereo_full = mode == "Local Viewer" and mon_count > 1 and not same_monitor_local_viewer
         self.stereo_output_label.visible = stereo_full
         self.stereo_monitor_dd.visible = stereo_full
         if hasattr(self, '_stereo_spacer'):
@@ -1759,6 +1778,18 @@ class GUIHandlerMixin:
         )
 
     def _auto_select_stereo_monitor(self):
+        import platform
+
+        same_monitor_local_viewer = (
+            platform.system() in {"Windows", "Darwin"}
+            and str(getattr(self, "run_mode_key", "")).strip().casefold()
+            in {"local viewer", "3d monitor"}
+            and str(getattr(self, "capture_mode_key", "")).strip().casefold()
+            == "monitor"
+        )
+        if same_monitor_local_viewer:
+            self.stereo_monitor_dd.value = self.monitor_dd.value
+            return
         mon_count = self._get_monitor_count()
         if mon_count <= 1:
             self.stereo_monitor_dd.value = ""
@@ -2118,7 +2149,11 @@ class GUIHandlerMixin:
                 "OpenXR Controls", "OpenXR Controls"
             )
         self.report_issue_btn.content.value = t.get("Report issue", "Report bug")
-        self.open_log_file_btn.content.value = t.get("Open log file", "Open log")
+        self.open_log_file_btn.content.value = t.get("Open log file", "Open log folder")
+        for button in (self.report_issue_btn, self.open_log_file_btn):
+            button.content.max_lines = 1
+            button.content.no_wrap = True
+        self.open_log_file_btn.width = S(170)
         self._sync_log_visibility_link()
 
         def _set_tooltip(ctrl, text):

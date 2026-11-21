@@ -105,6 +105,37 @@ def _sck_find_window(title):
                 return w
     return None
 
+
+def _sck_resolve_window_ids(window_ids):
+    """Resolve Cocoa window numbers to the SCWindow objects SCK requires."""
+    requested = []
+    for value in window_ids or ():
+        try:
+            window_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if window_id > 0 and window_id not in requested:
+            requested.append(window_id)
+    if not requested:
+        return []
+
+    def lookup(content):
+        by_id = {}
+        for window in content.windows():
+            try:
+                by_id[int(window.windowID())] = window
+            except (TypeError, ValueError):
+                continue
+        return [by_id[window_id] for window_id in requested if window_id in by_id]
+
+    windows = lookup(_sck_get_shareable_content())
+    if len(windows) == len(requested):
+        return windows
+    # The viewer is registered immediately before the capture source starts;
+    # force one fresh enumeration when ScreenCaptureKit's short content cache
+    # still predates the newly-created window.
+    return lookup(_sck_get_shareable_content(force=True))
+
 def get_window_info_mac(window_title):
     win = _sck_find_window(window_title)
     if win is None:
@@ -219,6 +250,7 @@ class _SCKFrameReceiver(NSObject):
         self._frame_count = 0
         self._frame_status_counts = {}
         self._texture_diag_logged = False
+        self._stream_stop_error = None
         self._condition = threading.Condition(self._lock)
         return self
 
@@ -400,7 +432,19 @@ class _SCKFrameReceiver(NSObject):
 
     def stream_didStopWithError_(self, stream, error):
         if error is not None:
-            print(f"[ScreenCaptureKit] Stream stopped with error: {error}")
+            with self._condition:
+                self._stream_stop_error = str(error)
+                self._condition.notify_all()
+            print(
+                f"[ScreenCaptureKit] Stream stopped with error: {error}",
+                flush=True,
+            )
+
+    def take_stream_stop_error(self):
+        with self._condition:
+            error = self._stream_stop_error
+            self._stream_stop_error = None
+        return error
 
     def get_latest_frame(self, timeout=0.1):
         """Return the newest frame, transferring ownership instead of copying.
@@ -470,7 +514,8 @@ class _SCKFrameReceiver(NSObject):
 class DesktopGrabber:
     def __init__(self, output_resolution=1080, fps=60, window_title=None,
                 capture_mode="Monitor", monitor_index=1, with_cursor=True,
-                fps_provider=None, gpu_required=False):
+                fps_provider=None, gpu_required=False,
+                excluded_window_handles_provider=None):
         # OUTPUT_RESOLUTION may be an int or a (width, height) tuple when
         # "Processing Resolution: Auto"; the grabber needs a target height.
         if isinstance(output_resolution, (tuple, list)):
@@ -492,6 +537,18 @@ class DesktopGrabber:
         self._last_frame = None
         self._display = None
         self._window = None
+        self._excluded_window_handles_provider = excluded_window_handles_provider
+        self._excluded_window_ids = ()
+        self._excluded_windows = []
+        self._window_filter_update_lock = threading.Lock()
+        self._stream_restart_lock = threading.Lock()
+        self._last_stream_restart_at = 0.0
+        self._stream_restart_error_logged = False
+        self._window_exclusion_requested = bool(
+            self.capture_mode == "Monitor"
+            and callable(self._excluded_window_handles_provider)
+        )
+        self.window_exclusion_available = False
         self.left = 0
         self.top = 0
         self.width = 0
@@ -563,6 +620,58 @@ class DesktopGrabber:
 
         self._start_stream()
 
+    def _restart_stream_if_needed(self) -> None:
+        """Recreate a display stream after a transient macOS Space change."""
+        receiver = self._receiver
+        if receiver is None:
+            return
+        error = receiver.take_stream_stop_error()
+        if error is None:
+            return
+        now = time.monotonic()
+        if now - self._last_stream_restart_at < 0.5:
+            return
+        with self._stream_restart_lock:
+            receiver = self._receiver
+            if receiver is None:
+                return
+            # Another grab call may have consumed the stop notification while
+            # waiting for the lock.
+            if receiver is not self._receiver:
+                return
+            self._last_stream_restart_at = now
+            old_stream = self._stream
+            self._stream = None
+            if old_stream is not None:
+                done = threading.Event()
+                try:
+                    old_stream.stopCaptureWithCompletionHandler_(
+                        lambda _error: done.set()
+                    )
+                    done.wait(timeout=3.0)
+                except Exception:
+                    pass
+            try:
+                self._start_stream()
+                self._stream_restart_error_logged = False
+                print(
+                    "[ScreenCaptureKit] Recreated monitor stream after a "
+                    f"display/Space transition ({error})",
+                    flush=True,
+                )
+            except Exception as exc:
+                if not self._stream_restart_error_logged:
+                    self._stream_restart_error_logged = True
+                    print(
+                        "[ScreenCaptureKit] Monitor stream recreation failed; "
+                        f"will retry ({type(exc).__name__}: {exc})",
+                        flush=True,
+                    )
+                retry_receiver = self._receiver
+                if retry_receiver is not None:
+                    with retry_receiver._condition:
+                        retry_receiver._stream_stop_error = error
+
     def _source_refresh_hz(self):
         """Use the display ceiling so ProMotion cannot exceed a lower FPS cap."""
         try:
@@ -598,8 +707,43 @@ class DesktopGrabber:
 
     def _start_stream(self):
         if self.capture_mode == "Monitor":
+            excluded_windows = []
+            if self._window_exclusion_requested:
+                try:
+                    requested_ids = tuple(
+                        self._excluded_window_handles_provider() or ()
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "ScreenCaptureKit could not read the Local Viewer window ID"
+                    ) from exc
+                requested_positive_ids = []
+                for value in requested_ids:
+                    try:
+                        window_id = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if window_id > 0 and window_id not in requested_positive_ids:
+                        requested_positive_ids.append(window_id)
+                excluded_windows = _sck_resolve_window_ids(requested_ids)
+                resolved_ids = tuple(
+                    int(window.windowID()) for window in excluded_windows
+                )
+                if not excluded_windows or set(resolved_ids) != set(requested_positive_ids):
+                    raise RuntimeError(
+                        "ScreenCaptureKit could not resolve all Local Viewer "
+                        f"window IDs for monitor exclusion: {list(requested_ids)}"
+                    )
+                self._excluded_window_ids = resolved_ids
+                self._excluded_windows = excluded_windows
+                self.window_exclusion_available = True
+                print(
+                    "[ScreenCaptureKit] Monitor capture excludes Local Viewer "
+                    f"window IDs {list(resolved_ids)}; external capture remains visible",
+                    flush=True,
+                )
             filt = SCK.SCContentFilter.alloc().initWithDisplay_excludingWindows_(
-                self._display, [])
+                self._display, excluded_windows)
         else:
             filt = SCK.SCContentFilter.alloc().initWithDisplay_includingWindows_(
                 self._display, [self._window])
@@ -609,6 +753,24 @@ class DesktopGrabber:
         config.setHeight_(self.height)
         config.setShowsCursor_(self.with_cursor)
         config.setPixelFormat_(CV.kCVPixelFormatType_32BGRA)
+        # The local viewers present through an sRGB swapchain/CAMetalLayer.
+        # ScreenCaptureKit otherwise keeps the display's native P3/extended
+        # color space, which makes the same 8-bit values look washed out after
+        # the GPU-only stereo path presents them as sRGB.
+        try:
+            from Quartz import kCGColorSpaceSRGB
+
+            if hasattr(config, "setColorSpaceName_"):
+                config.setColorSpaceName_(kCGColorSpaceSRGB)
+        except Exception:
+            # Older ScreenCaptureKit builds may not expose colorSpaceName;
+            # retain the native capture path in that case.
+            pass
+        print(
+            "[ScreenCaptureKit] Monitor stream config: "
+            f"cursor={'on' if self.with_cursor else 'off'} color_space=sRGB",
+            flush=True,
+        )
         config.setMinimumFrameInterval_(self._minimum_frame_interval(self.fps))
         # Keep the SCK producer low-latency. A bounded queue prevents retained
         # IOSurfaces from back-pressuring the display stream. The default
@@ -648,6 +810,76 @@ class DesktopGrabber:
 
         self._receiver.get_latest_frame(timeout=2.0)
 
+    def update_excluded_window_handles(self, window_ids) -> bool:
+        """Apply viewer-window changes to the active monitor stream."""
+        if self.capture_mode != "Monitor" or self._stream is None:
+            return False
+        requested_ids = []
+        for value in window_ids or ():
+            try:
+                window_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if window_id > 0 and window_id not in requested_ids:
+                requested_ids.append(window_id)
+
+        with self._window_filter_update_lock:
+            excluded_windows = _sck_resolve_window_ids(requested_ids)
+            resolved_ids = tuple(
+                int(window.windowID()) for window in excluded_windows
+            )
+            if set(resolved_ids) != set(requested_ids):
+                print(
+                    "[ScreenCaptureKit] Could not resolve all updated Local Viewer "
+                    f"window IDs: requested={requested_ids} resolved={list(resolved_ids)}",
+                    flush=True,
+                )
+                return False
+
+            content_filter = SCK.SCContentFilter.alloc().initWithDisplay_excludingWindows_(
+                self._display, excluded_windows
+            )
+            completed = threading.Event()
+            result = {}
+
+            def _on_update(error):
+                result["error"] = error
+                completed.set()
+
+            try:
+                self._stream.updateContentFilter_completionHandler_(
+                    content_filter, _on_update
+                )
+            except Exception as exc:
+                print(
+                    "[ScreenCaptureKit] Live window-filter update failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                return False
+            if not completed.wait(timeout=5.0):
+                print(
+                    "[ScreenCaptureKit] Timed out updating the monitor window filter",
+                    flush=True,
+                )
+                return False
+            if result.get("error") is not None:
+                print(
+                    f"[ScreenCaptureKit] Live window-filter update failed: {result['error']}",
+                    flush=True,
+                )
+                return False
+
+            self._excluded_window_ids = resolved_ids
+            self._excluded_windows = excluded_windows
+            self.window_exclusion_available = True
+            print(
+                "[ScreenCaptureKit] Updated monitor window exclusions "
+                f"to {list(resolved_ids)}",
+                flush=True,
+            )
+            return True
+
     def _sync_capture_fps(self):
         provider = self._fps_provider
         if not callable(provider):
@@ -667,6 +899,13 @@ class DesktopGrabber:
         config.setHeight_(self.height)
         config.setShowsCursor_(self.with_cursor)
         config.setPixelFormat_(CV.kCVPixelFormatType_32BGRA)
+        try:
+            from Quartz import kCGColorSpaceSRGB
+
+            if hasattr(config, "setColorSpaceName_"):
+                config.setColorSpaceName_(kCGColorSpaceSRGB)
+        except Exception:
+            pass
         config.setMinimumFrameInterval_(self._minimum_frame_interval(target_fps))
         try:
             if hasattr(config, "setQueueDepth_"):
@@ -739,6 +978,7 @@ class DesktopGrabber:
         path (capture.preprocess) accepts 4-channel BGRA directly. ``bgr``
         remains available for CPU consumers.
         """
+        self._restart_stream_if_needed()
         self._update_window_filter()
 
         frame = self._receiver.get_latest_frame(timeout=1.0 / max(1, self.fps))
@@ -776,6 +1016,7 @@ class DesktopGrabber:
 
     def grab_native_zero_copy(self, timeout=0.0):
         """Atomically wait for and take the newest retained IOSurface."""
+        self._restart_stream_if_needed()
         self._sync_capture_fps()
         self._update_window_filter()
         receiver = self._receiver

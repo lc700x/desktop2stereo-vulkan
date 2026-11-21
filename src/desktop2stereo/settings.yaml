@@ -1,15 +1,15 @@
-Capture Mode: File
-Monitor Index: 3
+Capture Mode: Monitor
+Monitor Index: 1
 Monitor Identity:
-  stable_id: DISPLAY\TUP0270\7&34414894&e&UID1536
-  name: D270H
-  manufacturer: TUP
-  model: D270H
-  serial: '808728147'
+  stable_id: cg:1552:41036:4251086178
+  name: iMac
+  manufacturer: '1552'
+  model: iMac
+  serial: '4251086178'
   left: 0
   top: 0
-  width: 3840
-  height: 2160
+  width: 1920
+  height: 1080
 Window Title: ''
 Show FPS: true
 Model List:
@@ -340,10 +340,10 @@ Model List:
   DepthPro-Large:
     resolutions:
     - 1536
-Depth Model: Distill-Any-Depth-Base
+Depth Model: Distill-Any-Depth-Small
 Depth Strength: 0.48
 Depth Quick: Standard
-Depth Resolution: 518
+Depth Resolution: 336
 Anti-aliasing: 2
 Depth Antialias Strength: 2.0
 Depth Pop: 0.0
@@ -381,20 +381,20 @@ Vulkan Projection Max LOD: 0.35
 Vulkan Projection MIP LOD Bias: -0.35
 Vulkan Projection RCAS Sharpness: 0.5
 Display Mode: Half-SBS
-FP16: true
+FP16: false
 torch.compile: false
 TensorRT: null
 Parallel Inference: false
 Parallel Inference Workers: 1
 Recompile TensorRT: false
-CoreML: null
+CoreML: true
 Recompile CoreML: false
-MIGraphX: true
+MIGraphX: null
 Recompile MIGraphX: false
 Recompile OpenVINO: false
 Computing Device: 0
-Language: CN
-Run Mode: OpenXR Link
+Language: EN
+Run Mode: Local Viewer
 XR Headset Model: Pico 4 / 4 Ultra
 XR Preview Window: true
 VSync: false
@@ -420,6 +420,7 @@ Stream Target Bitrate Mbps: 0
 Stream Peak Bitrate Mbps: 0
 Stream Calibration Port: 1123
 Stream Key: live
+Stereo Mix: null
 Audio Capture Backend: auto
 Video Encoder Backend: auto
 CRF: 23
@@ -429,29 +430,29 @@ Environment Model: Default
 NVIDIA Frame Generation: false
 Lossless Scaling Support: false
 LSFG Support: false
-Capture Tool: WindowsCaptureROCm
+Capture Tool: ScreenCaptureKit
 Display Fit Mode: contain
 Stream Display Fit Mode: contain
 Fill 16:9: true
 Fix Viewer Aspect: true
-Stereo Output: 2
+Stereo Output: 1
 Stereo Output Identity:
-  stable_id: DISPLAY\DELF015\7&314d3634&4&UID61696
-  name: Dell U2410(Digital)
-  manufacturer: DEL
-  model: DELL U2410
-  serial: J257M0CR0TUL
-  left: 7680
+  stable_id: cg:1552:41036:4251086178
+  name: iMac
+  manufacturer: '1552'
+  model: iMac
+  serial: '4251086178'
+  left: 0
   top: 0
   width: 1920
-  height: 1200
+  height: 1080
 Show Log Panel: true
 Stream Target FPS: 0
-Input Display Resolution Tier: 4K
+Input Display Resolution Tier: 1K
 Synthetic View: quality_4k
 OpenVINO: null
 Media Path: F:\Videos\【顶级画质】B站首支4K 120FPS HDR10影片《文字大战》\P1-【4K 120FPS HDR10】文字大战.mp4
-Media Playback Position: 346.366
+Media Playback Position: 0.0
 OpenXR Screen States:
   Default:
     position:
@@ -473,4 +474,4 @@ OpenXR Glow Modes:
   Default: 'off'
 Media Volume: 1.0
 Media Muted: false
-Media Browser Directory: F:\Videos
+Media Browser Directory: /Users/nick/desktop2stereo-vulkan/src

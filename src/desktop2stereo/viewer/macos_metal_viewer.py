@@ -1,10 +1,11 @@
 """macOS Metal local viewer — zero-copy-ish present path (Darwin only).
 
-Replaces the MoltenVK swapchain chain (GPU quantize -> .cpu() -> vkMapMemory ->
-vkCmdCopyBufferToImage -> blit) with the proven Desktop2Stereo v2.5 approach:
+Replaces the MoltenVK swapchain chain with a native GPU path:
 
-    SBS float32 (MPS) -> quantize on MPS -> one .cpu() copy -> numpy RGBA
-    -> CAMetalLayer MTLTexture replaceRegion -> textured-quad draw
+    CoreML/Metal warp-pack -> shared MTLBuffer texture view
+    -> CAMetalLayer textured-quad draw
+
+The strict macOS runtime rejects host-frame fallback presentation.
 
 Interface matches VulkanLocalViewer so the runtime can switch viewers without
 touching the pipeline: initialize() / present(frame) / poll_events() / close().
@@ -32,6 +33,15 @@ from viewer.vulkan_local_viewer import (
     is_exclusive_fullscreen_toggle,
     pack_frame_to_rgba8,
     present_fps_if_due,
+)
+from viewer.window_control import (
+    capture_cursor_snapshot,
+    cursor_overlay_rects,
+    cursor_screen_position,
+    cursor_snapshot_key,
+    pin_macos_viewer_window,
+    set_window_mouse_passthrough,
+    update_native_cursor_suppression,
 )
 
 METAL_SHADER = r"""
@@ -63,17 +73,41 @@ vertex VOut quad_vertex(uint vid [[vertex_id]]) {
     return out;
 }
 
+static float4 blend_cursor(
+    float4 color,
+    float2 pixel,
+    float4 rect,
+    texture2d<float> cursorTex,
+    sampler smp
+) {
+    if (rect.z <= 0.0 || rect.w <= 0.0) {
+        return color;
+    }
+    float2 cursor_uv = (pixel - rect.xy) / rect.zw;
+    if (all(cursor_uv >= 0.0) && all(cursor_uv < 1.0)) {
+        float4 cursor = cursorTex.sample(smp, cursor_uv);
+        color.rgb = mix(color.rgb, cursor.rgb, cursor.a);
+    }
+    return color;
+}
+
 fragment float4 quad_fragment(
     VOut in [[stage_in]],
     texture2d<float> tex [[texture(0)]],
+    texture2d<float> cursorTex [[texture(1)]],
     sampler smp [[sampler(0)]],
-    constant float4 &uv_xform [[buffer(0)]]
+    constant float4 &uv_xform [[buffer(0)]],
+    constant float4 &cursor_rect_left [[buffer(1)]],
+    constant float4 &cursor_rect_right [[buffer(2)]]
 ) {
     float2 uv = (in.uv - uv_xform.zw) / max(uv_xform.xy, float2(1e-6));
     if (any(uv < 0.0) || any(uv > 1.0)) {
         return float4(0.0, 0.0, 0.0, 1.0);
     }
-    return tex.sample(smp, uv);
+    float4 color = tex.sample(smp, uv);
+    color = blend_cursor(color, in.position.xy, cursor_rect_left, cursorTex, smp);
+    color = blend_cursor(color, in.position.xy, cursor_rect_right, cursorTex, smp);
+    return color;
 }
 """
 
@@ -99,6 +133,8 @@ struct Uniforms {
     float featherEnabled;
     float featherWidth;
     float _pad1;
+    float4 cursorRectLeft;
+    float4 cursorRectRight;
 };
 
 vertex VertexOut vertex_main(uint vid [[vertex_id]]) {
@@ -118,6 +154,24 @@ vertex VertexOut vertex_main(uint vid [[vertex_id]]) {
     out.position = float4(positions[vid], 0.0, 1.0);
     out.uv = uvs[vid];
     return out;
+}
+
+static float4 blend_cursor(
+    float4 color,
+    float2 pixel,
+    float4 rect,
+    texture2d<float> cursorTex,
+    sampler smp
+) {
+    if (rect.z <= 0.0 || rect.w <= 0.0) {
+        return color;
+    }
+    float2 cursor_uv = (pixel - rect.xy) / rect.zw;
+    if (all(cursor_uv >= 0.0) && all(cursor_uv < 1.0)) {
+        float4 cursor = cursorTex.sample(smp, cursor_uv);
+        color.rgb = mix(color.rgb, cursor.rgb, cursor.a);
+    }
+    return color;
 }
 
 static float2 displaced_uv(float2 uv, float eye, texture2d<float> depthTex, sampler s, constant Uniforms& u) {
@@ -156,6 +210,7 @@ fragment float4 fragment_main(
     VertexOut in [[stage_in]],
     texture2d<float> colorTex [[texture(0)]],
     texture2d<float> depthTex [[texture(1)]],
+    texture2d<float> cursorTex [[texture(2)]],
     constant Uniforms& u [[buffer(0)]]
 ) {
     constexpr sampler s(address::clamp_to_edge, filter::linear);
@@ -167,21 +222,15 @@ fragment float4 fragment_main(
     float2 uv = clamp((frag - u.viewport.xy) / u.viewport.zw, 0.0, 1.0);
     int mode = int(u.mode + 0.5);
 
-    if (mode == 0) {
-        return colorTex.sample(s, uv);
-    }
-
-    if (mode == 7) {
-        return colorTex.sample(s, displaced_uv(uv, u.eyeOffset, depthTex, s, u));
-    }
-
-    if (mode == 3) {
-        float d = depthTex.sample(s, uv).r;
-        return float4(spectral_r_ultrafast(d), 1.0);
-    }
-
     float4 color;
-    if (mode == 4) {
+    if (mode == 0) {
+        color = colorTex.sample(s, uv);
+    } else if (mode == 7) {
+        color = colorTex.sample(s, displaced_uv(uv, u.eyeOffset, depthTex, s, u));
+    } else if (mode == 3) {
+        float d = depthTex.sample(s, uv).r;
+        color = float4(spectral_r_ultrafast(d), 1.0);
+    } else if (mode == 4) {
         float2 luv = displaced_uv(uv, -u.eyeOffset, depthTex, s, u);
         float2 ruv = displaced_uv(uv,  u.eyeOffset, depthTex, s, u);
         float4 lc = colorTex.sample(s, luv);
@@ -202,6 +251,8 @@ fragment float4 fragment_main(
         float2 src = float2(uv.x < 0.5 ? uv.x * 2.0 : (uv.x - 0.5) * 2.0, uv.y);
         color = colorTex.sample(s, displaced_uv(src, eye, depthTex, s, u));
     }
+    color = blend_cursor(color, frag, u.cursorRectLeft, cursorTex, s);
+    color = blend_cursor(color, frag, u.cursorRectRight, cursorTex, s);
     return color;
 }
 """
@@ -221,6 +272,11 @@ class MetalLocalViewer:
         self.layer = None
         self._ns_window = None
         self._ns_view = None
+        self._capture_window_registered = False
+        self._cursor_texture = None
+        self._cursor_snapshot = None
+        self._cursor_snapshot_key = None
+        self._cursor_hide_enabled = False
         self._staging_texture = None
         self._staging_size = (0, 0)
         self._native_pack_size = (0, 0)
@@ -238,6 +294,8 @@ class MetalLocalViewer:
         self._warp_depth_tex = None
         self._warp_color_size = (0, 0)
         self._warp_depth_size = (0, 0)
+        self._drawable_pixel_format = None
+        self._source_pixel_format = None
         # Warp calibration knobs (v2.5 parity): IPD in UV units and the raw
         # depth-strength ratio fed to the shader's shift formula.
         self._warp_ipd_uv = float(os.environ.get("D2S_METAL_WARP_IPD", "0.064") or 0.064)
@@ -301,24 +359,26 @@ class MetalLocalViewer:
             glfw.terminate()
             raise RuntimeError("could not create Metal local viewer window")
         if exclusive_fullscreen:
-            # macOS: promote the borderless window to a real monitor fullscreen.
-            mode = glfw.get_video_mode(monitor)
-            glfw.set_window_monitor(
-                self.window,
-                monitor,
-                int(mx),
-                int(my),
-                int(mode.size.width),
-                int(mode.size.height),
-                int(mode.refresh_rate),
-            )
-            glfw.show_window(self.window)
             self._exclusive_fullscreen = True
         glfw.set_window_pos(self.window, x, y)
+        pin_macos_viewer_window(
+            self.window, fullscreen=exclusive_fullscreen
+        )
         glfw.set_key_callback(self.window, self._on_key)
 
         self._attach_metal_layer()
+        self._register_capture_window()
         self._build_pipeline()
+        self._cursor_texture = self._new_cursor_texture(1, 1, b"\x00\x00\x00\x00")
+        if self.config.cursor_passthrough:
+            self._cursor_hide_enabled = set_window_mouse_passthrough(
+                self.window,
+                True,
+                hide_cursor_overlay=bool(self.config.hide_cursor_overlay),
+            )
+        pin_macos_viewer_window(
+            self.window, fullscreen=exclusive_fullscreen
+        )
 
         if exclusive_fullscreen:
             mode = glfw.get_video_mode(self._target_monitor)
@@ -347,8 +407,21 @@ class MetalLocalViewer:
         if self.device is None:
             raise RuntimeError("No Metal device available")
         self.queue = self.device.newCommandQueue()
+        # Match Vulkan's sRGB swapchain. The native packer writes display-
+        # referred 8-bit RGB; an sRGB texture/layer keeps that data from being
+        # displayed with the paler linear-to-display interpretation.
+        self._drawable_pixel_format = getattr(
+            Metal,
+            "MTLPixelFormatBGRA8Unorm_sRGB",
+            Metal.MTLPixelFormatBGRA8Unorm,
+        )
+        self._source_pixel_format = getattr(
+            Metal,
+            "MTLPixelFormatRGBA8Unorm_sRGB",
+            Metal.MTLPixelFormatRGBA8Unorm,
+        )
         layer.setDevice_(self.device)
-        layer.setPixelFormat_(Metal.MTLPixelFormatBGRA8Unorm)
+        layer.setPixelFormat_(self._drawable_pixel_format)
         layer.setFramebufferOnly_(True)
         layer.setContentsScale_(ns_window.backingScaleFactor())
         if hasattr(layer, "setDisplaySyncEnabled_"):
@@ -363,6 +436,20 @@ class MetalLocalViewer:
         self._ns_view = view
         self.layer = layer
 
+    def _register_capture_window(self) -> None:
+        callback = getattr(self.config, "on_capture_window_exclusion", None)
+        if not callable(callback) or self._ns_window is None:
+            return
+        try:
+            window_id = int(self._ns_window.windowNumber())
+            self._capture_window_registered = bool(callback(window_id, True))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not register Cocoa window for capture exclusion: {exc}"
+            ) from exc
+        if not self._capture_window_registered:
+            raise RuntimeError("ScreenCaptureKit capture exclusion rejected the Cocoa window")
+
     def _build_pipeline(self) -> None:
         library, error = self.device.newLibraryWithSource_options_error_(
             METAL_SHADER, None, None
@@ -373,7 +460,7 @@ class MetalLocalViewer:
         desc.setVertexFunction_(library.newFunctionWithName_("quad_vertex"))
         desc.setFragmentFunction_(library.newFunctionWithName_("quad_fragment"))
         attachment = desc.colorAttachments().objectAtIndexedSubscript_(0)
-        attachment.setPixelFormat_(Metal.MTLPixelFormatBGRA8Unorm)
+        attachment.setPixelFormat_(self._drawable_pixel_format)
         self.pipeline, error = self.device.newRenderPipelineStateWithDescriptor_error_(
             desc, None
         )
@@ -397,7 +484,7 @@ class MetalLocalViewer:
             warp_desc.setVertexFunction_(warp_library.newFunctionWithName_("vertex_main"))
             warp_desc.setFragmentFunction_(warp_library.newFunctionWithName_("fragment_main"))
             warp_attachment = warp_desc.colorAttachments().objectAtIndexedSubscript_(0)
-            warp_attachment.setPixelFormat_(Metal.MTLPixelFormatBGRA8Unorm)
+            warp_attachment.setPixelFormat_(self._drawable_pixel_format)
             self._warp_pipeline, warp_pipeline_error = (
                 self.device.newRenderPipelineStateWithDescriptor_error_(warp_desc, None)
             )
@@ -420,13 +507,69 @@ class MetalLocalViewer:
         if self._staging_texture is not None and self._staging_size == (width, height):
             return self._staging_texture
         desc = Metal.MTLTextureDescriptor.texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
-            Metal.MTLPixelFormatRGBA8Unorm, width, height, False
+            self._source_pixel_format, width, height, False
         )
         desc.setUsage_(Metal.MTLTextureUsageShaderRead)
         desc.setStorageMode_(Metal.MTLStorageModeManaged)
         self._staging_texture = self.device.newTextureWithDescriptor_(desc)
         self._staging_size = (width, height)
         return self._staging_texture
+
+    def _new_cursor_texture(self, width: int, height: int, rgba: bytes) -> Any:
+        texture = self._make_texture(width, height, self._source_pixel_format)
+        region = Metal.MTLRegionMake2D(0, 0, width, height)
+        texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(
+            region, 0, rgba, width * 4
+        )
+        return texture
+
+    def _refresh_cursor_texture(self) -> None:
+        mode = str(getattr(self.config, "display_mode", ""))
+        if (
+            not self.config.cursor_passthrough
+            or not self.config.hide_cursor_overlay
+            or mode.strip().casefold().replace("_", "-")
+            not in {"half-sbs", "full-sbs"}
+        ):
+            return
+        key = cursor_snapshot_key(mode)
+        if key is None or (key == self._cursor_snapshot_key and self._cursor_snapshot):
+            return
+        snapshot = capture_cursor_snapshot(mode)
+        if snapshot is None:
+            return
+        self._cursor_texture = self._new_cursor_texture(
+            snapshot.width, snapshot.height, snapshot.rgba
+        )
+        self._cursor_snapshot = snapshot
+        self._cursor_snapshot_key = key
+
+    def _enable_native_cursor_hiding(self) -> None:
+        if not self.config.hide_cursor_overlay or self._cursor_hide_enabled:
+            return
+        self._cursor_hide_enabled = set_window_mouse_passthrough(
+            self.window,
+            True,
+            hide_cursor_overlay=True,
+        )
+
+    def _cursor_overlay_rects(
+        self, eye_rects: tuple[tuple[int, int, int, int], ...]
+    ) -> tuple[tuple[float, float, float, float], ...]:
+        self._refresh_cursor_texture()
+        empty = (0.0, 0.0, 0.0, 0.0)
+        if self._cursor_snapshot is None or not self.config.hide_cursor_overlay:
+            return (empty, empty)
+        rects = cursor_overlay_rects(
+            self._ns_window,
+            eye_rects,
+            self._cursor_snapshot,
+            cursor_screen_position(),
+        )
+        normalized = [tuple(float(value) for value in rect) for rect in rects[:2]]
+        while len(normalized) < 2:
+            normalized.append(empty)
+        return tuple(normalized)
 
     def _pack_native_coreml_frame(self, frame: Any):
         native_frame = getattr(frame, "viewer_native", None)
@@ -457,7 +600,7 @@ class MetalLocalViewer:
                 if buffer is None:
                     raise RuntimeError("could not allocate a Metal native-output buffer")
                 descriptor = Metal.MTLTextureDescriptor.texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
-                    Metal.MTLPixelFormatRGBA8Unorm, width, height, False
+                    self._source_pixel_format, width, height, False
                 )
                 descriptor.setUsage_(Metal.MTLTextureUsageShaderRead)
                 descriptor.setStorageMode_(Metal.MTLStorageModeShared)
@@ -517,7 +660,12 @@ class MetalLocalViewer:
             raise RuntimeError("Metal local viewer has not been initialized")
         self.poll_events()
 
-        gpu_required = os.environ.get("D2S_GPU_IMAGE_PIPELINE_REQUIRED", "0") == "1"
+        # macOS local presentation is GPU-only: native CoreML/Metal packing
+        # feeds the CAMetalLayer, and a host RGBA upload is never accepted.
+        gpu_required = (
+            sys.platform == "darwin"
+            or os.environ.get("D2S_GPU_IMAGE_PIPELINE_REQUIRED", "0") == "1"
+        )
         native_frame = getattr(frame, "viewer_native", None)
         # The shader-warp compatibility path uploads depth through CPU memory.
         # Strict GPU mode uses the native CoreML/Metal packer instead.
@@ -587,8 +735,10 @@ class MetalLocalViewer:
             return False
 
         fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
-        scale = self._ns_window.backingScaleFactor()
-        dw, dh = int(fb_w * scale), int(fb_h * scale)
+        # GLFW already reports framebuffer pixels on macOS. Multiplying by
+        # backingScaleFactor again overallocates Retina drawables (for example
+        # 1920x1080 becomes 7680x4320) and can make fullscreen presents vanish.
+        dw, dh = int(fb_w), int(fb_h)
         dw, dh = max(1, dw), max(1, dh)
         if self._last_drawable_size != (dw, dh):
             self.layer.setDrawableSize_((dw, dh))
@@ -624,6 +774,35 @@ class MetalLocalViewer:
             16,
             0,
         )
+        content_left = round(off_u * dw)
+        content_top = round(off_v * dh)
+        content_width = round(su * dw)
+        content_height = round(sv * dh)
+        cursor_rects = self._cursor_overlay_rects((
+            (
+                content_left,
+                content_top,
+                content_left + content_width // 2,
+                content_top + content_height,
+            ),
+            (
+                content_left + content_width // 2,
+                content_top,
+                content_left + content_width,
+                content_top + content_height,
+            ),
+        ))
+        encoder.setFragmentTexture_atIndex_(self._cursor_texture, 1)
+        encoder.setFragmentBytes_length_atIndex_(
+            struct.pack("4f", *cursor_rects[0]),
+            16,
+            1,
+        )
+        encoder.setFragmentBytes_length_atIndex_(
+            struct.pack("4f", *cursor_rects[1]),
+            16,
+            2,
+        )
         encoder.drawPrimitives_vertexStart_vertexCount_(
             Metal.MTLPrimitiveTypeTriangleStrip, 0, 4
         )
@@ -631,6 +810,7 @@ class MetalLocalViewer:
         # PyObjC selector: `presentDrawable:` maps to presentDrawable_.
         command_buffer.presentDrawable_(drawable)
         command_buffer.commit()
+        self._enable_native_cursor_hiding()
 
         now = time.perf_counter()
         self._fps_frames += 1
@@ -828,8 +1008,7 @@ class MetalLocalViewer:
                 _release_bgra()
             return False
         fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
-        scale = self._ns_window.backingScaleFactor()
-        dw_px, dh_px = max(1, int(fb_w * scale)), max(1, int(fb_h * scale))
+        dw_px, dh_px = max(1, int(fb_w)), max(1, int(fb_h))
         if self._last_drawable_size != (dw_px, dh_px):
             self.layer.setDrawableSize_((dw_px, dh_px))
             self._last_drawable_size = (dw_px, dh_px)
@@ -852,11 +1031,22 @@ class MetalLocalViewer:
         # Per-eye viewport draws always use warp mode 7 (the viewport selects
         # the eye region); single-viewport modes pass their own shader mode.
         mode_value = 7.0 if len(viewports) > 1 else float(mode_id)
+        eye_rects = tuple(
+            (
+                int(viewport[0]),
+                int(viewport[1]),
+                int(viewport[0] + viewport[2]),
+                int(viewport[1] + viewport[3]),
+            )
+            for viewport, _eye_offset in viewports
+        )
+        cursor_rects = self._cursor_overlay_rects(eye_rects)
+        encoder.setFragmentTexture_atIndex_(self._cursor_texture, 2)
         for viewport, eye_offset in viewports:
-            # struct.pack: numpy-free uniform payload (12 floats, native LE
+            # struct.pack: numpy-free uniform payload (20 floats, native LE
             # matches MSL float layout).
             payload = struct.pack(
-                "<12f",
+                "<20f",
                 eye_offset,
                 0.1 * self._warp_depth_ratio,
                 self._warp_convergence,
@@ -869,6 +1059,8 @@ class MetalLocalViewer:
                 0.0,
                 0.0,
                 0.0,
+                *cursor_rects[0],
+                *cursor_rects[1],
             )
             encoder.setFragmentBytes_length_atIndex_(payload, len(payload), 0)
             encoder.drawPrimitives_vertexStart_vertexCount_(
@@ -883,6 +1075,7 @@ class MetalLocalViewer:
             except Exception:
                 _release_bgra()
         command_buffer.commit()
+        self._enable_native_cursor_hiding()
 
         now = time.perf_counter()
         self._fps_frames += 1
@@ -946,6 +1139,7 @@ class MetalLocalViewer:
             glfw.set_window_attrib(self.window, glfw.DECORATED, glfw.TRUE)
             glfw.set_window_pos(self.window, x, y)
             glfw.set_window_size(self.window, width, height)
+        pin_macos_viewer_window(self.window, fullscreen=enabled)
         print(
             f"[MetalLocalViewer] Display fullscreen: {'on' if enabled else 'off'} "
             "(Alt+Enter)",
@@ -956,9 +1150,33 @@ class MetalLocalViewer:
         self.glfw.poll_events()
         if self.glfw.window_should_close(self.window):
             raise StopIteration
+        if self._exclusive_fullscreen:
+            pin_macos_viewer_window(self.window, fullscreen=True)
+        if self.config.hide_cursor_overlay:
+            update_native_cursor_suppression()
 
     def close(self) -> None:
         try:
+            if self.config.cursor_passthrough and self.window is not None:
+                set_window_mouse_passthrough(
+                    self.window,
+                    False,
+                    hide_cursor_overlay=False,
+                )
+                self._cursor_hide_enabled = False
+            if self._capture_window_registered and self._ns_window is not None:
+                try:
+                    window_id = int(self._ns_window.windowNumber())
+                    callback = getattr(self.config, "on_capture_window_exclusion", None)
+                    if callable(callback):
+                        callback(window_id, False)
+                except Exception as exc:
+                    print(
+                        "[MetalLocalViewer] Could not remove capture exclusion: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                self._capture_window_registered = False
             self._staging_texture = None
             self.pipeline = None
             self.queue = None
@@ -976,6 +1194,13 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
     viewer: MetalLocalViewer | None = None
     preview_logged = False
     try:
+        if getattr(config, "on_capture_windows_initialized", None) is not None:
+            # Same-monitor ScreenCaptureKit must start after the Cocoa window
+            # exists, otherwise its initial exclusion list is empty.
+            viewer = MetalLocalViewer(config)
+            viewer.initialize()
+            print("[MetalLocalViewer] Metal local window initialized", flush=True)
+            config.on_capture_windows_initialized()
         while not shutdown_event.is_set():
             try:
                 result, _started = runtime_q.get(timeout=0.05)

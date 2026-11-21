@@ -42,6 +42,13 @@ if OS_NAME == "Windows":
     from windows_dpi import set_per_monitor_dpi_v2
 
     set_per_monitor_dpi_v2()
+
+    def configure_macos_viewer_window(window, *, fullscreen=False):
+        return None
+
+    def pin_macos_viewer_window(window, *, fullscreen=False):
+        return None
+
     user32 = ctypes.windll.user32
     gdi32 = ctypes.windll.gdi32
     SetWindowDisplayAffinity = user32.SetWindowDisplayAffinity
@@ -733,6 +740,361 @@ if OS_NAME == "Windows":
             if self.cursor_dc:
                 gdi32.DeleteDC(self.cursor_dc)
 
+elif OS_NAME == "Darwin":
+    import AppKit
+    from AppKit import NSCursor, NSEvent, NSScreen
+
+    @dataclass(frozen=True)
+    class CursorSnapshot:
+        key: tuple[int, str, float]
+        rgba: bytes
+        width: int
+        height: int
+        hotspot_x: int
+        hotspot_y: int
+
+    _cursor_passthrough_windows: dict[int, tuple[object, bool]] = {}
+    _macos_window_pin_times: dict[int, float] = {}
+    _hidden_cursor_display_id: int | None = None
+    _cursor_suppression_target_display_id: int | None = None
+    _appkit_cursor_hidden = False
+    _cursor_snapshot_error_logged = False
+
+    def _cocoa_window(window):
+        import glfw
+
+        ptr = glfw.get_cocoa_window(window)
+        if not ptr:
+            raise RuntimeError("glfwGetCocoaWindow returned null")
+        import objc
+
+        return objc.objc_object(c_void_p=ptr)
+
+    def configure_macos_viewer_window(window, *, fullscreen=False):
+        """Configure the SBS window to survive native fullscreen Space changes."""
+        ns_window = _cocoa_window(window)
+        # A normal Cocoa window belongs to the Space in which it was created.
+        # Native video fullscreen creates a different Space, so ordering the
+        # same window again is not enough. These behaviors make the output a
+        # non-activating auxiliary window in every Space, including fullscreen
+        # Spaces owned by another application.
+        behavior = getattr(AppKit, "NSWindowCollectionBehaviorDefault", 0)
+        for name in (
+            "NSWindowCollectionBehaviorCanJoinAllSpaces",
+            # macOS 13+: this is the bit that lets a floating window join a
+            # different application's fullscreen Space, not just our own.
+            "NSWindowCollectionBehaviorCanJoinAllApplications",
+            "NSWindowCollectionBehaviorFullScreenAuxiliary",
+            "NSWindowCollectionBehaviorIgnoresCycle",
+        ):
+            behavior |= int(getattr(AppKit, name, 0))
+        if fullscreen:
+            # Stationary prevents Mission Control from moving the output to a
+            # different desktop while the source app changes fullscreen state.
+            behavior |= int(
+                getattr(AppKit, "NSWindowCollectionBehaviorStationary", 0)
+            )
+        ns_window.setCollectionBehavior_(behavior)
+        if hasattr(ns_window, "setCanHide_"):
+            ns_window.setCanHide_(False)
+        ns_window.setHidesOnDeactivate_(False)
+        level = (
+            getattr(AppKit, "NSStatusWindowLevel", AppKit.NSFloatingWindowLevel)
+            if fullscreen
+            else AppKit.NSNormalWindowLevel
+        )
+        ns_window.setLevel_(level)
+        return ns_window
+
+    def pin_macos_viewer_window(window, *, fullscreen=False):
+        """Keep SBS output above native fullscreen apps without activating it."""
+        ns_window = configure_macos_viewer_window(window, fullscreen=fullscreen)
+        window_id = int(ns_window.windowNumber())
+        now = time.monotonic()
+        last_pin = _macos_window_pin_times.get(window_id, 0.0)
+        if fullscreen and (now - last_pin >= 0.10 or not bool(ns_window.isVisible())):
+            ns_window.orderFrontRegardless()
+            _macos_window_pin_times[window_id] = now
+        return ns_window
+
+    def _cursor_scale(position=None) -> float:
+        point = NSEvent.mouseLocation() if position is None else position
+        for screen in NSScreen.screens():
+            # PyObjC returns CoreFoundation.CGRect for NSScreen.frame() on
+            # recent macOS releases; AppKit.NSPointInRect expects an NSRect
+            # object and raises ``CGRect has no attribute containsPoint_``.
+            frame = screen.frame()
+            if (
+                float(frame.origin.x) <= float(point.x) <
+                float(frame.origin.x + frame.size.width)
+                and float(frame.origin.y) <= float(point.y) <
+                float(frame.origin.y + frame.size.height)
+            ):
+                return float(screen.backingScaleFactor())
+        return 1.0
+
+    def _system_cursor():
+        try:
+            import objc
+
+            cursor = NSCursor.currentSystemCursor()
+            if cursor is None:
+                cursor = NSCursor.arrowCursor()
+            return cursor, int(objc.pyobjc_id(cursor)) if cursor is not None else 0
+        except Exception:
+            return None, 0
+
+    def cursor_snapshot_key(display_mode: str):
+        cursor, cursor_id = _system_cursor()
+        if cursor is None:
+            return None
+        mode = str(display_mode or "Half-SBS").strip().casefold().replace("_", "-")
+        position = NSEvent.mouseLocation()
+        return cursor_id, mode, _cursor_scale(position)
+
+    def cursor_screen_position():
+        point = NSEvent.mouseLocation()
+        return int(round(point.x)), int(round(point.y))
+
+    def capture_cursor_snapshot(display_mode: str):
+        global _cursor_snapshot_error_logged
+        try:
+            from PIL import Image
+
+            cursor, cursor_id = _system_cursor()
+            if cursor is None:
+                return None
+            image = cursor.image()
+            if image is None:
+                return None
+            position = NSEvent.mouseLocation()
+            scale = _cursor_scale(position)
+            mode = str(display_mode or "Half-SBS").strip().casefold().replace("_", "-")
+            tiff = image.TIFFRepresentation()
+            if tiff is None:
+                return None
+            import io
+
+            rgba_image = Image.open(io.BytesIO(bytes(tiff))).convert("RGBA")
+            target_width = max(1, round(float(image.size().width) * scale))
+            target_height = max(1, round(float(image.size().height) * scale))
+            if rgba_image.size != (target_width, target_height):
+                rgba_image = rgba_image.resize(
+                    (target_width, target_height), Image.Resampling.LANCZOS
+                )
+            hotspot = cursor.hotSpot()
+            hotspot_x = round(float(hotspot.x) * scale)
+            hotspot_y = round(
+                (float(image.size().height) - float(hotspot.y)) * scale
+            )
+            if mode == "half-sbs":
+                half_width = max(1, round(rgba_image.width * 0.5))
+                rgba_image = rgba_image.resize(
+                    (half_width, rgba_image.height), Image.Resampling.LANCZOS
+                )
+                hotspot_x = round(hotspot_x * half_width / target_width)
+            hotspot_x = max(0, min(rgba_image.width - 1, hotspot_x))
+            hotspot_y = max(0, min(rgba_image.height - 1, hotspot_y))
+            rgba = bytearray(rgba_image.tobytes())
+            if not any(rgba[3::4]):
+                for offset in range(0, len(rgba), 4):
+                    if any(rgba[offset : offset + 3]):
+                        rgba[offset + 3] = 255
+            return CursorSnapshot(
+                key=(cursor_id, mode, scale),
+                rgba=bytes(rgba),
+                width=rgba_image.width,
+                height=rgba_image.height,
+                hotspot_x=hotspot_x,
+                hotspot_y=hotspot_y,
+            )
+        except Exception as exc:
+            if not _cursor_snapshot_error_logged:
+                _cursor_snapshot_error_logged = True
+                print(
+                    "[WindowCapture] macOS cursor snapshot failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            return None
+
+    def cursor_overlay_rects(owner_window, eye_rects, snapshot, position):
+        if position is None or not eye_rects:
+            return ()
+        try:
+            point = AppKit.NSPoint(float(position[0]), float(position[1]))
+            window_point = owner_window.convertPointFromScreen_(point)
+            content = owner_window.contentView()
+            local = content.convertPoint_fromView_(window_point, None)
+            bounds = content.bounds()
+            width, height = float(bounds.size.width), float(bounds.size.height)
+            if width <= 0.0 or height <= 0.0:
+                return ()
+            if not (0.0 <= local.x < width and 0.0 <= local.y < height):
+                return ()
+            u = local.x / width
+            v = 1.0 - local.y / height
+            result = []
+            for left, top, right, bottom in eye_rects:
+                region_width = int(right) - int(left)
+                region_height = int(bottom) - int(top)
+                if region_width <= 0 or region_height <= 0:
+                    continue
+                x = int(left) + round(u * region_width) - snapshot.hotspot_x
+                y = int(top) + round(v * region_height) - snapshot.hotspot_y
+                result.append((x, y, snapshot.width, snapshot.height))
+            return tuple(result)
+        except Exception:
+            return ()
+
+    def _restore_hidden_cursor() -> None:
+        global _appkit_cursor_hidden, _cursor_suppression_target_display_id
+        global _hidden_cursor_display_id
+        display_id = _hidden_cursor_display_id
+        _hidden_cursor_display_id = None
+        _cursor_suppression_target_display_id = None
+        if display_id is not None:
+            try:
+                Quartz.CGDisplayShowCursor(display_id)
+            except Exception:
+                pass
+        if _appkit_cursor_hidden:
+            _appkit_cursor_hidden = False
+            try:
+                NSCursor.setHiddenUntilMouseMoves_(False)
+                NSCursor.unhide()
+            except Exception:
+                pass
+
+    def _cursor_display_id() -> int | None:
+        """Return the display currently under the pointer when available."""
+        try:
+            point = NSEvent.mouseLocation()
+            for screen in NSScreen.screens():
+                frame = screen.frame()
+                if (
+                    float(frame.origin.x) <= float(point.x) <
+                    float(frame.origin.x + frame.size.width)
+                    and float(frame.origin.y) <= float(point.y) <
+                    float(frame.origin.y + frame.size.height)
+                ):
+                    return int(
+                        screen.deviceDescription().get("NSScreenNumber", 0)
+                    ) or None
+        except Exception:
+            pass
+        return None
+
+    def _update_native_cursor_suppression() -> None:
+        global _appkit_cursor_hidden, _cursor_suppression_target_display_id
+        global _hidden_cursor_display_id
+        target_display = None
+        for window, should_hide in tuple(_cursor_passthrough_windows.values()):
+            if not should_hide:
+                continue
+            screen = window.screen()
+            if screen is not None:
+                target_display = int(
+                    screen.deviceDescription().get("NSScreenNumber", 0)
+                ) or None
+                break
+        if target_display is None:
+            target_display = _cursor_display_id()
+        if (
+            target_display is None
+            and Quartz is not None
+            and hasattr(Quartz, "CGMainDisplayID")
+        ):
+            target_display = int(Quartz.CGMainDisplayID())
+        if (
+            target_display == _cursor_suppression_target_display_id
+            and (target_display is None or native_cursor_suppressed())
+        ):
+            # Mouse movement can release AppKit's temporary hidden state. This
+            # flag reasserts it without incrementing NSCursor's hide counter.
+            try:
+                NSCursor.setHiddenUntilMouseMoves_(True)
+            except Exception:
+                pass
+            return
+        _restore_hidden_cursor()
+        _cursor_suppression_target_display_id = target_display
+        if target_display is not None:
+            try:
+                result = Quartz.CGDisplayHideCursor(target_display)
+            except Exception:
+                result = -1
+            if result in (None, 0):
+                _hidden_cursor_display_id = target_display
+            try:
+                NSCursor.hide()
+                NSCursor.setHiddenUntilMouseMoves_(True)
+                _appkit_cursor_hidden = True
+            except Exception:
+                pass
+
+    def native_cursor_suppressed():
+        return _hidden_cursor_display_id is not None or _appkit_cursor_hidden
+
+    def update_native_cursor_suppression():
+        try:
+            _update_native_cursor_suppression()
+        except Exception:
+            _restore_hidden_cursor()
+
+    atexit.register(_restore_hidden_cursor)
+
+    def set_window_mouse_passthrough(window, enabled, *, hide_cursor_overlay=False):
+        try:
+            ns_window = _cocoa_window(window)
+            window_id = int(ns_window.windowNumber())
+            ns_window.setIgnoresMouseEvents_(bool(enabled))
+            if enabled:
+                _cursor_passthrough_windows[window_id] = (
+                    ns_window, bool(hide_cursor_overlay)
+                )
+            else:
+                _cursor_passthrough_windows.pop(window_id, None)
+            update_native_cursor_suppression()
+            return True
+        except Exception as exc:
+            print(
+                f"[WindowCapture] macOS cursor passthrough failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return False
+
+    def hide_window_from_capture(*args, **kwargs):
+        return False
+
+    def show_window_in_capture(*args, **kwargs):
+        return True
+
+    def set_window_to_bottom(*args, **kwargs):
+        return None
+
+    def set_hwnd_capture_affinity(*args, **kwargs):
+        return False
+
+    class StereoCursorOverlay:
+        def __init__(self, *args, **kwargs):
+            self.window_handles = []
+
+        def capture_window_handles(self):
+            return ()
+
+        def update_capture_policy(self):
+            return None
+
+        def update(self, *args, **kwargs):
+            return None
+
+        def hide(self):
+            return None
+
+        def close(self):
+            return None
+
 else:
     CursorSnapshot = None
 
@@ -752,6 +1114,12 @@ else:
         return False
 
     def update_native_cursor_suppression():
+        return None
+
+    def configure_macos_viewer_window(window, *, fullscreen=False):
+        return None
+
+    def pin_macos_viewer_window(window, *, fullscreen=False):
         return None
 
     class StereoCursorOverlay:

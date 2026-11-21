@@ -25,6 +25,8 @@ class OpenGLLocalViewer:
         self.glfw = None
         self.window = None
         self._backend = None
+        self._ns_window = None
+        self._capture_window_registered = False
         self._initialized = False
         self._show_after_capture_protection = False
 
@@ -55,6 +57,32 @@ class OpenGLLocalViewer:
         self.window = glfw.create_window(w, h, self.config.title, None, None)
         if not self.window:
             raise RuntimeError("OpenGL fallback: could not create GLFW window")
+
+        if sys.platform == "darwin":
+            callback = getattr(self.config, "on_capture_window_exclusion", None)
+            if callable(callback):
+                try:
+                    import objc
+
+                    ptr = glfw.get_cocoa_window(self.window)
+                    self._ns_window = objc.objc_object(c_void_p=ptr)
+                    window_id = int(self._ns_window.windowNumber())
+                    self._capture_window_registered = bool(callback(window_id, True))
+                except Exception as exc:
+                    try:
+                        glfw.destroy_window(self.window)
+                    except Exception:
+                        pass
+                    self.window = None
+                    raise RuntimeError(
+                        f"Could not register Cocoa window for capture exclusion: {exc}"
+                    ) from exc
+                if not self._capture_window_registered:
+                    glfw.destroy_window(self.window)
+                    self.window = None
+                    raise RuntimeError(
+                        "ScreenCaptureKit capture exclusion rejected the Cocoa window"
+                    )
 
         if self._show_after_capture_protection:
             hide_window_from_capture(self.window)
@@ -131,6 +159,14 @@ class OpenGLLocalViewer:
                 raise StopIteration
 
     def close(self) -> None:
+        if self._capture_window_registered and self._ns_window is not None:
+            callback = getattr(self.config, "on_capture_window_exclusion", None)
+            if callable(callback):
+                try:
+                    callback(int(self._ns_window.windowNumber()), False)
+                except Exception:
+                    pass
+            self._capture_window_registered = False
         try:
             if self._backend is not None:
                 self._backend.close()

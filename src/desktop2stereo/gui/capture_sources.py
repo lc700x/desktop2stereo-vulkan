@@ -13,16 +13,17 @@ logger = logging.getLogger(__name__)
 
 
 def get_default_windows_capture_tool():
-    # ``DEVICES`` is lazy; indexing it triggers hardware discovery, while
-    # dict.get() would bypass the lazy loader and always look like CPU.
+    # ``DEVICES`` is lazy; reading its values triggers hardware discovery. Do
+    # not infer the backend from device 0: DirectML can occupy that slot before
+    # CUDA, and ROCm device labels are not guaranteed to contain "CUDA".
     try:
-        device_name = devices_module.DEVICES[0].get("name", "")
-    except (KeyError, TypeError):
-        device_name = ""
-    if "CUDA" in device_name and not devices_module.IS_ROCM:
-        return "WindowsCaptureCUDA"
-    if "CUDA" in device_name and devices_module.IS_ROCM:
+        devices = tuple(devices_module.DEVICES.values())
+    except (KeyError, TypeError, IndexError):
+        devices = ()
+    if devices_module.IS_ROCM:
         return "WindowsCaptureROCm"
+    if any("CUDA" in str(device.get("name", "")).upper() for device in devices):
+        return "WindowsCaptureCUDA"
     return "WindowsCapture"
 
 
@@ -196,12 +197,16 @@ def get_capture_tool_options(device_label):
         return ["ScreenCaptureKit", "Quartz"]
     if OS_NAME != "Windows":
         return ["DXCamera"]
-    # ``device_label`` may be the device name ("CUDA 0: AMD Radeon...") or, from
-    # the build path, the resolved default capture-tool name ("WindowsCaptureROCm").
-    # Never key the vendor branch on the label containing "CUDA" (the ROCm tool
-    # name has no such substring) — use the authoritative hardware detection.
+    # Force lazy hardware detection before selecting vendor-specific options.
+    # The first device may be DirectML, and ROCm labels do not always contain
+    # "CUDA", so the device label alone is not authoritative.
+    try:
+        devices = tuple(devices_module.DEVICES.values())
+    except (KeyError, TypeError, IndexError):
+        devices = ()
     is_rocm = devices_module.IS_ROCM
-    is_cuda = "CUDA" in str(device_label or "").upper()
+    is_cuda = any("CUDA" in str(device.get("name", "")).upper() for device in devices)
+    is_cuda = is_cuda or "CUDA" in str(device_label or "").upper()
     if is_rocm:
         return ["WindowsCaptureROCm", "DesktopDuplication", "WindowsCapture", "DXCamera"]
     if is_cuda:

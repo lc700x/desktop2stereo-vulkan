@@ -57,6 +57,7 @@ from viewer.window_control import (
     cursor_screen_position,
     cursor_snapshot_key,
     hide_window_from_capture,
+    pin_macos_viewer_window,
     set_window_mouse_passthrough,
     show_window_in_capture,
     update_native_cursor_suppression,
@@ -983,7 +984,8 @@ class VulkanLocalViewer:
         self._win32_hmonitor = 0
         self._win32_user32 = None
         self._capture_window_registration_pending = bool(
-            sys.platform == "win32" and config.on_capture_window_exclusion is not None
+            sys.platform in {"win32", "darwin"}
+            and config.on_capture_window_exclusion is not None
         )
         self._capture_window_registered = False
         self._last_visibility_enforce = 0.0
@@ -1136,37 +1138,30 @@ class VulkanLocalViewer:
             self.window,
             show_taskbar_button=self.config.show_taskbar_button,
         )
-        if self._exclusive_fullscreen:
-            if sys.platform == "darwin":
-                # The hidden-until-styled startup is a Windows trick
-                # (_configure_persistent_fullscreen); macOS must simply make
-                # the already-created borderless window a real monitor
-                # fullscreen or it stays invisible forever.
-                mode = glfw.get_video_mode(monitor)
-                glfw.set_window_monitor(
-                    self.window,
-                    monitor,
-                    int(mx),
-                    int(my),
-                    int(mode.size.width),
-                    int(mode.size.height),
-                    int(mode.refresh_rate),
-                )
-                # The VISIBLE=FALSE creation hint still applies.
-                glfw.show_window(self.window)
-            else:
-                self._configure_persistent_fullscreen()
-                glfw.poll_events()
+        if self._exclusive_fullscreen and sys.platform != "darwin":
+            self._configure_persistent_fullscreen()
+            glfw.poll_events()
         glfw.set_window_pos(self.window, x, y)
+        if sys.platform == "darwin":
+            pin_macos_viewer_window(
+                self.window, fullscreen=self._exclusive_fullscreen
+            )
+            if self._exclusive_fullscreen:
+                glfw.show_window(self.window)
         if self.config.cursor_passthrough:
             set_window_mouse_passthrough(
                 self.window,
                 True,
-                hide_cursor_overlay=self.config.hide_cursor_overlay,
+                hide_cursor_overlay=False,
             )
-        if self.config.on_capture_window_exclusion is not None and sys.platform == "win32":
+        if (
+            self.config.on_capture_window_exclusion is not None
+            and sys.platform in {"win32", "darwin"}
+        ):
             try:
-                hwnd = int(glfw.get_win32_window(self.window))
+                hwnd = self._capture_window_id()
+                if hwnd <= 0:
+                    raise RuntimeError("GLFW returned an invalid native window ID")
                 self._capture_window_registered = bool(
                     self.config.on_capture_window_exclusion(hwnd, True)
                 )
@@ -1177,7 +1172,7 @@ class VulkanLocalViewer:
                     f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
-            if self._capture_window_registered:
+            if self._capture_window_registered and sys.platform == "win32":
                 if not show_window_in_capture(self.window):
                     if self.config.exclude_from_capture:
                         hide_window_from_capture(self.window)
@@ -1186,14 +1181,18 @@ class VulkanLocalViewer:
                             "using global capture exclusion",
                             flush=True,
                         )
-            elif self.config.exclude_from_capture:
+            elif sys.platform == "win32" and self.config.exclude_from_capture:
                 hide_window_from_capture(self.window)
                 print(
                     "[VulkanLocalViewer] SBS output uses global capture exclusion; "
                     "remote desktop capture will not show it.",
                     flush=True,
                 )
-        elif self.config.exclude_from_capture:
+            elif sys.platform == "darwin" and not self._capture_window_registered:
+                raise RuntimeError(
+                    "ScreenCaptureKit capture exclusion rejected the Cocoa window"
+                )
+        elif sys.platform == "win32" and self.config.exclude_from_capture:
             hide_window_from_capture(self.window)
         glfw.set_key_callback(self.window, self._on_key)
         glfw.set_cursor_pos_callback(self.window, self._on_cursor_pos)
@@ -1206,19 +1205,26 @@ class VulkanLocalViewer:
         self._create_swapchain()
         self._create_sync()
         if self._capture_window_registered:
-            # WGC exclusion is applied to a visible WindowId before the capture
-            # session starts. The capture gate keeps the first session from
-            # running until on_capture_windows_initialized() releases it.
+            # The capture backend receives the visible native WindowId before
+            # its first session starts. The capture gate keeps that session
+            # from running until on_capture_windows_initialized() releases it.
             glfw.show_window(self.window)
             self._capture_window_registration_pending = False
-            if self.config.cursor_passthrough:
-                set_window_mouse_passthrough(
-                    self.window,
-                    True,
-                    hide_cursor_overlay=self.config.hide_cursor_overlay,
-                )
             if self._exclusive_fullscreen:
                 self._set_win32_topmost(True)
+        if sys.platform == "darwin":
+            # Showing a GLFW Cocoa window can cause AppKit to recompute its
+            # Space membership. Reapply the auxiliary/all-Spaces policy after
+            # the first show, before the source capture session starts.
+            pin_macos_viewer_window(
+                self.window, fullscreen=self._exclusive_fullscreen
+            )
+        if self.config.cursor_passthrough:
+            set_window_mouse_passthrough(
+                self.window,
+                True,
+                hide_cursor_overlay=bool(self.config.hide_cursor_overlay),
+            )
         # Do not include Vulkan setup time in the first measured FPS window.
         self._fps_started = time.perf_counter()
         self._present_window_start = self._fps_started
@@ -1233,7 +1239,7 @@ class VulkanLocalViewer:
 
     def _init_cursor_texture_overlay(self) -> None:
         if (
-            sys.platform != "win32"
+            sys.platform not in {"win32", "darwin"}
             or not self.config.cursor_passthrough
             or not self.config.hide_cursor_overlay
         ):
@@ -1273,12 +1279,13 @@ class VulkanLocalViewer:
             self._cursor_snapshot = snapshot
             self._cursor_snapshot_key = key
             overlay.set_rgba(snapshot.rgba, (snapshot.width, snapshot.height))
-        owner_hwnd = int(
-            self._win32_hwnd
-            or self.glfw.get_win32_window(self.window)
+        owner_window = (
+            int(self._win32_hwnd or self.glfw.get_win32_window(self.window))
+            if sys.platform == "win32"
+            else self._cocoa_window_object()
         )
         return cursor_overlay_rects(
-            owner_hwnd,
+            owner_window,
             eye_rects,
             self._cursor_snapshot,
             cursor_screen_position(),
@@ -1974,6 +1981,32 @@ class VulkanLocalViewer:
         if is_exclusive_fullscreen_toggle(key, action, mods, self.glfw):
             self._set_exclusive_fullscreen(not self._exclusive_fullscreen)
 
+    def _capture_window_id(self) -> int:
+        """Return the native ID understood by the active capture backend."""
+        if self.window is None or self.glfw is None:
+            return 0
+        if sys.platform == "win32":
+            return int(self.glfw.get_win32_window(self.window))
+        if sys.platform == "darwin":
+            ptr = self.glfw.get_cocoa_window(self.window)
+            if not ptr:
+                return 0
+            import objc
+
+            ns_window = objc.objc_object(c_void_p=ptr)
+            return int(ns_window.windowNumber())
+        return 0
+
+    def _cocoa_window_object(self):
+        if self.window is None or self.glfw is None:
+            return None
+        ptr = self.glfw.get_cocoa_window(self.window)
+        if not ptr:
+            return None
+        import objc
+
+        return objc.objc_object(c_void_p=ptr)
+
     def poll_events(self) -> None:
         self._read_media_state()
         self._refresh_media_textures()
@@ -1982,6 +2015,8 @@ class VulkanLocalViewer:
         if self.glfw.window_should_close(self.window):
             raise StopIteration
         self._keep_fullscreen_visible()
+        if sys.platform == "darwin" and self._exclusive_fullscreen:
+            pin_macos_viewer_window(self.window, fullscreen=True)
         self._sync_media_passthrough()
         if self.config.cursor_passthrough and self.config.hide_cursor_overlay:
             update_native_cursor_suppression()
@@ -2159,12 +2194,8 @@ class VulkanLocalViewer:
             glfw.set_window_attrib(self.window, glfw.DECORATED, glfw.TRUE)
             glfw.set_window_pos(self.window, x, y)
             glfw.set_window_size(self.window, width, height)
-            if self.config.cursor_passthrough:
-                set_window_mouse_passthrough(
-                    self.window,
-                    True,
-                    hide_cursor_overlay=self.config.hide_cursor_overlay,
-                )
+        if sys.platform == "darwin":
+            pin_macos_viewer_window(self.window, fullscreen=enabled)
         if self.device is not None:
             self.recreate_swapchain()
         print(
@@ -3234,7 +3265,13 @@ class VulkanLocalViewer:
         if self.window is None:
             raise RuntimeError("Vulkan local viewer has not been initialized")
         self.poll_events()
-        gpu_required = os.environ.get("D2S_GPU_IMAGE_PIPELINE_REQUIRED", "0") == "1"
+        # macOS local presentation is always GPU-only. This protects direct
+        # viewer users as well as the runtime path that sets the environment
+        # flag from CaptureConfig.gpu_required.
+        gpu_required = (
+            sys.platform == "darwin"
+            or os.environ.get("D2S_GPU_IMAGE_PIPELINE_REQUIRED", "0") == "1"
+        )
         direct_source = getattr(frame, "viewer_frame_direct", None)
         native_frame = getattr(frame, "viewer_native", None)
         cuda_frame = bool(getattr(frame, "is_cuda", False))
@@ -3520,7 +3557,7 @@ class VulkanLocalViewer:
                     pass
             if self._capture_window_registered and self.window is not None:
                 try:
-                    hwnd = int(self.glfw.get_win32_window(self.window))
+                    hwnd = self._capture_window_id()
                     self.config.on_capture_window_exclusion(hwnd, False)
                 except Exception as exc:
                     print(
@@ -4621,7 +4658,7 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             viewer = None
             if sys.platform == "darwin":
                 try:
-                    from viewer.metal_local_viewer import MetalLocalViewer
+                    from viewer.macos_metal_viewer import MetalLocalViewer
 
                     viewer = MetalLocalViewer(config)
                     viewer.initialize()
@@ -4632,6 +4669,11 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                         "trying OpenGL",
                         flush=True,
                     )
+                    if viewer is not None:
+                        try:
+                            viewer.close()
+                        except Exception:
+                            pass
                     viewer = None
             if viewer is None:
                 try:
@@ -4727,10 +4769,9 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
         # process alive with no visible window and no actionable log output.
         _initialize_main_viewer()
         if config.on_capture_windows_initialized is not None:
-            # Create every capture-excluded HWND before the WGC display session
-            # starts. This build applies the initial exclusion list correctly;
-            # live list updates can report a new iteration without excluding
-            # the window from the next frame.
+            # Create every capture-excluded native window before the display
+            # session starts. The initial exclusion list is applied at stream
+            # creation; live list updates are backend-specific.
             _initialize_preview_viewer()
             config.on_capture_windows_initialized()
 

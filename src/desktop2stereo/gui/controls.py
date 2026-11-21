@@ -221,7 +221,14 @@ class CompactDropdown(ft.Container):
         self.clip_behavior = ft.ClipBehavior.HARD_EDGE
         self.expand_loose = expand
 
-        self._label = ft.Text(value or "", size=FONT_SIZE, color=color("text_primary"))
+        self._label = ft.Text(
+            value or "",
+            size=FONT_SIZE,
+            color=color("text_primary"),
+            max_lines=1,
+            no_wrap=True,
+            overflow=ft.TextOverflow.ELLIPSIS,
+        )
         self._build_menu()
         self._apply_width()
         if _instances_list is not None:
@@ -277,6 +284,8 @@ class CompactDropdown(ft.Container):
                     option,
                     size=FONT_SIZE,
                     color=color("text_primary"),
+                    max_lines=1,
+                    no_wrap=True,
                 ),
                 height=S(32),
                 padding=ft.Padding(S(12), 0, S(12), 0),
