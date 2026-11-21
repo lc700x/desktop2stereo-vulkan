@@ -132,6 +132,11 @@ def _native_coreml_capture_enabled(ctx) -> bool:
     """Use native ScreenCaptureKit input when the runtime requires GPU frames."""
     if platform.system() != "Darwin":
         return False
+    # MLX consumes the regular PyTorch MPS tensor path. The native
+    # ScreenCaptureKit/CoreML bridge only produces the CoreML provider's
+    # IOSurface-backed input and cannot feed MLX directly.
+    if _runtime_depth_backend(getattr(ctx, "stereo_runtime", None)) == "mlx":
+        return False
     if bool(getattr(ctx, "gpu_required", False)):
         return True
     if ctx.run_mode in {"Local Viewer", "Viewer"}:

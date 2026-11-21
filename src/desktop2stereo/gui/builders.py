@@ -683,6 +683,8 @@ class GUIBuilderMixin:
             label="TensorRT", on_change=self._on_trt_toggle)
         self.coreml_cb = ft.Checkbox(scale=SCALE, visual_density=ft.VisualDensity.COMPACT,
             label="CoreML", on_change=self._on_coreml_toggle)
+        self.mlx_cb = ft.Checkbox(scale=SCALE, visual_density=ft.VisualDensity.COMPACT,
+            label="MLX", on_change=self._on_mlx_toggle)
         self.openvino_cb = ft.Checkbox(scale=SCALE, visual_density=ft.VisualDensity.COMPACT,
             label="OpenVINO", on_change=self._on_openvino_toggle)
         self.migraphx_cb = ft.Checkbox(scale=SCALE, visual_density=ft.VisualDensity.COMPACT,
@@ -693,12 +695,14 @@ class GUIBuilderMixin:
         self.recompile_migraphx_cb = ft.Checkbox(scale=SCALE, visual_density=ft.VisualDensity.COMPACT, label="Recompile MIGraphX")
         accel_row1 = ft.Row([self.torch_compile_cb, self.tensorrt_cb, self.recompile_trt_cb], spacing=S(20))
         accel_row2 = ft.Row([self.coreml_cb, self.recompile_coreml_cb, self.openvino_cb, self.recompile_openvino_cb], spacing=S(20))
-        accel_row3 = ft.Row([self.migraphx_cb, self.recompile_migraphx_cb], spacing=S(20))
+        accel_row3 = ft.Row([self.mlx_cb], spacing=S(20))
+        accel_row4 = ft.Row([self.migraphx_cb, self.recompile_migraphx_cb], spacing=S(20))
         self._accel_spacer = ft.Container(width=0)
         self.row4a = ft.Row([self.acceleration_label, accel_row1], spacing=1)
         self.row4b = ft.Row([self._accel_spacer, accel_row2], spacing=1)
         self.row4c = ft.Row([self._accel_spacer, accel_row3], spacing=1)
-        self._advanced_stereo_rows.extend([self.row4a, self.row4b, self.row4c])
+        self.row4d = ft.Row([self._accel_spacer, accel_row4], spacing=1)
+        self._advanced_stereo_rows.extend([self.row4a, self.row4b, self.row4c, self.row4d])
         for row in self._advanced_stereo_rows:
             row.visible = self.advanced_stereo_cb.value
 
@@ -1178,7 +1182,7 @@ class GUIBuilderMixin:
         depth_group = ft.Container(
             ft.Column([self._depth_stereo_group_heading, row0, row1, stereo_row0, hole_fill_row, advanced_stereo_row,
                        convergence_depth_row, depth_strength_row, row2b, stereo_row1, stereo_row3,
-                       stereo_row3b, stereo_row3c, stereo_row4, self.row4a, self.row4b, self.row4c], spacing=S(6)),
+                       stereo_row3b, stereo_row3c, stereo_row4, self.row4a, self.row4b, self.row4c, self.row4d], spacing=S(6)),
             margin=ft.Margin(0, 0, 0, S(6)),
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),

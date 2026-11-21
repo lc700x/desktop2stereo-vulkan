@@ -1,12 +1,15 @@
 -r requirements-pip-options.txt
 -f https://mirrors.nju.edu.cn/pytorch/whl --trusted-host mirrors.nju.edu.cn
-torch==2.9.0
-torchvision==0.24.0
+# PyTorch 2.12 exposes public MPS buffers for zero-copy MLX DLPack interop.
+torch==2.12.0
+torchvision==0.27.0
 pyobjc-core==12.2.1
 pyobjc-framework-Quartz==12.2.1
 pyobjc-framework-Metal==12.2.1
 # torchaudio==2.7.0
 coremltools==9.0
+mlx==0.32.4
+mlx-metal==0.32.4
 pyobjc-framework-CoreMedia==12.2.1
 pyobjc-framework-ScreenCaptureKit==12.2.1
 

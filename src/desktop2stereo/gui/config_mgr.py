@@ -271,6 +271,7 @@ class GUIConfigMixin:
         cml_val = cfg.get("CoreML")
         if cml_val is not None:
             self.coreml_cb.value = cml_val
+        self.mlx_cb.value = cfg.get("MLX", DEFAULTS["MLX"])
         self.recompile_coreml_cb.value = cfg.get("Recompile CoreML", DEFAULTS["Recompile CoreML"])
         ov_val = cfg.get("OpenVINO")
         if ov_val is not None:

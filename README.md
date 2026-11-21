@@ -36,6 +36,21 @@ src\python3\python.exe src\tools\openxr_vulkan_smoke.py --frames 300
 
 该入口只验证OpenXR Vulkan会话与交换链闭环，不代表Filament场景渲染已经接入。
 
+### macOS MLX 深度后端
+
+Apple Silicon 可在 GUI 的“推理加速”中启用 `MLX`，或用环境变量强制选择：
+
+```bash
+D2S_DEPTH_BACKEND=mlx src/python3/bin/python src/desktop2stereo/main.py
+```
+
+MLX 后端读取本地 Hugging Face `model.safetensors`，当前支持 DINOv2-backed
+Depth Anything/Distill-Any-Depth 模型，并要求 MPS RGB 输入。模型、预处理、推理
+和深度后处理都留在 Apple GPU 上；PyTorch 2.12 的 public Metal buffer 会让
+Metal DLPack 输入输出走 zero-copy。旧版 PyTorch 的 private MPS buffer 会退回
+GPU 本地复制（不会经过 CPU）。依赖见
+`src/env_install/requirements-mps.txt`。
+
 启用Filament GLB场景渲染时，显式指定当前平台Bridge和GLB资源：
 
 ```powershell
