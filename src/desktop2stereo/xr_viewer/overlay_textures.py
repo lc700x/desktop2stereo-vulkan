@@ -1,6 +1,7 @@
 # Desktop2Stereo OpenXR viewer: shared overlay RGBA texture builders.
 
 from functools import lru_cache
+import math
 from pathlib import Path
 
 import numpy as np
@@ -587,7 +588,7 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
         elif active:
             fill = colors["selection_container"]
         elif hovered:
-            fill = colors["blue_hover"]
+            fill = colors["blue_container"]
         else:
             fill = colors["card_alt"]
         if control.kind == "toggle":
@@ -627,6 +628,41 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
             target.text(
                 (x0 + 16 - bbox[0], (y0 + y1 - (bbox[3] - bbox[1])) / 2 - bbox[1]),
                 label, font=button_font, fill=text_color,
+            )
+            return
+
+        if control.icon in {"rotate_left", "rotate_right"}:
+            glyph = "\u21ba" if control.icon == "rotate_left" else "\u21bb"
+            icon_size = 24
+            icon_gap = 8
+            icon_font = _load_overlay_font_cached(24, None, False, False, False)
+            icon_box = target.textbbox((0, 0), glyph, font=icon_font)
+            glyph_width = icon_box[2] - icon_box[0]
+            glyph_height = icon_box[3] - icon_box[1]
+            label_font = _fit_overlay_font(
+                target,
+                label,
+                18,
+                max(1, x1 - x0 - icon_size - icon_gap - 16),
+                prefer_cjk=prefer_cjk,
+                minimum=18,
+            )
+            label_box = target.textbbox((0, 0), label, font=label_font)
+            label_width = label_box[2] - label_box[0]
+            group_width = icon_size + icon_gap + label_width
+            group_left = (x0 + x1 - group_width) / 2
+            center_y = (y0 + y1) / 2
+            icon_left = group_left + (icon_size - glyph_width) / 2 - icon_box[0]
+            icon_top = center_y - glyph_height / 2 - icon_box[1]
+            target.text(
+                (icon_left, icon_top), glyph, font=icon_font, fill=text_color,
+            )
+            text_top = center_y - (label_box[3] - label_box[1]) / 2 - label_box[1]
+            target.text(
+                (group_left + icon_size + icon_gap - label_box[0], text_top),
+                label,
+                font=label_font,
+                fill=text_color,
             )
             return
 

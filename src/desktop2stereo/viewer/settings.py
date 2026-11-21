@@ -137,10 +137,6 @@ def resolve_viewer_settings(settings: dict) -> ViewerSettings:
         input_monitor_index=monitor_index,
         output_monitor_index=stereo_display_index,
     )
-    if same_monitor_local_3d and display_mode not in {
-        "Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB"
-    }:
-        display_mode = "Half-SBS"
     use_stereo_monitor = same_monitor_local_3d
     output_resolution = compute_output_resolution(
         settings.get("Processing Resolution", "Auto"),

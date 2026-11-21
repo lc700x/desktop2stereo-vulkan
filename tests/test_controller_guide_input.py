@@ -16,8 +16,18 @@ class GuideHost(CoreControllerGuideInputMixin, CoreControllerShortcutsMixin):
         self._controller_calibration_mode = False
         self._vulkan_controller_proxy_enabled = False
         self.actions: list[tuple[str, dict]] = []
+        self.environment_mode = False
         self._init_controller_shortcuts()
         self._init_controller_guide_input()
+
+    def _operation_guide_environment_mode(self) -> bool:
+        return self.environment_mode
+
+    def update_shortcuts(self, *, left=None, right=None, after=0.0, environment=False) -> None:
+        self._frame_now += float(after)
+        self._controller_inputs = (left or {}, right or {})
+        self.environment_mode = environment
+        self._handle_controller_shortcuts(controller_toggle_checked=True)
 
     def _dispatch_controller_shortcut(self, action: str, **values) -> None:
         self.actions.append((action, values))
@@ -151,6 +161,88 @@ def test_operation_guide_matches_b_long_press_product_contract() -> None:
     assert any("同时长按 5s" in row[1] for row in cn_environment_rows)
     assert any("Hold together 5s" in row[1] for row in en_rows)
     assert any("Hold together 5s" in row[1] for row in en_environment_rows)
+
+
+def test_abxy_short_and_long_presses_match_the_controller_action_map() -> None:
+    cases = (
+        ("a_button", "right", "toggle_screen_shape", "cycle_status_panel", False),
+        ("b_button", "right", "toggle_passthrough", "toggle_operation_guide", False),
+        ("x_button", "left", "toggle_keyboard", "toggle_environment_background", False),
+        ("y_button", "left", "reset_screen", "cycle_screen_preset", False),
+        ("y_button", "left", "reset_screen", "cycle_room_environment", True),
+    )
+    for button, hand, short_action, long_action, environment in cases:
+        host = GuideHost()
+        pressed = {button: 1.0}
+        kwargs = {hand: pressed}
+        host.update_shortcuts(**kwargs, environment=environment)
+        host.update_shortcuts(**kwargs, after=1.01, environment=environment)
+        host.update_shortcuts(environment=environment)
+        assert [action for action, _values in host.actions] == [long_action]
+
+        host = GuideHost()
+        host.update_shortcuts(**kwargs, environment=environment)
+        host.update_shortcuts(after=0.2, environment=environment)
+        assert [action for action, _values in host.actions] == [short_action]
+
+
+def test_face_button_rows_document_short_long_and_contextual_behavior_bilingually() -> None:
+    cn_rows, cn_environment_rows = get_controller_help_rows("CN")
+    en_rows, en_environment_rows = get_controller_help_rows("EN")
+    assert ("右 A 键", "短按", "屏幕曲面/平面切换", False) in cn_rows
+    assert ("右 A 键", "长按 1s", "循环显示: 隐藏/FPS左下角/FPS+快捷键指南", False) in cn_rows
+    assert ("右 A 键", "短按", "屏幕曲面/平面切换", False) in cn_environment_rows
+    assert ("右 A 键", "长按 1s", "循环状态面板: 隐藏/FPS左下角/FPS+快捷键指南", False) in cn_environment_rows
+    for rows in (cn_rows, cn_environment_rows):
+        assert ("左 X 键", "短按", "显示/隐藏虚拟键盘", False) in rows
+        assert ("左 X 键", "长按 1s", "切换环境天空盒/黑色背景", False) in rows
+        assert ("右 B 键", "短按", "切换VDXR绿屏/背景色", False) in rows
+        assert ("右 B 键", "长按 1s", "显示/隐藏操作指南", False) in rows
+    assert ("左 Y 键", "长按 1s", "循环屏幕预设", False) in cn_rows
+    assert ("左 Y 键", "长按 1s", "切换房间环境", False) in cn_environment_rows
+    assert ("Right A button", "Short press", "Toggle curved/flat screen", False) in en_rows
+    assert ("Right A button", "Long press 1s", "Cycle panel: hidden/lower-left FPS/FPS + shortcut guide", False) in en_rows
+    assert ("Right A button", "Short press", "Toggle curved/flat screen", False) in en_environment_rows
+    assert ("Right A button", "Long press 1s", "Cycle status panel: hidden/lower-left FPS/FPS + shortcut guide", False) in en_environment_rows
+    for rows in (en_rows, en_environment_rows):
+        assert ("Left X button", "Short press", "Show/hide virtual keyboard", False) in rows
+        assert ("Left X button", "Long press 1s", "Toggle environment skybox / black", False) in rows
+        assert ("Right B button", "Short press", "Toggle VDXR green / background", False) in rows
+        assert ("Right B button", "Long press 1s", "Show/hide operation guide", False) in rows
+    assert ("Left Y button", "Long press 1s", "Cycle screen presets", False) in en_rows
+    assert ("Left Y button", "Long press 1s", "Switch room environment", False) in en_environment_rows
+
+
+def test_operation_guide_matches_keyboard_orbit_axis_mapping_and_reset_scope() -> None:
+    cn_rows, _ = get_controller_help_rows("CN")
+    en_rows, _ = get_controller_help_rows("EN")
+
+    assert (
+        "左握持 + 左摇杆 左右/前后",
+        "按住推动",
+        "键盘球面环绕",
+        False,
+    ) in cn_rows
+    assert (
+        "Left Grip + left stick L/R or U/D",
+        "Hold & push",
+        "Orbit keyboard around head",
+        False,
+    ) in en_rows
+    assert (
+        "左 Y 键",
+        "短按",
+        "重置屏幕位置和尺寸",
+        False,
+    ) in cn_rows
+    assert (
+        "Left Y button",
+        "Short press",
+        "Reset screen position and size",
+        False,
+    ) in en_rows
+    assert not any("摇杆按下" in row[0] and "键盘球面环绕" in row[2] for row in cn_rows)
+    assert not any("stick press" in row[0] and "Orbit keyboard" in row[2] for row in en_rows)
 
 
 def test_left_stick_radial_deadzone_and_response_curve_are_bounded() -> None:

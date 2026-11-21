@@ -2800,14 +2800,16 @@ class GUIProcessMixin:
             if not os.path.exists(LOG_FILE):
                 open(LOG_FILE, "a", encoding="utf-8").close()
             if OS_NAME == "Windows":
-                os.startfile(LOG_FILE)
+                subprocess.Popen(
+                    ["explorer", f"/select,{os.path.normpath(LOG_FILE)}"]
+                )
             elif OS_NAME == "Darwin":
-                subprocess.Popen(["open", LOG_FILE])
+                subprocess.Popen(["open", "-R", LOG_FILE])
             else:
-                subprocess.Popen(["xdg-open", LOG_FILE])
-            self.set_status(UI_MESSAGES[self.locale].get("Opening log file", "Opening log file"))
+                subprocess.Popen(["xdg-open", LOG_DIR])
+            self.set_status(UI_MESSAGES[self.locale].get("Opening log folder", "Opening log folder"))
         except Exception as exc:
-            logger.exception("Failed to open log file")
+            logger.exception("Failed to open log folder")
             self.set_status(str(exc))
 
     # ── reset ──

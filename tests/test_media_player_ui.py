@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import time
+from threading import Event
 from types import SimpleNamespace
 
 import numpy as np
+import media_ui
 from media_ui import (
     MEDIA_BROWSER_TEXTURE_SIZE,
+    MediaBrowserThumbnailCache,
     MediaHoverAnimation,
     _browser_button_rects,
+    _browser_grid_card_rect,
     _browser_layout,
     _button_rects,
     build_media_bar_rgba,
@@ -16,11 +20,13 @@ from media_ui import (
     media_bar_hit,
     media_bar_value_fraction,
     media_browser_hit,
+    media_browser_scroll_metrics,
     media_control_enabled,
     media_transport_icon,
 )
 from viewer.source_pointer import source_pointer_point
 from viewer.vulkan_local_viewer import VulkanLocalViewer
+from xr_viewer.settings_menu import OPENXR_MENU_COLORS, OPENXR_MENU_RADII
 
 
 def _state():
@@ -49,6 +55,11 @@ def _state():
             {"name": "recent.mp4", "path": "F:/Videos/recent.mp4", "kind": "video"},
         ],
     }
+
+
+def _rgb(token):
+    value = OPENXR_MENU_COLORS[token].lstrip("#")
+    return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4))
 
 
 def test_media_hover_animation_has_enter_and_exit_transitions():
@@ -94,6 +105,26 @@ def test_media_bar_hover_changes_pixels_and_keeps_timeline_end_knob_visible():
     right_edge = hovered[28:52, 940:1020, 3]
     assert right_edge.max() > 0
     assert np.any(right_edge != idle[28:52, 940:1020, 3])
+
+
+def test_media_volume_fill_uses_a_distinct_teal_hover_ramp():
+    state = _state()
+    idle = build_media_bar_rgba(state, width=1024, height=160)
+    hovered = build_media_bar_rgba(
+        state,
+        width=1024,
+        height=160,
+        hover="volume:0.500000",
+        hover_progress=1.0,
+    )
+    left, top, _right, bottom = _button_rects(1024, 160)["volume"]
+    center_y = (top + bottom) // 2
+    track_x = left + 14
+
+    assert tuple(idle[center_y, track_x, :3]) == _rgb("media_volume_fill")
+    assert tuple(hovered[center_y, track_x, :3]) == _rgb("media_volume_fill_hover")
+    assert _rgb("media_volume_fill") != _rgb("primary")
+    assert _rgb("media_volume_fill_hover") != _rgb("primary_hover")
 
 
 def test_media_bar_texture_and_hit_targets_are_stable():
@@ -200,6 +231,90 @@ def test_browser_texture_and_playlist_hit_targets():
     ) == ("browse_open", "C:/Videos/movie.mp4")
 
 
+def test_media_browser_uses_spatial_theme_radii_and_grid_list_controls():
+    assert OPENXR_MENU_RADII["panel"] == 28
+    assert OPENXR_MENU_RADII["control"] == 14
+    state = {
+        **_state(),
+        "browser_entries": [
+            {"name": f"movie-{index}.mp4", "path": f"F:/movie-{index}.mp4", "kind": "video"}
+            for index in range(20)
+        ],
+    }
+    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    buttons = _browser_button_rects(width, height)
+
+    for mode, action in (("grid", "browser_view_grid"), ("list", "browser_view_list")):
+        view_state = {**state, "browser_view_mode": mode}
+        layout = _browser_layout(view_state, width, height)
+        step, visible_count, max_offset = media_browser_scroll_metrics(view_state)
+        assert layout["view_mode"] == mode
+        assert step == (3 if mode == "grid" else 1)
+        assert visible_count == (9 if mode == "grid" else 10)
+        assert max_offset == (12 if mode == "grid" else 10)
+        rect = buttons[action]
+        assert media_browser_hit(
+            *_browser_uv((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2),
+            view_state,
+        ) == (action, None)
+        assert build_media_browser_rgba(view_state).shape == (height, width, 4)
+
+
+def test_media_browser_grid_preview_and_add_button_share_card_geometry():
+    entry = {"name": "movie.mp4", "path": "F:/movie.mp4", "kind": "video"}
+    state = {**_state(), "browser_entries": [entry]}
+    layout = _browser_layout(state, *MEDIA_BROWSER_TEXTURE_SIZE)
+    card = _browser_grid_card_rect(layout, 0)
+    preview = np.empty((8, 8, 3), dtype=np.uint8)
+    preview[:] = (210, 32, 48)
+    rgba = build_media_browser_rgba(state, thumbnails={entry["path"]: preview})
+    assert tuple(rgba[card[1] + 40, card[0] + 40, :3]) == (210, 32, 48)
+
+    add_x, add_y = card[2] - 32, card[3] - 32
+    assert media_browser_hit(*_browser_uv(add_x, add_y), state) == (
+        "playlist_add",
+        entry["path"],
+    )
+
+    list_state = {**state, "browser_view_mode": "list"}
+    list_layout = _browser_layout(list_state, *MEDIA_BROWSER_TEXTURE_SIZE)
+    row_y = list_layout["file_rows_y"] + list_layout["file_row_height"] / 2
+    assert media_browser_hit(
+        *_browser_uv(MEDIA_BROWSER_TEXTURE_SIZE[0] - 70, row_y), list_state
+    ) == ("playlist_add", entry["path"])
+
+
+def test_media_browser_thumbnail_cache_remembers_failed_previews(monkeypatch):
+    path = "F:/unreadable.mp4"
+    completed = Event()
+    calls = []
+
+    def failed_thumbnail(request_path, _kind, _size=(384, 216)):
+        calls.append(request_path)
+        completed.set()
+        return None
+
+    monkeypatch.setattr(media_ui, "_load_media_browser_thumbnail", failed_thumbnail)
+    cache = MediaBrowserThumbnailCache()
+    entries = [{"name": "unreadable.mp4", "path": path, "kind": "video"}]
+    try:
+        cache.visible_thumbnails(entries, scroll_offset=0, view_mode="grid")
+        assert completed.wait(1.0)
+        deadline = time.monotonic() + 1.0
+        revision = 0
+        while revision == 0 and time.monotonic() < deadline:
+            _thumbnails, revision = cache.visible_thumbnails(
+                entries, scroll_offset=0, view_mode="grid"
+            )
+            if revision == 0:
+                time.sleep(0.005)
+        assert revision > 0
+        cache.visible_thumbnails(entries, scroll_offset=0, view_mode="grid")
+        assert calls == [path]
+    finally:
+        cache.close()
+
+
 def test_browser_footer_actions_use_content_inset_and_stable_group_gap():
     width, height = MEDIA_BROWSER_TEXTURE_SIZE
     rects = _browser_button_rects(width, height)
@@ -219,6 +334,7 @@ def test_browser_footer_actions_use_content_inset_and_stable_group_gap():
 def test_browser_mounts_and_row_bounds_are_clickable_only_inside_geometry():
     state = {
         **_state(),
+        "browser_view_mode": "list",
         "browser_mounts": [
             {"name": "媒体 (F:)", "path": "F:/", "kind": "drive"},
         ],
@@ -244,7 +360,7 @@ def test_browser_mounts_and_row_bounds_are_clickable_only_inside_geometry():
         "entry",
         "F:/Videos/movie-0.mp4",
     )
-    assert media_browser_hit(0.72, 0.05, state) is None
+    assert media_browser_hit(0.72, 0.12, state) is None
 
 
 def test_pointer_texture_and_source_coordinate_mapping():
@@ -493,7 +609,7 @@ def test_playlist_controls_share_painted_geometry_and_page_offset():
 def test_add_button_does_not_open_selected_file():
     state = {**_state(), "browser_entries": [
         {"name": "movie.mp4", "path": "F:/movie.mp4", "kind": "video"}
-    ]}
+    ], "browser_view_mode": "list"}
     width, height = MEDIA_BROWSER_TEXTURE_SIZE
     layout = _browser_layout(state, width, height)
     x = width - 70

@@ -248,7 +248,14 @@ def test_resolve_viewer_settings_keeps_unset_stereo_output_unset():
     assert resolved.stereo_display_selection is False
 
 
-def test_single_windows_display_uses_local_viewer_as_stereo_output(monkeypatch):
+@pytest.mark.parametrize(
+    "display_mode",
+    [
+        "Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB",
+        "Depth Map", "Anaglyph", "Interleaved", "Mono", "Leia",
+    ],
+)
+def test_single_windows_display_preserves_local_3d_display_mode(monkeypatch, display_mode):
     from utils import display_info
 
     single_display = DisplayInfo(
@@ -258,20 +265,41 @@ def test_single_windows_display_uses_local_viewer_as_stereo_output(monkeypatch):
     monkeypatch.setattr("viewer.settings.platform.system", lambda: "Windows")
 
     monitor_capture = resolve_viewer_settings(
-        dict(BASE_SETTINGS, VSync=False, **{"Display Mode": "Mono", "Stereo Output": 2})
+        dict(BASE_SETTINGS, VSync=False, **{"Display Mode": display_mode, "Stereo Output": 2})
     )
-    assert monitor_capture.display_mode == "Half-SBS"
+    assert monitor_capture.display_mode == display_mode
     assert monitor_capture.stereo_display_index == 1
     assert monitor_capture.stereo_display_selection is True
 
+
+def test_single_windows_window_capture_does_not_enable_local_3d(monkeypatch):
+    from utils import display_info
+
+    single_display = DisplayInfo(
+        1, 1, 0, 0, 1920, 1080, stable_id="display-1", is_primary=True
+    )
+    monkeypatch.setattr(display_info, "enumerate_displays", lambda: [single_display])
+    monkeypatch.setattr("viewer.settings.platform.system", lambda: "Windows")
+
     window_capture = resolve_viewer_settings(
-        dict(BASE_SETTINGS, VSync=False, **{"Capture Mode": "Window", "Stereo Output": 2})
+        dict(
+            BASE_SETTINGS,
+            VSync=False,
+            **{"Capture Mode": "Window", "Display Mode": "Mono", "Stereo Output": 2},
+        )
     )
     assert window_capture.stereo_display_index is None
     assert window_capture.stereo_display_selection is False
 
 
-def test_multi_display_same_input_and_output_enables_local_3d(monkeypatch):
+@pytest.mark.parametrize(
+    "display_mode",
+    [
+        "Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB",
+        "Depth Map", "Anaglyph", "Interleaved", "Mono", "Leia",
+    ],
+)
+def test_multi_display_same_input_and_output_preserves_display_mode(monkeypatch, display_mode):
     monkeypatch.setattr("viewer.settings.platform.system", lambda: "Windows")
     same_display = resolve_viewer_settings(
         dict(
@@ -280,14 +308,14 @@ def test_multi_display_same_input_and_output_enables_local_3d(monkeypatch):
             **{
                 "Monitor Index": 2,
                 "Stereo Output": 2,
-                "Display Mode": "Mono",
+                "Display Mode": display_mode,
             },
         )
     )
     assert same_display.monitor_index == 2
     assert same_display.stereo_display_index == 2
     assert same_display.stereo_display_selection is True
-    assert same_display.display_mode == "Half-SBS"
+    assert same_display.display_mode == display_mode
 
     separate_display = resolve_viewer_settings(
         dict(

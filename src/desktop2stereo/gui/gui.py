@@ -21,6 +21,7 @@ from .config_mgr import GUIConfigMixin
 from .process import GUIProcessMixin, _setup_console_logging
 from .config import DEFAULTS
 from .controls import S
+from .theme import build_app_theme
 from .paths import BASE_DIR, GUI_READY_FILE, LOG_DIR
 from .localization import UI_MESSAGES
 
@@ -104,9 +105,10 @@ class Desktop2StereoGUI(
             font = "PingFang SC"
         else:
             font = "Noto Sans SC"
-        self.page.theme = ft.Theme(color_scheme_seed="blue", font_family=font)
+        self.page.theme = build_app_theme(font, "blue")
+        self.page.dark_theme = build_app_theme(font, "blue")
         self.page.spacing = 0
-        self.page.theme_mode = ft.ThemeMode.SYSTEM
+        self.page.theme_mode = ft.ThemeMode.DARK
         self.page.window.min_width = S(520)
         self.page.window.min_height = S(300)
 

@@ -305,3 +305,58 @@ def test_single_monitor_local_viewer_uses_same_monitor_3d_mode():
     ok, message = GUIProcessMixin._validate_config_before_run(Gui())
 
     assert ok
+
+
+def test_same_monitor_local_3d_keeps_all_display_modes_available():
+    from gui.handlers import GUIHandlerMixin
+
+    def widget(**kwargs):
+        return types.SimpleNamespace(**kwargs)
+
+    gui = types.SimpleNamespace(
+        run_mode_key="Local Viewer",
+        locale="EN",
+        run_mode_dd=widget(value=""),
+        display_mode_label=widget(visible=True),
+        display_mode_dd=widget(value="Leia", options=[]),
+        xr_headset_label=widget(visible=False),
+        xr_headset_dd=widget(visible=False),
+        row7b=widget(visible=False),
+        showfps_cb=widget(visible=False),
+        display_fit_dd=widget(visible=False),
+        monitor_label_to_index={"1: 1920x1080 @ (0,0)": 1},
+        monitor_dd=widget(value="1: 1920x1080 @ (0,0)"),
+        stereo_monitor_dd=widget(value="1: 1920x1080 @ (0,0)"),
+        stereo_output_label=widget(visible=False),
+        row9=widget(visible=False),
+        moonlight_controls_row=widget(visible=False),
+        capture_mode_key="Monitor",
+        _config={"Display Mode": "Leia"},
+        page=widget(update=lambda: None),
+    )
+    for name in (
+        "_sync_device_advanced_visibility",
+        "_sync_nvfruc_visibility",
+        "_sync_lsfg_visibility",
+        "_sync_moonlight_macos_help",
+        "_sync_moonlight_button_state",
+        "_sync_moonlight_encoder_options",
+        "_show_streamer_rows",
+        "_sync_manual_bitrate_visibility",
+        "update_stereo_monitor_menu",
+        "_fit_window_to_content",
+        "_auto_select_stereo_monitor",
+        "update_stream_url",
+    ):
+        setattr(gui, name, lambda *args: None)
+    gui._get_monitor_count = lambda: 1
+    gui._get_streamer_row_map = dict
+
+    GUIHandlerMixin._sync_visibility(gui)
+
+    assert gui.display_mode_dd.options == [
+        "Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB",
+        "Depth Map", "Anaglyph", "Interleaved", "Mono", "Leia",
+    ]
+    assert gui.display_mode_dd.value == "Leia"
+    assert gui._config["Display Mode"] == "Leia"

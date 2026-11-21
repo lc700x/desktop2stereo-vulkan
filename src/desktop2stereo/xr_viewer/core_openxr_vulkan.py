@@ -47,12 +47,13 @@ from app_runtime.output_contract import VulkanStereoOutputFrame
 from media_ui import (
     MEDIA_BROWSER_TEXTURE_ASPECT,
     MEDIA_BROWSER_TEXTURE_SIZE,
-    MEDIA_BROWSER_VISIBLE_ROWS,
     MediaHoverAnimation,
+    MediaBrowserThumbnailCache,
     build_media_bar_rgba,
     build_media_browser_rgba,
     media_bar_hit,
     media_browser_hit,
+    media_browser_scroll_metrics,
     media_control_enabled,
 )
 
@@ -1301,6 +1302,8 @@ class OpenXrVulkanPresenter(
         self._media_overlay_hover_animation = MediaHoverAnimation()
         self._media_overlay_scroll = 0
         self._media_overlay_scroll_next_at = 0.0
+        self._media_overlay_view_mode = "grid"
+        self._media_browser_thumbnail_cache = MediaBrowserThumbnailCache()
         self._media_overlay_trigger_down = [False, False]
         self._media_overlay_pending_selection: tuple[int, str, Any] | None = None
         self._media_overlay_last_click_at = 0.0
@@ -5171,7 +5174,7 @@ class OpenXrVulkanPresenter(
                 )
                 self._persist_screen_state(force=True)
                 self._refresh_settings_menu_values()
-        elif key == "reset:screen_shape":
+        elif key == "reset:screen_rotation":
             initial = self._filament_screen_initial
             current = self._filament_screen
             if initial is not None and current is not None:
@@ -5179,6 +5182,9 @@ class OpenXrVulkanPresenter(
                 self._filament_screen = (
                     current[0], current[1], current[2], tuple(rotation)
                 )
+                self._persist_screen_state(force=True)
+                self._refresh_settings_menu_values()
+        elif key == "reset:screen_shape":
             half_angle = float(defaults.get(
                 "screen:curve_half_angle", self._screen_initial_curve_half_angle
             ))
@@ -6172,6 +6178,27 @@ class OpenXrVulkanPresenter(
     ) -> None:
         if not hit:
             return
+        if hit in {"browser_view_grid", "browser_view_list"}:
+            self._media_overlay_view_mode = (
+                "grid" if hit == "browser_view_grid" else "list"
+            )
+            browser_state = {
+                **self._media_overlay_state,
+                "browser_view_mode": self._media_overlay_view_mode,
+            }
+            if self._media_overlay_view_mode == "grid":
+                self._media_overlay_scroll = (
+                    self._media_overlay_scroll // 3
+                ) * 3
+            _step, _visible_count, max_offset = media_browser_scroll_metrics(
+                browser_state
+            )
+            self._media_overlay_scroll = min(
+                max_offset, max(0, self._media_overlay_scroll)
+            )
+            self._media_overlay_browser_key = None
+            self._media_overlay_last_activity = time.monotonic()
+            return
         state = self._media_overlay_state
         if hit == "wake":
             self._media_overlay_last_activity = time.monotonic()
@@ -6329,6 +6356,10 @@ class OpenXrVulkanPresenter(
             return False
         state = self._media_overlay_state
         browser = bool(state.get("browser_visible"))
+        browser_state = {
+            **state,
+            "browser_view_mode": getattr(self, "_media_overlay_view_mode", "grid"),
+        }
         expanded = self._media_overlay_expanded()
         consumed = False
         hover_key: str | None = None
@@ -6339,7 +6370,10 @@ class OpenXrVulkanPresenter(
             if hit is not None:
                 if browser:
                     browser_hit = media_browser_hit(
-                        hit[0], hit[1], state, scroll_offset=self._media_overlay_scroll
+                        hit[0],
+                        hit[1],
+                        browser_state,
+                        scroll_offset=self._media_overlay_scroll,
                     )
                     self._settings_menu.hover_key = None
                     if browser_hit is not None:
@@ -6391,18 +6425,21 @@ class OpenXrVulkanPresenter(
                         pending_action, pending_value
                     )
                     consumed = True
-            vertical = -float(
+            vertical = float(
                 self._controller_input(hand).get("joystick_y", 0.0) or 0.0
             )
             if browser and expanded and hit is not None and abs(vertical) > 0.5:
                 now = time.monotonic()
                 if now >= self._media_overlay_scroll_next_at:
-                    entries = state.get("browser_entries") or []
+                    step, _visible_count, max_offset = media_browser_scroll_metrics(
+                        browser_state
+                    )
                     self._media_overlay_scroll = max(
                         0,
                         min(
-                            max(0, len(entries) - MEDIA_BROWSER_VISIBLE_ROWS),
-                            self._media_overlay_scroll + (1 if vertical > 0 else -1),
+                            max_offset,
+                            self._media_overlay_scroll
+                            + (step if vertical > 0 else -step),
                         ),
                     )
                     delay = 0.35 if self._media_overlay_scroll_next_at <= 0.0 else 0.08
@@ -7276,6 +7313,9 @@ class OpenXrVulkanPresenter(
         # worker thread and can otherwise enqueue another Vulkan submission
         # while teardown is destroying the adapter/device.
         self._accept_output = False
+        thumbnail_cache = getattr(self, "_media_browser_thumbnail_cache", None)
+        if thumbnail_cache is not None:
+            thumbnail_cache.close()
         self._flush_openxr_settings_and_screen_state()
         self._reset_settings_menu_grab()
         if _TOUCH_AVAILABLE and _touch_injector is not None:
@@ -14802,6 +14842,11 @@ class OpenXrVulkanPresenter(
         media_state = self._media_overlay_state
         if media_state and self._media_overlay_visible():
             browser_visible = bool(media_state.get("browser_visible"))
+            browser_view_mode = getattr(self, "_media_overlay_view_mode", "grid")
+            browser_state = {
+                **media_state,
+                "browser_view_mode": browser_view_mode,
+            }
             expanded = self._media_overlay_expanded()
             animator = getattr(self, "_media_overlay_hover_animation", None)
             if animator is None:
@@ -14811,9 +14856,20 @@ class OpenXrVulkanPresenter(
                 hover_visual, hover_progress = animator.update(
                     self._media_overlay_hover, time.perf_counter()
                 )
+            thumbnails, thumbnail_revision = {}, 0
+            if browser_visible:
+                thumbnails, thumbnail_revision = (
+                    self._media_browser_thumbnail_cache.visible_thumbnails(
+                        list(browser_state.get("browser_entries") or []),
+                        scroll_offset=self._media_overlay_scroll,
+                        view_mode=browser_view_mode,
+                    )
+                )
             browser_key = (
                 media_state.get("browser_revision"),
                 browser_visible,
+                browser_view_mode,
+                thumbnail_revision,
                 media_state.get("browser_path"),
                 media_state.get("browser_parent"),
                 media_state.get("browser_selection"),
@@ -14861,12 +14917,13 @@ class OpenXrVulkanPresenter(
                 ):
                     self._tool_quad_texture_cache["media_browser"] = (
                         build_media_browser_rgba(
-                            media_state,
+                            browser_state,
                             width=MEDIA_BROWSER_TEXTURE_SIZE[0],
                             height=MEDIA_BROWSER_TEXTURE_SIZE[1],
                             hover=hover_visual,
                             hover_progress=hover_progress,
                             scroll_offset=self._media_overlay_scroll,
+                            thumbnails=thumbnails,
                             lang=language,
                         )
                     )

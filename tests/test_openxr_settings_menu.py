@@ -301,9 +301,10 @@ def test_screen_layout_has_shape_and_placement_resets_in_their_cards():
     keys = set(controls)
     assert {
         "screen:distance", "screen:rotate:-90",
-        "screen:rotate:+90",
+        "screen:rotate:+90", "reset:screen_rotation",
     } <= keys
     assert controls["reset:screen_shape"].group == "screen_shape"
+    assert controls["reset:screen_rotation"].group == "screen_rotation"
     assert controls["reset:screen_placement"].group == "screen_placement"
     height = next(control for control in menu.controls() if control.key == "screen:height")
     assert (height.minimum, height.maximum, height.step) == (-10.0, 10.0, 0.05)
@@ -315,6 +316,72 @@ def test_screen_layout_has_shape_and_placement_resets_in_their_cards():
     assert max(control.rect[3] for control in rotations) < (
         controls["screen:width"].rect[1] - 0.05
     )
+
+
+def test_screen_rotation_buttons_align_to_slider_edges_and_have_equal_spacing():
+    menu = OpenXrSettingsMenu()
+    menu.set_tab("screen")
+    layout = menu.layout()
+    controls = {control.key: control for control in layout.controls}
+    rotations = (
+        controls["screen:rotate:-90"],
+        controls["screen:rotate:+90"],
+    )
+    shape_group = next(group for group in layout.groups if group.key == "screen_shape")
+    rotation_group = next(group for group in layout.groups if group.key == "screen_rotation")
+    width, height = SETTINGS_MENU_TEXTURE_SIZE
+
+    assert tuple(control.icon for control in rotations) == (
+        "rotate_left", "rotate_right",
+    )
+    assert tuple(control.group for control in rotations) == (
+        "screen_rotation", "screen_rotation",
+    )
+    slider_minus = controls["step:minus:screen:width"]
+    slider_plus = controls["step:plus:screen:width"]
+    assert rotations[0].rect[0] == pytest.approx(slider_minus.rect[0])
+    assert rotations[1].rect[2] == pytest.approx(slider_plus.rect[2])
+    assert (rotations[0].rect[2] - rotations[0].rect[0]) * width == pytest.approx(
+        (rotations[1].rect[2] - rotations[1].rect[0]) * width
+    )
+    assert (rotations[1].rect[0] - rotations[0].rect[2]) * width == pytest.approx(16)
+    row_center = (rotations[0].rect[0] + rotations[1].rect[2]) * width / 2
+    rotation_center = (rotation_group.rect[0] + rotation_group.rect[2]) * width / 2
+    shape_bottom = shape_group.rect[3] * SETTINGS_MENU_TEXTURE_SIZE[1]
+    rotation_top = rotation_group.rect[1] * SETTINGS_MENU_TEXTURE_SIZE[1]
+    shape_control_bottom = controls["screen:type:deep"].rect[3] * height
+    shape_reset = controls["reset:screen_shape"]
+    rotation_reset = controls["reset:screen_rotation"]
+    placement_group = next(
+        group for group in layout.groups if group.key == "screen_placement"
+    )
+    assert row_center == pytest.approx(rotation_center)
+    assert rotation_top - shape_bottom == pytest.approx(8)
+    assert shape_reset.rect[1] * height - shape_control_bottom == pytest.approx(8)
+    assert (shape_reset.rect[3] - shape_reset.rect[1]) * height == pytest.approx(32)
+    assert rotation_reset.group == "screen_rotation"
+    assert rotation_reset.rect[1] * height == pytest.approx(424)
+    assert rotation_reset.rect[1] * height - max(
+        control.rect[3] * height for control in rotations
+    ) == pytest.approx(8)
+    assert rotation_reset.rect[3] * height == pytest.approx(456)
+    assert rotation_group.rect[3] * height - rotation_reset.rect[3] * height == pytest.approx(16)
+    assert placement_group.rect[1] * height - rotation_group.rect[3] * height == pytest.approx(8)
+    assert placement_group.rect[3] * height == pytest.approx(768)
+    assert layout.content_viewport[3] * height == pytest.approx(784)
+    placement_rows = tuple(
+        controls[key] for key in (
+            "screen:width", "screen:height", "screen:distance",
+        )
+    )
+    assert tuple(
+        (next_row.rect[1] - row.rect[3]) * height
+        for row, next_row in zip(placement_rows, placement_rows[1:])
+    ) == pytest.approx((8, 8))
+    placement_reset = controls["reset:screen_placement"]
+    assert placement_reset.rect[1] * height - placement_rows[-1].rect[3] * height == pytest.approx(8)
+    assert (placement_reset.rect[3] - placement_reset.rect[1]) * height == pytest.approx(32)
+    assert gettext_for("CN", rotation_group.title) == "\u5c4f\u5e55\u65cb\u8f6c"
 
 
 def test_screen_crop_section_has_symmetric_crop_controls_and_navigation():
@@ -725,7 +792,10 @@ def test_scrolled_room_reset_buttons_remain_inside_the_viewport_and_hit_test():
         ("depth", None, ("reset:depth_stereo",)),
         ("glow", None, ("reset:glow_modes", "reset:glow_transparency")),
         ("room", None, ("reset:room_seats", "reset:room_scene")),
-        ("screen", "layout", ("reset:screen_shape", "reset:screen_placement")),
+        (
+            "screen", "layout",
+            ("reset:screen_shape", "reset:screen_rotation", "reset:screen_placement"),
+        ),
         ("screen", "crop", ("screen:reset_crop",)),
     ),
 )
@@ -767,10 +837,14 @@ def test_card_resets_stay_in_their_group_and_hit_test(tab, section, reset_keys):
 def test_group_cards_use_balanced_insets_and_consistent_vertical_gaps():
     menu = OpenXrSettingsMenu()
     cases = (
-        ("screen", "screen_shape", "screen_placement", 120, 384, 400, 736),
-        ("glow", "glow_modes", "glow_transparency", 32, 304, 320, 488),
+        ("screen", "screen_shape", "screen_rotation", 120, 304, 312, 472, 8),
+        ("screen", "screen_rotation", "screen_placement", 312, 472, 480, 768, 8),
+        ("glow", "glow_modes", "glow_transparency", 32, 304, 320, 488, 16),
     )
-    for tab, first_key, second_key, first_top, first_bottom, second_top, second_bottom in cases:
+    for (
+        tab, first_key, second_key, first_top, first_bottom,
+        second_top, second_bottom, gap,
+    ) in cases:
         menu.set_tab(tab)
         layout = menu.layout(show_glow=True)
         groups = {group.key: group for group in layout.groups}
@@ -778,7 +852,7 @@ def test_group_cards_use_balanced_insets_and_consistent_vertical_gaps():
         second = tuple(round(value * 832) for value in groups[second_key].rect)
         assert (first[1], first[3]) == (first_top, first_bottom)
         assert (second[1], second[3]) == (second_top, second_bottom)
-        assert second[1] - first[3] == 16
+        assert second[1] - first[3] == gap
 
     menu.set_tab("depth")
     depth_groups = {group.key: group for group in menu.layout().groups}
@@ -926,7 +1000,10 @@ def test_every_slider_uses_a_48_pixel_ray_target_and_separate_icon_button_slop()
             if control.kind == "slider":
                 assert (control.rect[3] - control.rect[1]) * 832 == pytest.approx(48)
             if control.kind == "slider_step":
-                assert (control.rect[3] - control.rect[1]) * 832 == pytest.approx(64)
+                expected_height = 48 if control.group == "screen_placement" else 64
+                assert (control.rect[3] - control.rect[1]) * 832 == pytest.approx(
+                    expected_height
+                )
                 assert (control.rect[2] - control.rect[0]) * 1024 >= 48
 
 

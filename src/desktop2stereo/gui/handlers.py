@@ -21,10 +21,7 @@ from streaming.audio import (
 from stereo_runtime.render_size import _normalize_render_scale_tier
 from streaming.stream_calibration import automatic_peak_bitrate_mbps
 from streaming.wasapi_audio import query_soundcard_loopback_devices
-from utils.run_mode import (
-    is_local_same_monitor_3d_mode,
-    target_fps_setting_key,
-)
+from utils.run_mode import target_fps_setting_key
 from utils.xr_headset_presets import display_to_xr_headset, xr_headset_options, xr_headset_to_display
 from xr_viewer.settings_menu import OPENXR_RENDER_SCALE_MAX, OPENXR_RENDER_SCALE_MIN
 from . import devices as devices_module
@@ -38,6 +35,7 @@ from .config import (
 )
 from .controls import FONT_SIZE, S
 from .localization import UI_MESSAGES, is_supported_locale
+from .theme import build_app_theme
 from .paths import BASE_DIR
 from .devices import DEVICES
 
@@ -1671,29 +1669,10 @@ class GUIHandlerMixin:
             self.showfps_cb.visible = True
         self.display_fit_dd.visible = display_fit_visible
         mon_count = self._get_monitor_count()
-        input_monitor_index = self.monitor_label_to_index.get(self.monitor_dd.value)
-        output_monitor_index = self.monitor_label_to_index.get(
-            self.stereo_monitor_dd.value
-        )
-        same_monitor_local_3d = is_local_same_monitor_3d_mode(
-            mode,
-            os_name=OS_NAME,
-            monitor_count=mon_count,
-            capture_mode=self.capture_mode_key,
-            input_monitor_index=input_monitor_index,
-            output_monitor_index=output_monitor_index,
-        )
-        self.display_mode_dd.options = (
-            ["Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB"]
-            if same_monitor_local_3d
-            else [
-                "Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB",
-                "Depth Map", "Anaglyph", "Interleaved", "Mono", "Leia",
-            ]
-        )
-        if same_monitor_local_3d and self.display_mode_dd.value not in self.display_mode_dd.options:
-            self.display_mode_dd.value = "Half-SBS"
-            self._config["Display Mode"] = "Half-SBS"
+        self.display_mode_dd.options = [
+            "Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB",
+            "Depth Map", "Anaglyph", "Interleaved", "Mono", "Leia",
+        ]
         stereo_full = mode == "Local Viewer" and mon_count > 1
         self.stereo_output_label.visible = stereo_full
         self.stereo_monitor_dd.visible = stereo_full
@@ -1799,11 +1778,12 @@ class GUIHandlerMixin:
             font = "PingFang SC"
         else:
             font = "Noto Sans SC"
-        if color == "system":
-            self.page.theme_mode = ft.ThemeMode.SYSTEM
-            self.page.theme = ft.Theme(color_scheme_seed="blue", font_family=font)
-        else:
-            self.page.theme = ft.Theme(color_scheme_seed=color, font_family=font)
+        theme_color = "blue" if color == "system" else color
+        self.page.theme = build_app_theme(font, theme_color)
+        self.page.dark_theme = build_app_theme(font, theme_color)
+        # The application surface system is intentionally dark. Following a
+        # light OS scheme produced dark labels on the dark panel background.
+        self.page.theme_mode = ft.ThemeMode.DARK
         self.page.update()
 
     def on_language_change(self, e):
@@ -1988,7 +1968,7 @@ class GUIHandlerMixin:
         headset_key = display_to_xr_headset(self.xr_headset_dd.value)
         self.xr_headset_dd.options = xr_headset_options(self.locale)
         self.xr_headset_dd.value = xr_headset_to_display(headset_key, self.locale)
-        self.xr_preview_cb.label = t.get("XR Preview Window", "XR画面预览窗口" if self.locale == "CN" else "XR Preview Window")
+        self.xr_preview_cb.label = t["XR Preview Window"]
         self.local_vsync_cb.label = t.get("VSync", "VSync")
         self.window_preview_cb.label = t.get("Window Preview", "Window Preview")
         self.target_fps_label.value = t.get("Capture FPS:", "Capture FPS:")

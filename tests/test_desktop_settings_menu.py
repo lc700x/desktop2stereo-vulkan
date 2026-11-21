@@ -20,6 +20,7 @@ def _control(
     maximum: float = 1.0,
     step: float = 0.05,
     enabled: bool = True,
+    icon: str | None = None,
 ):
     return SimpleNamespace(
         key=key,
@@ -29,6 +30,7 @@ def _control(
         maximum=maximum,
         step=step,
         enabled=enabled,
+        icon=icon,
     )
 
 
@@ -153,6 +155,17 @@ def test_snapshot_layout_signature_tracks_language_changes():
     assert _snapshot_layout_signature(english) != _snapshot_layout_signature(chinese)
 
 
+def test_snapshot_layout_signature_tracks_control_icons():
+    from xr_viewer.desktop_settings_menu import _snapshot_layout_signature
+
+    left = (_control("screen:rotate:-90", icon="rotate_left"),)
+    right = (_control("screen:rotate:-90", icon="rotate_right"),)
+
+    assert _snapshot_layout_signature({"controls": left}) != _snapshot_layout_signature(
+        {"controls": right}
+    )
+
+
 def test_flet_slider_snapshot_values_are_bounded_to_the_control_range():
     from xr_viewer.desktop_settings_menu import _bounded_slider_value
 
@@ -203,6 +216,7 @@ def test_screen_curveness_and_rotation_use_separate_flet_rows():
     assert _button_row_group("room:seat:middle") == "room_seats"
     assert _button_row_group("room:toggle_screen_reflection") == "room_scene"
     assert _button_row_group("reset:color_adjustment") == "color_adjustment"
+    assert _button_row_group("reset:screen_rotation") == "screen_rotation"
     assert _button_row_group("reset:screen_placement") == "screen_placement"
     assert _button_row_group("screen:reset_crop") == "screen_crop"
     assert _button_row_group("section:reset_defaults") == "screen_placement"
@@ -211,17 +225,42 @@ def test_screen_curveness_and_rotation_use_separate_flet_rows():
 def test_flet_controls_use_one_compact_dimension_step():
     from xr_viewer.desktop_settings_menu import (
         _FLET_BUTTON_HEIGHT,
+        _FLET_BUTTON_PADDING_X,
+        _FLET_BUTTON_PADDING_Y,
+        _FLET_GROUP_PADDING,
+        _FLET_INNER_SPACING,
+        _FLET_LAYOUT_SCALE,
+        _FLET_OUTER_PADDING,
         _FLET_PANEL_SIZE,
         _FLET_SECONDARY_BUTTON_HEIGHT,
+        _FLET_SIDEBAR_PADDING,
         _FLET_SIDEBAR_WIDTH,
         _FLET_SPACING,
         _FLET_STEP_BUTTON_SIZE,
         _compact_flet_dimension,
     )
+    from xr_viewer.settings_menu import (
+        SETTINGS_MENU_TEXTURE_SIZE,
+        _MENU_GROUP_GAP,
+        _MENU_GROUP_PADDING,
+        _SIDEBAR_CONTROL_PADDING,
+        _SIDEBAR_PANEL_LEFT,
+        _SIDEBAR_PANEL_RIGHT,
+    )
 
     assert _FLET_PANEL_SIZE == (760, 650)
-    assert _FLET_SIDEBAR_WIDTH == 144
-    assert _FLET_SPACING == 8
+    assert _FLET_LAYOUT_SCALE == _FLET_PANEL_SIZE[0] / SETTINGS_MENU_TEXTURE_SIZE[0]
+    assert _FLET_OUTER_PADDING == round(_SIDEBAR_PANEL_LEFT * _FLET_LAYOUT_SCALE)
+    assert _FLET_SIDEBAR_WIDTH == round(
+        (_SIDEBAR_PANEL_RIGHT - _SIDEBAR_PANEL_LEFT) * _FLET_LAYOUT_SCALE
+    )
+    assert _FLET_SIDEBAR_PADDING == round(
+        _SIDEBAR_CONTROL_PADDING * _FLET_LAYOUT_SCALE
+    )
+    assert _FLET_GROUP_PADDING == round(_MENU_GROUP_PADDING * _FLET_LAYOUT_SCALE)
+    assert _FLET_SPACING == round(_MENU_GROUP_GAP * _FLET_LAYOUT_SCALE)
+    assert _FLET_INNER_SPACING == 6
+    assert (_FLET_BUTTON_PADDING_X, _FLET_BUTTON_PADDING_Y) == (8, 4)
     assert _FLET_BUTTON_HEIGHT == 40
     assert _FLET_SECONDARY_BUTTON_HEIGHT == 32
     assert _FLET_STEP_BUTTON_SIZE == 40
@@ -230,6 +269,42 @@ def test_flet_controls_use_one_compact_dimension_step():
     assert _compact_flet_dimension(136) == 104
     assert _compact_flet_dimension(216) == 160
     assert _compact_flet_dimension(236) == 176
+
+
+def test_flet_rotation_and_section_controls_use_consistent_icon_and_height():
+    import flet as ft
+
+    from xr_viewer.desktop_settings_menu import (
+        _FLET_BUTTON_HEIGHT,
+        _FLET_INNER_SPACING,
+        _FLET_SECONDARY_BUTTON_HEIGHT,
+        _FLET_SPACING,
+        _button_height_for_key,
+        _compact_flet_dimension,
+        _flet_icon_for_control,
+        _reset_button_width_for_group,
+    )
+
+    assert _FLET_SPACING == 12
+    assert _FLET_INNER_SPACING == 6
+    assert _button_height_for_key("screen:section:layout") == _FLET_BUTTON_HEIGHT
+    assert _button_height_for_key("screen:rotate:-90") == _FLET_BUTTON_HEIGHT
+    assert _button_height_for_key("screen:rotate:+90") == _FLET_BUTTON_HEIGHT
+    assert _button_height_for_key("reset:screen_shape") == _FLET_SECONDARY_BUTTON_HEIGHT
+    assert _button_height_for_key("reset:screen_rotation") == _FLET_SECONDARY_BUTTON_HEIGHT
+    assert _button_height_for_key("reset:screen_placement") == _FLET_SECONDARY_BUTTON_HEIGHT
+    screen_reset_width = _compact_flet_dimension(120)
+    assert _reset_button_width_for_group("screen_shape") == screen_reset_width
+    assert _reset_button_width_for_group("screen_rotation") == screen_reset_width
+    assert _reset_button_width_for_group("screen_placement") == screen_reset_width
+    assert _reset_button_width_for_group("screen_crop") == _compact_flet_dimension(160)
+    assert _flet_icon_for_control(
+        ft, _control("screen:rotate:-90", icon="rotate_left")
+    ) == ft.Icons.ROTATE_LEFT
+    assert _flet_icon_for_control(
+        ft, _control("screen:rotate:+90", icon="rotate_right")
+    ) == ft.Icons.ROTATE_RIGHT
+    assert _flet_icon_for_control(ft, _control("screen:type:flat")) is None
 
 
 def test_flet_step_button_symbols_use_centered_zero_padding_style():

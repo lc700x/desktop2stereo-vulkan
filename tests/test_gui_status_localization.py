@@ -10,6 +10,13 @@ from gui.builders import GUIBuilderMixin, _main_menu_action_style
 from gui.handlers import GUIHandlerMixin
 from gui.localization import _STATUS_MESSAGES, MESSAGE_CATALOGS, translate_status
 from gui.process import GUIProcessMixin
+from gui.theme import build_app_theme, color
+
+
+def test_gui_locale_catalogs_have_matching_keys_and_xr_preview_translation():
+    assert set(MESSAGE_CATALOGS["EN"]) == set(MESSAGE_CATALOGS["CN"])
+    assert MESSAGE_CATALOGS["EN"]["XR Preview Window"] == "XR Preview Window"
+    assert MESSAGE_CATALOGS["CN"]["XR Preview Window"] == "XR 预览窗口"
 
 
 def test_media_controls_have_translations_for_every_locale():
@@ -64,12 +71,12 @@ def test_main_menu_actions_use_theme_colors_for_all_interaction_states():
         assert set(style.side) == expected_states
         assert style.elevation == 0
 
-    assert primary.bgcolor[states.DEFAULT] == ft.Colors.PRIMARY
-    assert primary.bgcolor[states.HOVERED] == ft.Colors.PRIMARY_CONTAINER
-    assert primary.color[states.DEFAULT] == ft.Colors.ON_PRIMARY
-    assert danger.bgcolor[states.DEFAULT] == ft.Colors.ERROR
-    assert danger.bgcolor[states.HOVERED] == ft.Colors.ERROR_CONTAINER
-    assert secondary.bgcolor[states.HOVERED] == ft.Colors.SURFACE_CONTAINER_HIGH
+    assert primary.bgcolor[states.DEFAULT] == color("primary")
+    assert primary.bgcolor[states.HOVERED] == color("primary_hover")
+    assert primary.color[states.DEFAULT] == color("primary_state_text")
+    assert danger.bgcolor[states.DEFAULT] == color("destructive")
+    assert danger.bgcolor[states.HOVERED] == color("destructive_hover")
+    assert secondary.bgcolor[states.HOVERED] == color("surface_container_high")
     assert secondary.side[states.FOCUSED].width == 2
 
     builder_source = inspect.getsource(GUIBuilderMixin.build_ui)
@@ -77,11 +84,65 @@ def test_main_menu_actions_use_theme_colors_for_all_interaction_states():
         ("reset_btn", "secondary"),
         ("stop_btn", "danger"),
         ("run_btn", "primary"),
+        ("report_issue_btn", "secondary"),
+        ("open_log_file_btn", "secondary"),
     ):
         start = builder_source.index(f"self.{button_name} = ft.Button(")
         end = builder_source.find("\n        self.", start + 1)
         button_source = builder_source[start:end if end >= 0 else None]
         assert f'_main_menu_action_style("{variant}")' in button_source
+
+
+def test_blue_theme_disables_material_hover_overlay_for_rounded_children():
+    theme = build_app_theme("Segoe UI", "blue")
+
+    assert theme.hover_color == ft.Colors.TRANSPARENT
+    assert theme.focus_color == ft.Colors.TRANSPARENT
+    assert theme.splash_color == ft.Colors.TRANSPARENT
+    assert theme.highlight_color == ft.Colors.TRANSPARENT
+
+
+def test_system_theme_stays_on_the_readable_dark_surface_scheme():
+    class Harness(GUIHandlerMixin):
+        pass
+
+    updates = []
+    gui = Harness()
+    gui.page = SimpleNamespace(
+        theme=None,
+        dark_theme=None,
+        theme_mode=None,
+        update=lambda: updates.append(True),
+    )
+
+    gui.on_theme_change(SimpleNamespace(control=SimpleNamespace(value="系统")))
+
+    assert gui.page.theme_mode == ft.ThemeMode.DARK
+    assert gui.page.theme is not None
+    assert gui.page.dark_theme is not None
+    assert updates == [True]
+
+
+def test_open_log_opens_the_log_folder(monkeypatch, tmp_path):
+    import gui.process as gui_process
+
+    log_dir = tmp_path / "logs"
+    log_file = log_dir / "desktop2stereo.log"
+    opened = []
+    statuses = []
+    monkeypatch.setattr(gui_process, "LOG_DIR", str(log_dir))
+    monkeypatch.setattr(gui_process, "LOG_FILE", str(log_file))
+    monkeypatch.setattr(gui_process, "OS_NAME", "Windows")
+    monkeypatch.setattr(gui_process.subprocess, "Popen", opened.append)
+
+    gui = object.__new__(gui_process.GUIProcessMixin)
+    gui.locale = "EN"
+    gui.set_status = statuses.append
+    gui.on_open_log_file()
+
+    assert opened == [["explorer", f"/select,{log_file}"]]
+    assert log_file.exists()
+    assert statuses == ["Opening log folder"]
 
 
 def test_capture_tool_change_keeps_capture_mode_locked_while_runtime_runs():

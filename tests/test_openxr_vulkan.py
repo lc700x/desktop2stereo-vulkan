@@ -7988,6 +7988,52 @@ def test_openxr_media_browser_trigger_click_dispatches_entry_on_release():
     assert calls[-1] == ("entry", "F:/Videos/movie.mkv")
 
 
+def test_openxr_media_browser_joystick_down_scrolls_to_later_grid_files():
+    presenter = OpenXrVulkanPresenter()
+    presenter._media_overlay_state = {
+        "ready": True,
+        "mode": "Browser",
+        "browser_visible": True,
+        "browser_entries": [
+            {"name": f"movie-{index}.mp4", "path": f"F:/movie-{index}.mp4", "kind": "video"}
+            for index in range(20)
+        ],
+        "browser_mounts": [],
+        "recent_entries": [],
+        "playlist_entries": [],
+    }
+    presenter._media_overlay_view_mode = "grid"
+    presenter._controller_inputs = (
+        {"trigger": 0.0, "joystick_y": 0.0},
+        {"trigger": 0.0, "joystick_y": 1.0},
+    )
+    presenter._media_overlay_ray_hit = (
+        lambda hand, browser=False: (0.5, 0.5) if hand == 1 and browser else None
+    )
+
+    presenter._handle_media_overlay_input()
+
+    assert presenter._media_overlay_scroll == 3
+
+
+def test_openxr_media_browser_view_toggle_preserves_aligned_grid_offset():
+    presenter = OpenXrVulkanPresenter()
+    presenter._media_overlay_state = {
+        "ready": True,
+        "browser_entries": [
+            {"name": f"movie-{index}.mp4", "path": f"F:/movie-{index}.mp4", "kind": "video"}
+            for index in range(20)
+        ],
+    }
+    presenter._media_overlay_view_mode = "list"
+    presenter._media_overlay_scroll = 7
+
+    presenter._dispatch_media_overlay_hit("browser_view_grid")
+
+    assert presenter._media_overlay_view_mode == "grid"
+    assert presenter._media_overlay_scroll == 6
+
+
 def test_openxr_media_browser_fits_texture_aspect_inside_screen():
     presenter = OpenXrVulkanPresenter()
     screen_width = 23.09
@@ -8658,6 +8704,11 @@ def test_settings_menu_screen_rotation_and_reset_restore_profile_pose() -> None:
         initial[0], initial[1], initial[2], (10.0, 20.0, 120.0)
     )
     assert presenter._screen_curve_half_angle == pytest.approx(math.radians(20.0))
+    presenter._apply_settings_menu_control(
+        controls["reset:screen_rotation"], (0.0, 0.0)
+    )
+    assert presenter._filament_screen == initial
+    assert presenter._screen_curve_half_angle == pytest.approx(math.radians(20.0))
 
 
 def test_screen_menu_resets_are_safe_without_a_screen_resource() -> None:
@@ -8666,12 +8717,13 @@ def test_screen_menu_resets_are_safe_without_a_screen_resource() -> None:
     controls = {item.key: item for item in presenter._settings_menu.controls()}
 
     presenter._apply_settings_menu_control(controls["reset:screen_shape"], None)
+    presenter._apply_settings_menu_control(controls["reset:screen_rotation"], None)
     presenter._apply_settings_menu_control(controls["reset:screen_placement"], None)
 
     assert presenter._filament_screen is None
 
 
-def test_settings_menu_screen_shape_reset_restores_only_shape_defaults() -> None:
+def test_settings_menu_screen_shape_reset_does_not_change_rotation() -> None:
     presenter = OpenXrVulkanPresenter()
     initial = ((1.0, 2.0, -3.0), 4.0, 2.25, (10.0, 20.0, 30.0))
     presenter._filament_screen_initial = initial
@@ -8689,7 +8741,9 @@ def test_settings_menu_screen_shape_reset_restores_only_shape_defaults() -> None
 
     presenter._apply_settings_menu_control(controls["reset:screen_shape"], None)
 
-    assert presenter._filament_screen == initial
+    assert presenter._filament_screen == (
+        initial[0], initial[1], initial[2], (0.0, 0.0, 120.0)
+    )
     assert presenter._screen_curve_half_angle == pytest.approx(math.radians(20.0))
     assert presenter._screen_curved
 

@@ -1,8 +1,10 @@
+import inspect
 import re
 from types import SimpleNamespace
 
 import flet as ft
 
+from .theme import color
 
 SCALE = 0.9
 
@@ -12,8 +14,19 @@ def S(v):
     return round(v * SCALE)
 
 
+def _supports_parameter(control_type, parameter):
+    """Feature-detect Flet control properties across the bundled runtime versions."""
+    try:
+        return parameter in inspect.signature(control_type.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 FONT_SIZE = S(14)
 LABEL_ALIGN_WIDTH = 0
+TRANSPARENT_CONTROL_STATES = {
+    state: ft.Colors.TRANSPARENT for state in ft.ControlState
+}
 
 
 def _refresh_if_attached(*controls):
@@ -47,7 +60,7 @@ class CompactTextField(ft.Container):
         self._read_only = read_only
         self._on_change = on_change
         self._value = value
-        self._label = ft.Text(value or "", size=FONT_SIZE)
+        self._label = ft.Text(value or "", size=FONT_SIZE, color=color("text_primary"))
         self._committed = False
         self._tooltip = tooltip or ""
         self._filter = filter
@@ -57,8 +70,14 @@ class CompactTextField(ft.Container):
     def _build_display(self):
         self.content = ft.Container(
             height=S(32), padding=ft.Padding(S(8), 0, S(8), 0),
-            border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
-            border_radius=4,
+            bgcolor=color("surface_container_high"),
+            border=ft.Border(
+                ft.BorderSide(1, color("outline")),
+                ft.BorderSide(1, color("outline")),
+                ft.BorderSide(1, color("outline")),
+                ft.BorderSide(1, color("outline")),
+            ),
+            border_radius=8,
             tooltip=self._tooltip,
             on_click=None if self._read_only else self._on_click,
             content=ft.Row([self._label], spacing=2, vertical_alignment=ft.CrossAxisAlignment.CENTER),
@@ -76,8 +95,14 @@ class CompactTextField(ft.Container):
         )
         self.content = ft.Container(
             height=S(32), padding=ft.Padding(S(4), 0, S(4), 0),
-            border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
-            border_radius=4, content=tf,
+            bgcolor=color("surface_container_high"),
+            border=ft.Border(
+                ft.BorderSide(1, color("outline")),
+                ft.BorderSide(1, color("outline")),
+                ft.BorderSide(1, color("outline")),
+                ft.BorderSide(1, color("outline")),
+            ),
+            border_radius=8, content=tf,
         )
         _refresh_if_attached(self)
 
@@ -120,17 +145,19 @@ class CompactDisplayField(ft.Container):
         self.height = S(32)
         self.padding = ft.Padding(S(8), 0, S(8), 0)
         self.border = ft.Border(
-            ft.BorderSide(1, ft.Colors.OUTLINE),
-            ft.BorderSide(1, ft.Colors.OUTLINE),
-            ft.BorderSide(1, ft.Colors.OUTLINE),
-            ft.BorderSide(1, ft.Colors.OUTLINE),
+            ft.BorderSide(1, color("outline")),
+            ft.BorderSide(1, color("outline")),
+            ft.BorderSide(1, color("outline")),
+            ft.BorderSide(1, color("outline")),
         )
-        self.border_radius = 4
+        self.bgcolor = color("surface_container_high")
+        self.border_radius = 8
         self.clip_behavior = ft.ClipBehavior.HARD_EDGE
         self.on_click = on_click
         self._label = ft.Text(
             self._value,
             size=FONT_SIZE,
+            color=color("text_primary"),
             no_wrap=True,
             overflow=ft.TextOverflow.ELLIPSIS,
         )
@@ -171,6 +198,7 @@ class CompactDropdown(ft.Container):
     """Compact dropdown, PopupMenuButton with controllable width."""
 
     _instances = None
+    _CORNER_RADIUS = 14
 
     def __init__(self, options=None, value="", on_select=None, expand=False,
                  dyna_width=None, width=None, min_width=None, max_width=None,
@@ -183,14 +211,17 @@ class CompactDropdown(ft.Container):
         self._min = min_width or 0
         self._max = max_width or 0
         self._tooltip = tooltip
+        self._trigger_hovered = False
         self.height = S(32)
         self.padding = 0
-        self.bgcolor = None
+        # Clip the child trigger so rounded hover paint cannot spill out.
+        self.bgcolor = ft.Colors.TRANSPARENT
         self.border = None
-        self.border_radius = 0
+        self.border_radius = self._CORNER_RADIUS
+        self.clip_behavior = ft.ClipBehavior.HARD_EDGE
         self.expand_loose = expand
 
-        self._label = ft.Text(value or "", size=FONT_SIZE)
+        self._label = ft.Text(value or "", size=FONT_SIZE, color=color("text_primary"))
         self._build_menu()
         self._apply_width()
         if _instances_list is not None:
@@ -240,38 +271,111 @@ class CompactDropdown(ft.Container):
                 ev = SimpleNamespace(control=SimpleNamespace(value=val))
                 self._on_select_cb(ev)
 
-        items = [
-            ft.PopupMenuItem(content=ft.Container(ft.Text(o, size=FONT_SIZE), padding=ft.Padding(8, 0, 8, 0)), data=o, height=S(32), padding=0, on_click=on_item_click)
-            for o in self._options
-        ]
+        def build_item(option):
+            option_surface = ft.Container(
+                content=ft.Text(
+                    option,
+                    size=FONT_SIZE,
+                    color=color("text_primary"),
+                ),
+                height=S(32),
+                padding=ft.Padding(S(12), 0, S(12), 0),
+                bgcolor=ft.Colors.TRANSPARENT,
+                border_radius=S(10),
+                alignment=ft.Alignment.CENTER_LEFT,
+                expand=True,
+            )
+
+            def on_option_hover(e):
+                hovered = str(getattr(e, "data", "false")).casefold() == "true"
+                option_surface.bgcolor = (
+                    color("primary_container")
+                    if hovered
+                    else ft.Colors.TRANSPARENT
+                )
+                _refresh_if_attached(option_surface)
+
+            option_surface.on_hover = on_option_hover
+            return ft.PopupMenuItem(
+                content=option_surface,
+                data=option,
+                height=S(36),
+                padding=0,
+                on_click=on_item_click,
+            )
+
+        items = [build_item(option) for option in self._options]
 
         has_limit = self._min or self._max
         align = ft.MainAxisAlignment.SPACE_BETWEEN if (self._fixed is not None or self._dyna or has_limit) else ft.MainAxisAlignment.START
-
-        self.content = ft.PopupMenuButton(
-            items=items,
-            menu_position=ft.PopupMenuPosition.UNDER,
-            enable_feedback=False,
-            padding=0, menu_padding=0,
-            tooltip=self._tooltip or "",
-            content=ft.Container(
-                height=S(32),
-                padding=ft.Padding(S(8), 0, S(8), 0),
-                tooltip=self._tooltip or "",
-                border=ft.Border(
-                    ft.BorderSide(1, ft.Colors.OUTLINE),
-                    ft.BorderSide(1, ft.Colors.OUTLINE),
-                    ft.BorderSide(1, ft.Colors.OUTLINE),
-                    ft.BorderSide(1, ft.Colors.OUTLINE),
-                ),
-                border_radius=4,
-                content=ft.Row([
-                    self._label,
-                    ft.Icon(ft.Icons.ARROW_DROP_DOWN, size=S(16)),
-                ], spacing=2, alignment=align,
-                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        rounded_shape = ft.RoundedRectangleBorder(radius=self._CORNER_RADIUS)
+        self._trigger_surface = ft.Container(
+            height=S(32),
+            padding=ft.Padding(S(8), 0, S(8), 0),
+            bgcolor=color(
+                "primary_hover_container"
+                if self._trigger_hovered
+                else "surface_container_high"
             ),
+            border=ft.Border(
+                ft.BorderSide(1, color("outline")),
+                ft.BorderSide(1, color("outline")),
+                ft.BorderSide(1, color("outline")),
+                ft.BorderSide(1, color("outline")),
+            ),
+            border_radius=self._CORNER_RADIUS,
+            clip_behavior=ft.ClipBehavior.HARD_EDGE,
+            on_hover=self._on_trigger_hover,
+            content=ft.Row([
+                self._label,
+                ft.Icon(ft.Icons.ARROW_DROP_DOWN, size=S(16), color=color("text_secondary")),
+            ], spacing=2, alignment=align,
+               vertical_alignment=ft.CrossAxisAlignment.CENTER),
         )
+
+        popup_kwargs = {
+            "items": items,
+            "menu_position": ft.PopupMenuPosition.UNDER,
+            "enable_feedback": False,
+            "padding": 0,
+            "menu_padding": S(4),
+            "splash_radius": 0,
+            # Keep hover paint on the rounded trigger surface, not the Material anchor.
+            "shape": rounded_shape,
+            "clip_behavior": ft.ClipBehavior.HARD_EDGE,
+            "style": ft.ButtonStyle(
+                shape=rounded_shape,
+                padding=0,
+                elevation=0,
+                bgcolor=ft.Colors.TRANSPARENT,
+                overlay_color=TRANSPARENT_CONTROL_STATES,
+            ),
+            # Match the log-level dropdown: an empty tooltip disables the
+            # PopupMenuButton's built-in rectangular "Show menu" overlay.
+            "tooltip": "",
+            "content": self._trigger_surface,
+        }
+        # border_radius was added to PopupMenuButton after Flet 0.86.5.
+        # Older installed/portable runtimes still get the clipped rounded child
+        # surface and transparent Material overlay, without failing at startup.
+        if _supports_parameter(ft.PopupMenuButton, "border_radius"):
+            popup_kwargs["border_radius"] = self._CORNER_RADIUS
+        self.content = ft.PopupMenuButton(**popup_kwargs)
+        self.content.theme = ft.Theme(
+            hover_color=ft.Colors.TRANSPARENT,
+            splash_color=ft.Colors.TRANSPARENT,
+            highlight_color=ft.Colors.TRANSPARENT,
+            focus_color=ft.Colors.TRANSPARENT,
+        )
+
+    def _on_trigger_hover(self, e):
+        self._trigger_hovered = str(getattr(e, "data", "false")).casefold() == "true"
+        self._trigger_surface.bgcolor = color(
+            "primary_hover_container"
+            if self._trigger_hovered
+            else "surface_container_high"
+        )
+        _refresh_if_attached(self._trigger_surface)
 
     def set_tooltip(self, text):
         self._tooltip = text

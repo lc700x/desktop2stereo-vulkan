@@ -1,16 +1,16 @@
 import ast
 import asyncio
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
 import flet as ft
-
-from path_config import APP_ROOT
-
+from gui import controls
+from gui.builders import GUIBuilderMixin
 from gui.config import DEFAULTS
 from gui.controls import CompactDisplayField, CompactDropdown, S
-from gui.builders import GUIBuilderMixin
-
+from gui.theme import color
+from path_config import APP_ROOT
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDERS_SOURCE = APP_ROOT / "gui" / "builders.py"
@@ -44,6 +44,79 @@ def test_compact_dropdown_setters_tolerate_unattached_flet_controls() -> None:
 
     assert dropdown.value == "RTMP Streamer"
     assert dropdown.options == ["RTMP Streamer", "Local Viewer"]
+
+
+def test_compact_dropdown_material_highlight_uses_rounded_surface() -> None:
+    dropdown = CompactDropdown(options=["Local Viewer"], value="Local Viewer")
+    button = dropdown.content
+    trigger = button.content
+
+    assert isinstance(button, ft.PopupMenuButton)
+    assert button.tooltip == ""
+    assert button.theme.hover_color == ft.Colors.TRANSPARENT
+    assert button.theme.splash_color == ft.Colors.TRANSPARENT
+    assert button.theme.highlight_color == ft.Colors.TRANSPARENT
+    assert button.theme.focus_color == ft.Colors.TRANSPARENT
+    assert button.clip_behavior == ft.ClipBehavior.HARD_EDGE
+    assert button.border_radius == dropdown._CORNER_RADIUS
+    assert isinstance(button.shape, ft.RoundedRectangleBorder)
+    assert button.shape.radius == dropdown._CORNER_RADIUS
+    assert isinstance(button.style, ft.ButtonStyle)
+    assert isinstance(button.style.shape, ft.RoundedRectangleBorder)
+    assert button.style.shape.radius == dropdown._CORNER_RADIUS
+    assert button.style.bgcolor == ft.Colors.TRANSPARENT
+    assert button.splash_radius == 0
+    assert all(
+        button.style.overlay_color[state] == ft.Colors.TRANSPARENT
+        for state in ft.ControlState
+    )
+    assert trigger.border_radius == dropdown._CORNER_RADIUS
+    assert trigger.clip_behavior == ft.ClipBehavior.HARD_EDGE
+    assert trigger.on_hover is not None
+    assert trigger.tooltip is None
+    assert dropdown.border_radius == dropdown._CORNER_RADIUS
+    assert dropdown.bgcolor == ft.Colors.TRANSPARENT
+    assert dropdown.clip_behavior == ft.ClipBehavior.HARD_EDGE
+
+    trigger.on_hover(SimpleNamespace(data="true"))
+    assert trigger.bgcolor == color("primary_hover_container")
+    trigger.on_hover(SimpleNamespace(data="false"))
+    assert trigger.bgcolor == color("surface_container_high")
+
+    assert button.menu_padding == S(4)
+    option = button.items[0]
+    option_surface = option.content
+    assert option.height == S(36)
+    assert option_surface.border_radius == S(10)
+    option_surface.on_hover(SimpleNamespace(data="true"))
+    assert option_surface.bgcolor == color("primary_container")
+    option_surface.on_hover(SimpleNamespace(data="false"))
+    assert option_surface.bgcolor == ft.Colors.TRANSPARENT
+
+
+def test_compact_dropdown_supports_flet_without_popup_border_radius(monkeypatch) -> None:
+    popup_menu_button = ft.PopupMenuButton
+
+    class LegacyPopupMenuButton:
+        def __new__(cls, **kwargs):
+            if "border_radius" in kwargs:
+                raise TypeError("unexpected keyword argument 'border_radius'")
+            return popup_menu_button(**kwargs)
+
+    monkeypatch.setattr(controls.ft, "PopupMenuButton", LegacyPopupMenuButton)
+    dropdown = CompactDropdown(options=["Local Viewer"], value="Local Viewer")
+    button = dropdown.content
+
+    assert isinstance(button, popup_menu_button)
+    assert getattr(button, "border_radius", None) is None
+    assert button.shape.radius == dropdown._CORNER_RADIUS
+    assert button.style.shape.radius == dropdown._CORNER_RADIUS
+    assert all(
+        button.style.overlay_color[state] == ft.Colors.TRANSPARENT
+        for state in ft.ControlState
+    )
+    assert button.content.border_radius == dropdown._CORNER_RADIUS
+    assert button.content.clip_behavior == ft.ClipBehavior.HARD_EDGE
 
 
 def test_compact_dropdown_update_is_safe_before_page_mount() -> None:
@@ -551,6 +624,12 @@ def test_media_timeline_has_its_own_row_and_volume_shares_transport_row():
     assert "expand=1" in seek_slider and "width=" not in seek_slider
     assert "width=S(110)" in builders[builders.index("self.media_position_text = ft.Text("):seek_start]
     assert "text_align=ft.TextAlign.LEFT" in builders[builders.index("self.media_position_text = ft.Text("):seek_start]
+    volume_start = builders.index("self.media_volume_slider = ft.Slider(")
+    volume_end = builders.index("self.media_status_text = ft.Text(", volume_start)
+    volume_slider = builders[volume_start:volume_end]
+    assert 'active_color=color("media_volume_fill")' in volume_slider
+    assert 'inactive_color=color("media_volume_track")' in volume_slider
+    assert 'thumb_color=color("media_volume_fill_hover")' in volume_slider
     open_group = builders[
         builders.index("self.media_open_file_btn = ft.Button("):
         builders.index("self.media_open_group = ft.Row(")
@@ -559,7 +638,8 @@ def test_media_timeline_has_its_own_row_and_volume_shares_transport_row():
     assert "self.media_open_folder_btn = ft.Button(" in open_group
     assert "width=S(145)" in open_group
     assert "media_volume_slider" in transport
-    assert "bgcolor=ft.Colors.SURFACE_CONTAINER_LOW" in controls
+    assert 'bgcolor=color("surface")' in controls
+    assert "border_radius=S(14)" in controls
     assert controls.index("self.media_seek_row") < controls.index("self.media_transport_row")
     assert "media_volume_row" not in builders
 
@@ -578,7 +658,8 @@ def test_capture_source_refresh_gap_preserves_label_alignment_and_mode_visibilit
         and any(isinstance(target, ast.Name) and target.id == "row8" for target in node.targets)
     )
     gui = SimpleNamespace(
-        capture_mode_dd=CompactDropdown(options=["输入屏幕"], value="输入屏幕", dyna_width=True),
+        capture_mode_dd=CompactDropdown(options=["输入屏幕"], value="输入屏幕", width=S(130)),
+        _capture_mode_spacer=ft.Container(width=S(110)),
         monitor_dd=CompactDropdown(options=["1: D270H 3840x2160"], value="1: D270H 3840x2160"),
         window_dd=CompactDropdown(),
         media_path_text=ft.Text(visible=False),
@@ -589,7 +670,7 @@ def test_capture_source_refresh_gap_preserves_label_alignment_and_mode_visibilit
     exec(compile(ast.Module(body=[assignment], type_ignores=[]), str(BUILDERS_SOURCE), "exec"), scope)
     row = scope["row8"]
     source_group = row.controls[-1]
-    assert row.controls[:-1] == [gui.capture_mode_dd]
+    assert row.controls[:-1] == [gui.capture_mode_dd, gui._capture_mode_spacer]
     assert row.spacing == 1
     assert source_group.controls == [gui.monitor_dd, gui.window_dd, gui.media_path_text, gui.refresh_btn]
     assert source_group.spacing == S(12)
@@ -606,21 +687,18 @@ def test_capture_source_refresh_gap_preserves_label_alignment_and_mode_visibilit
 
 
 
-def test_capture_mode_dropdown_uses_the_same_dynamic_width_as_labels(monkeypatch):
-    import gui.controls as controls
-
+def test_capture_mode_dropdown_is_compact_and_keeps_source_group_aligned():
     tree = ast.parse(BUILDERS_SOURCE.read_text(encoding="utf-8"))
     constructor = next(
         node.value for node in ast.walk(tree)
         if isinstance(node, ast.Assign)
         and any(isinstance(target, ast.Attribute) and target.attr == "capture_mode_dd" for target in node.targets)
     )
-    assert next(keyword.value.value for keyword in constructor.keywords if keyword.arg == "dyna_width") is True
-    assert not any(keyword.arg == "width" for keyword in constructor.keywords)
-    dropdown = CompactDropdown(options=["Input Screen", "Media Player"], value="Input Screen", dyna_width=True)
-    for label_width in (S(96), S(130), S(160)):
-        monkeypatch.setattr(controls, "LABEL_ALIGN_WIDTH", label_width)
-        dropdown.reapply_width()
-        assert dropdown.width == label_width
-        dropdown.value = "Media Player"
-        assert dropdown.width == label_width
+    width_keyword = next(keyword.value for keyword in constructor.keywords if keyword.arg == "width")
+    assert isinstance(width_keyword, ast.Call)
+    assert next(arg.value for arg in width_keyword.args) == 130
+    assert not any(keyword.arg == "dyna_width" for keyword in constructor.keywords)
+
+    align_source = inspect.getsource(GUIBuilderMixin._auto_align_labels)
+    assert "self._capture_mode_spacer.width = max(0, final_w - S(130) - 1)" in align_source
+    assert "self._safe_update(self._capture_mode_spacer)" in align_source

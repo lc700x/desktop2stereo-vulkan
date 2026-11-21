@@ -9,7 +9,7 @@ hf_xet==1.5.1
 safetensors==0.8.0
 numpy==2.5.0
 pillow==12.2.0
-flet==0.86.5
+flet[desktop]==1.1.2
 onnx==1.22.0
 onnxscript==0.7.0
 mss==10.2.0

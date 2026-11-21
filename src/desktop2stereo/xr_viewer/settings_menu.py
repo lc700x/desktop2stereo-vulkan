@@ -3,39 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
+from theme_tokens import MOONLIGHT_BLUE_COLORS
+
 SETTINGS_MENU_TEXTURE_SIZE = (1024, 832)
 SETTINGS_MENU_WORLD_SIZE = (0.95, 0.77)
 OPENXR_RENDER_SCALE_MIN = 0.5
 OPENXR_RENDER_SCALE_MAX = 4.0
 # Shared semantic tokens keep the in-headset and desktop OpenXR panels aligned.
-OPENXR_MENU_COLORS = {
-    "surface": "#242424",
-    "surface_header": "#2C2C2C",
-    "surface_container": "#303030",
-    "surface_container_high": "#484848",
-    "outline": "#828993",
-    "track": "#848B95",
-    "primary": "#165FC2",
-    "primary_hover": "#1C67C3",
-    "primary_state_text": "#EBEDF0",
-    "primary_container": "#1766C7",
-    "switch_track_active": "#16B85F",
-    "primary_hover_container": "#1C67C3",
-    "selection_container": "#165FC2",
-    "selection_hover_container": "#1C67C3",
-    "selection_text": "#EBEDF0",
-    "text_primary": "#EBEDF0",
-    "text_secondary": "#BEC4CC",
-    "text_disabled": "#A3A8B0",
-    "destructive": "#B33248",
-    "destructive_hover": "#B83B50",
-    "destructive_text": "#EBEDF0",
-    "destructive_outline": "#C68289",
-}
+OPENXR_MENU_COLORS = dict(MOONLIGHT_BLUE_COLORS)
 OPENXR_MENU_RADII = {
-    "panel": 24,
+    "panel": 28,
     "group": 16,
-    "control": 8,
+    "control": 14,
 }
 _GRID = 8
 _MENU_GROUP_PADDING = 16
@@ -43,6 +22,9 @@ _MENU_GROUP_GAP = 16
 _MENU_TITLE_HEIGHT = 24
 _MENU_TITLE_CARD_GAP = 16
 _MENU_CONTROL_GAP = 16
+_SCREEN_SETTINGS_ROW_GAP = _GRID
+_SCREEN_ROTATION_BUTTON_HEIGHT = 48
+_SCREEN_ROTATION_BUTTON_GAP = _MENU_CONTROL_GAP
 _MENU_SLIDER_ROW_STEP = 80
 _SIDEBAR_PANEL_LEFT = 32
 _SIDEBAR_PANEL_RIGHT = 256
@@ -60,11 +42,13 @@ _CONTENT_RIGHT = _CONTENT_PANEL_RIGHT - _MENU_GROUP_PADDING
 _CONTENT_WIDTH = _CONTENT_RIGHT - _CONTENT_LEFT
 _CONTENT_TOP = 32
 _CONTENT_BOTTOM = 768
+_SCREEN_LAYOUT_CONTENT_BOTTOM = 784
 
 OPENXR_MENU_GROUP_LABELS = {
     "render_quality": "Render quality",
     "color_adjustment": "Color adjustment",
     "screen_shape": "Screen shape",
+    "screen_rotation": "Screen rotation",
     "screen_placement": "Screen placement",
     "screen_crop": "Crop settings",
     "depth_modes": "Stereo mode",
@@ -94,6 +78,7 @@ class MenuControl:
     enabled: bool = True
     group: str = ""
     fixed: bool = False
+    icon: str | None = None
 
     def contains(self, u: float, v: float) -> bool:
         x0, y0, x1, y1 = self.rect
@@ -257,11 +242,12 @@ class OpenXrSettingsMenu:
             enabled: bool = True,
             group: str = "",
             fixed: bool = False,
+            icon: str | None = None,
         ) -> None:
             x, y, width, height = box
             controls.append(MenuControl(
                 key, label, rect(x, y, width, height), kind, minimum, maximum,
-                step, enabled, group, fixed,
+                step, enabled, group, fixed, icon,
             ))
 
         def add_group(
@@ -292,9 +278,10 @@ class OpenXrSettingsMenu:
             step: float,
             group: str,
             enabled: bool = True,
+            step_target_height: int = 64,
         ) -> None:
-            # +/- retain 64 px ray targets. The slider and both targets share a
-            # center line, with 8 px between neighboring hit regions.
+            # Keep targets centered on the rail; screen placement uses 48 px
+            # targets with an 8 px gap to fit its card inside the viewport.
             center_y = row_y + 48
             slider_left = x + 72
             slider_right = x + row_width - 72
@@ -306,13 +293,18 @@ class OpenXrSettingsMenu:
             )
             add(
                 f"step:minus:{key}", "-",
-                (x, center_y - 32, 64, 64),
+                (x, center_y - step_target_height // 2, 64, step_target_height),
                 kind="slider_step", minimum=minimum, maximum=maximum,
                 step=step, enabled=enabled, group=group,
             )
             add(
                 f"step:plus:{key}", "+",
-                (x + row_width - 64, center_y - 32, 64, 64),
+                (
+                    x + row_width - 64,
+                    center_y - step_target_height // 2,
+                    64,
+                    step_target_height,
+                ),
                 kind="slider_step", minimum=minimum, maximum=maximum,
                 step=step, enabled=enabled, group=group,
             )
@@ -326,8 +318,12 @@ class OpenXrSettingsMenu:
             kind: str = "button",
             enabled: bool = True,
             fixed: bool = False,
+            icon: str | None = None,
         ) -> None:
-            add(key, label, box, kind=kind, group=group, enabled=enabled, fixed=fixed)
+            add(
+                key, label, box, kind=kind, group=group,
+                enabled=enabled, fixed=fixed, icon=icon,
+            )
 
         # Keep fixed navigation anchored to the top of the panel. Group labels
         # carry page context, so the redundant global title bar is omitted.
@@ -660,9 +656,46 @@ class OpenXrSettingsMenu:
                 group="screen_passthrough", kind="toggle",
             )
         elif self.tab == "screen":
+            screen_shape_top = 120
+            screen_shape_controls_top = 176
+            screen_shape_controls_height = 72
+            screen_shape_reset_top = (
+                screen_shape_controls_top + screen_shape_controls_height
+                + _SCREEN_SETTINGS_ROW_GAP
+            )
+            screen_shape_group_height = (
+                _MENU_TITLE_HEIGHT + _MENU_TITLE_CARD_GAP + _MENU_GROUP_PADDING
+                + screen_shape_controls_height + _SCREEN_SETTINGS_ROW_GAP
+                + 32 + _MENU_GROUP_PADDING
+            )
+            screen_rotation_top = (
+                screen_shape_top + screen_shape_group_height + _SCREEN_SETTINGS_ROW_GAP
+            )
+            screen_rotation_controls_top = screen_rotation_top + 56
+            screen_rotation_reset_top = (
+                screen_rotation_controls_top + _SCREEN_ROTATION_BUTTON_HEIGHT
+                + _SCREEN_SETTINGS_ROW_GAP
+            )
+            screen_rotation_group_height = (
+                _MENU_TITLE_HEIGHT + _MENU_TITLE_CARD_GAP + _MENU_GROUP_PADDING
+                + _SCREEN_ROTATION_BUTTON_HEIGHT + _SCREEN_SETTINGS_ROW_GAP
+                + 32 + _MENU_GROUP_PADDING
+            )
+            screen_placement_top = (
+                screen_rotation_top + screen_rotation_group_height
+                + _SCREEN_SETTINGS_ROW_GAP
+            )
+            screen_placement_controls_top = screen_placement_top + 48
+            screen_placement_reset_top = (
+                screen_placement_controls_top + 2 * 56 + 72 + _SCREEN_SETTINGS_ROW_GAP
+            )
+            screen_placement_group_height = (
+                screen_placement_reset_top + 32 + _MENU_GROUP_PADDING
+                - screen_placement_top
+            )
             add_group(
-                "screen_shape", _CONTENT_PANEL_LEFT, 120,
-                _CONTENT_PANEL_WIDTH, 264, title="Screen shape",
+                "screen_shape", _CONTENT_PANEL_LEFT, screen_shape_top,
+                _CONTENT_PANEL_WIDTH, screen_shape_group_height, title="Screen shape",
             )
             shape_items = (
                 ("screen:type:flat", "Flat", True),
@@ -677,27 +710,48 @@ class OpenXrSettingsMenu:
                     key, label, (x0, 176, shape_width, 72),
                     group="screen_shape", enabled=enabled,
                 )
-            for key, label, x0 in (
-                (
-                    "screen:rotate:-90", "Rotate -90",
-                    _CONTENT_PANEL_LEFT + (_CONTENT_PANEL_WIDTH - 304) // 2,
-                ),
-                (
-                    "screen:rotate:+90", "Rotate +90",
-                    _CONTENT_PANEL_LEFT + (_CONTENT_PANEL_WIDTH - 304) // 2 + 160,
-                ),
-            ):
-                add_button(
-                    key, label, (x0, 264, 144, 48), group="screen_shape",
-                )
             add_button(
                 "reset:screen_shape", "Reset",
-                (_CONTENT_RIGHT - 120, 328, 120, 40),
+                (
+                    _CONTENT_RIGHT - 120, screen_shape_reset_top, 120, 32,
+                ),
                 group="screen_shape",
             )
             add_group(
-                "screen_placement", _CONTENT_PANEL_LEFT, 400,
-                _CONTENT_PANEL_WIDTH, 336,
+                "screen_rotation", _CONTENT_PANEL_LEFT, screen_rotation_top,
+                _CONTENT_PANEL_WIDTH, screen_rotation_group_height,
+            )
+            rotation_button_width = (
+                _CONTENT_WIDTH - _SCREEN_ROTATION_BUTTON_GAP
+            ) // 2
+            for index, (key, label, icon) in enumerate((
+                ("screen:rotate:-90", "Rotate -90", "rotate_left"),
+                ("screen:rotate:+90", "Rotate +90", "rotate_right"),
+            )):
+                add_button(
+                    key,
+                    label,
+                    (
+                        _CONTENT_LEFT + index * (
+                            rotation_button_width + _SCREEN_ROTATION_BUTTON_GAP
+                        ),
+                        screen_rotation_controls_top,
+                        rotation_button_width,
+                        _SCREEN_ROTATION_BUTTON_HEIGHT,
+                    ),
+                    group="screen_rotation",
+                    icon=icon,
+                )
+            add_button(
+                "reset:screen_rotation", "Reset",
+                (
+                    _CONTENT_RIGHT - 120, screen_rotation_reset_top, 120, 32,
+                ),
+                group="screen_rotation",
+            )
+            add_group(
+                "screen_placement", _CONTENT_PANEL_LEFT, screen_placement_top,
+                _CONTENT_PANEL_WIDTH, screen_placement_group_height,
             )
             for index, (key, label, minimum, maximum, step) in enumerate((
                 ("screen:width", "Screen size", 0.25, 2.0, 0.01),
@@ -706,26 +760,34 @@ class OpenXrSettingsMenu:
             )):
                 add_slider(
                     key, label, _CONTENT_LEFT,
-                    456 + index * 64, _CONTENT_WIDTH,
+                    screen_placement_controls_top + index * 56, _CONTENT_WIDTH,
                     minimum, maximum, step, "screen_placement",
+                    step_target_height=48,
                 )
             add_button(
                 "reset:screen_placement", "Reset",
-                (_CONTENT_RIGHT - 120, 680, 120, 40),
+                (
+                    _CONTENT_RIGHT - 120, screen_placement_reset_top, 120, 32,
+                ),
                 group="screen_placement",
             )
 
         viewport_y = 120 if self.tab == "screen" else _CONTENT_TOP
+        viewport_bottom = (
+            _SCREEN_LAYOUT_CONTENT_BOTTOM
+            if self.tab == "screen" and self.screen_section == "layout"
+            else _CONTENT_BOTTOM
+        )
         viewport = rect(
             _CONTENT_PANEL_LEFT, viewport_y,
             _CONTENT_PANEL_RIGHT - _CONTENT_PANEL_LEFT,
-            _CONTENT_BOTTOM - viewport_y,
+            viewport_bottom - viewport_y,
         )
         content_bottom = max(
             [viewport_y, *(int(round(group.rect[3] * SETTINGS_MENU_TEXTURE_SIZE[1]))
                             for group in groups if not group.fixed)],
         )
-        scroll_max = max(0.0, float(content_bottom - _CONTENT_BOTTOM))
+        scroll_max = max(0.0, float(content_bottom - viewport_bottom))
         self._layout_cache_key = cache_key
         self._layout_cache_base = MenuLayout(
             tuple(controls), tuple(groups), viewport, scroll_max,
@@ -762,7 +824,7 @@ class OpenXrSettingsMenu:
             item if shifted_rect(item.rect, item.fixed) is item.rect else MenuControl(
                 item.key, item.label, shifted_rect(item.rect, item.fixed),
                 item.kind, item.minimum, item.maximum, item.step, item.enabled,
-                item.group, item.fixed,
+                item.group, item.fixed, item.icon,
             )
             for item in base.controls
         )
@@ -859,6 +921,7 @@ class OpenXrSettingsMenu:
                 control.enabled and not at_limit,
                 control.group,
                 control.fixed,
+                control.icon,
             ))
         return tuple(updated)
 

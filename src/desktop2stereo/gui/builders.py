@@ -17,6 +17,7 @@ from .controls import (
 )
 from .paths import BASE_DIR
 from .localization import UI_MESSAGES
+from .theme import color
 from .capture_sources import (
     PRIMARY_MONITOR_SUFFIX, get_capture_tool_options,
     get_default_windows_capture_tool, get_primary_monitor_index,
@@ -30,73 +31,73 @@ logger = logging.getLogger(__name__)
 
 def _main_menu_action_style(variant: str) -> ft.ButtonStyle:
     state = ft.ControlState
-    neutral_background = ft.Colors.SURFACE_CONTAINER_LOW
-    disabled_side = ft.BorderSide(1, ft.Colors.OUTLINE_VARIANT)
+    neutral_background = color("surface")
+    disabled_side = ft.BorderSide(1, color("text_disabled"))
 
     if variant == "primary":
         backgrounds = {
-            state.DEFAULT: ft.Colors.PRIMARY,
-            state.HOVERED: ft.Colors.PRIMARY_CONTAINER,
-            state.PRESSED: ft.Colors.PRIMARY,
-            state.FOCUSED: ft.Colors.PRIMARY,
+            state.DEFAULT: color("primary"),
+            state.HOVERED: color("primary_hover"),
+            state.PRESSED: color("primary"),
+            state.FOCUSED: color("primary"),
             state.DISABLED: neutral_background,
         }
         foregrounds = {
-            state.DEFAULT: ft.Colors.ON_PRIMARY,
-            state.HOVERED: ft.Colors.ON_PRIMARY_CONTAINER,
-            state.PRESSED: ft.Colors.ON_PRIMARY,
-            state.FOCUSED: ft.Colors.ON_PRIMARY,
-            state.DISABLED: ft.Colors.ON_SURFACE_VARIANT,
+            state.DEFAULT: color("primary_state_text"),
+            state.HOVERED: color("surface"),
+            state.PRESSED: color("primary_state_text"),
+            state.FOCUSED: color("primary_state_text"),
+            state.DISABLED: color("text_disabled"),
         }
         borders = {
-            state.DEFAULT: ft.BorderSide(1, ft.Colors.PRIMARY),
-            state.HOVERED: ft.BorderSide(1, ft.Colors.PRIMARY_CONTAINER),
-            state.PRESSED: ft.BorderSide(1, ft.Colors.PRIMARY),
-            state.FOCUSED: ft.BorderSide(2, ft.Colors.ON_PRIMARY),
+            state.DEFAULT: ft.BorderSide(1, color("primary")),
+            state.HOVERED: ft.BorderSide(1, color("outline")),
+            state.PRESSED: ft.BorderSide(1, color("primary")),
+            state.FOCUSED: ft.BorderSide(2, color("outline")),
             state.DISABLED: disabled_side,
         }
     elif variant == "danger":
         backgrounds = {
-            state.DEFAULT: ft.Colors.ERROR,
-            state.HOVERED: ft.Colors.ERROR_CONTAINER,
-            state.PRESSED: ft.Colors.ERROR,
-            state.FOCUSED: ft.Colors.ERROR,
+            state.DEFAULT: color("destructive"),
+            state.HOVERED: color("destructive_hover"),
+            state.PRESSED: color("destructive"),
+            state.FOCUSED: color("destructive"),
             state.DISABLED: neutral_background,
         }
         foregrounds = {
-            state.DEFAULT: ft.Colors.ON_ERROR,
-            state.HOVERED: ft.Colors.ON_ERROR_CONTAINER,
-            state.PRESSED: ft.Colors.ON_ERROR,
-            state.FOCUSED: ft.Colors.ON_ERROR,
-            state.DISABLED: ft.Colors.ON_SURFACE_VARIANT,
+            state.DEFAULT: color("destructive_text"),
+            state.HOVERED: color("destructive_text"),
+            state.PRESSED: color("destructive_text"),
+            state.FOCUSED: color("destructive_text"),
+            state.DISABLED: color("text_disabled"),
         }
         borders = {
-            state.DEFAULT: ft.BorderSide(1, ft.Colors.ERROR),
-            state.HOVERED: ft.BorderSide(1, ft.Colors.ERROR_CONTAINER),
-            state.PRESSED: ft.BorderSide(1, ft.Colors.ERROR),
-            state.FOCUSED: ft.BorderSide(2, ft.Colors.ON_ERROR),
+            state.DEFAULT: ft.BorderSide(1, color("destructive")),
+            state.HOVERED: ft.BorderSide(1, color("destructive_outline")),
+            state.PRESSED: ft.BorderSide(1, color("destructive")),
+            state.FOCUSED: ft.BorderSide(2, color("destructive_outline")),
             state.DISABLED: disabled_side,
         }
     elif variant == "secondary":
         backgrounds = {
-            state.DEFAULT: ft.Colors.SURFACE_CONTAINER_LOW,
-            state.HOVERED: ft.Colors.SURFACE_CONTAINER_HIGH,
-            state.PRESSED: ft.Colors.SURFACE_CONTAINER_HIGHEST,
-            state.FOCUSED: ft.Colors.SURFACE_CONTAINER_LOW,
+            state.DEFAULT: color("surface_header"),
+            state.HOVERED: color("surface_container_high"),
+            state.PRESSED: color("primary_container"),
+            state.FOCUSED: color("surface_header"),
             state.DISABLED: neutral_background,
         }
         foregrounds = {
-            state.DEFAULT: ft.Colors.ON_SURFACE,
-            state.HOVERED: ft.Colors.ON_SURFACE,
-            state.PRESSED: ft.Colors.ON_SURFACE,
-            state.FOCUSED: ft.Colors.ON_SURFACE,
-            state.DISABLED: ft.Colors.ON_SURFACE_VARIANT,
+            state.DEFAULT: color("text_primary"),
+            state.HOVERED: color("text_primary"),
+            state.PRESSED: color("primary_state_text"),
+            state.FOCUSED: color("text_primary"),
+            state.DISABLED: color("text_disabled"),
         }
         borders = {
-            state.DEFAULT: ft.BorderSide(1, ft.Colors.OUTLINE),
-            state.HOVERED: ft.BorderSide(1, ft.Colors.OUTLINE),
-            state.PRESSED: ft.BorderSide(1, ft.Colors.OUTLINE),
-            state.FOCUSED: ft.BorderSide(2, ft.Colors.PRIMARY),
+            state.DEFAULT: ft.BorderSide(1, color("outline")),
+            state.HOVERED: ft.BorderSide(1, color("outline")),
+            state.PRESSED: ft.BorderSide(1, color("primary_hover")),
+            state.FOCUSED: ft.BorderSide(2, color("primary_hover")),
             state.DISABLED: disabled_side,
         }
     else:
@@ -107,7 +108,7 @@ def _main_menu_action_style(variant: str) -> ft.ButtonStyle:
         color=foregrounds,
         side=borders,
         elevation=0,
-        shape=ft.RoundedRectangleBorder(radius=6),
+        shape=ft.RoundedRectangleBorder(radius=10),
         animation_duration=120,
     )
 
@@ -412,6 +413,9 @@ class GUIBuilderMixin:
         if hasattr(self, '_accel_spacer'):
             self._accel_spacer.width = final_w
             self._safe_update(self._accel_spacer)
+        if hasattr(self, '_capture_mode_spacer'):
+            self._capture_mode_spacer.width = max(0, final_w - S(130) - 1)
+            self._safe_update(self._capture_mode_spacer)
         self._labels_aligned = True
 
     # ── UI construction ──
@@ -881,8 +885,9 @@ class GUIBuilderMixin:
             ],
             value=capture_mode_messages.get("Input Screen", "Input Screen"),
             on_select=self.on_capture_mode_change,
-            dyna_width=True,
+            width=S(130),
         )
+        self._capture_mode_spacer = ft.Container(width=0)
         self.monitor_dd = CompactDropdown(on_select=self._on_monitor_change, max_width=S(300))
         self.window_dd = CompactDropdown(on_select=self.on_window_selected, max_width=S(300))
         self.refresh_btn = ft.Button(content=ft.Text("Refresh", size=FONT_SIZE),
@@ -938,6 +943,7 @@ class GUIBuilderMixin:
         row8 = ft.Row(
             [
                 self.capture_mode_dd,
+                self._capture_mode_spacer,
                 ft.Row(
                     [
                         self.monitor_dd,
@@ -977,6 +983,14 @@ class GUIBuilderMixin:
             max=1,
             value=0,
             height=S(34),
+            active_color=color("primary"),
+            inactive_color=color("track"),
+            thumb_color=color("primary_hover"),
+            overlay_color={
+                ft.ControlState.HOVERED: ft.Colors.with_opacity(0.20, color("primary_hover")),
+                ft.ControlState.FOCUSED: ft.Colors.with_opacity(0.24, color("outline")),
+                ft.ControlState.PRESSED: ft.Colors.with_opacity(0.28, color("primary_hover")),
+            },
             expand=1,
             on_change_end=self.on_media_seek,
         )
@@ -1005,13 +1019,21 @@ class GUIBuilderMixin:
             value=1,
             height=S(34),
             width=S(125),
+            active_color=color("media_volume_fill"),
+            inactive_color=color("media_volume_track"),
+            thumb_color=color("media_volume_fill_hover"),
+            overlay_color={
+                ft.ControlState.HOVERED: ft.Colors.with_opacity(0.20, color("media_volume_fill_hover")),
+                ft.ControlState.FOCUSED: ft.Colors.with_opacity(0.24, color("outline")),
+                ft.ControlState.PRESSED: ft.Colors.with_opacity(0.28, color("media_volume_fill_hover")),
+            },
             on_change=self.on_media_volume,
         )
         self.media_status_text = ft.Text(
             media_messages.get("No media loaded", "No media loaded"),
             size=max(10, FONT_SIZE - 1),
             width=S(150),
-            color=ft.Colors.GREY,
+            color=color("text_secondary"),
             no_wrap=True,
             overflow=ft.TextOverflow.ELLIPSIS,
         )
@@ -1045,6 +1067,12 @@ class GUIBuilderMixin:
             spacing=S(8),
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
+        panel_border = ft.Border(
+            ft.BorderSide(1, ft.Colors.with_opacity(0.55, color("outline"))),
+            ft.BorderSide(1, ft.Colors.with_opacity(0.55, color("outline"))),
+            ft.BorderSide(1, ft.Colors.with_opacity(0.55, color("outline"))),
+            ft.BorderSide(1, ft.Colors.with_opacity(0.55, color("outline"))),
+        )
         self.media_controls_row = ft.Container(
             content=ft.Column(
                 [
@@ -1055,8 +1083,9 @@ class GUIBuilderMixin:
                 tight=True,
             ),
             padding=ft.Padding(S(12), S(8), S(12), S(8)),
-            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
-            border_radius=S(10),
+            bgcolor=color("surface"),
+            border=panel_border,
+            border_radius=S(14),
             visible=False,
         )
 
@@ -1085,7 +1114,7 @@ class GUIBuilderMixin:
         self.theme_label = ft.Text("Theme:", size=FONT_SIZE, width=S(130))
         self.theme_dd = CompactDropdown(
             options=["system", "blue", "green", "red", "purple", "orange", "teal", "pink", "grey"],
-            value="system", on_select=self.on_theme_change, width=S(130))
+            value="blue", on_select=self.on_theme_change, width=S(130))
         self.reset_btn = ft.Button(content=ft.Text("Reset", size=FONT_SIZE),
             width=S(110), height=S(32), on_click=self.reset_defaults,
             style=_main_menu_action_style("secondary"))
@@ -1184,12 +1213,16 @@ class GUIBuilderMixin:
         self.report_issue_btn = ft.Button(
             content=ft.Text(UI_MESSAGES[self.locale].get("Report issue", "Report bug"), size=FONT_SIZE),
             width=S(150),
+            height=S(32),
             on_click=self.on_report_issue,
+            style=_main_menu_action_style("secondary"),
         )
         self.open_log_file_btn = ft.Button(
             content=ft.Text(UI_MESSAGES[self.locale].get("Open log file", "Open log"), size=FONT_SIZE),
             width=S(150),
+            height=S(32),
             on_click=self.on_open_log_file,
+            style=_main_menu_action_style("secondary"),
         )
         self.download_progress_title = ft.Text("Download", size=12, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE)
         self.download_progress_percent = ft.Text("0%", size=12, color=ft.Colors.BLUE)

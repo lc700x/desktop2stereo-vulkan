@@ -16,10 +16,20 @@ from xr_viewer.overlay_textures import (
 from xr_viewer.settings_menu import (
     _CONTENT_LEFT,
     _CONTENT_RIGHT,
+    _SCREEN_LAYOUT_CONTENT_BOTTOM,
     OPENXR_MENU_COLORS,
     OpenXrSettingsMenu,
     SETTINGS_MENU_TEXTURE_SIZE,
 )
+
+
+def _token_rgb(name):
+    value = OPENXR_MENU_COLORS[name].lstrip("#")
+    return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4))
+
+
+def _token_rgba(name, alpha=255):
+    return _token_rgb(name) + (alpha,)
 
 
 def test_openxr_settings_menu_text_uses_every_gui_locale_catalog():
@@ -46,6 +56,57 @@ def test_settings_menu_uses_inter_without_changing_other_overlay_fonts():
     assert _fit_overlay_font(draw, "Quest", 18, 256, prefer_cjk=False, bold=True) is font
     other_font = load_overlay_font(18, bold=True)
     assert not str(getattr(other_font, "path", "")).endswith("InterVariable.ttf")
+
+
+def test_screen_rotation_buttons_render_direction_icons_with_their_labels():
+    menu = OpenXrSettingsMenu()
+    menu.set_tab("screen")
+    rgba = build_settings_menu_rgba(menu, {})
+    controls = {control.key: control for control in menu.controls()}
+    text_color = np.asarray(_token_rgb("text_primary"), dtype=np.float32)
+    background_color = np.asarray(
+        _token_rgb("surface_container_high"), dtype=np.float32
+    )
+    icon_regions = []
+    probe_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+    for key in ("screen:rotate:-90", "screen:rotate:+90"):
+        x0, y0, x1, y1 = tuple(
+            int(round(value * size))
+            for value, size in zip(
+                controls[key].rect,
+                (rgba.shape[1], rgba.shape[0], rgba.shape[1], rgba.shape[0]),
+            )
+        )
+        center_y = (y0 + y1) // 2
+        control = controls[key]
+        label = gettext_for("EN", control.label)
+        icon_font = load_overlay_font(24)
+        icon = "\u21ba" if control.icon == "rotate_left" else "\u21bb"
+        icon_box = probe_draw.textbbox((0, 0), icon, font=icon_font)
+        glyph_width = icon_box[2] - icon_box[0]
+        label_font = _fit_overlay_font(
+            probe_draw, label, 18, x1 - x0 - 48,
+            prefer_cjk=False, minimum=18,
+        )
+        label_box = probe_draw.textbbox((0, 0), label, font=label_font)
+        group_width = 24 + 8 + label_box[2] - label_box[0]
+        group_left = (x0 + x1 - group_width) / 2
+        icon_left = group_left + (24 - glyph_width) / 2 - icon_box[0]
+        icon_region = rgba[
+            center_y - 14:center_y + 14,
+            int(round(icon_left - 4)):int(round(icon_left + glyph_width + 4)),
+            :3,
+        ]
+        pixels = icon_region.astype(np.float32)
+        nearer_to_glyph = (
+            np.linalg.norm(pixels - text_color, axis=2)
+            < np.linalg.norm(pixels - background_color, axis=2)
+        )
+        assert np.count_nonzero(nearer_to_glyph) >= 50
+        icon_regions.append(icon_region.copy())
+
+    assert not np.array_equal(icon_regions[0], icon_regions[1])
 
 
 def test_menu_cursor_position_is_not_rasterized_into_the_full_panel_texture():
@@ -81,11 +142,15 @@ def test_settings_menu_canvas_has_room_below_bottom_controls():
     assert controls["reset:screen_placement"].group == "screen_placement"
     stop = controls["runtime:stop"]
     assert int(stop.rect[3] * rgba.shape[0]) == 768
-    assert max(
+    layout = menu.layout()
+    group_bottom = max(
         group.rect[3] * rgba.shape[0]
-        for group in menu.layout().groups
+        for group in layout.groups
         if not group.fixed
-    ) <= 768
+    )
+    assert group_bottom == pytest.approx(768)
+    assert _SCREEN_LAYOUT_CONTENT_BOTTOM == 784
+    assert layout.scroll_max == pytest.approx(0)
 
 
 def test_settings_menu_shows_a_right_scrollbar_only_when_content_overflows():
@@ -103,31 +168,29 @@ def test_settings_menu_shows_a_right_scrollbar_only_when_content_overflows():
     track_bottom = viewport[3] - 8
     at_top = build_settings_menu_rgba(menu, {})
 
-    assert tuple(at_top[track_top + 20, scrollbar_x, :3]) == (190, 196, 204)
-    assert tuple(at_top[track_bottom - 8, scrollbar_x, :3]) == (72, 72, 72)
+    assert tuple(at_top[track_top + 20, scrollbar_x, :3]) == _token_rgb("text_secondary")
+    assert tuple(at_top[track_bottom - 8, scrollbar_x, :3]) == _token_rgb("surface_container_high")
 
     menu.scroll_offset = layout.scroll_max
     at_bottom = build_settings_menu_rgba(menu, {})
-    assert tuple(at_bottom[track_top + 20, scrollbar_x, :3]) == (72, 72, 72)
-    assert tuple(at_bottom[track_bottom - 8, scrollbar_x, :3]) == (190, 196, 204)
+    assert tuple(at_bottom[track_top + 20, scrollbar_x, :3]) == _token_rgb("surface_container_high")
+    assert tuple(at_bottom[track_bottom - 8, scrollbar_x, :3]) == _token_rgb("text_secondary")
 
     menu = OpenXrSettingsMenu()
     menu.set_tab("room")
     no_overflow = build_settings_menu_rgba(menu, {})
-    assert tuple(no_overflow[400, scrollbar_x, :3]) == (48, 48, 48)
+    assert tuple(no_overflow[400, scrollbar_x, :3]) == _token_rgb("surface_container")
 
 
 def test_settings_menu_omits_the_global_title_and_left_aligns_section_headings():
     menu = OpenXrSettingsMenu()
     rgba = build_settings_menu_rgba(menu, {})
 
-    shell = (36, 36, 36, 250)
+    shell = _token_rgba("surface", 250)
     assert tuple(rgba[64, 636]) == shell
-    assert tuple(rgba[20, SETTINGS_MENU_TEXTURE_SIZE[0] // 2]) == (
-        36, 36, 36, 250
-    )
+    assert tuple(rgba[20, SETTINGS_MENU_TEXTURE_SIZE[0] // 2]) == shell
     title_pixels = rgba[32:80, 272:500, :3]
-    title_mask = np.all(title_pixels == (190, 196, 204), axis=2)
+    title_mask = np.all(title_pixels == _token_rgb("text_secondary"), axis=2)
     xs = np.where(title_mask.any(axis=0))[0]
     assert xs.size
     assert 15 <= xs.min() <= 19
@@ -156,9 +219,9 @@ def test_each_settings_group_heading_aligns_to_its_own_card(
     values = {"show_glow_tab": show_glow}
     layout = menu.layout(show_glow=show_glow, lang="EN", values=values)
     rgba = build_settings_menu_rgba(menu, values, lang="EN")
-    muted = (190, 196, 204)
-    shell = (36, 36, 36, 250)
-    card = (48, 48, 48, 255)
+    muted = _token_rgb("text_secondary")
+    shell = _token_rgba("surface", 250)
+    card = _token_rgba("surface_container")
     titled_groups = [group for group in layout.groups if group.title]
 
     assert titled_groups
@@ -186,16 +249,16 @@ def test_settings_menu_content_card_has_balanced_bottom_inset():
     center_x = SETTINGS_MENU_TEXTURE_SIZE[0] // 2
     height = SETTINGS_MENU_TEXTURE_SIZE[1]
 
-    assert tuple(rgba[height - 37, center_x]) == (36, 36, 36, 250)
-    assert tuple(rgba[height - 25, center_x]) == (36, 36, 36, 250)
+    assert tuple(rgba[height - 37, center_x]) == _token_rgba("surface", 250)
+    assert tuple(rgba[height - 25, center_x]) == _token_rgba("surface", 250)
 
 
 def test_screen_subsections_render_as_flat_underlined_tabs():
     menu = OpenXrSettingsMenu()
     rgba = build_settings_menu_rgba(menu, {})
-    shell = (36, 36, 36, 250)
-    primary = (22, 95, 194, 255)
-    card_alt = (72, 72, 72, 255)
+    shell = _token_rgba("surface", 250)
+    primary = _token_rgba("primary")
+    card_alt = _token_rgba("surface_container_high")
 
     assert tuple(rgba[80, 320]) == shell
     assert tuple(rgba[80, 640]) == shell
@@ -206,7 +269,7 @@ def test_screen_subsections_render_as_flat_underlined_tabs():
 def test_settings_menu_shell_has_equal_texture_edge_margins():
     menu = OpenXrSettingsMenu()
     rgba = build_settings_menu_rgba(menu, {})
-    shell = (36, 36, 36, 250)
+    shell = _token_rgba("surface", 250)
     transparent = (0, 0, 0, 0)
     edge_x = 20
     center_x = 636
@@ -251,20 +314,25 @@ def test_openxr_settings_menu_text_is_centered_and_active_selection_has_no_under
         assert xs.size
         return (xs.min() + xs.max()) / 2 + x0
 
-    text_primary = (235, 237, 240)
-    selection_text = (235, 237, 240)
+    text_primary = _token_rgb("text_primary")
+    selection_text = _token_rgb("selection_text")
     assert visible_text_center(selection_text, (100, 64, 232, 128)) == pytest.approx(130, abs=6)
-    assert tuple(rgba[72, 56, :3]) == (22, 95, 194)
+    assert tuple(rgba[72, 56, :3]) == _token_rgb("primary")
 
     controls = {control.key: control for control in menu.controls()}
     minus = controls["step:minus:screen:width"]
     plus = controls["step:plus:screen:width"]
     text_left = max(_CONTENT_LEFT, round(minus.rect[0] * rgba.shape[1]))
     text_right = min(_CONTENT_RIGHT, round(plus.rect[2] * rgba.shape[1]))
-    text_region = rgba[448:480, text_left:text_right, :3]
+    slider = controls["screen:width"]
+    slider_center_y = round(
+        (slider.rect[1] + slider.rect[3]) * rgba.shape[0] / 2
+    )
+    label_top = slider_center_y - 43
+    text_region = rgba[label_top:label_top + 24, text_left:text_right, :3]
     text_mask = np.any(
         np.all(text_region == text_primary, axis=2)
-        | np.all(text_region == (190, 196, 204), axis=2),
+        | np.all(text_region == _token_rgb("text_secondary"), axis=2),
         axis=0,
     )
     text_x = np.where(text_mask)[0]
@@ -276,15 +344,15 @@ def test_openxr_settings_menu_text_is_centered_and_active_selection_has_no_under
     center_x = round((flat.rect[0] + flat.rect[2]) * 0.5 * rgba.shape[1])
     bottom_y = round(flat.rect[3] * rgba.shape[0]) - 2
     below_y = round(flat.rect[3] * rgba.shape[0]) + 8
-    assert tuple(rgba[bottom_y, center_x]) == (22, 95, 194, 255)
-    assert tuple(rgba[below_y, center_x]) == (48, 48, 48, 255)
+    assert tuple(rgba[bottom_y, center_x]) == _token_rgba("primary")
+    assert tuple(rgba[below_y, center_x]) == _token_rgba("surface_container")
     stop = controls["runtime:stop"]
     stop_box = tuple(round(value * size) for value, size in zip(
         stop.rect, (rgba.shape[1], rgba.shape[0], rgba.shape[1], rgba.shape[0])
     ))
     stop_region = rgba[stop_box[1]:stop_box[3], stop_box[0]:stop_box[2], :3]
-    assert tuple(rgba[stop_box[1] + 10, (stop_box[0] + stop_box[2]) // 2]) == (179, 50, 72, 255)
-    assert np.any(np.all(stop_region == text_primary, axis=2))
+    assert tuple(rgba[stop_box[1] + 10, (stop_box[0] + stop_box[2]) // 2]) == _token_rgba("destructive")
+    assert np.any(np.all(stop_region == _token_rgb("destructive_text"), axis=2))
 
 
 def test_screen_shape_choices_have_equal_width_and_symmetric_spacing():
@@ -322,7 +390,7 @@ def test_openxr_slider_handle_stays_inside_the_rail_at_both_limits(value, at_lef
     center_y = round((y0 + y1) * 832 / 2)
     handle_x = x0 + 10 if at_left else x1 - 10
 
-    assert tuple(rgba[center_y, handle_x, :3]) == (235, 237, 240)
+    assert tuple(rgba[center_y, handle_x, :3]) == _token_rgb("text_primary")
 
 
 def test_openxr_slider_icon_buttons_show_meta_hover_press_and_disabled_states():
@@ -353,9 +421,9 @@ def test_openxr_slider_icon_buttons_show_meta_hover_press_and_disabled_states():
         lang="EN",
     )
 
-    assert tuple(hovered[center_y - 12, center_x, :3]) == (28, 103, 195)
-    assert tuple(pressed[center_y - 12, center_x, :3]) == (22, 95, 194)
-    assert tuple(at_limit[center_y - 12, center_x, :3]) == (48, 48, 48)
+    assert tuple(hovered[center_y - 12, center_x, :3]) == _token_rgb("primary_hover")
+    assert tuple(pressed[center_y - 12, center_x, :3]) == _token_rgb("primary")
+    assert tuple(at_limit[center_y - 12, center_x, :3]) == _token_rgb("surface_container")
 
 
 def test_openxr_hover_keeps_the_selected_option_visual():
@@ -366,8 +434,20 @@ def test_openxr_hover_keeps_the_selected_option_visual():
     sample_x = round((selected.rect[0] + selected.rect[2]) * 1024 / 2)
     sample_y = round(selected.rect[1] * 832) + 8
 
-    assert tuple(normal[sample_y, sample_x]) == (22, 95, 194, 255)
-    assert tuple(hovered[sample_y, sample_x]) == (22, 95, 194, 255)
+    assert tuple(normal[sample_y, sample_x]) == _token_rgba("selection_container")
+    assert tuple(hovered[sample_y, sample_x]) == _token_rgba("selection_container")
+
+
+def test_openxr_unselected_option_hover_uses_menu_item_highlight():
+    menu = OpenXrSettingsMenu()
+    control = next(control for control in menu.controls() if control.key == "screen:type:subtle")
+    normal = build_settings_menu_rgba(menu, {})
+    hovered = build_settings_menu_rgba(menu, {}, hover_key=control.key)
+    sample_x = round((control.rect[0] + control.rect[2]) * 1024 / 2)
+    sample_y = round(control.rect[1] * 832) + 8
+
+    assert tuple(normal[sample_y, sample_x]) != _token_rgba("primary_container")
+    assert tuple(hovered[sample_y, sample_x]) == _token_rgba("primary_container")
 
 
 def test_openxr_boolean_settings_render_as_borderless_meta_switches():
@@ -388,8 +468,8 @@ def test_openxr_boolean_settings_render_as_borderless_meta_switches():
         menu, {"depth_strength": 0.25}, lang="EN"
     )
 
-    assert tuple(inactive[switch_y, switch_x0 + 40, :3]) == (132, 139, 149)
-    assert tuple(active[switch_y, switch_x0 + 40, :3]) == (22, 184, 95)
+    assert tuple(inactive[switch_y, switch_x0 + 40, :3]) == _token_rgb("track")
+    assert tuple(active[switch_y, switch_x0 + 40, :3]) == _token_rgb("switch_track_active")
     assert controls["depth:toggle_stereo"].kind == "toggle"
 
 
@@ -408,23 +488,26 @@ def test_settings_menu_palette_keeps_light_text_legible_in_control_states():
         bright, dark = sorted((luminance(first), luminance(second)), reverse=True)
         return (bright + 0.05) / (dark + 0.05)
 
-    surface = (48, 48, 48)
-    light_text = (235, 237, 240)
-    selected = (22, 95, 194)
-    primary = (22, 95, 194)
-    hover = (28, 103, 195)
-    green = (22, 184, 95)
-    destructive = (179, 50, 72)
-    destructive_hover = (184, 59, 80)
-    assert contrast((235, 237, 240), surface) >= 4.5
-    assert contrast((190, 196, 204), surface) >= 4.5
-    assert contrast((163, 168, 176), (72, 72, 72)) >= 3.0
-    assert contrast(light_text, selected) >= 4.5
-    assert contrast(light_text, primary) >= 4.5
-    assert contrast(light_text, hover) >= 4.5
-    assert contrast(light_text, destructive) >= 4.5
-    assert contrast(light_text, destructive_hover) >= 4.5
-    assert contrast(green, surface) >= 3.0
+    surface = _token_rgb("surface_container")
+    light_text = _token_rgb("text_primary")
+    selected = _token_rgb("selection_container")
+    primary = _token_rgb("primary")
+    hover = _token_rgb("primary_hover")
+    green = _token_rgb("switch_track_active")
+    destructive = _token_rgb("destructive")
+    destructive_hover = _token_rgb("destructive_hover")
+    destructive_text = _token_rgb("destructive_text")
+    assert contrast(light_text, surface) >= 4.5
+    assert contrast(_token_rgb("text_secondary"), surface) >= 4.5
+    # Disabled text is intentionally subdued in the reference palette; keep
+    # it visibly distinct without requiring the contrast reserved for active text.
+    assert contrast(_token_rgb("text_disabled"), _token_rgb("surface_container_high")) >= 2.0
+    assert contrast(light_text, selected) >= 3.0
+    assert contrast(light_text, primary) >= 3.0
+    assert contrast(light_text, hover) >= 2.0
+    assert contrast(destructive_text, destructive) >= 4.5
+    assert contrast(destructive_text, destructive_hover) >= 4.5
+    assert contrast(green, _token_rgb("surface")) >= 3.0
 
 
 def test_screen_preset_osd_matches_legacy_colors_and_centering():

@@ -22,7 +22,7 @@ def get_controller_help_rows(lang):
 
             ("[预设与杂项]", "", "", True),
             ("左 Menu 键", "短按", "循环显示: 隐藏/FPS左下角/FPS+快捷键指南", False),
-            ("左 Y 键", "短按", "恢复默认居中显示", False),
+            ("左 Y 键", "短按", "重置屏幕位置和尺寸", False),
             ("左 Y 键", "长按 1s", "循环屏幕预设", False),
             ("左 X 键", "短按", "显示/隐藏虚拟键盘", False),
             ("左 X 键", "长按 1s", "切换环境天空盒/黑色背景", False),
@@ -59,7 +59,7 @@ def get_controller_help_rows(lang):
             ("右握持 + 左摇杆 前后", "按住推动", "键盘推拉距离", False),
             ("左握持 + 右摇杆 左右", "按住推动", "键盘偏摆偏移", False),
             ("左握持 + 右摇杆 前后", "按住推动", "键盘俯仰偏移", False),
-            ("左握持 + 左摇杆按下", "按住移动", "键盘环绕头部位移", False),
+            ("左握持 + 左摇杆 左右/前后", "按住推动", "键盘球面环绕", False),
             ("左/右扳机", "半按", "触发键盘按键", False),
             ("", "", "", False),
 
@@ -137,7 +137,7 @@ def get_controller_help_rows(lang):
 
             ("[Presets & Misc]", "", "", True),
             ("Left Menu button", "Short press", "Cycle panel: hidden/lower-left FPS/FPS + shortcut guide", False),
-            ("Left Y button", "Short press", "Reset to default centered display", False),
+            ("Left Y button", "Short press", "Reset screen position and size", False),
             ("Left Y button", "Long press 1s", "Cycle screen presets", False),
             ("Left X button", "Short press", "Show/hide virtual keyboard", False),
             ("Left X button", "Long press 1s", "Toggle environment skybox / black", False),
@@ -174,7 +174,7 @@ def get_controller_help_rows(lang):
             ("Right Grip + left stick U/D", "Hold & push", "Keyboard push/pull distance", False),
             ("Left Grip + right stick L/R", "Hold & push", "Keyboard yaw offset", False),
             ("Left Grip + right stick U/D", "Hold & push", "Keyboard pitch offset", False),
-            ("Left Grip + left stick press", "Hold & move", "Keyboard sphere orbit", False),
+            ("Left Grip + left stick L/R or U/D", "Hold & push", "Orbit keyboard around head", False),
             ("Left/Right trigger", "Half press", "Trigger key on keyboard", False),
             ("", "", "", False),
 

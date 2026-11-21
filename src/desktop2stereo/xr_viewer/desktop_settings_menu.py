@@ -27,8 +27,15 @@ from .settings_menu import (
     OPENXR_MENU_COLORS,
     OPENXR_MENU_GROUP_LABELS,
     OPENXR_MENU_RADII,
-    _MENU_TITLE_CARD_GAP,
+    SETTINGS_MENU_TEXTURE_SIZE,
+    _SCREEN_ROTATION_BUTTON_HEIGHT,
+    _SCREEN_SETTINGS_ROW_GAP,
+    _MENU_GROUP_GAP,
+    _MENU_GROUP_PADDING,
     _MENU_TITLE_HEIGHT,
+    _SIDEBAR_CONTROL_PADDING,
+    _SIDEBAR_PANEL_LEFT,
+    _SIDEBAR_PANEL_RIGHT,
 )
 
 
@@ -43,8 +50,19 @@ _FLET_DRAWER_VISIBILITY_CHECK_SECONDS = 0.25
 _FLET_DRAWER_WIDTH = 192
 _FLET_DRAWER_TAB_WIDTH = 12
 _FLET_DRAWER_HIDE_DELAY_SECONDS = 0.3
-_FLET_SIDEBAR_WIDTH = 144
-_FLET_SPACING = 8
+_FLET_LAYOUT_SCALE = _FLET_PANEL_SIZE[0] / SETTINGS_MENU_TEXTURE_SIZE[0]
+_FLET_OUTER_PADDING = round(_SIDEBAR_PANEL_LEFT * _FLET_LAYOUT_SCALE)
+_FLET_SIDEBAR_WIDTH = round(
+    (_SIDEBAR_PANEL_RIGHT - _SIDEBAR_PANEL_LEFT) * _FLET_LAYOUT_SCALE
+)
+_FLET_SIDEBAR_PADDING = round(_SIDEBAR_CONTROL_PADDING * _FLET_LAYOUT_SCALE)
+_FLET_SIDEBAR_CONTROL_WIDTH = _FLET_SIDEBAR_WIDTH - 2 * _FLET_SIDEBAR_PADDING
+_FLET_GROUP_PADDING = round(_MENU_GROUP_PADDING * _FLET_LAYOUT_SCALE)
+_FLET_SPACING = round(_MENU_GROUP_GAP * _FLET_LAYOUT_SCALE)
+_FLET_INNER_SPACING = round(_SCREEN_SETTINGS_ROW_GAP * _FLET_LAYOUT_SCALE)
+_FLET_TITLE_HEIGHT = round(_MENU_TITLE_HEIGHT * _FLET_LAYOUT_SCALE)
+_FLET_BUTTON_PADDING_X = 8
+_FLET_BUTTON_PADDING_Y = 4
 _FLET_BUTTON_HEIGHT = 40
 _FLET_SECONDARY_BUTTON_HEIGHT = 32
 _FLET_STEP_BUTTON_SIZE = 40
@@ -219,6 +237,29 @@ def _is_reset_control(key: str) -> bool:
         key.startswith("reset:")
         or key in {"screen:reset_crop", "section:reset_defaults"}
     )
+
+
+def _button_height_for_key(key: str) -> int:
+    if _is_reset_control(key):
+        return _FLET_SECONDARY_BUTTON_HEIGHT
+    if key.startswith("screen:rotate:"):
+        return _compact_flet_dimension(_SCREEN_ROTATION_BUTTON_HEIGHT)
+    return _FLET_BUTTON_HEIGHT
+
+
+def _reset_button_width_for_group(group_key: str) -> int:
+    width = 120 if group_key in {
+        "screen_shape", "screen_rotation", "screen_placement",
+    } else 160
+    return _compact_flet_dimension(width)
+
+
+def _flet_icon_for_control(ft: Any, control: Any) -> Any | None:
+    icon_name = {
+        "rotate_left": "ROTATE_LEFT",
+        "rotate_right": "ROTATE_RIGHT",
+    }.get(str(getattr(control, "icon", "") or ""))
+    return getattr(ft.Icons, icon_name) if icon_name else None
 
 
 def _make_step_button_style(ft: Any) -> Any:
@@ -490,6 +531,7 @@ def _snapshot_layout_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
                 bool(control.enabled),
                 str(getattr(control, "group", "")),
                 bool(getattr(control, "fixed", False)),
+                str(getattr(control, "icon", "") or ""),
             )
             for control in controls
         ),
@@ -709,7 +751,7 @@ def _run_flet_desktop_settings_app(
         body = ft.Container(
             content=body_content,
             expand=True,
-            padding=ft.Padding.only(top=8),
+            padding=ft.Padding.only(top=_FLET_INNER_SPACING),
         )
         sidebar = ft.Column(expand=True, spacing=_FLET_SPACING)
         section_toolbar = ft.Container(height=0)
@@ -721,7 +763,11 @@ def _run_flet_desktop_settings_app(
         main_area = ft.Container(
             content=main_column,
             expand=True,
-            padding=ft.Padding.only(right=8, top=8, bottom=8),
+            padding=ft.Padding.only(
+                right=_FLET_OUTER_PADDING,
+                top=_FLET_OUTER_PADDING,
+                bottom=_FLET_OUTER_PADDING,
+            ),
         )
         layout = ft.Row(
             controls=[
@@ -730,7 +776,7 @@ def _run_flet_desktop_settings_app(
                     expand=False,
                     bgcolor=_menu_color("surface_container"),
                     border_radius=OPENXR_MENU_RADII["group"],
-                    padding=8,
+                    padding=_FLET_SIDEBAR_PADDING,
                     content=sidebar,
                 ),
                 main_area,
@@ -742,7 +788,7 @@ def _run_flet_desktop_settings_app(
         panel_view = ft.Container(
             expand=True,
             bgcolor=_menu_color("surface"),
-            padding=8,
+            padding=_FLET_OUTER_PADDING,
             content=layout,
         )
 
@@ -1019,7 +1065,10 @@ def _run_flet_desktop_settings_app(
                 fixed=True,
             )
 
-            def make_button(control: Any, *, width: int | None = None) -> Any:
+            def make_button(
+                control: Any, *, width: int | None = None,
+                expand: int | None = None,
+            ) -> Any:
                 key = str(control.key)
                 active = _control_is_selected(key, values)
                 destructive = key == "runtime:stop"
@@ -1039,18 +1088,30 @@ def _run_flet_desktop_settings_app(
                 hover_color = (
                     _menu_color("destructive_hover") if destructive
                     else _menu_color("selection_hover_container") if active
-                    else _menu_color("primary_hover")
+                    else _menu_color("primary_container")
                 )
-                button_height = (
-                    _FLET_SECONDARY_BUTTON_HEIGHT if _is_reset_control(key) or key.startswith(
-                        ("screen:section:", "screen:rotate:")
-                    ) else _FLET_BUTTON_HEIGHT
-                )
+                button_height = _button_height_for_key(key)
                 button_width = (
                     width if width is not None
-                    else _FLET_SIDEBAR_WIDTH - 24 if destructive
+                    else _FLET_SIDEBAR_CONTROL_WIDTH if destructive
                     else None
                 )
+                state_text_colors = {
+                    state.DEFAULT: text_color,
+                    state.HOVERED: (
+                        _menu_color("destructive_text")
+                        if destructive else _menu_color("primary_state_text")
+                    ),
+                    state.FOCUSED: (
+                        _menu_color("destructive_text")
+                        if destructive else _menu_color("primary_state_text")
+                    ),
+                    state.PRESSED: (
+                        _menu_color("destructive_text")
+                        if destructive else _menu_color("primary_state_text")
+                    ),
+                    state.DISABLED: _menu_color("text_disabled"),
+                }
                 return ft.ElevatedButton(
                     content=ft.Text(
                         translate(str(control.label)),
@@ -1058,10 +1119,12 @@ def _run_flet_desktop_settings_app(
                         weight=ft.FontWeight.W_600,
                         text_align=ft.TextAlign.CENTER,
                     ),
+                    icon=_flet_icon_for_control(ft, control),
                     on_click=queue_button(key),
                     disabled=not enabled,
                     width=button_width,
                     height=button_height,
+                    expand=expand,
                     style=ft.ButtonStyle(
                         bgcolor={
                             state.DEFAULT: background,
@@ -1073,23 +1136,12 @@ def _run_flet_desktop_settings_app(
                             ),
                             state.DISABLED: _menu_color("surface_container_high"),
                         },
-                        color={
-                            state.DEFAULT: text_color,
-                            state.HOVERED: (
-                                _menu_color("destructive_text")
-                                if destructive else _menu_color("primary_state_text")
-                            ),
-                            state.FOCUSED: (
-                                _menu_color("destructive_text")
-                                if destructive else _menu_color("primary_state_text")
-                            ),
-                            state.PRESSED: (
-                                _menu_color("destructive_text")
-                                if destructive else _menu_color("primary_state_text")
-                            ),
-                            state.DISABLED: _menu_color("text_disabled"),
-                        },
-                        padding=ft.Padding.symmetric(horizontal=6, vertical=4),
+                        color=state_text_colors,
+                        icon_color=state_text_colors,
+                        padding=ft.Padding.symmetric(
+                            horizontal=_FLET_BUTTON_PADDING_X,
+                            vertical=_FLET_BUTTON_PADDING_Y,
+                        ),
                         elevation=0,
                         text_style=ft.TextStyle(
                             size=14,
@@ -1142,13 +1194,13 @@ def _run_flet_desktop_settings_app(
                                 expand=True,
                             ),
                         ],
-                        spacing=6,
+                        spacing=_FLET_SPACING,
                         expand=True,
                         alignment=ft.MainAxisAlignment.START,
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     on_click=queue_button(key),
-                    width=_FLET_SIDEBAR_WIDTH - 24,
+                    width=_FLET_SIDEBAR_CONTROL_WIDTH,
                     height=_FLET_BUTTON_HEIGHT,
                     style=ft.ButtonStyle(
                         bgcolor={
@@ -1171,7 +1223,10 @@ def _run_flet_desktop_settings_app(
                             state.PRESSED: _menu_color("primary_state_text"),
                             state.DISABLED: _menu_color("text_disabled"),
                         },
-                        padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+                        padding=ft.Padding.symmetric(
+                            horizontal=_FLET_BUTTON_PADDING_X,
+                            vertical=_FLET_BUTTON_PADDING_Y,
+                        ),
                         elevation=0,
                         text_style=ft.TextStyle(size=14, weight=ft.FontWeight.W_600),
                         shape=ft.RoundedRectangleBorder(
@@ -1262,7 +1317,7 @@ def _run_flet_desktop_settings_app(
                                 ),
                                 value_label,
                             ],
-                            spacing=4,
+                            spacing=_FLET_INNER_SPACING,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
                         ft.Row(
@@ -1271,11 +1326,11 @@ def _run_flet_desktop_settings_app(
                                 slider,
                                 plus_button,
                             ],
-                            spacing=4,
+                            spacing=_FLET_INNER_SPACING,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
                     ],
-                    spacing=4,
+                    spacing=_FLET_INNER_SPACING,
                 )
 
             content: list[Any] = []
@@ -1296,48 +1351,46 @@ def _run_flet_desktop_settings_app(
                         return
                     buttons = list(pending_buttons)
                     pending_buttons.clear()
-                    if group_key == "screen_shape":
-                        content_row = ft.Row(
+                    children.append(
+                        ft.Row(
                             controls=buttons,
                             alignment=ft.MainAxisAlignment.CENTER,
                             spacing=_FLET_SPACING,
                             wrap=True,
                             run_spacing=_FLET_SPACING,
                         )
-                    else:
-                        content_row = ft.Row(
-                            controls=buttons,
-                            alignment=ft.MainAxisAlignment.CENTER,
-                            spacing=_FLET_SPACING,
-                            wrap=True,
-                            run_spacing=_FLET_SPACING,
-                        )
-                    children.append(content_row)
+                    )
 
-                shape_controls = (
-                    [item for item in items if str(item.key).startswith("screen:type:")],
-                    [item for item in items if str(item.key).startswith("screen:rotate:")],
-                ) if group_key == "screen_shape" else None
-                if shape_controls is not None:
-                    for shape_row in shape_controls:
-                        row_buttons = [
-                            make_button(
-                                item,
-                                width=_compact_flet_dimension(
-                                    160 if str(item.key).startswith("screen:rotate:") else 96
-                                ),
-                            )
-                            for item in shape_row
-                        ]
-                        children.append(
-                            ft.Row(
-                                controls=row_buttons,
-                                alignment=ft.MainAxisAlignment.CENTER,
-                                spacing=_FLET_SPACING,
-                                wrap=True,
-                                run_spacing=_FLET_SPACING,
-                            )
+                screen_row = (
+                    [item for item in items if str(item.key).startswith("screen:type:")]
+                    if group_key == "screen_shape"
+                    else [item for item in items if str(item.key).startswith("screen:rotate:")]
+                    if group_key == "screen_rotation"
+                    else None
+                )
+                if screen_row is not None:
+                    button_width = (
+                        _compact_flet_dimension(96)
+                        if group_key == "screen_shape" else None
+                    )
+                    row_buttons = [
+                        make_button(
+                            item,
+                            width=button_width,
+                            expand=1 if group_key == "screen_rotation" else None,
                         )
+                        for item in screen_row
+                    ]
+                    children.append(
+                        ft.Row(
+                            controls=row_buttons,
+                            alignment=ft.MainAxisAlignment.CENTER,
+                            spacing=_FLET_SPACING,
+                            expand=group_key == "screen_rotation",
+                            wrap=group_key != "screen_rotation",
+                            run_spacing=_FLET_SPACING,
+                        )
+                    )
                 else:
                     button_items = [
                         item for item in items
@@ -1402,7 +1455,7 @@ def _run_flet_desktop_settings_app(
                             controls=[
                                 make_button(
                                     item,
-                                    width=_compact_flet_dimension(160),
+                                    width=_reset_button_width_for_group(group_key),
                                 )
                                 for item in reset_items
                             ],
@@ -1422,16 +1475,19 @@ def _run_flet_desktop_settings_app(
                     ),
                     bgcolor=_menu_color("surface_container"),
                     border_radius=OPENXR_MENU_RADII["group"],
-                    padding=8,
+                    padding=_FLET_GROUP_PADDING,
                 )
                 group_content: Any = group_card
                 if group_title:
                     group_content = ft.Column(
                         controls=[
                             ft.Container(
-                                height=_MENU_TITLE_HEIGHT,
+                                height=_FLET_TITLE_HEIGHT,
                                 alignment=ft.Alignment.CENTER_LEFT,
-                                padding=ft.Padding.only(left=8, right=8),
+                                padding=ft.Padding.only(
+                                    left=_FLET_GROUP_PADDING,
+                                    right=_FLET_GROUP_PADDING,
+                                ),
                                 content=ft.Text(
                                     group_title,
                                     size=16,
@@ -1490,7 +1546,7 @@ def _run_flet_desktop_settings_app(
                 ft.Container(expand=True),
                 make_button(
                     reset_orientation_control,
-                    width=_FLET_SIDEBAR_WIDTH - 24,
+                    width=_FLET_SIDEBAR_CONTROL_WIDTH,
                 ),
                 make_button(stop_control) if stop_control is not None else ft.Container(height=_FLET_BUTTON_HEIGHT),
             ]

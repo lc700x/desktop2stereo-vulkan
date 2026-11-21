@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 
 import numpy as np
 from gui.localization import gettext_for, normalize_locale
@@ -17,9 +20,140 @@ MEDIA_BROWSER_TEXTURE_ASPECT = (
 _MEDIA_BROWSER_SIZE = MEDIA_BROWSER_TEXTURE_SIZE
 MEDIA_BROWSER_VISIBLE_ROWS = 10
 _BROWSER_VISIBLE_ROWS = MEDIA_BROWSER_VISIBLE_ROWS
+_BROWSER_GRID_COLUMNS = 3
+_BROWSER_GRID_ROWS = 3
+_BROWSER_GRID_GAP = 18
+_BROWSER_THUMBNAIL_SIZE = (384, 216)
+_BROWSER_THUMBNAIL_CACHE_ITEMS = 32
+_BROWSER_THUMBNAIL_MAX_PENDING = 8
 MEDIA_HOVER_DURATION_S = 0.16
 _MEDIA_HOVER_BUTTON_SCALE = 0.035
 _MEDIA_HOVER_ROW_SCALE = 0.010
+
+
+def _load_media_browser_thumbnail(
+    path: str,
+    kind: str,
+    size: tuple[int, int] = _BROWSER_THUMBNAIL_SIZE,
+) -> np.ndarray | None:
+    """Decode one small preview on a worker thread; unsupported files use icons."""
+    try:
+        if kind == "image":
+            from PIL import Image, ImageOps
+
+            with Image.open(path) as source:
+                if source.width * source.height > 80_000_000:
+                    return None
+                source.draft("RGB", size)
+                preview = ImageOps.exif_transpose(source)
+                preview.thumbnail(size, Image.Resampling.LANCZOS)
+                return np.asarray(preview.convert("RGB"), dtype=np.uint8).copy()
+
+        if kind == "video":
+            import cv2
+            from PIL import Image
+
+            timeout_key = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
+            read_timeout_key = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
+            if timeout_key is not None and read_timeout_key is not None:
+                capture = cv2.VideoCapture(
+                    path,
+                    cv2.CAP_FFMPEG,
+                    [int(timeout_key), 2500, int(read_timeout_key), 2500],
+                )
+            else:
+                capture = cv2.VideoCapture(path)
+            try:
+                if not capture.isOpened():
+                    return None
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    return None
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                preview = Image.fromarray(frame, mode="RGB")
+                preview.thumbnail(size, Image.Resampling.LANCZOS)
+                return np.asarray(preview, dtype=np.uint8).copy()
+            finally:
+                capture.release()
+    except Exception:
+        return None
+    return None
+
+
+class MediaBrowserThumbnailCache:
+    """Bounded, asynchronous thumbnail cache for the OpenXR browser surface."""
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="d2s-media-thumbnail"
+        )
+        self._cache: OrderedDict[str, np.ndarray | None] = OrderedDict()
+        self._pending: dict[str, Future[np.ndarray | None]] = {}
+        self._revision = 0
+        self._closed = False
+        self._lock = Lock()
+
+    def visible_thumbnails(
+        self,
+        entries: list[dict],
+        *,
+        scroll_offset: int,
+        view_mode: str,
+    ) -> tuple[dict[str, np.ndarray], int]:
+        state = {"browser_entries": entries, "browser_view_mode": view_mode}
+        layout = _browser_layout(state, *MEDIA_BROWSER_TEXTURE_SIZE)
+        visible_count = layout["visible_entry_count"]
+        offset = max(0, min(int(scroll_offset), max(0, len(entries) - visible_count)))
+        visible = entries[offset : offset + visible_count]
+        candidates = visible + entries[
+            offset + visible_count : offset + visible_count + layout["scroll_step"]
+        ]
+
+        with self._lock:
+            if self._closed:
+                return {}, self._revision
+            for path, future in tuple(self._pending.items()):
+                if not future.done():
+                    continue
+                self._pending.pop(path, None)
+                try:
+                    thumbnail = future.result()
+                except Exception:
+                    thumbnail = None
+                self._cache[path] = thumbnail
+                self._cache.move_to_end(path)
+                while len(self._cache) > _BROWSER_THUMBNAIL_CACHE_ITEMS:
+                    self._cache.popitem(last=False)
+                self._revision += 1
+
+            for entry in candidates:
+                path = str(entry.get("path") or "")
+                kind = str(entry.get("kind") or "")
+                if not path or kind not in {"image", "video"}:
+                    continue
+                if path in self._cache:
+                    self._cache.move_to_end(path)
+                    continue
+                if path in self._pending:
+                    continue
+                if len(self._pending) >= _BROWSER_THUMBNAIL_MAX_PENDING:
+                    break
+                self._pending[path] = self._executor.submit(
+                    _load_media_browser_thumbnail, path, kind
+                )
+
+            return (
+                {path: self._cache[path] for path in (str(item.get("path") or "") for item in visible)
+                 if path in self._cache and self._cache[path] is not None},
+                self._revision,
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 @dataclass
@@ -278,6 +412,144 @@ def _draw_kind_icon(draw, kind: str, cx: int, cy: int, color) -> None:
         _draw_file_icon(draw, cx, cy, color)
 
 
+def _draw_browser_preview_icon(draw, kind: str, cx: int, cy: int, color) -> None:
+    if kind == "directory":
+        draw.rounded_rectangle(
+            (cx - 40, cy - 22, cx + 40, cy + 30),
+            radius=8,
+            outline=color,
+            width=5,
+        )
+        draw.line((cx - 38, cy - 22, cx - 20, cy - 38, cx + 4, cy - 38), fill=color, width=5)
+        draw.line((cx + 4, cy - 38, cx + 16, cy - 22), fill=color, width=5)
+    elif kind == "video":
+        draw.rounded_rectangle(
+            (cx - 42, cy - 30, cx + 42, cy + 30),
+            radius=8,
+            outline=color,
+            width=5,
+        )
+        draw.polygon(
+            ((cx - 10, cy - 18), (cx + 20, cy), (cx - 10, cy + 18)),
+            fill=color,
+        )
+    elif kind == "image":
+        draw.rounded_rectangle(
+            (cx - 42, cy - 30, cx + 42, cy + 30),
+            radius=8,
+            outline=color,
+            width=5,
+        )
+        draw.ellipse((cx + 12, cy - 20, cx + 26, cy - 6), fill=color)
+        draw.line(
+            (cx - 30, cy + 20, cx - 4, cy - 6, cx + 14, cy + 14, cx + 30, cy - 2),
+            fill=color,
+            width=5,
+        )
+    else:
+        draw.rounded_rectangle(
+            (cx - 32, cy - 40, cx + 32, cy + 40),
+            radius=7,
+            outline=color,
+            width=5,
+        )
+        draw.line((cx - 18, cy - 10, cx + 18, cy - 10), fill=color, width=4)
+        draw.line((cx - 18, cy + 4, cx + 18, cy + 4), fill=color, width=4)
+        draw.line((cx - 18, cy + 18, cx + 10, cy + 18), fill=color, width=4)
+
+
+def _paste_browser_thumbnail(
+    image,
+    draw,
+    rect: tuple[int, int, int, int],
+    thumbnail: np.ndarray | None,
+    kind: str,
+    *,
+    radius: int,
+) -> None:
+    from PIL import Image, ImageDraw as PillowImageDraw, ImageOps
+
+    left, top, right, bottom = rect
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    draw.rounded_rectangle(
+        rect,
+        radius=radius,
+        fill=_rgba("surface_container_high", 230),
+    )
+    if thumbnail is not None:
+        try:
+            source = Image.fromarray(np.asarray(thumbnail, dtype=np.uint8)).convert("RGB")
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+            source = ImageOps.fit(source, (width, height), method=resampling)
+            mask = Image.new("L", (width, height), 0)
+            PillowImageDraw.Draw(mask).rounded_rectangle(
+                (0, 0, width - 1, height - 1), radius=radius, fill=255
+            )
+            image.paste(source, (left, top), mask)
+            draw.rounded_rectangle(
+                rect,
+                radius=radius,
+                outline=_rgba("outline", 92),
+                width=1,
+            )
+            return
+        except Exception:
+            pass
+    _draw_browser_preview_icon(
+        draw,
+        kind,
+        (left + right) // 2,
+        (top + bottom) // 2,
+        _rgba("text_secondary"),
+    )
+
+
+def _draw_browser_view_icon(draw, rect, view_mode: str, color) -> None:
+    left, top, right, bottom = rect
+    cx, cy = (left + right) // 2, (top + bottom) // 2
+    if view_mode == "grid":
+        for row in range(2):
+            for column in range(2):
+                x = cx - 12 + column * 14
+                y = cy - 12 + row * 14
+                draw.rounded_rectangle((x, y, x + 10, y + 10), radius=2, fill=color)
+        return
+    for offset in (-10, 0, 10):
+        draw.ellipse((cx - 14, cy + offset - 2, cx - 10, cy + offset + 2), fill=color)
+        draw.rounded_rectangle(
+            (cx - 5, cy + offset - 2, cx + 14, cy + offset + 2),
+            radius=2,
+            fill=color,
+        )
+
+
+def _draw_browser_panel_background(image, draw, rect) -> None:
+    from PIL import Image, ImageDraw
+
+    top_rgb = np.asarray(_rgba("surface_header")[:3], dtype=np.float32)
+    bottom_rgb = np.asarray(_rgba("surface")[:3], dtype=np.float32)
+    blend = np.linspace(0.0, 1.0, image.height, dtype=np.float32)[:, None, None]
+    rows = np.rint(top_rgb[None, None, :] * (1.0 - blend) + bottom_rgb[None, None, :] * blend)
+    pixels = np.empty((image.height, image.width, 4), dtype=np.uint8)
+    pixels[:, :, :3] = np.repeat(rows.astype(np.uint8), image.width, axis=1)
+    pixels[:, :, 3] = 238
+    gradient = Image.fromarray(pixels, mode="RGBA")
+    mask = Image.new("L", image.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        rect,
+        radius=OPENXR_MENU_RADII["panel"],
+        fill=255,
+    )
+    image.paste(gradient, (0, 0), mask)
+    draw.rounded_rectangle(
+        rect,
+        radius=OPENXR_MENU_RADII["panel"],
+        outline=_rgba("outline", 52),
+        width=1,
+    )
+
+
 def _draw_play_icon(draw, cx: int, cy: int, color, *, pause: bool) -> None:
     if pause:
         draw.rounded_rectangle((cx - 8, cy - 11, cx - 3, cy + 11), radius=2, fill=color)
@@ -390,7 +662,7 @@ def _seek_track_rect(width: int, height: int) -> tuple[int, int, int, int]:
     return (24, track_y - 10, width - 24, track_y + 16)
 
 
-def _browser_layout(state: dict, width: int, height: int) -> dict[str, int]:
+def _browser_layout(state: dict, width: int, height: int) -> dict[str, int | str]:
     """Keep browser painting and hit testing on one shared geometry."""
     mounts = list(state.get("browser_mounts") or [])
     recent = list(state.get("recent_entries") or [])
@@ -410,7 +682,29 @@ def _browser_layout(state: dict, width: int, height: int) -> dict[str, int]:
     )
     playlist_rows_y = playlist_heading_y + 36
     playlist_row_height = 72
-    file_rows_y = max(164, int(height * 0.14))
+    view_mode = str(state.get("browser_view_mode") or "grid").casefold()
+    if view_mode not in {"grid", "list"}:
+        view_mode = "grid"
+    file_rows_y = max(168, int(height * 0.14))
+    file_row_height = max(84, (height - file_rows_y - 120) // _BROWSER_VISIBLE_ROWS)
+    grid_left = sidebar_right + 18
+    grid_right = width - 38
+    grid_width = max(_BROWSER_GRID_COLUMNS, grid_right - grid_left)
+    grid_card_width = (
+        grid_width - _BROWSER_GRID_GAP * (_BROWSER_GRID_COLUMNS - 1)
+    ) // _BROWSER_GRID_COLUMNS
+    grid_bottom = max(file_rows_y + 1, height - 132)
+    grid_card_height = max(
+        220,
+        (grid_bottom - file_rows_y - _BROWSER_GRID_GAP * (_BROWSER_GRID_ROWS - 1))
+        // _BROWSER_GRID_ROWS,
+    )
+    grid_preview_height = min(grid_card_height - 96, (grid_card_width - 24) * 9 // 16)
+    visible_entry_count = (
+        _BROWSER_GRID_COLUMNS * _BROWSER_GRID_ROWS
+        if view_mode == "grid"
+        else _BROWSER_VISIBLE_ROWS
+    )
     return {
         "sidebar_right": sidebar_right,
         "mount_top": mount_top,
@@ -426,10 +720,62 @@ def _browser_layout(state: dict, width: int, height: int) -> dict[str, int]:
         "playlist_offset": playlist_offset,
         "playlist_row_height": playlist_row_height,
         "file_rows_y": file_rows_y,
-        "file_row_height": max(
-            72, (height - file_rows_y - 120) // _BROWSER_VISIBLE_ROWS
-        ),
+        "file_row_height": file_row_height,
+        "view_mode": view_mode,
+        "visible_entry_count": visible_entry_count,
+        "scroll_step": _BROWSER_GRID_COLUMNS if view_mode == "grid" else 1,
+        "grid_columns": _BROWSER_GRID_COLUMNS,
+        "grid_rows": _BROWSER_GRID_ROWS,
+        "grid_gap": _BROWSER_GRID_GAP,
+        "grid_left": grid_left,
+        "grid_top": file_rows_y,
+        "grid_card_width": grid_card_width,
+        "grid_card_height": grid_card_height,
+        "grid_preview_height": grid_preview_height,
     }
+
+
+def media_browser_scroll_metrics(state: dict) -> tuple[int, int, int]:
+    """Return the current scroll step, visible count, and maximum item offset."""
+    layout = _browser_layout(state, *_MEDIA_BROWSER_SIZE)
+    entries = list(state.get("browser_entries") or [])
+    visible_count = layout["visible_entry_count"]
+    if layout["view_mode"] == "grid":
+        total_rows = (len(entries) + layout["grid_columns"] - 1) // layout["grid_columns"]
+        max_offset = max(0, total_rows - layout["grid_rows"]) * layout["grid_columns"]
+    else:
+        max_offset = max(0, len(entries) - visible_count)
+    return (
+        layout["scroll_step"],
+        visible_count,
+        max_offset,
+    )
+
+
+def _browser_grid_card_rect(
+    layout: dict[str, int | str], index: int
+) -> tuple[int, int, int, int]:
+    row, column = divmod(index, layout["grid_columns"])
+    left = layout["grid_left"] + column * (
+        layout["grid_card_width"] + layout["grid_gap"]
+    )
+    top = layout["grid_top"] + row * (
+        layout["grid_card_height"] + layout["grid_gap"]
+    )
+    return (
+        left,
+        top,
+        left + layout["grid_card_width"],
+        top + layout["grid_card_height"],
+    )
+
+
+def _browser_grid_add_rect(card: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    return (card[2] - 56, card[3] - 56, card[2] - 8, card[3] - 8)
+
+
+def _browser_list_add_rect(center_y: int, width: int) -> tuple[int, int, int, int]:
+    return (width - 94, center_y - 24, width - 46, center_y + 24)
 
 
 def _browser_button_rects(
@@ -447,10 +793,26 @@ def _browser_button_rects(
     refresh_x = width - top_margin - button_w
     up_x = refresh_x - top_gap - button_w
     close_x = up_x - top_gap - button_w
+    view_size = 56
+    view_gap = 8
+    view_list_x = close_x - view_gap - view_size
+    view_grid_x = view_list_x - view_gap - view_size
     previous_x = footer_margin
     next_x = previous_x + footer_button_w + footer_gap
     clear_x = next_x + footer_button_w + footer_gap
     return {
+        "browser_view_grid": (
+            view_grid_x,
+            top_margin,
+            view_grid_x + view_size,
+            top_margin + view_size,
+        ),
+        "browser_view_list": (
+            view_list_x,
+            top_margin,
+            view_list_x + view_size,
+            top_margin + view_size,
+        ),
         "browser_close": (
             close_x,
             top_margin,
@@ -824,7 +1186,7 @@ def build_media_bar_rgba(
         (track_x0, center_y - track_height // 2, track_x1, center_y + track_height // 2),
         radius=max(4, track_height // 2),
         fill=_mix_rgba(
-            _rgba("track", 220 if volume_enabled else 105),
+            _rgba("media_volume_track", 220 if volume_enabled else 105),
             _rgba("primary", 230),
             volume_progress * 0.28,
         ),
@@ -835,7 +1197,11 @@ def build_media_bar_rgba(
         draw.rounded_rectangle(
             (track_x0, center_y - track_height // 2, vx, center_y + track_height // 2),
             radius=max(4, track_height // 2),
-            fill=_mix_rgba(_rgba("primary"), _rgba("primary_hover"), volume_progress),
+            fill=_mix_rgba(
+                _rgba("media_volume_fill"),
+                _rgba("media_volume_fill_hover"),
+                volume_progress,
+            ),
         )
     draw.ellipse(
         (vx - knob_radius, center_y - knob_radius, vx + knob_radius, center_y + knob_radius),
@@ -955,6 +1321,7 @@ def build_media_browser_rgba(
     hover: str | None = None,
     hover_progress: float = 1.0,
     scroll_offset: int = 0,
+    thumbnails: dict[str, np.ndarray] | None = None,
     lang: str = "EN",
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
@@ -964,6 +1331,7 @@ def build_media_browser_rgba(
     width, height = image.size
     layout = _browser_layout(state, width, height)
     rects = _browser_button_rects(width, height)
+    thumbnails = thumbnails or {}
     shell = (12, 12, width - 13, height - 13)
     draw.rounded_rectangle(shell, radius=OPENXR_MENU_RADII["panel"], fill=_rgba("surface", 238))
     sidebar_right = layout["sidebar_right"]
@@ -1265,7 +1633,7 @@ def build_media_browser_rgba(
         font=_font(28, bold=True),
         fill=_rgba("text_primary"),
     )
-    header_actions_left = rects["browser_close"][0] - 24
+    header_actions_left = rects["browser_view_grid"][0] - 24
     _text(
         draw,
         (header_left, 94),
@@ -1298,75 +1666,173 @@ def build_media_browser_rgba(
             fill=_rgba("text_primary", 255 if enabled else 104),
             anchor="mm",
         )
+    for key, mode in (("browser_view_grid", "grid"), ("browser_view_list", "list")):
+        enabled = media_control_enabled(key, state)
+        action_rect = _draw_control_surface(
+            draw,
+            rects[key],
+            enabled=enabled,
+            hovered=hover_action == key,
+            progress=hover_amount,
+            primary=layout["view_mode"] == mode,
+            idle_alpha=230,
+            disabled_alpha=105,
+            radius=OPENXR_MENU_RADII["control"],
+        )
+        _draw_browser_view_icon(
+            draw,
+            action_rect,
+            mode,
+            _rgba("text_primary", 255 if enabled else 104),
+        )
     entries = list(state.get("browser_entries") or [])
-    visible_rows = _BROWSER_VISIBLE_ROWS
     selected_path = str(state.get("browser_selection") or "")
     row_top = layout["file_rows_y"]
-    row_height = layout["file_row_height"]
-    visible = entries[int(scroll_offset): int(scroll_offset) + visible_rows]
-    for index, entry in enumerate(visible):
-        y0 = row_top + index * row_height
-        y1 = y0 + row_height - 4
-        path = str(entry.get("path", ""))
-        hovered = hover_action == "entry" and path == hover_path
-        if path == selected_path or hovered:
-            row = _scaled_rect(
-                (sidebar_right + 18, y0, width - 38, y1),
-                hover_amount if hovered else 0.0,
-                scale=_MEDIA_HOVER_ROW_SCALE,
-                lift=0.8,
+    visible_count = layout["visible_entry_count"]
+    _scroll_step, _visible_count, max_offset = media_browser_scroll_metrics(state)
+    scroll_offset = max(0, min(int(scroll_offset), max_offset))
+    visible = entries[scroll_offset : scroll_offset + visible_count]
+    if layout["view_mode"] == "grid":
+        for index, entry in enumerate(visible):
+            card = _browser_grid_card_rect(layout, index)
+            path = str(entry.get("path", ""))
+            kind = str(entry.get("kind") or "other")
+            selected = path == selected_path
+            hovered = hover_action == "entry" and path == hover_path
+            card_fill = _mix_rgba(
+                _rgba("surface_container", 225),
+                _rgba("primary_container", 220),
+                0.58 if selected else 0.0,
             )
             draw.rounded_rectangle(
-                row,
-                radius=8,
-                fill=_mix_rgba(
-                    _rgba("primary_container", 180),
-                    _rgba("primary_hover", 220),
-                    hover_amount if hovered else 0.0,
+                card,
+                radius=OPENXR_MENU_RADII["control"],
+                fill=card_fill,
+                outline=(
+                    _rgba("primary_hover", 220)
+                    if hovered
+                    else _rgba("outline", 150 if selected else 52)
                 ),
+                width=2 if selected or hovered else 1,
             )
-        center_y = (y0 + y1) // 2
-        _draw_kind_icon(
-            draw,
-            str(entry.get("kind") or "other"),
-            sidebar_right + 42,
-            center_y,
-            _rgba("text_primary"),
-        )
-        _text(
-            draw,
-            (sidebar_right + 76, center_y),
-            _fit_text(
+            preview_top = card[1] + 12
+            preview_height = min(
+                layout["grid_preview_height"], card[3] - card[1] - 94
+            )
+            preview_rect = (
+                card[0] + 12,
+                preview_top,
+                card[2] - 12,
+                preview_top + preview_height,
+            )
+            _paste_browser_thumbnail(
+                image,
                 draw,
-                str(entry.get("name") or path),
-                21,
-                width - sidebar_right - 204,
-            ),
-            21,
-            fill=_rgba("text_primary"),
-            anchor="lm",
-        )
-        if entry.get("kind") in {"video", "image", "disc"}:
-            left = width - 94
-            add_hovered = hover_action == "playlist_add" and hover_target == path
-            add_rect = _draw_control_surface(
-                draw,
-                (left, center_y - 24, left + 48, center_y + 24),
-                enabled=True,
-                hovered=add_hovered,
-                progress=hover_amount,
-                idle_alpha=220,
-                disabled_alpha=105,
+                preview_rect,
+                thumbnails.get(path),
+                kind,
                 radius=OPENXR_MENU_RADII["control"],
             )
             _text(
                 draw,
-                ((add_rect[0] + add_rect[2]) // 2, (add_rect[1] + add_rect[3]) // 2),
-                "+",
+                (card[0] + 14, preview_rect[3] + 14),
+                _fit_text(
+                    draw,
+                    str(entry.get("name") or path),
+                    24,
+                    card[2] - card[0] - 28,
+                ),
                 24,
                 fill=_rgba("text_primary"),
-                anchor="mm",
             )
+            if kind in {"video", "image", "disc"}:
+                add_hovered = hover_action == "playlist_add" and hover_target == path
+                add_rect = _draw_control_surface(
+                    draw,
+                    _browser_grid_add_rect(card),
+                    enabled=True,
+                    hovered=add_hovered,
+                    progress=hover_amount,
+                    idle_alpha=220,
+                    radius=OPENXR_MENU_RADII["control"],
+                )
+                _text(
+                    draw,
+                    (
+                        (add_rect[0] + add_rect[2]) // 2,
+                        (add_rect[1] + add_rect[3]) // 2,
+                    ),
+                    "+",
+                    24,
+                    fill=_rgba("text_primary"),
+                    anchor="mm",
+                )
+    else:
+        row_height = layout["file_row_height"]
+        for index, entry in enumerate(visible):
+            y0 = row_top + index * row_height
+            y1 = y0 + row_height - 4
+            path = str(entry.get("path", ""))
+            hovered = hover_action == "entry" and path == hover_path
+            if path == selected_path or hovered:
+                row = _scaled_rect(
+                    (sidebar_right + 18, y0, width - 38, y1),
+                    hover_amount if hovered else 0.0,
+                    scale=_MEDIA_HOVER_ROW_SCALE,
+                    lift=0.8,
+                )
+                draw.rounded_rectangle(
+                    row,
+                    radius=OPENXR_MENU_RADII["control"],
+                    fill=_mix_rgba(
+                        _rgba("primary_container", 180),
+                        _rgba("primary_hover", 220),
+                        hover_amount if hovered else 0.0,
+                    ),
+                )
+            center_y = (y0 + y1) // 2
+            _draw_kind_icon(
+                draw,
+                str(entry.get("kind") or "other"),
+                sidebar_right + 42,
+                center_y,
+                _rgba("text_primary"),
+            )
+            _text(
+                draw,
+                (sidebar_right + 76, center_y),
+                _fit_text(
+                    draw,
+                    str(entry.get("name") or path),
+                    24,
+                    width - sidebar_right - 204,
+                ),
+                24,
+                fill=_rgba("text_primary"),
+                anchor="lm",
+            )
+            if entry.get("kind") in {"video", "image", "disc"}:
+                add_hovered = hover_action == "playlist_add" and hover_target == path
+                add_rect = _draw_control_surface(
+                    draw,
+                    _browser_list_add_rect(center_y, width),
+                    enabled=True,
+                    hovered=add_hovered,
+                    progress=hover_amount,
+                    idle_alpha=220,
+                    radius=OPENXR_MENU_RADII["control"],
+                )
+                _text(
+                    draw,
+                    (
+                        (add_rect[0] + add_rect[2]) // 2,
+                        (add_rect[1] + add_rect[3]) // 2,
+                    ),
+                    "+",
+                    24,
+                    fill=_rgba("text_primary"),
+                    anchor="mm",
+                )
     if not entries:
         _text(
             draw,
@@ -1411,6 +1877,8 @@ def media_browser_hit(
         "browser_up",
         "browser_refresh",
         "browser_close",
+        "browser_view_grid",
+        "browser_view_list",
         "browse_open",
         "playlist_previous",
         "playlist_next",
@@ -1482,16 +1950,35 @@ def media_browser_hit(
                     if media_control_enabled("playlist_select", state)
                     else None
                 )
-    row_top = layout["file_rows_y"]
-    row_height = layout["file_row_height"]
-    row_bottom = row_top + _BROWSER_VISIBLE_ROWS * row_height
-    if sidebar_right + 18 <= x <= width - 38 and row_top <= y < row_bottom:
-        index = int((y - row_top) // row_height) + int(scroll_offset)
-        entries = list(state.get("browser_entries") or [])
-        if 0 <= index < len(entries):
-            if width - 94 <= x <= width - 46 and entries[index].get("kind") in {"video", "image", "disc"}:
-                center_y = row_top + (index - int(scroll_offset)) * row_height + (row_height - 4) // 2
-                if abs(y - center_y) <= 24:
-                    return "playlist_add", entries[index].get("path")
-            return ("entry", entries[index].get("path"))
+    entries = list(state.get("browser_entries") or [])
+    _scroll_step, visible_count, max_offset = media_browser_scroll_metrics(state)
+    offset = max(0, min(int(scroll_offset), max_offset))
+    visible = entries[offset : offset + visible_count]
+    if layout["view_mode"] == "grid":
+        for index, entry in enumerate(visible):
+            left, top, right, bottom = _browser_grid_card_rect(layout, index)
+            if left <= x <= right and top <= y <= bottom:
+                if entry.get("kind") in {"video", "image", "disc"}:
+                    add_left, add_top, add_right, add_bottom = _browser_grid_add_rect(
+                        (left, top, right, bottom)
+                    )
+                    if add_left <= x <= add_right and add_top <= y <= add_bottom:
+                        return "playlist_add", entry.get("path")
+                return "entry", entry.get("path")
+    else:
+        row_top = layout["file_rows_y"]
+        row_height = layout["file_row_height"]
+        row_bottom = row_top + visible_count * row_height
+        if sidebar_right + 18 <= x <= width - 38 and row_top <= y < row_bottom:
+            index = int((y - row_top) // row_height)
+            if 0 <= index < len(visible):
+                entry = visible[index]
+                center_y = row_top + index * row_height + (row_height - 4) // 2
+                if entry.get("kind") in {"video", "image", "disc"}:
+                    add_left, add_top, add_right, add_bottom = _browser_list_add_rect(
+                        center_y, width
+                    )
+                    if add_left <= x <= add_right and add_top <= y <= add_bottom:
+                        return "playlist_add", entry.get("path")
+                return "entry", entry.get("path")
     return None

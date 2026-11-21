@@ -31,76 +31,97 @@ if sys.platform == "win32":
     set_per_monitor_dpi_v2()
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--seconds", type=float, default=40.0)
-parser.add_argument("--label", default="")
-parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
-parser.add_argument("--interval", default="5")
-args = parser.parse_args()
+def main() -> int:
+    parser.add_argument("--seconds", type=float, default=40.0)
+    parser.add_argument("--label", default="")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument("--interval", default="5")
+    parser.add_argument("--model", help="Override Depth Model for this process")
+    parser.add_argument("--resolution", type=int, help="Override Depth Resolution for this process")
+    parser.add_argument(
+        "--parallel-inference-workers",
+        type=int,
+        choices=(1, 2, 3),
+        help="Set in-memory Parallel Inference and worker count for this process",
+    )
+    args = parser.parse_args()
 
-# Deterministic, clean process environment (mirrors run_windows_cuda.bat).
-for name in (
-    "D2S_FILAMENT_CONTROLLER_EYE_DIAGNOSTIC", "D2S_FILAMENT_EYE_DIAGNOSTIC",
-    "D2S_FILAMENT_MULTIVIEW_LAYER_READBACK", "D2S_FILAMENT_MULTIVIEW",
-    "D2S_FILAMENT_SHADER_DUMP_DIR", "D2S_FILAMENT_MULTIVIEW_PROJECTION_DIAGNOSTIC",
-    "D2S_FILAMENT_PROJECTION_ONLY", "D2S_OPENXR_PROJECTION_ARRAY_EYE_DIAGNOSTIC",
-    "D2S_OPENXR_SCREEN_QUAD_EYE_DIAGNOSTIC", "D2S_VULKAN_PROJECTION_COMPOSER_EYE_DIAGNOSTIC",
-    "D2S_VULKAN_PROJECTION_QUALITY_CHAIN", "D2S_ROCM_DISABLE_OPENXR_OVERLAYS",
-    "D2S_ROCM_ENABLE_OPENXR_OVERLAYS", "D2S_DEBUG", "D2S_BENCHMARK",
-):
-    os.environ.pop(name, None)
+    # Deterministic, clean process environment (mirrors run_windows_cuda.bat).
+    for name in (
+        "D2S_FILAMENT_CONTROLLER_EYE_DIAGNOSTIC", "D2S_FILAMENT_EYE_DIAGNOSTIC",
+        "D2S_FILAMENT_MULTIVIEW_LAYER_READBACK", "D2S_FILAMENT_MULTIVIEW",
+        "D2S_FILAMENT_SHADER_DUMP_DIR", "D2S_FILAMENT_MULTIVIEW_PROJECTION_DIAGNOSTIC",
+        "D2S_FILAMENT_PROJECTION_ONLY", "D2S_OPENXR_PROJECTION_ARRAY_EYE_DIAGNOSTIC",
+        "D2S_OPENXR_SCREEN_QUAD_EYE_DIAGNOSTIC", "D2S_VULKAN_PROJECTION_COMPOSER_EYE_DIAGNOSTIC",
+        "D2S_VULKAN_PROJECTION_QUALITY_CHAIN", "D2S_ROCM_DISABLE_OPENXR_OVERLAYS",
+        "D2S_ROCM_ENABLE_OPENXR_OVERLAYS", "D2S_DEBUG", "D2S_BENCHMARK",
+    ):
+        os.environ.pop(name, None)
 
-os.environ["D2S_FPS_BREAKDOWN"] = "1"
-os.environ["D2S_FPS_BREAKDOWN_INTERVAL"] = args.interval
-os.environ["D2S_FPS_BREAKDOWN_LIMIT"] = "0"
-os.environ["D2S_CRASH_LOG_DIR"] = str(ROOT / "outputs" / "openxr_ab")
+    os.environ["D2S_FPS_BREAKDOWN"] = "1"
+    os.environ["D2S_FPS_BREAKDOWN_INTERVAL"] = args.interval
+    os.environ["D2S_FPS_BREAKDOWN_LIMIT"] = "0"
+    os.environ["D2S_CRASH_LOG_DIR"] = str(ROOT / "outputs" / "openxr_ab")
 
-overrides: dict[str, str] = {}
-for item in args.set:
-    if "=" not in item:
-        raise SystemExit(f"--set expects KEY=VALUE, got {item!r}")
-    key, value = item.split("=", 1)
-    os.environ[key] = value
-    overrides[key] = value
+    overrides: dict[str, str] = {}
+    for item in args.set:
+        if "=" not in item:
+            raise SystemExit(f"--set expects KEY=VALUE, got {item!r}")
+        key, value = item.split("=", 1)
+        os.environ[key] = value
+        overrides[key] = value
 
-import utils  # noqa: E402
-from utils.settings import load_settings  # noqa: E402
+    import utils  # noqa: E402
 
-settings = load_settings()
+    settings = utils._get_settings()
+    if args.model:
+        settings["Depth Model"] = args.model
+    if args.resolution is not None:
+        settings["Depth Resolution"] = args.resolution
+    if args.parallel_inference_workers is not None:
+        settings["Parallel Inference"] = args.parallel_inference_workers > 1
+        settings["Parallel Inference Workers"] = args.parallel_inference_workers
 
-from stereo_runtime.hot_reload import StereoHotReloader  # noqa: E402
+    from stereo_runtime.hot_reload import StereoHotReloader  # noqa: E402
 
-StereoHotReloader.poll_settings_snapshot_if_needed = lambda *_a, **_kw: None
+    StereoHotReloader.poll_settings_snapshot_if_needed = lambda *_a, **_kw: None
 
-try:
-    from capture.backends.windows_capture_event import WindowsCaptureEventRunner  # noqa: E402
+    try:
+        from capture.backends.windows_capture_event import WindowsCaptureEventRunner  # noqa: E402
 
-    WindowsCaptureEventRunner._start_keyboard_worker = lambda *_a, **_kw: None
-except Exception:
-    pass
+        WindowsCaptureEventRunner._start_keyboard_worker = lambda *_a, **_kw: None
+    except Exception:
+        pass
 
-from app_runtime.runtime_entry import run_processing_runtime  # noqa: E402
+    from app_runtime.runtime_entry import run_processing_runtime  # noqa: E402
 
-print(
-    f"[XR-A/B] label={args.label or 'unnamed'} seconds={args.seconds} "
-    f"overrides={overrides or '{}'}",
-    flush=True,
-)
-print(
-    "[XR-A/B] settings "
-    f"run_mode={settings.get('Run Mode')} model={settings.get('Depth Model')} "
-    f"depth_resolution={settings.get('Depth Resolution')} "
-    f"render_scale={settings.get('Render Scale')} "
-    f"xr_render={settings.get('XR Render')} xr_mode={settings.get('XR Render Mode')} "
-    f"controller={settings.get('Controller Model')} "
-    f"environment={settings.get('Environment Model')}",
-    flush=True,
-)
-print(f"[XR-A/B] utils RUN_MODE={utils.RUN_MODE} DEVICE_INFO={utils.DEVICE_INFO}", flush=True)
+    print(
+        f"[XR-A/B] label={args.label or 'unnamed'} seconds={args.seconds} "
+        f"overrides={overrides or '{}'}",
+        flush=True,
+    )
+    print(
+        "[XR-A/B] settings "
+        f"run_mode={settings.get('Run Mode')} model={settings.get('Depth Model')} "
+        f"depth_resolution={settings.get('Depth Resolution')} "
+        f"parallel_inference={settings.get('Parallel Inference')} "
+        f"parallel_workers={settings.get('Parallel Inference Workers')} "
+        f"render_scale={settings.get('Render Scale')} "
+        f"xr_render={settings.get('XR Render')} xr_mode={settings.get('XR Render Mode')} "
+        f"controller={settings.get('Controller Model')} "
+        f"environment={settings.get('Environment Model')}",
+        flush=True,
+    )
+    print(f"[XR-A/B] utils RUN_MODE={utils.RUN_MODE} DEVICE_INFO={utils.DEVICE_INFO}", flush=True)
 
-try:
-    rc = run_processing_runtime(max_seconds=args.seconds)
-except Exception as exc:
-    print(f"[XR-A/B] FAILED {type(exc).__name__}: {exc}", flush=True)
-    raise
-print(f"[XR-A/B] finished rc={rc}", flush=True)
-raise SystemExit(int(rc or 0))
+    try:
+        rc = run_processing_runtime(max_seconds=args.seconds)
+    except Exception as exc:
+        print(f"[XR-A/B] FAILED {type(exc).__name__}: {exc}", flush=True)
+        raise
+    print(f"[XR-A/B] finished rc={rc}", flush=True)
+    return int(rc or 0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

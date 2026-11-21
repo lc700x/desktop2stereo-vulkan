@@ -290,6 +290,16 @@ def test_display_fit_stretch_uses_the_complete_source_and_target() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "display_mode",
+    ["Depth Map", "Anaglyph", "Interleaved", "Mono", "Leia"],
+)
+def test_single_image_display_modes_fill_same_monitor_target(display_mode: str) -> None:
+    assert presentation_blit_regions(
+        (1920, 1080), (3840, 2160), "contain", display_mode
+    ) == (((0, 0, 1920, 1080), (0, 0, 3840, 2160)),)
+
+
 def test_display_fit_normalizes_localized_stretch_label() -> None:
     assert presentation_blit_regions(
         (3840, 2160), (3840, 2400), "拉伸铺满", "Half-SBS"
