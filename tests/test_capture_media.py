@@ -1839,6 +1839,36 @@ def test_file_mode_without_saved_path_opens_output_browser_without_error(tmp_pat
     finally:
         source.stop()
 
+
+def test_file_mode_with_missing_saved_path_opens_configured_browser_directory(tmp_path):
+    missing_path = tmp_path / "old-machine" / "movie.mp4"
+    browser_directory = tmp_path / "media"
+    browser_directory.mkdir()
+    source = MediaCaptureSource(SimpleNamespace(
+        media_path=str(missing_path),
+        capture_mode="File",
+        media_resume_position=0.0,
+        media_volume=1.0,
+        media_muted=False,
+        media_browser_directory=str(browser_directory),
+        media_session_id="browser-session",
+        media_state_path=str(tmp_path / "media-state.json"),
+        media_control_path=None,
+        media_gui_control_path=None,
+        media_viewer_control_path=None,
+        media_audio_enabled=False,
+        output_resolution=1080,
+        fps=30,
+    ))
+    try:
+        assert source._browser_mode is True
+        assert source._ready is True
+        assert source.error.startswith("FileNotFoundError:")
+        assert source._browser.snapshot()["browser_path"] == str(browser_directory)
+        assert source._browser.snapshot()["browser_visible"] is True
+    finally:
+        source.stop()
+
 @pytest.mark.parametrize("backend", ["nvdec", "ffmpeg-software", "source-frames"])
 def test_frame_pump_decimates_once_and_preserves_original_pts(backend, monkeypatch):
     """Exercise the real reader + pump, not a mock that already invents correct PTS."""

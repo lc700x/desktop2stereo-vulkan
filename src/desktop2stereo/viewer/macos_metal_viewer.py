@@ -13,6 +13,7 @@ touching the pipeline: initialize() / present(frame) / poll_events() / close().
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import queue
@@ -23,6 +24,12 @@ from dataclasses import replace
 from typing import Any
 
 from utils.display_info import resolve_glfw_monitor_index
+from media_ui import (
+    MEDIA_BROWSER_TEXTURE_SIZE,
+    build_media_browser_rgba,
+    media_browser_hit,
+    media_browser_scroll_metrics,
+)
 
 if sys.platform == "darwin":
     import Metal
@@ -121,12 +128,15 @@ fragment float4 quad_fragment(
     texture2d<float> tex [[texture(0)]],
     texture2d<float> cursorTex [[texture(1)]],
     texture2d<float> fpsTex [[texture(2)]],
+    texture2d<float> mediaTex [[texture(3)]],
     sampler smp [[sampler(0)]],
     constant float4 &uv_xform [[buffer(0)]],
     constant float4 &cursor_rect_left [[buffer(1)]],
     constant float4 &cursor_rect_right [[buffer(2)]],
     constant float4 &fps_rect_left [[buffer(3)]],
-    constant float4 &fps_rect_right [[buffer(4)]]
+    constant float4 &fps_rect_right [[buffer(4)]],
+    constant float4 &media_rect_left [[buffer(5)]],
+    constant float4 &media_rect_right [[buffer(6)]]
 ) {
     float2 uv = (in.uv - uv_xform.zw) / max(uv_xform.xy, float2(1e-6));
     if (any(uv < 0.0) || any(uv > 1.0)) {
@@ -137,6 +147,8 @@ fragment float4 quad_fragment(
     color = blend_cursor(color, in.position.xy, cursor_rect_right, cursorTex, smp);
     color = blend_overlay(color, in.position.xy, fps_rect_left, fpsTex, smp);
     color = blend_overlay(color, in.position.xy, fps_rect_right, fpsTex, smp);
+    color = blend_overlay(color, in.position.xy, media_rect_left, mediaTex, smp);
+    color = blend_overlay(color, in.position.xy, media_rect_right, mediaTex, smp);
     return color;
 }
 """
@@ -166,6 +178,7 @@ struct Uniforms {
     float4 cursorRectLeft;
     float4 cursorRectRight;
     float4 fpsRect;
+    float4 mediaRect;
     // x/y are the raw Core ML depth range; z selects raw-depth sampling.
     float4 rawNormalize;
 };
@@ -270,6 +283,7 @@ fragment float4 fragment_main(
     texture2d<float> depthTex [[texture(1)]],
     texture2d<float> cursorTex [[texture(2)]],
     texture2d<float> fpsTex [[texture(3)]],
+    texture2d<float> mediaTex [[texture(4)]],
     constant Uniforms& u [[buffer(0)]]
 ) {
     constexpr sampler s(address::clamp_to_edge, filter::linear);
@@ -319,23 +333,10 @@ fragment float4 fragment_main(
     color = blend_cursor(color, frag, u.cursorRectLeft, cursorTex, s);
     color = blend_cursor(color, frag, u.cursorRectRight, cursorTex, s);
     color = blend_overlay(color, frag, u.fpsRect, fpsTex, s);
+    color = blend_overlay(color, frag, u.mediaRect, mediaTex, s);
     return color;
 }
 """
-
-
-def _srgb_view_for_capture_texture(texture: Any) -> Any:
-    """Interpret BGRA ScreenCaptureKit bytes as sRGB without copying them."""
-    srgb_format = Metal.MTLPixelFormatBGRA8Unorm_sRGB
-    pixel_format = texture.pixelFormat()
-    if pixel_format == srgb_format:
-        return texture
-    if pixel_format != Metal.MTLPixelFormatBGRA8Unorm:
-        raise RuntimeError(f"unsupported ScreenCaptureKit texture format: {pixel_format}")
-    view = texture.newTextureViewWithPixelFormat_(srgb_format)
-    if view is None:
-        raise RuntimeError("could not create an sRGB view of the ScreenCaptureKit texture")
-    return view
 
 
 class MetalLocalViewer:
@@ -360,6 +361,17 @@ class MetalLocalViewer:
         self._fps_overlay_texture = None
         self._fps_overlay_size = (0, 0)
         self._fps_overlay_visible = False
+        self._media_overlay_texture = None
+        self._media_overlay_size = (0, 0)
+        self._media_overlay_key = None
+        self._media_state: dict[str, Any] = {}
+        self._media_state_read_at = 0.0
+        self._media_browser_scroll = 0
+        self._media_browser_hover: str | None = None
+        self._media_browser_rects: tuple[tuple[int, int, int, int], ...] = ()
+        self._last_eye_rects: tuple[tuple[int, int, int, int], ...] = ()
+        self._media_last_cursor_position: tuple[float, float] | None = None
+        self._media_passthrough_active = False
         self._staging_texture = None
         self._staging_size = (0, 0)
         self._native_pack_size = (0, 0)
@@ -485,6 +497,9 @@ class MetalLocalViewer:
         self._fps_started = time.perf_counter()
         self._present_window_start = self._fps_started
         glfw.set_key_callback(self.window, self._on_key)
+        glfw.set_cursor_pos_callback(self.window, self._on_cursor_pos)
+        glfw.set_mouse_button_callback(self.window, self._on_mouse_button)
+        glfw.set_scroll_callback(self.window, self._on_scroll)
 
         self._attach_metal_layer()
         self._register_capture_window()
@@ -492,12 +507,15 @@ class MetalLocalViewer:
         self._cursor_texture = self._new_cursor_texture(1, 1, b"\x00\x00\x00\x00")
         self._fps_overlay_texture = self._new_cursor_texture(1, 1, b"\x00\x00\x00\x00")
         self._fps_overlay_size = (1, 1)
+        self._media_overlay_texture = self._new_cursor_texture(1, 1, b"\x00\x00\x00\x00")
+        self._media_overlay_size = (1, 1)
         if self.config.cursor_passthrough:
             self._cursor_hide_enabled = set_window_mouse_passthrough(
                 self.window,
                 True,
                 hide_cursor_overlay=bool(self.config.hide_cursor_overlay),
             )
+            self._media_passthrough_active = True
         pin_macos_viewer_window(
             self.window, fullscreen=exclusive_fullscreen
         )
@@ -529,10 +547,11 @@ class MetalLocalViewer:
         if self.device is None:
             raise RuntimeError("No Metal device available")
         self.queue = self.device.newCommandQueue()
-        # Decode sRGB inputs to linear values when sampled, then let the sRGB
-        # drawable encode them once. Tell WindowServer the layer uses sRGB too.
-        self._drawable_pixel_format = Metal.MTLPixelFormatBGRA8Unorm_sRGB
-        self._source_pixel_format = Metal.MTLPixelFormatRGBA8Unorm_sRGB
+        # SCK supplies display-referred sRGB bytes. Keep the render target and
+        # staged textures unorm so Metal does not apply another transfer; tag
+        # the layer so WindowServer can color-manage those bytes for the display.
+        self._drawable_pixel_format = Metal.MTLPixelFormatBGRA8Unorm
+        self._source_pixel_format = Metal.MTLPixelFormatRGBA8Unorm
         layer.setDevice_(self.device)
         layer.setPixelFormat_(self._drawable_pixel_format)
         layer.setColorspace_(Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB))
@@ -653,6 +672,192 @@ class MetalLocalViewer:
             enabled and self._fps_overlay_texture is not None
         )
         return self._fps_overlay_visible
+
+    def _read_media_state(self) -> dict[str, Any]:
+        path = str(getattr(self.config, "media_state_path", "") or "").strip()
+        session = str(getattr(self.config, "media_session_id", "") or "").strip()
+        now = time.monotonic()
+        state_cache = getattr(self, "_media_state", {})
+        if not path or now - float(getattr(self, "_media_state_read_at", 0.0)) < 0.20:
+            return state_cache
+        self._media_state_read_at = now
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                state = json.load(stream)
+        except (OSError, ValueError, UnicodeError):
+            return state_cache
+        if not isinstance(state, dict) or (session and state.get("session") != session):
+            return state_cache
+        if state != state_cache:
+            self._media_state = state
+            self._media_overlay_key = None
+        return state
+
+    def _media_browser_visible(self) -> bool:
+        state = self._read_media_state()
+        visible = (
+            str(state.get("mode", "")).casefold() == "browser"
+            and bool(state.get("ready", True))
+            and bool(state.get("browser_visible"))
+        )
+        if getattr(self.config, "cursor_passthrough", False) and self.window is not None:
+            want_passthrough = not visible
+            if want_passthrough != getattr(self, "_media_passthrough_active", False):
+                set_window_mouse_passthrough(
+                    self.window,
+                    want_passthrough,
+                    hide_cursor_overlay=bool(
+                        want_passthrough
+                        and bool(getattr(self.config, "hide_cursor_overlay", False))
+                    ),
+                )
+                self._media_passthrough_active = want_passthrough
+        return visible
+
+    @staticmethod
+    def _media_browser_rect_for_eye(
+        eye_rect: tuple[int, int, int, int]
+    ) -> tuple[int, int, int, int]:
+        left, top, right, bottom = (int(value) for value in eye_rect)
+        eye_w = max(1, right - left)
+        eye_h = max(1, bottom - top)
+        aspect = MEDIA_BROWSER_TEXTURE_SIZE[0] / MEDIA_BROWSER_TEXTURE_SIZE[1]
+        max_w = max(1, int(eye_w * 0.98))
+        max_h = max(1, int(eye_h * 0.88))
+        if max_w / max_h > aspect:
+            panel_h = max_h
+            panel_w = max(1, int(panel_h * aspect))
+        else:
+            panel_w = max_w
+            panel_h = max(1, int(panel_w / aspect))
+        x = left + (eye_w - panel_w) // 2
+        y = top + (eye_h - panel_h) // 2
+        return (x, y, x + panel_w, y + panel_h)
+
+    def _media_overlay_rects(
+        self, eye_rects: tuple[tuple[int, int, int, int], ...]
+    ) -> tuple[tuple[float, float, float, float], ...]:
+        if not self._media_browser_visible() or self._media_overlay_texture is None:
+            return tuple((0.0, 0.0, 0.0, 0.0) for _ in eye_rects) or (
+                (0.0, 0.0, 0.0, 0.0),
+            )
+        rects = tuple(self._media_browser_rect_for_eye(rect) for rect in eye_rects)
+        self._media_browser_rects = rects
+        return tuple(tuple(float(value) for value in rect) for rect in rects) or (
+            (0.0, 0.0, 0.0, 0.0),
+        )
+
+    def _refresh_media_overlay(self) -> None:
+        if not self._media_browser_visible():
+            return
+        state = self._media_state
+        key = (
+            state.get("browser_revision"),
+            state.get("browser_path"),
+            state.get("browser_selection"),
+            state.get("browser_error"),
+            self._media_browser_scroll,
+            getattr(self.config, "locale", "EN"),
+        )
+        if key == self._media_overlay_key:
+            return
+        lang = "CN" if str(getattr(self.config, "locale", "EN")).upper() == "CN" else "EN"
+        rgba = build_media_browser_rgba(
+            state,
+            width=MEDIA_BROWSER_TEXTURE_SIZE[0],
+            height=MEDIA_BROWSER_TEXTURE_SIZE[1],
+            hover=self._media_browser_hover,
+            scroll_offset=self._media_browser_scroll,
+            lang=lang,
+        )
+        width, height = (int(value) for value in rgba.shape[1::-1])
+        if self._media_overlay_texture is None or self._media_overlay_size != (width, height):
+            self._media_overlay_texture = self._make_texture(
+                width, height, self._source_pixel_format
+            )
+            self._media_overlay_size = (width, height)
+        region = Metal.MTLRegionMake2D(0, 0, width, height)
+        self._media_overlay_texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(
+            region, 0, rgba.tobytes(), width * 4
+        )
+        self._media_overlay_key = key
+
+    def _media_action(self, action: str, value: Any = None) -> bool:
+        callback = getattr(self.config, "media_action_callback", None)
+        if not callable(callback):
+            return False
+        return bool(callback(action, value))
+
+    def _dispatch_media_hit(self, hit: tuple[str, Any] | None) -> None:
+        if hit is None:
+            return
+        action, value = hit
+        if action in {"entry", "recent"}:
+            self._media_action("browse_open", {"path": value})
+        elif action == "mount":
+            self._media_action("browse", value)
+        elif action in {"browse_open", "playlist_add", "playlist_select", "playlist_remove", "recent_remove"}:
+            self._media_action(action, {"path": value} if value else None)
+        else:
+            self._media_action(action, value)
+
+    def _media_hit_from_cursor(self, xpos: float, ypos: float) -> tuple[str, Any] | None:
+        if not self._media_browser_visible() or not self._media_browser_rects:
+            return None
+        try:
+            client_w, client_h = self.glfw.get_window_size(self.window)
+            fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
+        except Exception:
+            return None
+        x = float(xpos) * max(1, int(fb_w)) / max(1, int(client_w))
+        y = float(ypos) * max(1, int(fb_h)) / max(1, int(client_h))
+        for rect, panel in zip(self._last_eye_rects, self._media_browser_rects):
+            left, top, right, bottom = panel
+            if not (left <= x < right and top <= y < bottom):
+                continue
+            u = (x - left) / max(1, right - left)
+            v = (y - top) / max(1, bottom - top)
+            hit = media_browser_hit(
+                u,
+                v,
+                self._media_state,
+                scroll_offset=self._media_browser_scroll,
+            )
+            if hit is None:
+                return None
+            return hit
+        return None
+
+    def _on_cursor_pos(self, _window: Any, xpos: float, ypos: float) -> None:
+        self._media_last_cursor_position = (float(xpos), float(ypos))
+        hit = self._media_hit_from_cursor(xpos, ypos)
+        next_hover = f"{hit[0]}:{hit[1]}" if hit is not None else None
+        if next_hover != self._media_browser_hover:
+            self._media_browser_hover = next_hover
+            self._media_overlay_key = None
+            self._refresh_media_overlay()
+
+    def _on_mouse_button(self, _window: Any, button: int, action: int, _mods: int) -> None:
+        if int(button) != int(getattr(self.glfw, "MOUSE_BUTTON_LEFT", 0)):
+            return
+        if int(action) != int(getattr(self.glfw, "PRESS", 1)):
+            return
+        try:
+            xpos, ypos = self.glfw.get_cursor_pos(self.window)
+        except Exception:
+            return
+        self._dispatch_media_hit(self._media_hit_from_cursor(xpos, ypos))
+
+    def _on_scroll(self, _window: Any, _xoffset: float, yoffset: float) -> None:
+        if not self._media_browser_visible():
+            return
+        _step, _visible, maximum = media_browser_scroll_metrics(self._media_state)
+        self._media_browser_scroll = max(
+            0,
+            min(maximum, self._media_browser_scroll + (-3 if yoffset > 0 else 3)),
+        )
+        self._media_overlay_key = None
+        self._refresh_media_overlay()
 
     def _upload_fps_overlay(self, panel: Any) -> bool:
         if panel is None:
@@ -897,6 +1102,13 @@ class MetalLocalViewer:
             or os.environ.get("D2S_GPU_IMAGE_PIPELINE_REQUIRED", "0") == "1"
         )
         native_frame = getattr(frame, "viewer_native", None)
+        if (
+            self._media_browser_visible()
+            and native_frame is None
+            and getattr(frame, "viewer_rgb", None) is None
+            and getattr(frame, "viewer_frame_np", None) is None
+        ):
+            return self.present_media_browser()
         # The shader-warp compatibility path uploads depth through CPU memory.
         # Strict GPU mode uses the native CoreML/Metal packer instead.
         rgb = getattr(frame, "viewer_rgb", None)
@@ -1017,6 +1229,9 @@ class MetalLocalViewer:
                 content_top + content_height,
             ),
         )
+        self._last_eye_rects = eye_rects
+        self._refresh_media_overlay()
+        media_rects = self._media_overlay_rects(eye_rects)
 
         submit_started = time.perf_counter()
         command_buffer = self.queue.commandBuffer()
@@ -1047,6 +1262,10 @@ class MetalLocalViewer:
         if fps_texture is None:
             fps_texture = self._cursor_texture
         encoder.setFragmentTexture_atIndex_(fps_texture, 2)
+        media_texture = self._media_overlay_texture
+        if media_texture is None:
+            media_texture = self._cursor_texture
+        encoder.setFragmentTexture_atIndex_(media_texture, 3)
         encoder.setFragmentBytes_length_atIndex_(
             struct.pack("4f", *cursor_rects[0]), 16, 1
         )
@@ -1062,6 +1281,16 @@ class MetalLocalViewer:
             ),
             16,
             4,
+        )
+        encoder.setFragmentBytes_length_atIndex_(
+            struct.pack("4f", *media_rects[0]), 16, 5
+        )
+        encoder.setFragmentBytes_length_atIndex_(
+            struct.pack(
+                "4f", *(media_rects[1] if len(media_rects) > 1 else media_rects[0])
+            ),
+            16,
+            6,
         )
         encoder.drawPrimitives_vertexStart_vertexCount_(
             Metal.MTLPrimitiveTypeTriangleStrip, 0, 4
@@ -1096,6 +1325,10 @@ class MetalLocalViewer:
 
     def present_cached(self) -> bool:
         """Redraw the last GPU frame so cursor motion is independent of inference."""
+        if self._media_browser_visible() and getattr(self, "_cursor_texture", None) is not None:
+            self.poll_events()
+            self._sync_fps_overlay_visibility()
+            return self._present_packed_texture(self._cursor_texture, 2, 1)
         if (
             self.window is not None
             and self._initialized_flag()
@@ -1119,6 +1352,14 @@ class MetalLocalViewer:
         self.poll_events()
         self._sync_fps_overlay_visibility()
         return self._present_packed_texture(texture, width, height)
+
+    def present_media_browser(self) -> bool:
+        """Present the file browser before a media frame is available."""
+        if not self._media_browser_visible() or getattr(self, "_cursor_texture", None) is None:
+            return False
+        self.poll_events()
+        self._sync_fps_overlay_visibility()
+        return self._present_packed_texture(self._cursor_texture, 2, 1)
 
     def _present_cached(self) -> bool:
         """Compatibility alias matching the Vulkan viewer interface."""
@@ -1168,7 +1409,7 @@ class MetalLocalViewer:
         )
         if self._warp_color_size != color_size:
             self._warp_color_tex = self._make_texture(
-                color_size[0], color_size[1], Metal.MTLPixelFormatRGBA8Unorm
+                color_size[0], color_size[1], self._source_pixel_format
             )
             self._warp_color_size = color_size
         fmt = self._warp_depth_format or Metal.MTLPixelFormatR32Float
@@ -1417,10 +1658,9 @@ class MetalLocalViewer:
                 (width, height), (dw, dh), depth_u8=depth_is_u8
             )
         if zc_texture is not None:
-            # CVMetalTextureCache exposes BGRA8Unorm, so sampling it directly
-            # treats encoded sRGB values as linear and washes out the output.
-            # This compatible view decodes sRGB from the same IOSurface.
-            color_tex = _srgb_view_for_capture_texture(zc_texture)
+            # Preserve ScreenCaptureKit's display-referred sRGB bytes through
+            # the unorm drawable; the CAMetalLayer carries the sRGB colorspace.
+            color_tex = zc_texture
         else:
             color_region = Metal.MTLRegionMake2D(0, 0, width, height)
             self._warp_color_tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(
@@ -1519,6 +1759,9 @@ class MetalLocalViewer:
             )
             for viewport, _eye_offset in viewports
         )
+        self._last_eye_rects = eye_rects
+        self._refresh_media_overlay()
+        media_rects = self._media_overlay_rects(eye_rects)
         cursor_rects = self._cursor_overlay_rects(eye_rects)
         fps_rects = self._fps_overlay_rects(eye_rects)
         encoder.setFragmentTexture_atIndex_(self._cursor_texture, 2)
@@ -1526,11 +1769,15 @@ class MetalLocalViewer:
         if fps_texture is None:
             fps_texture = self._cursor_texture
         encoder.setFragmentTexture_atIndex_(fps_texture, 3)
+        media_texture = self._media_overlay_texture
+        if media_texture is None:
+            media_texture = self._cursor_texture
+        encoder.setFragmentTexture_atIndex_(media_texture, 4)
         for index, (viewport, eye_offset) in enumerate(viewports):
-            # struct.pack: numpy-free uniform payload (28 floats, native LE
+            # struct.pack: numpy-free uniform payload (32 floats, native LE
             # matches MSL float layout).
             payload = struct.pack(
-                "<28f",
+                "<32f",
                 eye_offset,
                 warp_depth_strength,
                 warp_convergence,
@@ -1548,6 +1795,11 @@ class MetalLocalViewer:
                 *(
                     fps_rects[index]
                     if index < len(fps_rects)
+                    else (0.0, 0.0, 0.0, 0.0)
+                ),
+                *(
+                    media_rects[index]
+                    if index < len(media_rects)
                     else (0.0, 0.0, 0.0, 0.0)
                 ),
                 *raw_normalize,
@@ -2036,9 +2288,11 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
                 if viewer is not None:
                     now = time.perf_counter()
                     cached_present = getattr(viewer, "present_cached", None)
+                    browser_visible = getattr(viewer, "_media_browser_visible", None)
+                    browser_visible = bool(browser_visible()) if callable(browser_visible) else False
                     if (
                         callable(cached_present)
-                        and _has_cached_frame(viewer)
+                        and (_has_cached_frame(viewer) or browser_visible)
                         and now >= next_cached_present_at
                     ):
                         present_started = now

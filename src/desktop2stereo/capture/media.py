@@ -816,9 +816,14 @@ class MediaCaptureSource:
             if self._configured_mode.casefold() == "file":
                 self._browser_mode = True
                 self._ready = True
-                self._browser.open(
-                    str(Path(self.path).parent) if self.path else None
-                )
+                browser_directory = str(
+                    getattr(self.config, "media_browser_directory", "") or ""
+                ).strip()
+                if not browser_directory or not Path(browser_directory).is_dir():
+                    browser_directory = (
+                        str(Path(self.path).parent) if self.path else ""
+                    )
+                self._browser.open(browser_directory or None)
             if self.error:
                 print(f"[media] {self.error}", flush=True)
         self._publish_state(force=True)
