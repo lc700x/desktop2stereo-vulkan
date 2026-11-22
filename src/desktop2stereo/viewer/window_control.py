@@ -775,18 +775,24 @@ elif OS_NAME == "Darwin":
         ns_window = _cocoa_window(window)
         # A normal Cocoa window belongs to the Space in which it was created.
         # Native video fullscreen creates a different Space, so ordering the
-        # same window again is not enough. These behaviors make the output a
-        # non-activating auxiliary window in every Space, including fullscreen
-        # Spaces owned by another application.
+        # same window again is not enough. The output must join the active
+        # Space without activating or stealing focus from the video player.
         behavior = getattr(AppKit, "NSWindowCollectionBehaviorDefault", 0)
-        for name in (
+        # AppKit treats CanJoinAllApplications as a full-screen participation
+        # mode, not an additional decoration on FullScreenAuxiliary. Setting
+        # both makes the GLFW window ineligible to join another app's full-
+        # screen Space on current macOS releases.
+        behavior_names = [
             "NSWindowCollectionBehaviorCanJoinAllSpaces",
-            # macOS 13+: this is the bit that lets a floating window join a
-            # different application's fullscreen Space, not just our own.
-            "NSWindowCollectionBehaviorCanJoinAllApplications",
-            "NSWindowCollectionBehaviorFullScreenAuxiliary",
             "NSWindowCollectionBehaviorIgnoresCycle",
-        ):
+        ]
+        if fullscreen:
+            behavior_names.append(
+                "NSWindowCollectionBehaviorCanJoinAllApplications"
+            )
+        else:
+            behavior_names.append("NSWindowCollectionBehaviorFullScreenAuxiliary")
+        for name in behavior_names:
             behavior |= int(getattr(AppKit, name, 0))
         if fullscreen:
             # Stationary prevents Mission Control from moving the output to a
