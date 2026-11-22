@@ -45,12 +45,14 @@ def test_install_mps_contains_moltenvk_install_step() -> None:
     assert "brew list --formula vulkan-loader" in script
 
 
-def test_install_mps_rebuilds_a_verified_python312_environment() -> None:
+def test_install_mps_rebuilds_a_verified_python312_mps_environment() -> None:
     script = (ROOT / "src" / "env_install" / "install-mps").read_text(encoding="utf-8")
     assert 'PYTHON_CMD="python3.12"' in script
     assert "brew install python@3.12" in script
     assert 'STAGING_ENV="$PROJECT_ROOT/python3.staging.$$"' in script
     assert 'requirements-mps.txt' in script
     assert "verify_macos_runtime" in script
+    assert "import coremltools" in script
+    assert "mlx" not in script.lower()
     assert 'BACKUP_ENV="$VIRTUAL_ENV.backup.' in script
     assert "chmod -R 777" not in script

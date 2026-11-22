@@ -10,7 +10,6 @@ from pathlib import Path
 _OPTIONAL_MODULES = {
     "flet": "flet",
     "torch": "torch",
-    "mlx": "mlx.core",
     "vulkan": "vulkan",
     "openxr": "xr",
     "tensorrt": "tensorrt",
@@ -214,7 +213,7 @@ def hardware_regression_matrix() -> list[dict[str, object]]:
         ("Linux", "NVIDIA", "TensorRT -> PyTorch CUDA -> CPU"),
         ("Linux", "AMD", "MIGraphX/ROCm -> PyTorch ROCm -> CPU"),
         ("Linux", "Intel/其他 GPU", "已验证厂商后端 -> CPU"),
-        ("macOS", "Apple Silicon", "MLX Metal -> PyTorch MPS -> GPU stereo output"),
+        ("macOS", "Apple Silicon", "CoreML/PyTorch MPS -> GPU stereo output"),
         ("macOS", "Intel Mac", "本项目不实现原生 CoreML/Metal 链路"),
         ("跨平台", "GPU 后端不可用", "CPU 推理 -> CPU 合成/输出"),
     ]

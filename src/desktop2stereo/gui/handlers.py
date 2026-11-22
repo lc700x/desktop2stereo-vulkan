@@ -264,8 +264,6 @@ class GUIHandlerMixin:
         self.coreml_cb.visible = mps
         self.coreml_cb.disabled = False
         self.recompile_coreml_cb.visible = self.coreml_cb.value if self.coreml_cb.visible else False
-        self.mlx_cb.visible = mps
-        self.mlx_cb.disabled = False
         self.openvino_cb.visible = xpu
         self.openvino_cb.disabled = False
         self.recompile_openvino_cb.visible = self.openvino_cb.value if self.openvino_cb.visible else False
@@ -286,7 +284,6 @@ class GUIHandlerMixin:
             self.recompile_migraphx_cb.visible = False
             self.coreml_cb.visible = False
             self.recompile_coreml_cb.visible = False
-            self.mlx_cb.visible = False
             self.openvino_cb.visible = False
             self.recompile_openvino_cb.visible = False
         current_model = self.current_model_name
@@ -312,11 +309,6 @@ class GUIHandlerMixin:
         self.recompile_coreml_cb.visible = self.coreml_cb.value
         self._fit_window_to_content()
 
-    def _on_mlx_toggle(self, e):
-        if e is not None:
-            self._config["MLX"] = bool(self.mlx_cb.value)
-        self._fit_window_to_content()
-
     def _on_openvino_toggle(self, e):
         if e is not None:
             self._config["OpenVINO"] = bool(self.openvino_cb.value)
@@ -335,7 +327,6 @@ class GUIHandlerMixin:
         values = {
             "TensorRT": None,
             "CoreML": None,
-            "MLX": None,
             "OpenVINO": None,
             "MIGraphX": None,
         }
@@ -370,11 +361,6 @@ class GUIHandlerMixin:
             active_cb = self.coreml_cb
             recompile_cb = self.recompile_coreml_cb
             disabled_by_model = any(kw in model_lower for kw in DISABLE_COREML_KEYWORDS)
-            values["MLX"] = (
-                bool(self.mlx_cb.value)
-                if use_control_values
-                else bool(self._config.get("MLX", DEFAULTS["MLX"]))
-            )
         elif "XPU" in device_label:
             active_key = "OpenVINO"
             recompile_key = "Recompile OpenVINO"
@@ -405,7 +391,6 @@ class GUIHandlerMixin:
         if update_controls:
             self.tensorrt_cb.value = bool(values["TensorRT"])
             self.coreml_cb.value = bool(values["CoreML"])
-            self.mlx_cb.value = bool(values["MLX"])
             self.openvino_cb.value = bool(values["OpenVINO"])
             self.migraphx_cb.value = bool(values["MIGraphX"])
             self.recompile_trt_cb.value = recompile_values["Recompile TensorRT"]
@@ -415,7 +400,6 @@ class GUIHandlerMixin:
 
         self._on_trt_toggle(None)
         self._on_coreml_toggle(None)
-        self._on_mlx_toggle(None)
         self._on_openvino_toggle(None)
         self._on_migraphx_toggle(None)
 
@@ -2000,7 +1984,6 @@ class GUIHandlerMixin:
         self.parallel_inference_dd.options = self._parallel_inference_options()
         self.parallel_inference_dd.value = self._parallel_inference_to_display(parallel_workers)
         self.coreml_cb.label = t["CoreML"]
-        self.mlx_cb.label = t.get("MLX", "MLX")
         self.openvino_cb.label = t["OpenVINO"]
         self.recompile_trt_cb.label = t["Recompile TensorRT"]
         self.recompile_coreml_cb.label = t["Recompile CoreML"]

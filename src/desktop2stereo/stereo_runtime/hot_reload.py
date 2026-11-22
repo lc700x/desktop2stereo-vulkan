@@ -94,7 +94,7 @@ def _is_fast_quality(settings_dict: dict, config) -> bool:
 
 
 def _depth_backend_hot_reload(settings_dict: dict, config):
-    backend_keys = {"Depth Backend", "MIGraphX", "TensorRT", "ONNX", "MLX"}
+    backend_keys = {"Depth Backend", "MIGraphX", "TensorRT", "ONNX"}
     if not backend_keys.intersection(settings_dict):
         return None
     import torch
@@ -110,11 +110,6 @@ def _depth_backend_hot_reload(settings_dict: dict, config):
         return "tensorrt_native"
     if to_bool_hot_reload(settings_dict.get("ONNX", False)):
         return "onnx_cuda"
-    if device_type == "mps" and "MLX" in settings_dict:
-        if to_bool_hot_reload(settings_dict["MLX"]):
-            return "mlx"
-        if getattr(config, "depth_backend", None) == "mlx":
-            return "auto"
     if settings_dict.get("Depth Backend"):
         return _normalize_depth_backend(settings_dict["Depth Backend"])
     # No backend explicitly selected: "TensorRT: null" etc. are saved

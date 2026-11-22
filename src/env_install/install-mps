@@ -53,7 +53,7 @@ echo "- Updating pip"
     --cache-dir "$PIP_CACHE_DIR" --prefer-binary \
     --retries "$PIP_RETRIES" --timeout "$PIP_TIMEOUT"
 
-echo "- Installing macOS MPS and MLX requirements"
+echo "- Installing macOS MPS and CoreML requirements"
 "$STAGING_PYTHON" -m pip install -r "$SCRIPT_DIR/requirements-mps.txt" \
     --cache-dir "$PIP_CACHE_DIR" --prefer-binary \
     --retries "$PIP_RETRIES" --timeout "$PIP_TIMEOUT"
@@ -63,21 +63,18 @@ echo "- Installing macOS MPS and MLX requirements"
 
 verify_macos_runtime() {
     "$1" - <<'PY'
-import mlx.core as mx
-import mlx.nn  # noqa: F401
+import coremltools
 import torch
 
-if not mx.is_available(mx.gpu) or not mx.metal.is_available():
-    raise SystemExit("MLX Metal GPU is unavailable")
 if not torch.backends.mps.is_available():
     raise SystemExit("PyTorch MPS is unavailable")
-print(f"MLX Metal and PyTorch MPS are ready (MLX {mx.__version__ if hasattr(mx, '__version__') else 'installed'})")
+print(f"PyTorch MPS and CoreML are ready (torch {torch.__version__}, coremltools {coremltools.__version__})")
 PY
 }
 
-echo "- Verifying MLX Metal and PyTorch MPS"
+echo "- Verifying PyTorch MPS and CoreML"
 if ! verify_macos_runtime "$STAGING_PYTHON"; then
-    echo "The replacement environment failed its MLX/MPS check; the current environment was kept." >&2
+    echo "The replacement environment failed its MPS/CoreML check; the current environment was kept." >&2
     echo "Review the error above, then rerun src/env_install/install-mps." >&2
     exit 1
 fi

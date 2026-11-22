@@ -709,24 +709,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             "yes",
             "on",
         }
-        mlx_requested = str(settings.get("MLX", False)).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        configured_backend = str(settings.get("Depth Backend", "")).strip().lower()
-        forced_backend = os.environ.get("D2S_DEPTH_BACKEND", "").strip().lower()
-        mlx_requested = mlx_requested or configured_backend in {
-            "mlx",
-            "apple_mlx",
-            "mlx_metal",
-        } or forced_backend in {
-            "mlx",
-            "apple_mlx",
-            "mlx_metal",
-        }
-        if coreml_requested and not mlx_requested:
+        if coreml_requested:
             os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")
             os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")
         # Ship packed uint8 SBS so the viewer skips float32 transport

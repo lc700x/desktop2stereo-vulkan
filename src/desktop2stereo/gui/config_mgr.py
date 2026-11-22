@@ -69,6 +69,7 @@ class GUIConfigMixin:
             cfg["Stereo Output"] = resolved_stereo_index
         self._config = cfg.copy()
         self._config.pop("Debug Mode", None)
+        self._config.pop("MLX", None)
         
         # Try to find the saved monitor by index, fallback to primary or first available
         label = None
@@ -271,7 +272,6 @@ class GUIConfigMixin:
         cml_val = cfg.get("CoreML")
         if cml_val is not None:
             self.coreml_cb.value = cml_val
-        self.mlx_cb.value = cfg.get("MLX", DEFAULTS["MLX"])
         self.recompile_coreml_cb.value = cfg.get("Recompile CoreML", DEFAULTS["Recompile CoreML"])
         ov_val = cfg.get("OpenVINO")
         if ov_val is not None:
@@ -622,6 +622,7 @@ class GUIConfigMixin:
             except Exception:
                 pass
         cfg.pop("Debug Mode", None)
+        cfg.pop("MLX", None)
         hole_fill_mode = self._display_to_hole_fill_mode(self.hole_fill_mode_dd.value)
         temporal_strength = self._temporal_strength_for_hole_fill(
             self._parse_float(self.temporal_strength_dd.value, DEFAULTS["Temporal Strength"]),

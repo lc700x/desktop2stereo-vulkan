@@ -30,6 +30,35 @@ def test_settings_default_coreml_flags_off() -> None:
     assert config.recompile_coreml is False
 
 
+def test_legacy_mlx_setting_does_not_disable_coreml_or_select_removed_backend() -> None:
+    config = runtime_config_from_d2s_settings(
+        {
+            "Depth Model": "xingyang1/Distill-Any-Depth-Small-hf",
+            "CoreML": True,
+            "MLX": True,
+        },
+        cache_dir="/tmp/d2s-models",
+        device="mps",
+    )
+
+    assert config.depth_backend == "auto"
+    assert config.use_coreml is True
+
+
+@pytest.mark.parametrize("backend", ["mlx", "apple_mlx", "mlx_metal"])
+def test_legacy_mlx_backend_selection_falls_back_to_auto(backend: str) -> None:
+    config = runtime_config_from_d2s_settings(
+        {
+            "Depth Model": "xingyang1/Distill-Any-Depth-Small-hf",
+            "Depth Backend": backend,
+        },
+        cache_dir="/tmp/d2s-models",
+        device="mps",
+    )
+
+    assert config.depth_backend == "auto"
+
+
 def test_depth_aa_defaults_to_two_and_preserves_explicit_zero() -> None:
     default_config = runtime_config_from_d2s_settings(
         {"Depth Model": "xingyang1/Distill-Any-Depth-Small-hf"},

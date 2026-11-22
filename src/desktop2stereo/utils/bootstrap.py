@@ -55,7 +55,6 @@ def _normalize_legacy_settings(settings: dict, *, os_name: str | None = None) ->
         "MIGraphX": False,
         "Recompile MIGraphX": False,
         "CoreML": os_name == "Darwin",
-        "MLX": False,
         "Recompile CoreML": False,
         "OpenVINO": False,
         "Recompile OpenVINO": False,

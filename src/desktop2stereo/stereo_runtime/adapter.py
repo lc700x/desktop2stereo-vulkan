@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 RuntimeMode = Literal["auto", "movie", "game", "image", "debug"]
 StereoQuality = Literal["fast", "fast_plus", "quality_4k", "hq_4k"]
-DepthBackend = Literal["auto", "tensorrt_native", "onnx_cuda", "pytorch_cuda", "pytorch_rocm", "migraphx_rocm", "directml", "mlx"]
+DepthBackend = Literal["auto", "tensorrt_native", "onnx_cuda", "pytorch_cuda", "pytorch_rocm", "migraphx_rocm", "directml"]
 OnnxDtypeMode = Literal["auto", "fp16", "fp32"]
 DepthUpsampleMode = Literal["bilinear", "guided"]
 OutputFormat = Literal["half_sbs", "full_sbs", "half_tab", "full_tab", "mono", "anaglyph", "interleaved", "leia", "depth_map"]
@@ -180,7 +180,7 @@ def runtime_frame_contract(config: StereoRuntimeConfig) -> dict[str, str]:
         "host_responsibility": "capture current image frame, perform capture-side color preprocessing, and pass an RGB frame at source resolution",
         "stereo_runtime_responsibility": "prepare RGB frame for depth inference, run depth provider, and synthesize stereo output",
         "not_stereo_runtime_responsibility": "desktop capture, BGR/BGRA-to-RGB conversion, window/monitor source handling",
-        "backend_detail": "TensorRT/ONNX/PyTorch/MLX/Triton packing remains internal to stereo_runtime",
+        "backend_detail": "TensorRT/ONNX/PyTorch/Triton packing remains internal to stereo_runtime",
         "quality_rule": "host must not downscale or alter depth inference resolution semantics",
     }
 
@@ -221,8 +221,6 @@ def runtime_config_from_d2s_settings(
         depth_backend = "onnx_cuda"
     elif settings.get("Depth Backend"):
         depth_backend = _normalize_depth_backend(settings["Depth Backend"])
-    elif _to_bool(settings.get("MLX", False)) and device_type == "mps":
-        depth_backend = "mlx"
     elif is_rocm:
         depth_backend = "pytorch_rocm"
     else:
@@ -343,9 +341,7 @@ def runtime_config_from_d2s_settings(
         color_tint=float(settings.get("Color Tint", 0.0)),
         debug_output=_to_bool(settings.get("Debug Stereo Output", False)),
         profile_sync=_to_bool(settings.get("Depth Profile Sync", settings.get("Profile Sync", False))),
-        # MLX consumes the regular MPS frame path. Native ScreenCaptureKit /
-        # CoreML capture must not be enabled alongside it.
-        use_coreml=_to_bool(settings.get("CoreML", False)) and depth_backend != "mlx",
+        use_coreml=_to_bool(settings.get("CoreML", False)),
         recompile_coreml=_to_bool(settings.get("Recompile CoreML", False)),
         use_torch_compile=_to_bool(settings.get("torch.compile", False)),
         parallel_inference=parallel_workers > 1,
@@ -454,9 +450,10 @@ def _normalize_depth_backend(value: Any) -> DepthBackend:
         "migraphx_rocm": "migraphx_rocm",
         "directml": "directml",
         "dml": "directml",
-        "mlx": "mlx",
-        "apple_mlx": "mlx",
-        "mlx_metal": "mlx",
+        # Older macOS settings may still select the removed MLX provider.
+        "mlx": "auto",
+        "apple_mlx": "auto",
+        "mlx_metal": "auto",
         "rocm_migraphx": "migraphx_rocm",
     }
     try:

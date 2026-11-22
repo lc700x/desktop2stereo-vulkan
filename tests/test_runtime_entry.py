@@ -428,7 +428,8 @@ def test_macos_local_viewer_defaults_coreml_to_ane_without_overriding_user_choic
         source.index("configured_target_fps = target_fps_for_run_mode(settings)")
     ]
 
-    assert 'if bool(settings.get("CoreML", False)):' in local_viewer_branch
+    assert 'coreml_requested = str(settings.get("CoreML", False))' in local_viewer_branch
+    assert "if coreml_requested:" in local_viewer_branch
     assert 'os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")' in local_viewer_branch
     assert 'os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")' in local_viewer_branch
 

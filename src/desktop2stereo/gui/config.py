@@ -165,7 +165,6 @@ DEFAULTS = {
     "Parallel Inference Workers": 1,
     "Recompile TensorRT": False,
     "CoreML": default_coreml_enabled(),
-    "MLX": False,
     "Recompile CoreML": False,
     "MIGraphX": False,
     "Recompile MIGraphX": False,
