@@ -1,7 +1,8 @@
 -r requirements-pip-options.txt
 -f https://mirrors.nju.edu.cn/pytorch/whl --trusted-host mirrors.nju.edu.cn
-torch==2.9.0
-torchvision==0.24.0
+# CoreML Tools 9.0 tests Torch through 2.7.0.
+torch==2.7.0
+torchvision==0.22.0
 pyobjc-core==12.2.1
 pyobjc-framework-Quartz==12.2.1
 pyobjc-framework-Metal==12.2.1
