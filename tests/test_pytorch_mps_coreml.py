@@ -14,6 +14,7 @@ from stereo_runtime.depth_provider import (
 from stereo_runtime.providers.apple.pytorch_mps import (
     CoreMLEngine,
     GenericAutoDepthMpsProvider,
+    coreml_availability_error,
     create_pytorch_mps_provider,
     is_coreml_available,
 )
@@ -21,6 +22,18 @@ from stereo_runtime.providers.apple.pytorch_mps import (
 
 def test_is_coreml_available_returns_bool() -> None:
     assert isinstance(is_coreml_available(), bool)
+
+
+def test_coreml_import_failure_keeps_setup_instruction(monkeypatch) -> None:
+    import stereo_runtime.providers.apple.pytorch_mps as mps_module
+
+    monkeypatch.setattr(mps_module.sys, "platform", "darwin")
+    monkeypatch.setitem(__import__("sys").modules, "coremltools", None)
+
+    reason = coreml_availability_error()
+
+    assert reason is not None
+    assert "install-mps" in reason
 
 
 def test_native_coreml_startup_does_not_load_a_second_python_model(monkeypatch) -> None:

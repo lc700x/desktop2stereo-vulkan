@@ -110,6 +110,9 @@ int32_t d2s_coreml_io_pack_metal(void *handle, int32_t slot,
                                  D2SCoreMLIOPackResult *result);
 
 int32_t d2s_coreml_io_release(void *handle, int32_t slot);
+void *d2s_coreml_io_frame_color_texture(void *handle, int32_t slot);
+void *d2s_coreml_io_frame_depth_buffer(void *handle, int32_t slot);
+int32_t d2s_coreml_io_frame_depth_is_float16(void *handle, int32_t slot);
 const char *d2s_coreml_io_last_error(void *handle);
 void d2s_coreml_io_destroy(void *handle);
 

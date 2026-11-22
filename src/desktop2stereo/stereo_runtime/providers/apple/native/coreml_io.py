@@ -243,6 +243,7 @@ class NativeCoreMLFrame:
     input_shared: bool
     output_backing_used: bool
     output_zero_copy: bool
+    depth_is_float16: bool = False
     normalize_lo: float = 0.0
     normalize_hi: float = 1.0
     raw_normalize_lo: float = 0.0
@@ -321,6 +322,10 @@ class NativeCoreMLFrame:
         """Attach the shared stereo parameters before presenter-side packing."""
         self.warp_config = dict(values)
 
+    def metal_resources(self) -> tuple[Any, Any] | None:
+        """Return borrowed capture texture and native depth buffer objects."""
+        return self.bridge.metal_resources(self)
+
     def release(self) -> None:
         with self._lifetime_lock:
             if self.released:
@@ -385,6 +390,18 @@ class NativeCoreMLIOBridge:
         self._library.d2s_coreml_io_pack_metal.restype = ctypes.c_int32
         self._library.d2s_coreml_io_release.argtypes = [ctypes.c_void_p, ctypes.c_int32]
         self._library.d2s_coreml_io_release.restype = ctypes.c_int32
+        for name in (
+            "d2s_coreml_io_frame_color_texture",
+            "d2s_coreml_io_frame_depth_buffer",
+        ):
+            function = getattr(self._library, name)
+            function.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+            function.restype = ctypes.c_void_p
+        self._library.d2s_coreml_io_frame_depth_is_float16.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int32,
+        ]
+        self._library.d2s_coreml_io_frame_depth_is_float16.restype = ctypes.c_int32
         self._library.d2s_coreml_io_last_error.argtypes = [ctypes.c_void_p]
         self._library.d2s_coreml_io_last_error.restype = ctypes.c_char_p
         self._library.d2s_coreml_io_destroy.argtypes = [ctypes.c_void_p]
@@ -495,6 +512,11 @@ class NativeCoreMLIOBridge:
                 input_shared=bool(result.input_shared),
                 output_backing_used=bool(result.output_backing_used),
                 output_zero_copy=bool(result.output_zero_copy),
+                depth_is_float16=bool(
+                    self._library.d2s_coreml_io_frame_depth_is_float16(
+                        handle, int(result.slot)
+                    )
+                ),
                 normalize_lo=float(result.normalize_lo),
                 normalize_hi=float(result.normalize_hi),
                 raw_normalize_lo=float(result.raw_normalize_lo),
@@ -512,6 +534,27 @@ class NativeCoreMLIOBridge:
                 except Exception:
                     pass
             raise
+        finally:
+            self._end_call()
+
+    def metal_resources(self, frame: NativeCoreMLFrame) -> tuple[Any, Any] | None:
+        """Wrap borrowed native Metal resources while ``frame`` remains held."""
+        import objc
+
+        handle = self._begin_call(allow_closing=True)
+        try:
+            color_pointer = self._library.d2s_coreml_io_frame_color_texture(
+                handle, int(frame.slot)
+            )
+            depth_pointer = self._library.d2s_coreml_io_frame_depth_buffer(
+                handle, int(frame.slot)
+            )
+            if not color_pointer or not depth_pointer:
+                return None
+            return (
+                objc.objc_object(c_void_p=int(color_pointer)),
+                objc.objc_object(c_void_p=int(depth_pointer)),
+            )
         finally:
             self._end_call()
 

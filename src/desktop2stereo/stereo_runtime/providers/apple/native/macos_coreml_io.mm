@@ -75,6 +75,8 @@ typedef struct {
     uint32_t output_format;
     uint32_t output_channels;
     D2SCoreMLIOWarpConfig stereo;
+    float raw_normalize_lo;
+    float raw_normalize_hi;
 } D2SWarpParams;
 
 static const char *D2SMetalSource = R"D2S(
@@ -267,6 +269,8 @@ struct WarpParams {
     int edge_aa_enabled;
     int half_sbs_single_sample;
     int stream_bgra;
+    float raw_normalize_lo;
+    float raw_normalize_hi;
 };
 
 kernel void d2s_preprocess(
@@ -466,6 +470,181 @@ static inline float3 sample_color(texture2d<float, access::sample> color,
     float2 uv = (point + 0.5f) /
                 float2(p.source_width, p.source_height);
     return color.sample(s, uv).rgb;
+}
+
+// The local viewer's low-latency Half-SBS mode does not need the full DIBR
+// gather search: it has no hole fill and emits one center sample per output
+// pixel. Keep this direct inverse warp separate from the quality path so the
+// stream encoder can continue using the existing center-sampled DIBR branch.
+static inline float3 finite_color(float3 value);
+
+static inline float3 fast_warp_at(
+    texture2d<float, access::sample> color, device float *depth,
+    float x, float y, float eye_sign, constant WarpParams& p) {
+    float value = processed_depth_at(depth, x, y, p);
+    float shift = shift_from_depth(value, x, p);
+    float source_x = clamp(x + shift * eye_sign, 0.0f,
+                           float(p.source_width) - 1.0f);
+    return sample_color(color, source_x, y, p);
+}
+
+// Local Half-SBS uses one inverse-warp sample for each display pixel. Keep
+// that path in a separate kernel so the compiler does not carry the full DIBR
+// gather, occlusion, and hole-fill control flow into the hot shader.
+kernel void d2s_warp_pack_half_sbs_fast(
+    texture2d<float, access::sample> color [[texture(0)]],
+    device float *depth [[buffer(0)]],
+    device uchar *output [[buffer(1)]],
+    constant WarpParams& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint total = p.output_width * p.output_height;
+    if (gid >= total || p.output_format != 0u ||
+        p.source_width != p.output_width || p.output_width < 2u) return;
+    uint x = gid % p.output_width;
+    uint y = gid / p.output_width;
+    uint eye_width = p.output_width / 2u;
+    bool left = x < eye_width;
+    uint eye_x = left ? x : x - eye_width;
+    float source_x = (float(eye_x) + 0.5f) *
+                         (float(p.source_width) / float(eye_width)) - 0.5f;
+    float3 pixel = fast_warp_at(
+        color, depth, source_x + 0.5f, float(y),
+        left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f), p);
+    pixel = finite_color(pixel);
+    uint offset = gid * p.output_channels;
+    output[offset + 0u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 1u] = uchar(clamp(pixel.g * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 2u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.r : pixel.b) * 255.0f + 0.5f, 0.0f, 255.0f));
+    if (p.output_channels == 4u) output[offset + 3u] = 255u;
+}
+
+static inline float fast_normalize_depth(float value, constant WarpParams& p) {
+    if (!isfinite(value)) value = 1.0f;
+    return clamp((value - p.raw_normalize_lo) /
+                 max(p.raw_normalize_hi - p.raw_normalize_lo, 1.0e-6f),
+                 0.0f, 1.0f);
+}
+
+static inline float fast_raw_depth_at_float(device const float *depth, float x,
+                                            float y, constant WarpParams& p) {
+    float u = (x + 0.5f) / float(p.source_width);
+    float v = (y + 0.5f) / float(p.source_height);
+    float sx = clamp(u * float(p.depth_width) - 0.5f,
+                     0.0f, float(p.depth_width) - 1.001f);
+    float sy = clamp(v * float(p.depth_height) - 0.5f,
+                     0.0f, float(p.depth_height) - 1.001f);
+    uint x0 = uint(floor(sx));
+    uint y0 = uint(floor(sy));
+    uint x1 = min(x0 + 1u, p.depth_width - 1u);
+    uint y1 = min(y0 + 1u, p.depth_height - 1u);
+    float fx = sx - float(x0);
+    float fy = sy - float(y0);
+    float a = depth[y0 * p.depth_width + x0];
+    float b = depth[y0 * p.depth_width + x1];
+    float c = depth[y1 * p.depth_width + x0];
+    float d = depth[y1 * p.depth_width + x1];
+    return fast_normalize_depth(mix(mix(a, b, fx), mix(c, d, fx), fy), p);
+}
+
+static inline float fast_raw_depth_at_half(device const half *depth, float x,
+                                           float y, constant WarpParams& p) {
+    float u = (x + 0.5f) / float(p.source_width);
+    float v = (y + 0.5f) / float(p.source_height);
+    float sx = clamp(u * float(p.depth_width) - 0.5f,
+                     0.0f, float(p.depth_width) - 1.001f);
+    float sy = clamp(v * float(p.depth_height) - 0.5f,
+                     0.0f, float(p.depth_height) - 1.001f);
+    uint x0 = uint(floor(sx));
+    uint y0 = uint(floor(sy));
+    uint x1 = min(x0 + 1u, p.depth_width - 1u);
+    uint y1 = min(y0 + 1u, p.depth_height - 1u);
+    float fx = sx - float(x0);
+    float fy = sy - float(y0);
+    float a = float(depth[y0 * p.depth_width + x0]);
+    float b = float(depth[y0 * p.depth_width + x1]);
+    float c = float(depth[y1 * p.depth_width + x0]);
+    float d = float(depth[y1 * p.depth_width + x1]);
+    return fast_normalize_depth(mix(mix(a, b, fx), mix(c, d, fx), fy), p);
+}
+
+static inline float3 fast_raw_warp_at_float(
+    texture2d<float, access::sample> color, device const float *depth,
+    float x, float y, float eye_sign, constant WarpParams& p) {
+    float value = depth_pop(fast_raw_depth_at_float(depth, x, y, p), p);
+    float shift = shift_from_depth(value, x, p);
+    float source_x = clamp(x + shift * eye_sign, 0.0f,
+                           float(p.source_width) - 1.0f);
+    return sample_color(color, source_x, y, p);
+}
+
+static inline float3 fast_raw_warp_at_half(
+    texture2d<float, access::sample> color, device const half *depth,
+    float x, float y, float eye_sign, constant WarpParams& p) {
+    float value = depth_pop(fast_raw_depth_at_half(depth, x, y, p), p);
+    float shift = shift_from_depth(value, x, p);
+    float source_x = clamp(x + shift * eye_sign, 0.0f,
+                           float(p.source_width) - 1.0f);
+    return sample_color(color, source_x, y, p);
+}
+
+kernel void d2s_warp_pack_half_sbs_fast_float(
+    texture2d<float, access::sample> color [[texture(0)]],
+    device const float *depth [[buffer(0)]],
+    device uchar *output [[buffer(1)]],
+    constant WarpParams& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint total = p.output_width * p.output_height;
+    if (gid >= total || p.output_format != 0u ||
+        p.source_width != p.output_width || p.output_width < 2u) return;
+    uint x = gid % p.output_width;
+    uint y = gid / p.output_width;
+    uint eye_width = p.output_width / 2u;
+    bool left = x < eye_width;
+    uint eye_x = left ? x : x - eye_width;
+    float source_x = (float(eye_x) + 0.5f) *
+                         (float(p.source_width) / float(eye_width)) - 0.5f;
+    float3 pixel = fast_raw_warp_at_float(
+        color, depth, source_x + 0.5f, float(y),
+        left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f), p);
+    pixel = finite_color(pixel);
+    uint offset = gid * p.output_channels;
+    output[offset + 0u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 1u] = uchar(clamp(pixel.g * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 2u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.r : pixel.b) * 255.0f + 0.5f, 0.0f, 255.0f));
+    if (p.output_channels == 4u) output[offset + 3u] = 255u;
+}
+
+kernel void d2s_warp_pack_half_sbs_fast_half(
+    texture2d<float, access::sample> color [[texture(0)]],
+    device const half *depth [[buffer(0)]],
+    device uchar *output [[buffer(1)]],
+    constant WarpParams& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint total = p.output_width * p.output_height;
+    if (gid >= total || p.output_format != 0u ||
+        p.source_width != p.output_width || p.output_width < 2u) return;
+    uint x = gid % p.output_width;
+    uint y = gid / p.output_width;
+    uint eye_width = p.output_width / 2u;
+    bool left = x < eye_width;
+    uint eye_x = left ? x : x - eye_width;
+    float source_x = (float(eye_x) + 0.5f) *
+                         (float(p.source_width) / float(eye_width)) - 0.5f;
+    float3 pixel = fast_raw_warp_at_half(
+        color, depth, source_x + 0.5f, float(y),
+        left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f), p);
+    pixel = finite_color(pixel);
+    uint offset = gid * p.output_channels;
+    output[offset + 0u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 1u] = uchar(clamp(pixel.g * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 2u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.r : pixel.b) * 255.0f + 0.5f, 0.0f, 255.0f));
+    if (p.output_channels == 4u) output[offset + 3u] = 255u;
 }
 
 static inline float projected_target_x(float source_x, float depth_value,
@@ -921,6 +1100,9 @@ static inline float3 output_eye_pixel(
     // Half-SBS averages two complete eye pixels with positive weights.
     if (p.output_format != 0u || p.source_width != p.output_width) {
         return eye_pixel(color, depth, x, y, eye_sign, screen_edge, p);
+    }
+    if (p.half_sbs_single_sample >= 2) {
+        return fast_warp_at(color, depth, x + 0.5f, y, eye_sign, p);
     }
     // Moonlight renders each eye at half the source width. A center sample
     // avoids evaluating the full depth reprojection twice for every streamed
@@ -1382,6 +1564,9 @@ typedef struct {
     __strong id<MTLComputePipelineState> depth_upsample_pipeline;
     __strong id<MTLComputePipelineState> depth_global_gaussian_pipeline;
     __strong id<MTLComputePipelineState> warp_pipeline;
+    __strong id<MTLComputePipelineState> fast_half_sbs_pipeline;
+    __strong id<MTLComputePipelineState> fast_half_sbs_float_pipeline;
+    __strong id<MTLComputePipelineState> fast_half_sbs_half_pipeline;
     __strong id<MTLBuffer> upsampled_depth_buffer;
     __strong id<MTLBuffer> global_gaussian_depth_buffer;
     CVMetalTextureCacheRef texture_cache;
@@ -1404,6 +1589,7 @@ typedef struct {
     float depth_range_lo;
     float depth_range_hi;
     int32_t depth_range_initialized;
+    uint32_t depth_range_interval;
     char error[512];
 } D2SCoreMLIO;
 
@@ -1449,22 +1635,25 @@ static size_t d2s_shape_count(NSArray<NSNumber *> *shape) {
     return count;
 }
 
-static void d2s_release_slot(D2SSlot *slot) {
+static void d2s_release_slot(D2SSlot *slot, BOOL preserve_bindings) {
     // Core ML may reset its execution stream asynchronously after prediction
-    // returns. Drop the bound objects before their Metal storage, and only
-    // after the viewer has finished consuming this slot.
+    // returns. Always drop the prediction object and the capture resources
+    // before reusing the slot. The fixed-shape arrays and feature bindings can
+    // be retained after a successful pack: predictionFromFeatures is
+    // synchronous, and the slot's output buffer is not reused until pack has
+    // completed. This avoids allocating the Core ML bridge objects per frame.
     slot->prediction = nil;
-    slot->prediction_options = nil;
-    slot->features = nil;
-    slot->output_array = nil;
-    slot->input_array = nil;
-    // Core ML may finish releasing a backing array asynchronously after the
-    // prediction call returns. Do not reuse these buffers across predictions.
-    slot->input_buffer = nil;
-    slot->raw_depth_buffer = nil;
-    slot->normalized_depth_buffer = nil;
-    slot->depth_range_buffer = nil;
-    slot->status_buffer = nil;
+    if (!preserve_bindings) {
+        slot->prediction_options = nil;
+        slot->features = nil;
+        slot->output_array = nil;
+        slot->input_array = nil;
+        slot->input_buffer = nil;
+        slot->raw_depth_buffer = nil;
+        slot->normalized_depth_buffer = nil;
+        slot->depth_range_buffer = nil;
+        slot->status_buffer = nil;
+    }
     slot->color_texture = nil;
     if (slot->color_cv_texture != NULL) {
         CFRelease(slot->color_cv_texture);
@@ -1483,7 +1672,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     if (ctx->pack_mutex_initialized) pthread_mutex_lock(&ctx->pack_mutex);
     if (ctx->mutex_initialized) pthread_mutex_lock(&ctx->mutex);
     for (int i = 0; i < 3; ++i) {
-        d2s_release_slot(&ctx->slots[i]);
+        d2s_release_slot(&ctx->slots[i], NO);
         ctx->slots[i].packed_buffer = nil;
         ctx->slots[i].filtered_depth_buffer = nil;
         ctx->slots[i].filter_intermediate_buffer = nil;
@@ -1511,6 +1700,9 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     ctx->upsampled_depth_buffer = nil;
     ctx->global_gaussian_depth_buffer = nil;
     ctx->warp_pipeline = nil;
+    ctx->fast_half_sbs_pipeline = nil;
+    ctx->fast_half_sbs_float_pipeline = nil;
+    ctx->fast_half_sbs_half_pipeline = nil;
     ctx->input_name = nil;
     ctx->output_name = nil;
     ctx->input_shape = nil;
@@ -1542,9 +1734,15 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     id<MTLFunction> range_histogram_float = [library newFunctionWithName:@"d2s_depth_range_histogram_float"];
     id<MTLFunction> range_reduce = [library newFunctionWithName:@"d2s_depth_range_reduce"];
     id<MTLFunction> warp = [library newFunctionWithName:@"d2s_warp_pack"];
+    id<MTLFunction> fast_half_sbs = [library newFunctionWithName:@"d2s_warp_pack_half_sbs_fast"];
+    id<MTLFunction> fast_half_sbs_float =
+        [library newFunctionWithName:@"d2s_warp_pack_half_sbs_fast_float"];
+    id<MTLFunction> fast_half_sbs_half =
+        [library newFunctionWithName:@"d2s_warp_pack_half_sbs_fast_half"];
     if (!preprocess || !norm_half || !norm_float || !range_reset ||
         !range_minmax_half || !range_minmax_float || !range_histogram_half ||
-        !range_histogram_float || !range_reduce || !warp) return NO;
+        !range_histogram_float || !range_reduce || !warp || !fast_half_sbs ||
+        !fast_half_sbs_float || !fast_half_sbs_half) return NO;
     ctx->preprocess_pipeline = [ctx->device newComputePipelineStateWithFunction:preprocess error:error];
     ctx->normalize_half_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_half error:error];
     ctx->normalize_float_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_float error:error];
@@ -1555,11 +1753,19 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     ctx->depth_range_histogram_float_pipeline = [ctx->device newComputePipelineStateWithFunction:range_histogram_float error:error];
     ctx->depth_range_reduce_pipeline = [ctx->device newComputePipelineStateWithFunction:range_reduce error:error];
     ctx->warp_pipeline = [ctx->device newComputePipelineStateWithFunction:warp error:error];
+    ctx->fast_half_sbs_pipeline = [ctx->device
+        newComputePipelineStateWithFunction:fast_half_sbs error:error];
+    ctx->fast_half_sbs_float_pipeline = [ctx->device
+        newComputePipelineStateWithFunction:fast_half_sbs_float error:error];
+    ctx->fast_half_sbs_half_pipeline = [ctx->device
+        newComputePipelineStateWithFunction:fast_half_sbs_half error:error];
     if (!(ctx->preprocess_pipeline && ctx->normalize_half_pipeline &&
            ctx->normalize_float_pipeline && ctx->depth_range_reset_pipeline &&
            ctx->depth_range_minmax_half_pipeline && ctx->depth_range_minmax_float_pipeline &&
            ctx->depth_range_histogram_half_pipeline && ctx->depth_range_histogram_float_pipeline &&
-           ctx->depth_range_reduce_pipeline && ctx->warp_pipeline)) return NO;
+           ctx->depth_range_reduce_pipeline && ctx->warp_pipeline &&
+           ctx->fast_half_sbs_pipeline && ctx->fast_half_sbs_float_pipeline &&
+           ctx->fast_half_sbs_half_pipeline)) return NO;
 
     NSError *filter_error = nil;
     id<MTLLibrary> filter_library = [ctx->device newLibraryWithSource:
@@ -1611,6 +1817,10 @@ static BOOL d2s_get_model_contract(D2SCoreMLIO *ctx, NSError **error) {
         input.multiArrayConstraint.shape.count != 4 ||
         output.multiArrayConstraint.shape.count < 2) {
         d2s_set_error(ctx, @"native CoreML bridge requires array input/output features");
+        return NO;
+    }
+    if (input.multiArrayConstraint.dataType != MLMultiArrayDataTypeFloat32) {
+        d2s_set_error(ctx, @"native CoreML bridge requires a Float32 input feature");
         return NO;
     }
     ctx->input_shape = input.multiArrayConstraint.shape;
@@ -1666,6 +1876,15 @@ void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
         ctx->pack_mutex_initialized = 1;
         ctx->input_width = input_width;
         ctx->input_height = input_height;
+        ctx->depth_range_interval = 2;
+        const char *range_interval = getenv("D2S_COREML_DEPTH_RANGE_INTERVAL");
+        if (range_interval != NULL && range_interval[0] != '\0') {
+            char *end = NULL;
+            long requested = strtol(range_interval, &end, 10);
+            if (end != range_interval && end != NULL && *end == '\0') {
+                ctx->depth_range_interval = (uint32_t)MIN(8L, MAX(1L, requested));
+            }
+        }
         ctx->device = MTLCreateSystemDefaultDevice();
         if (ctx->device == nil) {
             d2s_set_create_error(error_buffer, error_capacity, @"Metal device unavailable");
@@ -1678,16 +1897,42 @@ void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
             d2s_destroy_context(ctx);
             return NULL;
         }
-        ctx->pack_queue = [ctx->device newCommandQueue];
-        if (ctx->pack_queue == nil) {
-            d2s_set_create_error(error_buffer, error_capacity, @"Metal pack command queue unavailable");
-            d2s_destroy_context(ctx);
-            return NULL;
+        const char *shared_queue = getenv("D2S_COREML_SHARED_METAL_QUEUE");
+        BOOL use_shared_queue = shared_queue == NULL ||
+            !(strcmp(shared_queue, "0") == 0 ||
+              strcasecmp(shared_queue, "false") == 0 ||
+              strcasecmp(shared_queue, "off") == 0 ||
+              strcasecmp(shared_queue, "no") == 0);
+        if (use_shared_queue) {
+            // CoreML and the native packer share one queue by default. This
+            // avoids cross-queue scheduling overhead on Apple GPUs while
+            // preserving D2S_COREML_SHARED_METAL_QUEUE=0 as a diagnostic.
+            ctx->pack_queue = ctx->queue;
+        } else {
+            ctx->pack_queue = [ctx->device newCommandQueue];
+            if (ctx->pack_queue == nil) {
+                d2s_set_create_error(error_buffer, error_capacity,
+                                     @"Metal pack command queue unavailable");
+                d2s_destroy_context(ctx);
+                return NULL;
+            }
         }
         NSError *error = nil;
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:model_path]];
         MLModelConfiguration *configuration = [MLModelConfiguration new];
-        configuration.computeUnits = d2s_compute_units(compute_units);
+        MLComputeUnits selected_units = d2s_compute_units(compute_units);
+        configuration.computeUnits = selected_units;
+        // Keep Core ML on the same device as the IOSurface and Metal postprocess
+        // queues. This is the documented way to avoid an implicit cross-device
+        // handoff when a system exposes more than one Metal device.
+        configuration.preferredMetalDevice = ctx->device;
+        if (selected_units == MLComputeUnitsCPUAndGPU ||
+            selected_units == MLComputeUnitsAll) {
+            // Core ML's official low-precision GPU option is useful for the
+            // Float16 artifact. ANE-only and CPU-only configurations do not
+            // use this GPU accumulation setting.
+            configuration.allowLowPrecisionAccumulationOnGPU = YES;
+        }
         NSURL *load_url = url;
         if ([url.pathExtension.lowercaseString isEqualToString:@"mlpackage"]) {
             load_url = [MLModel compileModelAtURL:url error:&error];
@@ -1836,6 +2081,25 @@ static BOOL d2s_gpu_depth_range(D2SCoreMLIO *ctx, D2SSlot *slot,
     return isfinite(*lo) && isfinite(*hi) && *hi > *lo;
 }
 
+static BOOL d2s_reuse_depth_range(D2SCoreMLIO *ctx, uint64_t frame_id,
+                                  float *lo, float *hi) {
+    if (ctx->depth_range_interval <= 1) return NO;
+    const char *disabled = getenv("D2S_DEPTH_RANGE_TEMPORAL");
+    if (disabled != NULL && (strcmp(disabled, "0") == 0 ||
+                             strcasecmp(disabled, "false") == 0 ||
+                             strcasecmp(disabled, "off") == 0)) {
+        return NO;
+    }
+    D2SLockGuard lock(&ctx->mutex);
+    if (!ctx->depth_range_initialized || frame_id <= ctx->depth_range_frame_id ||
+        frame_id - ctx->depth_range_frame_id >= ctx->depth_range_interval) {
+        return NO;
+    }
+    *lo = ctx->depth_range_lo;
+    *hi = ctx->depth_range_hi;
+    return isfinite(*lo) && isfinite(*hi) && *hi > *lo;
+}
+
 static int32_t d2s_stabilize_depth_range(D2SCoreMLIO *ctx, uint64_t frame_id,
                                          float *lo, float *hi) {
     const char *disabled = getenv("D2S_DEPTH_RANGE_TEMPORAL");
@@ -1908,7 +2172,7 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
             MTLPixelFormatBGRA8Unorm, width, height, 0, &cv_texture);
         if (texture_status != kCVReturnSuccess || cv_texture == NULL) {
             d2s_set_error(ctx, @"ScreenCaptureKit pixel buffer could not become a Metal texture");
-            d2s_release_slot(slot);
+            d2s_release_slot(slot, NO);
             return D2S_COREML_ERROR;
         }
         slot->color_cv_texture = cv_texture;
@@ -1947,87 +2211,94 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
             !slot->normalized_depth_buffer || !slot->status_buffer ||
             !slot->depth_range_buffer) {
             d2s_set_error(ctx, @"native CoreML Metal buffer allocation failed");
-            d2s_release_slot(slot);
+            d2s_release_slot(slot, NO);
             return D2S_COREML_ERROR;
         }
         double preprocess_start = d2s_now_ms();
         if (!d2s_dispatch_preprocess(ctx, slot, (uint32_t)width, (uint32_t)height)) {
             d2s_set_error(ctx, @"Metal CoreML preprocessing command failed");
-            d2s_release_slot(slot);
+            d2s_release_slot(slot, NO);
             return D2S_COREML_ERROR;
         }
         double preprocess_ms = d2s_now_ms() - preprocess_start;
-        NSArray<NSNumber *> *input_strides = @[
-            @(3 * ctx->input_width * ctx->input_height),
-            @(ctx->input_width * ctx->input_height),
-            @(ctx->input_width), @1];
         NSError *error = nil;
-        MLMultiArray *input_array = [[MLMultiArray alloc]
-            initWithDataPointer:slot->input_buffer.contents
-            shape:ctx->input_shape dataType:MLMultiArrayDataTypeFloat32
-            strides:input_strides deallocator:nil error:&error];
-        if (input_array == nil) {
-            d2s_set_error(ctx, error.localizedDescription ?: @"CoreML input binding failed");
-            d2s_release_slot(slot);
+        // The model shape and the Metal buffers are fixed for a bridge
+        // instance. Keep the Core ML bindings with the ring slot so the hot
+        // path only updates the input buffer and invokes prediction.
+        if (slot->input_array == nil) {
+            NSArray<NSNumber *> *input_strides = @[
+                @(3 * ctx->input_width * ctx->input_height),
+                @(ctx->input_width * ctx->input_height),
+                @(ctx->input_width), @1];
+            slot->input_array = [[MLMultiArray alloc]
+                initWithDataPointer:slot->input_buffer.contents
+                shape:ctx->input_shape dataType:MLMultiArrayDataTypeFloat32
+                strides:input_strides deallocator:nil error:&error];
+        }
+        if (slot->output_array == nil) {
+            NSArray<NSNumber *> *output_strides = @[
+                @(ctx->depth_width * ctx->depth_height), @(ctx->depth_width), @1];
+            slot->output_array = [[MLMultiArray alloc]
+                initWithDataPointer:slot->raw_depth_buffer.contents
+                shape:ctx->output_shape dataType:ctx->output_type
+                strides:output_strides deallocator:nil error:&error];
+        }
+        if (slot->input_array == nil || slot->output_array == nil) {
+            d2s_set_error(ctx, error.localizedDescription ?: @"CoreML array binding failed");
+            d2s_release_slot(slot, NO);
             return D2S_COREML_ERROR;
         }
-        slot->input_array = input_array;
-        NSArray<NSNumber *> *output_strides = @[
-            @(ctx->depth_width * ctx->depth_height), @(ctx->depth_width), @1];
-        MLMultiArray *output_array = [[MLMultiArray alloc]
-            initWithDataPointer:slot->raw_depth_buffer.contents
-            shape:ctx->output_shape dataType:ctx->output_type
-            strides:output_strides deallocator:nil error:&error];
-        if (output_array == nil) {
-            d2s_set_error(ctx, error.localizedDescription ?: @"CoreML output binding failed");
-            d2s_release_slot(slot);
-            return D2S_COREML_ERROR;
+        if (slot->features == nil) {
+            MLFeatureValue *input_value =
+                [MLFeatureValue featureValueWithMultiArray:slot->input_array];
+            slot->features = [[MLDictionaryFeatureProvider alloc]
+                initWithDictionary:@{ctx->input_name: input_value} error:&error];
         }
-        slot->output_array = output_array;
-        MLFeatureValue *input_value = [MLFeatureValue featureValueWithMultiArray:input_array];
-        MLDictionaryFeatureProvider *features = [[MLDictionaryFeatureProvider alloc]
-            initWithDictionary:@{ctx->input_name: input_value} error:&error];
-        if (features == nil) {
+        if (slot->features == nil) {
             d2s_set_error(ctx, error.localizedDescription ?: @"CoreML feature provider creation failed");
-            d2s_release_slot(slot);
+            d2s_release_slot(slot, NO);
             return D2S_COREML_ERROR;
         }
-        slot->features = features;
-        MLPredictionOptions *options = [MLPredictionOptions new];
-        options.outputBackings = @{ctx->output_name: output_array};
-        slot->prediction_options = options;
+        if (slot->prediction_options == nil) {
+            slot->prediction_options = [MLPredictionOptions new];
+            slot->prediction_options.outputBackings =
+                @{ctx->output_name: slot->output_array};
+        }
         double model_start = d2s_now_ms();
-        id<MLFeatureProvider> prediction = [ctx->model predictionFromFeatures:features
-                                                                       options:options
+        id<MLFeatureProvider> prediction = [ctx->model predictionFromFeatures:slot->features
+                                                                       options:slot->prediction_options
                                                                         error:&error];
         double model_ms = d2s_now_ms() - model_start;
         if (prediction == nil) {
             d2s_set_error(ctx, error.localizedDescription ?: @"CoreML prediction failed");
-            d2s_release_slot(slot);
+            d2s_release_slot(slot, NO);
             return D2S_COREML_ERROR;
         }
         slot->prediction = prediction;
         MLFeatureValue *output_value = [prediction featureValueForName:ctx->output_name];
         MLMultiArray *returned_array = output_value.multiArrayValue;
         if (returned_array == nil ||
-            (returned_array != output_array &&
-             returned_array.dataPointer != output_array.dataPointer)) {
+            (returned_array != slot->output_array &&
+             returned_array.dataPointer != slot->output_array.dataPointer)) {
             d2s_set_error(ctx, @"CoreML ignored the requested shared output backing");
-            d2s_release_slot(slot);
+            d2s_release_slot(slot, NO);
             return D2S_COREML_OUTPUT_BACKING;
         }
         double postprocess_start = d2s_now_ms();
         float lo = 0.0f, hi = 1.0f;
         uint32_t nonfinite = 0;
-        if (!d2s_gpu_depth_range(ctx, slot, &lo, &hi, &nonfinite)) {
+        BOOL reused_depth_range = d2s_reuse_depth_range(ctx, frame_id, &lo, &hi);
+        if (!reused_depth_range &&
+            !d2s_gpu_depth_range(ctx, slot, &lo, &hi, &nonfinite)) {
             d2s_set_error(ctx, @"Metal depth range reduction failed");
-            d2s_release_slot(slot);
+            d2s_release_slot(slot, NO);
             return D2S_COREML_ERROR;
         }
         const float raw_lo = lo;
         const float raw_hi = hi;
-        const int32_t range_history_reset =
-            d2s_stabilize_depth_range(ctx, frame_id, &lo, &hi);
+        const int32_t range_history_reset = reused_depth_range
+            ? 0
+            : d2s_stabilize_depth_range(ctx, frame_id, &lo, &hi);
         slot->normalize_lo = lo;
         slot->normalize_hi = hi;
         double postprocess_ms = d2s_now_ms() - postprocess_start;
@@ -2156,18 +2427,32 @@ static int32_t d2s_coreml_io_pack_internal(
             (uint32_t)output_format,
             output_channels,
             warp_config != NULL ? *warp_config : default_stereo,
+            0.0f,
+            1.0f,
         };
         BOOL global_depth_gaussian = params.stereo.edge_aa_enabled != 0;
         BOOL model_depth_filtered = NO;
         // Depth is filtered before the warp; no pixel-space AA follows it.
         params.stereo.edge_aa_enabled = 0;
+        params.raw_normalize_lo = slot->normalize_lo;
+        params.raw_normalize_hi = slot->normalize_hi;
+        BOOL fast_half_sbs_raw =
+            !global_depth_gaussian &&
+            output_format == D2S_OUTPUT_HALF_SBS &&
+            output_channels == 4u &&
+            params.stereo.half_sbs_single_sample >= 2 &&
+            params.stereo.antialias_strength <= 0.0f;
         id<MTLBuffer> warp_destination = destination_buffer;
         id<MTLCommandBuffer> command = [ctx->pack_queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-        d2s_encode_normalize(ctx, slot, encoder, slot->normalize_lo, slot->normalize_hi);
-        [encoder endEncoding];
+        id<MTLComputeCommandEncoder> encoder = nil;
+        if (!fast_half_sbs_raw) {
+            encoder = [command computeCommandEncoder];
+            d2s_encode_normalize(ctx, slot, encoder, slot->normalize_lo, slot->normalize_hi);
+            [encoder endEncoding];
+        }
 
-        id<MTLBuffer> warp_depth_buffer = slot->normalized_depth_buffer;
+        id<MTLBuffer> warp_depth_buffer = fast_half_sbs_raw
+            ? slot->raw_depth_buffer : slot->normalized_depth_buffer;
         if (params.stereo.antialias_strength > 0.0f &&
             ctx->depth_filter_pipeline != nil) {
             size_t depth_bytes = ctx->depth_count * sizeof(float);
@@ -2303,12 +2588,28 @@ static int32_t d2s_coreml_io_pack_internal(
         }
 
         encoder = [command computeCommandEncoder];
-        [encoder setComputePipelineState:ctx->warp_pipeline];
+        BOOL fast_half_sbs =
+            ctx->fast_half_sbs_pipeline != nil &&
+            output_format == D2S_OUTPUT_HALF_SBS &&
+            output_channels == 4u &&
+            params.stereo.half_sbs_single_sample >= 2 &&
+            params.stereo.antialias_strength <= 0.0f;
+        id<MTLComputePipelineState> warp_pipeline =
+            fast_half_sbs_raw
+                ? (slot->output_is_float16
+                    ? ctx->fast_half_sbs_half_pipeline
+                    : ctx->fast_half_sbs_float_pipeline)
+                : (fast_half_sbs ? ctx->fast_half_sbs_pipeline : ctx->warp_pipeline);
+        [encoder setComputePipelineState:warp_pipeline];
         [encoder setTexture:slot->color_texture atIndex:0];
         [encoder setBuffer:warp_depth_buffer offset:0 atIndex:0];
         [encoder setBuffer:warp_destination offset:0 atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
-        NSUInteger threads = 64;
+        // Apple GPUs sustain a little more occupancy with 128 scalar lanes
+        // for this one-dimensional output kernel. Keep a conservative clamp
+        // for devices exposing a smaller per-group limit.
+        NSUInteger max_threads = warp_pipeline.maxTotalThreadsPerThreadgroup;
+        NSUInteger threads = max_threads > 0 ? MIN((NSUInteger)128, max_threads) : 64;
         const char *thread_override = getenv("D2S_METAL_WARP_THREADS");
         if (thread_override != NULL && thread_override[0] != '\0') {
             char *end = NULL;
@@ -2316,7 +2617,7 @@ static int32_t d2s_coreml_io_pack_internal(
             if (end != thread_override && end != NULL && *end == '\0' &&
                 (requested == 64 || requested == 128 || requested == 256) &&
                 (NSUInteger)requested <=
-                    ctx->warp_pipeline.maxTotalThreadsPerThreadgroup) {
+                    warp_pipeline.maxTotalThreadsPerThreadgroup) {
                 threads = (NSUInteger)requested;
             }
         }
@@ -2387,9 +2688,38 @@ int32_t d2s_coreml_io_release(void *handle, int32_t slot_index) {
     if (ctx == NULL || slot_index < 0 || slot_index >= 3) return D2S_COREML_ERROR;
     {
         D2SLockGuard lock(&ctx->mutex);
-        d2s_release_slot(&ctx->slots[slot_index]);
+        d2s_release_slot(&ctx->slots[slot_index], YES);
     }
     return D2S_COREML_OK;
+}
+
+void *d2s_coreml_io_frame_color_texture(void *handle, int32_t slot_index) {
+    D2SCoreMLIO *ctx = (D2SCoreMLIO *)handle;
+    if (ctx == NULL || slot_index < 0 || slot_index >= 3) return NULL;
+    D2SLockGuard lock(&ctx->mutex);
+    D2SSlot *slot = &ctx->slots[slot_index];
+    if (slot->state != 1 || slot->color_texture == nil) return NULL;
+    // Borrowed for the lifetime of the retained NativeCoreMLFrame. The caller
+    // must release the frame only after its Metal command buffer completes.
+    return (__bridge void *)slot->color_texture;
+}
+
+void *d2s_coreml_io_frame_depth_buffer(void *handle, int32_t slot_index) {
+    D2SCoreMLIO *ctx = (D2SCoreMLIO *)handle;
+    if (ctx == NULL || slot_index < 0 || slot_index >= 3) return NULL;
+    D2SLockGuard lock(&ctx->mutex);
+    D2SSlot *slot = &ctx->slots[slot_index];
+    if (slot->state != 1 || slot->raw_depth_buffer == nil) return NULL;
+    // Borrowed for the lifetime of the retained NativeCoreMLFrame.
+    return (__bridge void *)slot->raw_depth_buffer;
+}
+
+int32_t d2s_coreml_io_frame_depth_is_float16(void *handle, int32_t slot_index) {
+    D2SCoreMLIO *ctx = (D2SCoreMLIO *)handle;
+    if (ctx == NULL || slot_index < 0 || slot_index >= 3) return 0;
+    D2SLockGuard lock(&ctx->mutex);
+    D2SSlot *slot = &ctx->slots[slot_index];
+    return slot->state == 1 && slot->output_is_float16 ? 1 : 0;
 }
 
 const char *d2s_coreml_io_last_error(void *handle) {

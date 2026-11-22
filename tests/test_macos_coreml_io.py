@@ -98,6 +98,19 @@ def test_native_scalar_kernels_use_one_dimensional_threadgroups() -> None:
     assert "threadsPerThreadgroup:MTLSizeMake(w, h, 1)" not in pack
 
 
+def test_native_local_half_sbs_has_raw_depth_fast_kernels() -> None:
+    source = _NATIVE_SOURCE.read_text()
+    assert "d2s_warp_pack_half_sbs_fast_float" in source
+    assert "d2s_warp_pack_half_sbs_fast_half" in source
+    assert "fast_raw_depth_at_float" in source
+    assert "fast_raw_depth_at_half" in source
+    pack_start = source.index("static int32_t d2s_coreml_io_pack_internal")
+    pack = source[pack_start:]
+    assert "BOOL fast_half_sbs_raw" in pack
+    assert "slot->raw_depth_buffer" in pack
+    assert "D2S_COREML_DEPTH_RANGE_INTERVAL" in source
+
+
 def test_native_output_resolution_depth_gaussian_runs_before_warp_without_color_aa() -> None:
     source = _NATIVE_SOURCE.read_text()
     pack_start = source.index("static int32_t d2s_coreml_io_pack_internal")
@@ -106,7 +119,7 @@ def test_native_output_resolution_depth_gaussian_runs_before_warp_without_color_
 
     gaussian = pack.index("if (global_depth_gaussian)")
     upsample = pack.index("setComputePipelineState:ctx->depth_upsample_pipeline")
-    warp = pack.index("[encoder setComputePipelineState:ctx->warp_pipeline]")
+    warp = pack.index("[encoder setComputePipelineState:warp_pipeline]")
     assert "depth_upsample_pipeline" in pack[gaussian:warp]
     assert "depth_global_gaussian_pipeline" in pack[gaussian:warp]
     gaussian_start = source.index("kernel void d2s_filter_depth_global_gaussian")
@@ -202,7 +215,7 @@ def test_screen_edge_disparity_fade_matches_android_eight_pixel_band() -> None:
 def test_native_warp_uses_depth_dimensions_for_depth_sampling() -> None:
     source = _NATIVE_SOURCE.read_text()
     warp_start = source.index("struct WarpParams")
-    warp_end = source.index("kernel void d2s_warp_pack", warp_start)
+    warp_end = source.index("kernel void d2s_warp_pack(", warp_start)
     warp = source[warp_start:warp_end]
     pack_start = source.index("int32_t d2s_coreml_io_pack")
     pack = source[pack_start:]
@@ -257,6 +270,22 @@ def test_native_result_reports_finite_depth_contract() -> None:
     frame = _native_frame(object())
     assert frame.finite_depth is True
     assert frame.nonfinite_count == 0
+
+
+def test_native_coreml_uses_documented_device_and_precision_configuration() -> None:
+    source = _NATIVE_SOURCE.read_text()
+    contract_start = source.index("static BOOL d2s_get_model_contract")
+    contract_end = source.index("void *d2s_coreml_io_create", contract_start)
+    contract = source[contract_start:contract_end]
+    create_start = source.index("void *d2s_coreml_io_create")
+    create_end = source.index("static int32_t d2s_find_slot", create_start)
+    create = source[create_start:create_end]
+
+    assert "MLMultiArrayDataTypeFloat32" in contract
+    assert "configuration.preferredMetalDevice = ctx->device;" in create
+    assert "configuration.allowLowPrecisionAccumulationOnGPU = YES;" in create
+    assert "predictionFromFeatures:slot->features" in source
+    assert "slot->prediction_options.outputBackings" in source
 
 
 def test_native_frame_pack_uses_destination_without_host_conversion() -> None:

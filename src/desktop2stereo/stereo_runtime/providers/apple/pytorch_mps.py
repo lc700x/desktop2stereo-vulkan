@@ -46,16 +46,23 @@ class _MpsInfoMixin:
         )
 
 
-def is_coreml_available() -> bool:
-    """CoreML acceleration is macOS-only and needs coremltools."""
+def coreml_availability_error() -> str | None:
+    """Return an actionable Core ML setup error, or ``None`` when available."""
     if sys.platform != "darwin":
-        return False
+        return "Core ML acceleration requires macOS"
     try:
         import coremltools  # noqa: F401
+    except Exception as exc:
+        return (
+            f"CoreML import failed ({type(exc).__name__}: {exc}); "
+            "run src/env_install/install-mps to repair the macOS environment"
+        )
+    return None
 
-        return True
-    except Exception:
-        return False
+
+def is_coreml_available() -> bool:
+    """CoreML acceleration is macOS-only and needs coremltools."""
+    return coreml_availability_error() is None
 
 
 @contextlib.contextmanager
@@ -641,9 +648,12 @@ class _CoreMLMixin:
         engine = None
         try:
             import coremltools as ct
-        except Exception:
+        except Exception as exc:
             self._set_coreml_info(fallback_reason="coremltools_unavailable")
-            print("[CoreML] coremltools is not installed; using PyTorch MPS", flush=True)
+            print(
+                f"[CoreML] {coreml_availability_error() or exc}; using PyTorch MPS",
+                flush=True,
+            )
             engines[key] = None
             return None
 
@@ -908,6 +918,7 @@ __all__ = [
     "DistillAnyDepthBaseMps",
     "TorchMpsDepthProvider",
     "coreml_safe_interpolate",
+    "coreml_availability_error",
     "create_pytorch_mps_provider",
     "is_coreml_available",
     "is_mps_torch_available",

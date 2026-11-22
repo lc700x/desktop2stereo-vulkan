@@ -434,6 +434,11 @@ def test_macos_local_viewer_defaults_coreml_to_ane_without_overriding_user_choic
     assert 'os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")' in local_viewer_branch
 
 
+def test_macos_local_viewer_defaults_to_metal_deferred_present() -> None:
+    source = RUNTIME_ENTRY.read_text(encoding="utf-8")
+    assert 'os.environ.get("D2S_MAC_VIEWER", "metal")' in source
+
+
 def test_stream_compute_units_are_not_changed_by_local_viewer_default() -> None:
     source = RUNTIME_ENTRY.read_text(encoding="utf-8")
     local_viewer_branch = source[

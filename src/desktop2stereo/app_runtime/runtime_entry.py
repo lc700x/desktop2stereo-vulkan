@@ -1750,14 +1750,13 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 # wait loop below is parked on a helper thread instead and the
                 # viewer owns the main thread.
                 #
-                # Default viewer on macOS is Vulkan since round 24 (fused
-                # Metal warp-pack kernel via torch.mps.compile_shader beats
-                # the CAMetalLayer path). D2S_MAC_VIEWER=metal selects the
-                # full CAMetalLayer deferred-warp path; on its failure this
-                # still falls back to run_vulkan_local_viewer, which chains
-                # Vulkan -> CAMetalLayer -> OpenGL.
+                # Default viewer on macOS is the CAMetalLayer deferred-warp
+                # path. It keeps ScreenCaptureKit/Core ML resources on the GPU
+                # and avoids the synchronous SBS pack. Set
+                # D2S_MAC_VIEWER=vulkan to use the compatibility viewer; a
+                # Metal initialization failure still falls back to Vulkan.
                 use_metal_viewer = (
-                    os.environ.get("D2S_MAC_VIEWER", "vulkan").strip().lower()
+                    os.environ.get("D2S_MAC_VIEWER", "metal").strip().lower()
                     == "metal"
                 )
 

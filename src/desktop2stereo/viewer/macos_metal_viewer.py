@@ -13,6 +13,7 @@ touching the pipeline: initialize() / present(frame) / poll_events() / close().
 
 from __future__ import annotations
 
+import math
 import os
 import queue
 import struct
@@ -27,12 +28,18 @@ if sys.platform == "darwin":
     import Metal
     import Quartz
 from viewer.vulkan_local_viewer import (
+    FPS_REPORT_INTERVAL_SECONDS,
     VulkanLocalViewerConfig,
     fit_rect,
     frame_to_rgba_bytes,
     is_exclusive_fullscreen_toggle,
     pack_frame_to_rgba8,
     present_fps_if_due,
+)
+from viewer.vulkan_fps_overlay import (
+    build_fps_panel_rgba,
+    overlay_rect_for_eye,
+    overlay_size_for_display_mode,
 )
 from viewer.window_control import (
     capture_cursor_snapshot,
@@ -91,14 +98,35 @@ static float4 blend_cursor(
     return color;
 }
 
+static float4 blend_overlay(
+    float4 color,
+    float2 pixel,
+    float4 rect,
+    texture2d<float> overlayTex,
+    sampler smp
+) {
+    if (rect.z <= 0.0 || rect.w <= 0.0) {
+        return color;
+    }
+    float2 overlay_uv = (pixel - rect.xy) / rect.zw;
+    if (all(overlay_uv >= 0.0) && all(overlay_uv < 1.0)) {
+        float4 overlay = overlayTex.sample(smp, overlay_uv);
+        color.rgb = mix(color.rgb, overlay.rgb, overlay.a);
+    }
+    return color;
+}
+
 fragment float4 quad_fragment(
     VOut in [[stage_in]],
     texture2d<float> tex [[texture(0)]],
     texture2d<float> cursorTex [[texture(1)]],
+    texture2d<float> fpsTex [[texture(2)]],
     sampler smp [[sampler(0)]],
     constant float4 &uv_xform [[buffer(0)]],
     constant float4 &cursor_rect_left [[buffer(1)]],
-    constant float4 &cursor_rect_right [[buffer(2)]]
+    constant float4 &cursor_rect_right [[buffer(2)]],
+    constant float4 &fps_rect_left [[buffer(3)]],
+    constant float4 &fps_rect_right [[buffer(4)]]
 ) {
     float2 uv = (in.uv - uv_xform.zw) / max(uv_xform.xy, float2(1e-6));
     if (any(uv < 0.0) || any(uv > 1.0)) {
@@ -107,6 +135,8 @@ fragment float4 quad_fragment(
     float4 color = tex.sample(smp, uv);
     color = blend_cursor(color, in.position.xy, cursor_rect_left, cursorTex, smp);
     color = blend_cursor(color, in.position.xy, cursor_rect_right, cursorTex, smp);
+    color = blend_overlay(color, in.position.xy, fps_rect_left, fpsTex, smp);
+    color = blend_overlay(color, in.position.xy, fps_rect_right, fpsTex, smp);
     return color;
 }
 """
@@ -135,6 +165,9 @@ struct Uniforms {
     float _pad1;
     float4 cursorRectLeft;
     float4 cursorRectRight;
+    float4 fpsRect;
+    // x/y are the raw Core ML depth range; z selects raw-depth sampling.
+    float4 rawNormalize;
 };
 
 vertex VertexOut vertex_main(uint vid [[vertex_id]]) {
@@ -174,9 +207,34 @@ static float4 blend_cursor(
     return color;
 }
 
+static float4 blend_overlay(
+    float4 color,
+    float2 pixel,
+    float4 rect,
+    texture2d<float> overlayTex,
+    sampler smp
+) {
+    if (rect.z <= 0.0 || rect.w <= 0.0) {
+        return color;
+    }
+    float2 overlay_uv = (pixel - rect.xy) / rect.zw;
+    if (all(overlay_uv >= 0.0) && all(overlay_uv < 1.0)) {
+        float4 overlay = overlayTex.sample(smp, overlay_uv);
+        color.rgb = mix(color.rgb, overlay.rgb, overlay.a);
+    }
+    return color;
+}
+
 static float2 displaced_uv(float2 uv, float eye, texture2d<float> depthTex, sampler s, constant Uniforms& u) {
     // Depth is globally antialiased before upload, so one sample is enough.
-    float d = clamp(depthTex.sample(s, uv).r, 0.0, 1.0);
+    float d = depthTex.sample(s, uv).r;
+    if (!isfinite(d)) d = 1.0;
+    if (u.rawNormalize.z > 0.5) {
+        d = clamp((d - u.rawNormalize.x) /
+                  max(u.rawNormalize.y - u.rawNormalize.x, 1.0e-6), 0.0, 1.0);
+    } else {
+        d = clamp(d, 0.0, 1.0);
+    }
     // Asymmetric depth shaping: boosts near-object pop ~35%
     float depth_shaped = d * (1.0 + 0.35 * (1.0 - d));
     float shift = (depth_shaped - u.convergence) * u.depthStrength * eye;
@@ -211,6 +269,7 @@ fragment float4 fragment_main(
     texture2d<float> colorTex [[texture(0)]],
     texture2d<float> depthTex [[texture(1)]],
     texture2d<float> cursorTex [[texture(2)]],
+    texture2d<float> fpsTex [[texture(3)]],
     constant Uniforms& u [[buffer(0)]]
 ) {
     constexpr sampler s(address::clamp_to_edge, filter::linear);
@@ -229,6 +288,12 @@ fragment float4 fragment_main(
         color = colorTex.sample(s, displaced_uv(uv, u.eyeOffset, depthTex, s, u));
     } else if (mode == 3) {
         float d = depthTex.sample(s, uv).r;
+        if (!isfinite(d)) d = 1.0;
+        if (u.rawNormalize.z > 0.5) {
+            d = (d - u.rawNormalize.x) /
+                max(u.rawNormalize.y - u.rawNormalize.x, 1.0e-6);
+        }
+        d = clamp(d, 0.0, 1.0);
         color = float4(spectral_r_ultrafast(d), 1.0);
     } else if (mode == 4) {
         float2 luv = displaced_uv(uv, -u.eyeOffset, depthTex, s, u);
@@ -253,6 +318,7 @@ fragment float4 fragment_main(
     }
     color = blend_cursor(color, frag, u.cursorRectLeft, cursorTex, s);
     color = blend_cursor(color, frag, u.cursorRectRight, cursorTex, s);
+    color = blend_overlay(color, frag, u.fpsRect, fpsTex, s);
     return color;
 }
 """
@@ -277,6 +343,9 @@ class MetalLocalViewer:
         self._cursor_snapshot = None
         self._cursor_snapshot_key = None
         self._cursor_hide_enabled = False
+        self._fps_overlay_texture = None
+        self._fps_overlay_size = (0, 0)
+        self._fps_overlay_visible = False
         self._staging_texture = None
         self._staging_size = (0, 0)
         self._native_pack_size = (0, 0)
@@ -288,6 +357,31 @@ class MetalLocalViewer:
         self._fps_frames = 0
         self._fps_started = time.perf_counter()
         self._last_drawable_size = (0, 0)
+        self._last_present_texture = None
+        self._last_present_size = (0, 0)
+        self._last_native_frame = None
+        self._last_native_entry: dict[str, Any] | None = None
+        self._display_refresh_hz = 60.0
+        # Keep the Metal OSD metrics compatible with the Vulkan/Windows viewer.
+        self._present_total = 0
+        self._present_reused = 0
+        self._content_fps = 0.0
+        self._content_frame_count = 0
+        self._reuse_ratio = 0.0
+        self._present_window_start = time.perf_counter()
+        self._last_latency_ms = 0.0
+        self._latency_history: list[float] = []
+        self._latency_history_max = 300
+        self._latency_anchor = "poll"
+        self._latency_stage_history: list[dict[str, float]] = []
+        self._latency_stage_history_max = 300
+        self._last_present_metrics: dict[str, float] = {}
+        self._upstream_fps = 0.0
+        self.upstream_fps_provider = None
+        self.sys_load_provider = None
+        self._load_snapshot: dict[str, Any] = {}
+        self._gpu_util = None
+        self._gpu_util_max = None
         # Deferred shader-warp state (rgb+depth present path).
         self._warp_pipeline = None
         self._warp_color_tex = None
@@ -331,7 +425,10 @@ class MetalLocalViewer:
         glfw.window_hint(glfw.VISIBLE, glfw.TRUE)
         glfw.window_hint(glfw.DECORATED, glfw.TRUE)
         glfw.window_hint(glfw.FLOATING, glfw.FALSE)
-        glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.TRUE)
+        # The SBS output must not activate its own Space when a source app
+        # enters native fullscreen. It is mouse-transparent and is pinned by
+        # AppKit instead.
+        glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.FALSE)
 
         monitors = glfw.get_monitors() or []
         monitor = (
@@ -347,6 +444,11 @@ class MetalLocalViewer:
             mx, my = glfw.get_monitor_pos(monitor)
             x, y = int(mx) + 40, int(my) + 40
             self._windowed_rect = (mx + 40, my + 40, width, height)
+            try:
+                mode = glfw.get_video_mode(monitor)
+                self._display_refresh_hz = max(20.0, float(mode.refresh_rate))
+            except (AttributeError, TypeError, ValueError):
+                self._display_refresh_hz = 60.0
         exclusive_fullscreen = bool(self.config.fullscreen and monitor is not None)
         if exclusive_fullscreen:
             mode = glfw.get_video_mode(monitor)
@@ -364,12 +466,18 @@ class MetalLocalViewer:
         pin_macos_viewer_window(
             self.window, fullscreen=exclusive_fullscreen
         )
+        # Match the Vulkan/Windows viewer: the first OSD interval starts after
+        # the window, Metal layer, and pipelines are ready.
+        self._fps_started = time.perf_counter()
+        self._present_window_start = self._fps_started
         glfw.set_key_callback(self.window, self._on_key)
 
         self._attach_metal_layer()
         self._register_capture_window()
         self._build_pipeline()
         self._cursor_texture = self._new_cursor_texture(1, 1, b"\x00\x00\x00\x00")
+        self._fps_overlay_texture = self._new_cursor_texture(1, 1, b"\x00\x00\x00\x00")
+        self._fps_overlay_size = (1, 1)
         if self.config.cursor_passthrough:
             self._cursor_hide_enabled = set_window_mouse_passthrough(
                 self.window,
@@ -523,6 +631,77 @@ class MetalLocalViewer:
         )
         return texture
 
+    def _show_fps_enabled(self) -> bool:
+        provider = getattr(self.config, "show_fps_provider", None)
+        if callable(provider):
+            try:
+                return bool(provider())
+            except Exception:
+                pass
+        return bool(getattr(self.config, "show_fps", False))
+
+    def _sync_fps_overlay_visibility(self) -> bool:
+        """Read the live GUI setting and update the per-frame draw flag."""
+        enabled = self._show_fps_enabled()
+        self._fps_overlay_visible = bool(
+            enabled and self._fps_overlay_texture is not None
+        )
+        return self._fps_overlay_visible
+
+    def _upload_fps_overlay(self, panel: Any) -> bool:
+        if panel is None:
+            return False
+        try:
+            width, height = (int(value) for value in panel.size)
+            if width <= 0 or height <= 0:
+                return False
+            rgba = (
+                panel
+                if getattr(panel, "mode", None) == "RGBA"
+                else panel.convert("RGBA")
+            )
+            pixels = rgba.tobytes()
+            texture = self._fps_overlay_texture
+            if texture is None or self._fps_overlay_size != (width, height):
+                texture = self._make_texture(width, height, self._source_pixel_format)
+                if texture is None:
+                    return False
+                self._fps_overlay_texture = texture
+                self._fps_overlay_size = (width, height)
+            region = Metal.MTLRegionMake2D(0, 0, width, height)
+            texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(
+                region, 0, pixels, width * 4
+            )
+            return True
+        except Exception as exc:
+            print(
+                "[MetalLocalViewer] FPS overlay upload skipped: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return False
+
+    def _fps_overlay_rects(
+        self, eye_rects: tuple[tuple[int, int, int, int], ...]
+    ) -> tuple[tuple[float, float, float, float], ...]:
+        empty = (0.0, 0.0, 0.0, 0.0)
+        if (
+            not self._fps_overlay_visible
+            or self._fps_overlay_texture is None
+            or self._fps_overlay_size == (0, 0)
+        ):
+            return tuple(empty for _ in eye_rects) or (empty,)
+        display_size = overlay_size_for_display_mode(
+            self._fps_overlay_size,
+            getattr(self.config, "display_mode", "Half-SBS"),
+        )
+        return tuple(
+            tuple(
+                float(value) for value in overlay_rect_for_eye(eye_rect, display_size)
+            )
+            for eye_rect in eye_rects
+        ) or (empty,)
+
     def _refresh_cursor_texture(self) -> None:
         mode = str(getattr(self.config, "display_mode", ""))
         if (
@@ -583,6 +762,33 @@ class MetalLocalViewer:
         source_width, source_height = map(int, source_size)
         output_format = str(getattr(frame, "output_format", "half_sbs") or "half_sbs")
         normalized_format = output_format.strip().casefold().replace("-", "_")
+        low_latency = os.environ.get("D2S_METAL_LOW_LATENCY", "1").strip().lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }
+        if normalized_format == "half_sbs" and low_latency:
+            # A Half-SBS output pixel represents one pixel in each eye. The
+            # local viewer uses the direct inverse-warp variant to avoid the
+            # full per-pixel DIBR gather while keeping all work on Metal.
+            warp_config = dict(getattr(native_frame, "warp_config", None) or {})
+            # Value 2 selects the local viewer's direct inverse warp. The
+            # streaming path keeps value 1 for its existing DIBR center sample.
+            warp_config["half_sbs_single_sample"] = 2
+            # The fast warp has no edge supersampling or hole-fill gather.
+            # Disable the separate full-resolution Gaussian pass as well;
+            # otherwise it adds several milliseconds without affecting the
+            # direct output branch.
+            warp_config["edge_aa_enabled"] = 0
+            configure_warp = getattr(native_frame, "configure_warp", None)
+            if callable(configure_warp):
+                configure_warp(**warp_config)
+            else:
+                try:
+                    native_frame.warp_config = warp_config
+                except (AttributeError, TypeError):
+                    pass
         width = source_width * 2 if normalized_format == "full_sbs" else source_width
         height = source_height * 2 if normalized_format == "full_tab" else source_height
         size = (width, height)
@@ -631,7 +837,7 @@ class MetalLocalViewer:
 
         pack_started = time.perf_counter()
         try:
-            native_frame.pack_metal(
+            pack_metrics = native_frame.pack_metal(
                 objc.pyobjc_id(slot["buffer"]),
                 width * height * 4,
                 size,
@@ -651,6 +857,20 @@ class MetalLocalViewer:
             ) * 1000.0
             debug["macos_metal_host_image_copies"] = 0
             debug["macos_metal_gpu_output_buffer"] = 1
+            debug["macos_metal_half_sbs_single_sample"] = int(
+                2 if normalized_format == "half_sbs" and low_latency else 0
+            )
+            debug["macos_metal_low_latency"] = int(low_latency)
+            if isinstance(pack_metrics, dict):
+                debug["macos_metal_pack_gpu_ms"] = float(
+                    pack_metrics.get("metal_gpu_ms", 0.0) or 0.0
+                )
+                debug["macos_metal_pack_host_handoff_ms"] = float(
+                    pack_metrics.get("host_handoff_copy_ms", 0.0) or 0.0
+                )
+                debug["macos_metal_pack_warp_threads"] = int(
+                    pack_metrics.get("warp_threads", 0) or 0
+                )
         return slot, slot["texture"], width, height
 
     # ── frame flow ──
@@ -659,6 +879,10 @@ class MetalLocalViewer:
         if self.window is None or not self._initialized_flag():
             raise RuntimeError("Metal local viewer has not been initialized")
         self.poll_events()
+        # The GUI callback is live and may change while the viewer thread is
+        # presenting. Read it for every frame so hiding/showing the panel does
+        # not wait for the five-second FPS reporting interval.
+        self._sync_fps_overlay_visibility()
 
         # macOS local presentation is GPU-only: native CoreML/Metal packing
         # feeds the CAMetalLayer, and a host RGBA upload is never accepted.
@@ -690,6 +914,16 @@ class MetalLocalViewer:
             raise RuntimeError(
                 "GPU-only Metal presentation requires a native CoreML/Metal frame"
             )
+        if native_frame is not None and os.environ.get(
+            "D2S_METAL_DEFERRED_NATIVE_WARP", "1"
+        ).strip().lower() not in {"0", "false", "off", "no"}:
+            # Keep Core ML's IOSurface texture and raw depth buffer alive until
+            # the CAMetalLayer command completes. This avoids the old full-frame
+            # native SBS pack and its synchronous GPU wait on the local viewer.
+            native_present = self._present_native_coreml_warp(frame)
+            if native_present is not None:
+                return native_present
+        pack_started = time.perf_counter()
         native_pack = self._pack_native_coreml_frame(frame)
         native_slot = None
         if native_pack is not None:
@@ -703,7 +937,6 @@ class MetalLocalViewer:
         host_np = None if native_slot is not None else getattr(frame, "viewer_frame_np", None)
         if native_slot is not None:
             pixels = None
-            pack_started = time.perf_counter()
         elif host_np is not None:
             pixels, width, height = host_np
             pack_started = time.perf_counter()
@@ -728,6 +961,17 @@ class MetalLocalViewer:
                 region, 0, pixels, width * 4
             )
 
+        return self._present_packed_texture(texture, width, height, native_slot=native_slot)
+
+    def _present_packed_texture(
+        self,
+        texture: Any,
+        width: int,
+        height: int,
+        *,
+        native_slot: dict[str, Any] | None = None,
+    ) -> bool:
+        """Submit a packed GPU texture with the live cursor overlays."""
         drawable = self.layer.nextDrawable()
         if drawable is None:
             if native_slot is not None:
@@ -738,19 +982,37 @@ class MetalLocalViewer:
         # GLFW already reports framebuffer pixels on macOS. Multiplying by
         # backingScaleFactor again overallocates Retina drawables (for example
         # 1920x1080 becomes 7680x4320) and can make fullscreen presents vanish.
-        dw, dh = int(fb_w), int(fb_h)
-        dw, dh = max(1, dw), max(1, dh)
+        dw, dh = max(1, int(fb_w)), max(1, int(fb_h))
         if self._last_drawable_size != (dw, dh):
             self.layer.setDrawableSize_((dw, dh))
             self._last_drawable_size = (dw, dh)
 
         # Aspect-fit the SBS texture inside the drawable (letterbox black).
-        sx = sy = s = min(dw / width, dh / height)
-        su = min(1.0, (width * s) / dw)
-        sv = min(1.0, (height * s) / dh)
+        scale = min(dw / width, dh / height)
+        su = min(1.0, (width * scale) / dw)
+        sv = min(1.0, (height * scale) / dh)
         off_u = (1.0 - su) / 2.0
         off_v = (1.0 - sv) / 2.0
+        content_left = round(off_u * dw)
+        content_top = round(off_v * dh)
+        content_width = round(su * dw)
+        content_height = round(sv * dh)
+        eye_rects = (
+            (
+                content_left,
+                content_top,
+                content_left + content_width // 2,
+                content_top + content_height,
+            ),
+            (
+                content_left + content_width // 2,
+                content_top,
+                content_left + content_width,
+                content_top + content_height,
+            ),
+        )
 
+        submit_started = time.perf_counter()
         command_buffer = self.queue.commandBuffer()
         if native_slot is not None:
             command_buffer.addCompletedHandler_(
@@ -767,62 +1029,124 @@ class MetalLocalViewer:
         encoder.setRenderPipelineState_(self.pipeline)
         encoder.setFragmentTexture_atIndex_(texture, 0)
         encoder.setFragmentSamplerState_atIndex_(self.sampler, 0)
+        # PyObjC requires a buffer-protocol object for `const void*`; a plain
+        # tuple raises "too few values (4) expecting at least 16".
         encoder.setFragmentBytes_length_atIndex_(
-            # PyObjC requires a buffer-protocol object for `const void*`;
-            # a plain tuple raises "too few values (4) expecting at least 16".
-            struct.pack("4f", su, sv, off_u, off_v),
-            16,
-            0,
+            struct.pack("4f", su, sv, off_u, off_v), 16, 0
         )
-        content_left = round(off_u * dw)
-        content_top = round(off_v * dh)
-        content_width = round(su * dw)
-        content_height = round(sv * dh)
-        cursor_rects = self._cursor_overlay_rects((
-            (
-                content_left,
-                content_top,
-                content_left + content_width // 2,
-                content_top + content_height,
-            ),
-            (
-                content_left + content_width // 2,
-                content_top,
-                content_left + content_width,
-                content_top + content_height,
-            ),
-        ))
+        cursor_rects = self._cursor_overlay_rects(eye_rects)
+        fps_rects = self._fps_overlay_rects(eye_rects)
         encoder.setFragmentTexture_atIndex_(self._cursor_texture, 1)
+        fps_texture = self._fps_overlay_texture
+        if fps_texture is None:
+            fps_texture = self._cursor_texture
+        encoder.setFragmentTexture_atIndex_(fps_texture, 2)
         encoder.setFragmentBytes_length_atIndex_(
-            struct.pack("4f", *cursor_rects[0]),
-            16,
-            1,
+            struct.pack("4f", *cursor_rects[0]), 16, 1
         )
         encoder.setFragmentBytes_length_atIndex_(
-            struct.pack("4f", *cursor_rects[1]),
+            struct.pack("4f", *cursor_rects[1]), 16, 2
+        )
+        encoder.setFragmentBytes_length_atIndex_(
+            struct.pack("4f", *fps_rects[0]), 16, 3
+        )
+        encoder.setFragmentBytes_length_atIndex_(
+            struct.pack(
+                "4f", *(fps_rects[1] if len(fps_rects) > 1 else fps_rects[0])
+            ),
             16,
-            2,
+            4,
         )
         encoder.drawPrimitives_vertexStart_vertexCount_(
             Metal.MTLPrimitiveTypeTriangleStrip, 0, 4
         )
         encoder.endEncoding()
-        # PyObjC selector: `presentDrawable:` maps to presentDrawable_.
         command_buffer.presentDrawable_(drawable)
+        self._last_present_metrics = {
+            "metal_present_submit_cpu_ms": 0.0,
+        }
         command_buffer.commit()
+        self._last_present_metrics = {
+            "metal_present_submit_cpu_ms": max(
+                0.0, (time.perf_counter() - submit_started) * 1000.0
+            ),
+        }
+        self._last_present_texture = texture
+        self._last_present_size = (int(width), int(height))
         self._enable_native_cursor_hiding()
 
         now = time.perf_counter()
         self._fps_frames += 1
-        fps = present_fps_if_due(self._fps_frames, now - self._fps_started)
+        fps = present_fps_if_due(
+            self._fps_frames,
+            now - self._fps_started,
+            interval=FPS_REPORT_INTERVAL_SECONDS,
+        )
         if fps is not None:
             self._report_present_fps(fps, self._fps_frames)
             self._fps_frames = 0
             self._fps_started = now
         return True
 
+    def present_cached(self) -> bool:
+        """Redraw the last GPU frame so cursor motion is independent of inference."""
+        if (
+            self.window is not None
+            and self._initialized_flag()
+            and getattr(self, "_last_native_frame", None) is not None
+        ):
+            self.poll_events()
+            self._sync_fps_overlay_visibility()
+            presented = self._present_native_coreml_warp(None, cached=True)
+            if presented is not None:
+                return presented
+        texture = self._last_present_texture
+        width, height = self._last_present_size
+        if (
+            self.window is None
+            or not self._initialized_flag()
+            or texture is None
+            or width <= 0
+            or height <= 0
+        ):
+            return False
+        self.poll_events()
+        self._sync_fps_overlay_visibility()
+        return self._present_packed_texture(texture, width, height)
+
+    def _present_cached(self) -> bool:
+        """Compatibility alias matching the Vulkan viewer interface."""
+        return self.present_cached()
+
+    def cached_present_interval(self) -> float:
+        """Return a bounded display cadence for cursor-only redraws."""
+        try:
+            refresh_hz = float(self._display_refresh_hz)
+        except (AttributeError, TypeError, ValueError):
+            refresh_hz = 60.0
+        return 1.0 / max(20.0, min(240.0, refresh_hz))
+
     def _initialized_flag(self) -> bool:
         return self.pipeline is not None
+
+    def _retire_native_entry_if_ready(self, entry: dict[str, Any]) -> None:
+        """Release a native slot once it is dropped and no Metal command uses it."""
+        if (
+            entry.get("drop")
+            and entry.get("completed")
+            and not entry.get("released")
+        ):
+            entry["released"] = True
+            try:
+                entry["frame"].release()
+            except Exception:
+                pass
+
+    def _complete_native_entry(self, entry: dict[str, Any]) -> None:
+        """Finish one command-buffer lease on a retained native frame."""
+        entry["pending"] = max(0, int(entry.get("pending", 0)) - 1)
+        entry["completed"] = entry["pending"] == 0
+        self._retire_native_entry_if_ready(entry)
 
     # ── deferred shader-warp present (rgb + depth) ──
 
@@ -869,10 +1193,16 @@ class MetalLocalViewer:
         return max(1, int(round(src_w * scale))), max(1, int(round(src_h * scale)))
 
     def _warp_viewports(
-        self, win_w: int, win_h: int, tex_w: int, tex_h: int
+        self,
+        win_w: int,
+        win_h: int,
+        tex_w: int,
+        tex_h: int,
+        *,
+        ipd_uv: float | None = None,
     ) -> list[tuple[tuple[int, int, int, int], float]]:
         """Eye viewports + eye offsets, ported from v2.5 _stereo_viewports."""
-        ipd_half = self._warp_ipd_uv / 2.0
+        ipd_half = (self._warp_ipd_uv if ipd_uv is None else ipd_uv) / 2.0
         mode = str(getattr(self.config, "display_mode", "Half-SBS"))
         fill = bool(getattr(self.config, "fill_16_9", True))
 
@@ -923,13 +1253,90 @@ class MetalLocalViewer:
             return 2
         return 7  # SBS warp (per-eye draws with explicit eye offsets)
 
-    def _present_warp(self, rgb: Any, depth: Any, bgra: Any = None) -> bool:
+    def _present_native_coreml_warp(
+        self, frame: Any, *, cached: bool = False
+    ) -> bool | None:
+        """Render from retained Core ML Metal resources without an SBS pack."""
+        native_frame = (
+            getattr(frame, "viewer_native", None)
+            if not cached
+            else self._last_native_frame
+        )
+        if native_frame is None:
+            return None
+        resources = getattr(native_frame, "metal_resources", None)
+        if not callable(resources):
+            return None
+        try:
+            metal_resources = resources()
+        except Exception:
+            metal_resources = None
+        if not metal_resources:
+            return None
+        color_texture, depth_buffer = metal_resources
+        if not cached:
+            entry = {
+                "frame": native_frame,
+                "completed": True,
+                "pending": 0,
+                "drop": False,
+                "released": False,
+            }
+            previous = self._last_native_entry
+            if previous is not None:
+                previous["drop"] = True
+                self._retire_native_entry_if_ready(previous)
+            self._last_native_entry = entry
+            self._last_native_frame = native_frame
+        else:
+            entry = self._last_native_entry
+            if entry is None or entry.get("released"):
+                return None
+        entry["pending"] = int(entry.get("pending", 0)) + 1
+        entry["completed"] = False
+        debug_info = getattr(frame, "debug_info", None) if frame is not None else None
+        if isinstance(debug_info, dict):
+            debug_info["macos_metal_deferred_native_warp"] = 1
+            debug_info["macos_metal_host_image_copies"] = 0
+            debug_info["macos_metal_gpu_output_buffer"] = 0
+            debug_info["macos_metal_output_pack_ms"] = 0.0
+        presented = self._present_warp(
+            None,
+            None,
+            native_color_texture=color_texture,
+            native_depth_buffer=depth_buffer,
+            native_frame=native_frame,
+            native_release_entry=entry,
+        )
+        if presented is False:
+            self._complete_native_entry(entry)
+        if presented and not cached:
+            object.__setattr__(frame, "viewer_native", None)
+        elif presented is False and not cached:
+            entry["drop"] = True
+            self._retire_native_entry_if_ready(entry)
+            if self._last_native_entry is entry:
+                self._last_native_entry = None
+                self._last_native_frame = None
+        return presented
+
+    def _present_warp(
+        self,
+        rgb: Any,
+        depth: Any,
+        bgra: Any = None,
+        *,
+        native_color_texture: Any = None,
+        native_depth_buffer: Any = None,
+        native_frame: Any = None,
+        native_release_entry: dict[str, Any] | None = None,
+    ) -> bool:
         import torch  # local: module stays importable without torch
 
         # Zero-copy fast path: sample the captured SCK BGRA texture directly
         # (IOSurface-backed, never touches CPU); release it once the GPU is
         # done. Fallback: device-pack the preprocessed tensor.
-        zc_texture = None
+        zc_texture = native_color_texture
         if bgra is not None:
             try:
                 zc_texture = bgra.mtl_texture()
@@ -961,16 +1368,46 @@ class MetalLocalViewer:
         # Numpy-free depth upload: pull the (already contiguous) CPU tensor
         # and hand pyobjc its raw bytes via the buffer protocol. bytes() on a
         # uint8/fp32 CPU tensor is a single flat copy — no numpy view math.
-        depth_t = depth.detach()
-        if depth_t.dtype != torch.uint8:
-            depth_t = depth_t.float()
-        depth_t = depth_t.contiguous().cpu().reshape(-1, depth_t.shape[-1])
-        dh, dw = int(depth_t.shape[0]), int(depth_t.shape[1])
-        depth_is_u8 = depth_t.dtype == torch.uint8
-
-        self._ensure_warp_textures(
-            (width, height), (dw, dh), depth_u8=depth_is_u8
-        )
+        raw_normalize = (0.0, 1.0, 0.0, 0.0)
+        if native_depth_buffer is not None and native_frame is not None:
+            dw, dh = int(native_frame.depth_width), int(native_frame.depth_height)
+            depth_is_float16 = bool(getattr(native_frame, "depth_is_float16", False))
+            depth_format = (
+                Metal.MTLPixelFormatR16Float
+                if depth_is_float16
+                else Metal.MTLPixelFormatR32Float
+            )
+            depth_desc = (
+                Metal.MTLTextureDescriptor
+                .texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
+                    depth_format, dw, dh, False
+                )
+            )
+            depth_desc.setUsage_(Metal.MTLTextureUsageShaderRead)
+            depth_desc.setStorageMode_(Metal.MTLStorageModeShared)
+            depth_texture = native_depth_buffer.newTextureWithDescriptor_offset_bytesPerRow_(
+                depth_desc,
+                0,
+                dw * (2 if depth_is_float16 else 4),
+            )
+            if depth_texture is None:
+                return None
+            raw_normalize = (
+                float(getattr(native_frame, "raw_normalize_lo", 0.0)),
+                float(getattr(native_frame, "raw_normalize_hi", 1.0)),
+                1.0,
+                0.0,
+            )
+        else:
+            depth_t = depth.detach()
+            if depth_t.dtype != torch.uint8:
+                depth_t = depth_t.float()
+            depth_t = depth_t.contiguous().cpu().reshape(-1, depth_t.shape[-1])
+            dh, dw = int(depth_t.shape[0]), int(depth_t.shape[1])
+            depth_is_u8 = depth_t.dtype == torch.uint8
+            self._ensure_warp_textures(
+                (width, height), (dw, dh), depth_u8=depth_is_u8
+            )
         if zc_texture is not None:
             color_tex = zc_texture
         else:
@@ -979,26 +1416,50 @@ class MetalLocalViewer:
                 color_region, 0, rgba, width * 4
             )
             color_tex = self._warp_color_tex
-        # ctypes.string_at: C-speed raw copy of the tensor's bytes.
-        # bytes(tensor) is NOT viable — torch.__bytes__ loops per element
-        # (~400ms for 2MB!); numpy is intentionally avoided here per leg-2.
-        import ctypes
+        if native_depth_buffer is None:
+            # ctypes.string_at: C-speed raw copy of the tensor's bytes.
+            # bytes(tensor) loops per element; numpy is intentionally avoided.
+            import ctypes
 
-        flat = depth_t.reshape(-1)
-        depth_payload = ctypes.string_at(flat.data_ptr(), flat.numel())
-        depth_bpr = dw * (1 if depth_is_u8 else 4)
-        depth_region = Metal.MTLRegionMake2D(0, 0, dw, dh)
-        self._warp_depth_tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(
-            depth_region, 0, depth_payload, depth_bpr
-        )
+            flat = depth_t.reshape(-1)
+            depth_payload = ctypes.string_at(flat.data_ptr(), flat.numel())
+            depth_bpr = dw * (1 if depth_is_u8 else 4)
+            depth_region = Metal.MTLRegionMake2D(0, 0, dw, dh)
+            self._warp_depth_tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(
+                depth_region, 0, depth_payload, depth_bpr
+            )
+            depth_texture = self._warp_depth_tex
+        native_warp = dict(getattr(native_frame, "warp_config", None) or {})
+        if native_frame is not None:
+            native_max_disparity = max(
+                0.0, float(native_warp.get("max_disparity_px", 48.0))
+            )
+            native_ipd_uv = native_max_disparity / max(float(width), 1.0)
+            warp_depth_strength = max(
+                0.0, float(native_warp.get("depth_strength", 1.0))
+            )
+            warp_convergence = float(native_warp.get("convergence", 0.0))
+        else:
+            native_ipd_uv = None
+            warp_depth_strength = 0.1 * self._warp_depth_ratio
+            warp_convergence = self._warp_convergence
         if os.environ.get("D2S_PREP_TRACE") == "1" and not getattr(
             self, "_warp_trace_once", False
         ):
             self._warp_trace_once = True
+            trace_depth_u8 = (
+                False if native_depth_buffer is not None else depth_is_u8
+            )
+            trace_depth_bpr = dw * (
+                2 if native_depth_buffer is not None and native_frame is not None
+                and bool(getattr(native_frame, "depth_is_float16", False))
+                else 1 if trace_depth_u8 else 4
+            )
             print(
-                f"[warp-trace] u8={depth_is_u8} {dw}x{dh} bpr={depth_bpr} "
+                f"[warp-trace] u8={trace_depth_u8} {dw}x{dh} bpr={trace_depth_bpr} "
                 f"zcolor={zc_texture is not None} "
-                f"depth_fmt={self._warp_depth_format}",
+                "depth_fmt="
+                f"{getattr(self, '_warp_depth_format', depth_format if native_depth_buffer is not None else '')}",
                 flush=True,
             )
 
@@ -1013,6 +1474,7 @@ class MetalLocalViewer:
             self.layer.setDrawableSize_((dw_px, dh_px))
             self._last_drawable_size = (dw_px, dh_px)
 
+        submit_started = time.perf_counter()
         command_buffer = self.queue.commandBuffer()
         pass_desc = Metal.MTLRenderPassDescriptor.renderPassDescriptor()
         attachment = pass_desc.colorAttachments().objectAtIndexedSubscript_(0)
@@ -1024,10 +1486,16 @@ class MetalLocalViewer:
         encoder = command_buffer.renderCommandEncoderWithDescriptor_(pass_desc)
         encoder.setRenderPipelineState_(self._warp_pipeline)
         encoder.setFragmentTexture_atIndex_(color_tex, 0)
-        encoder.setFragmentTexture_atIndex_(self._warp_depth_tex, 1)
+        encoder.setFragmentTexture_atIndex_(depth_texture, 1)
 
         mode_id = self._warp_mode_id(str(getattr(self.config, "display_mode", "Half-SBS")))
-        viewports = self._warp_viewports(dw_px, dh_px, width, height)
+        viewports = self._warp_viewports(
+            dw_px,
+            dh_px,
+            width,
+            height,
+            ipd_uv=native_ipd_uv,
+        )
         # Per-eye viewport draws always use warp mode 7 (the viewport selects
         # the eye region); single-viewport modes pass their own shader mode.
         mode_value = 7.0 if len(viewports) > 1 else float(mode_id)
@@ -1041,15 +1509,20 @@ class MetalLocalViewer:
             for viewport, _eye_offset in viewports
         )
         cursor_rects = self._cursor_overlay_rects(eye_rects)
+        fps_rects = self._fps_overlay_rects(eye_rects)
         encoder.setFragmentTexture_atIndex_(self._cursor_texture, 2)
-        for viewport, eye_offset in viewports:
-            # struct.pack: numpy-free uniform payload (20 floats, native LE
+        fps_texture = self._fps_overlay_texture
+        if fps_texture is None:
+            fps_texture = self._cursor_texture
+        encoder.setFragmentTexture_atIndex_(fps_texture, 3)
+        for index, (viewport, eye_offset) in enumerate(viewports):
+            # struct.pack: numpy-free uniform payload (28 floats, native LE
             # matches MSL float layout).
             payload = struct.pack(
-                "<20f",
+                "<28f",
                 eye_offset,
-                0.1 * self._warp_depth_ratio,
-                self._warp_convergence,
+                warp_depth_strength,
+                warp_convergence,
                 0.0,
                 float(viewport[0]),
                 float(viewport[1]),
@@ -1061,6 +1534,12 @@ class MetalLocalViewer:
                 0.0,
                 *cursor_rects[0],
                 *cursor_rects[1],
+                *(
+                    fps_rects[index]
+                    if index < len(fps_rects)
+                    else (0.0, 0.0, 0.0, 0.0)
+                ),
+                *raw_normalize,
             )
             encoder.setFragmentBytes_length_atIndex_(payload, len(payload), 0)
             encoder.drawPrimitives_vertexStart_vertexCount_(
@@ -1074,28 +1553,287 @@ class MetalLocalViewer:
                 command_buffer.addCompletedHandler_(_release_bgra)
             except Exception:
                 _release_bgra()
+        if native_frame is not None:
+            def _release_native(_cb=None):
+                try:
+                    if native_release_entry is None:
+                        native_frame.release()
+                        return
+                    self._complete_native_entry(native_release_entry)
+                except Exception:
+                    pass
+
+            try:
+                command_buffer.addCompletedHandler_(_release_native)
+            except Exception:
+                _release_native()
+        self._last_present_metrics = {
+            "metal_present_submit_cpu_ms": 0.0,
+        }
+        try:
+            def _record_present_gpu(_cb):
+                try:
+                    gpu_start = _cb.GPUStartTime
+                    gpu_end = _cb.GPUEndTime
+                    if callable(gpu_start):
+                        gpu_start = gpu_start()
+                    if callable(gpu_end):
+                        gpu_end = gpu_end()
+                    if gpu_end >= gpu_start and gpu_start > 0.0:
+                        self._last_present_metrics["metal_present_gpu_ms"] = (
+                            gpu_end - gpu_start
+                        ) * 1000.0
+                except Exception:
+                    pass
+
+            command_buffer.addCompletedHandler_(_record_present_gpu)
+        except Exception:
+            pass
         command_buffer.commit()
+        self._last_present_metrics["metal_present_submit_cpu_ms"] = max(
+            0.0, (time.perf_counter() - submit_started) * 1000.0
+        )
         self._enable_native_cursor_hiding()
 
         now = time.perf_counter()
         self._fps_frames += 1
-        fps = present_fps_if_due(self._fps_frames, now - self._fps_started)
+        fps = present_fps_if_due(
+            self._fps_frames,
+            now - self._fps_started,
+            interval=FPS_REPORT_INTERVAL_SECONDS,
+        )
         if fps is not None:
             self._report_present_fps(fps, self._fps_frames)
             self._fps_frames = 0
             self._fps_started = now
         return True
 
+    def record_present(self, reused: bool) -> None:
+        """Count successful submissions for the shared Windows-style OSD."""
+        self._present_total += 1
+        if reused:
+            self._present_reused += 1
+
+    def _refresh_content_rate(self) -> None:
+        window_start = getattr(self, "_present_window_start", None)
+        if window_start is None:
+            return
+        now = time.perf_counter()
+        elapsed = now - window_start
+        if elapsed < 0.5:
+            return
+        fresh = self._present_total - self._present_reused
+        self._content_fps = fresh / elapsed
+        self._content_frame_count = fresh
+        self._reuse_ratio = (
+            self._present_reused / self._present_total
+            if self._present_total
+            else 0.0
+        )
+        self._present_total = 0
+        self._present_reused = 0
+        self._present_window_start = now
+
+    def content_fps(self) -> float:
+        return self._content_fps
+
+    def reuse_ratio(self) -> float:
+        return self._reuse_ratio
+
+    def latency_ms(self) -> float:
+        return self._last_latency_ms
+
+    def avg_latency_ms(self) -> float:
+        if not self._latency_history:
+            return 0.0
+        return sum(self._latency_history) / len(self._latency_history)
+
+    @staticmethod
+    def _sample_percentile(samples: list[float], quantile: float) -> float:
+        if not samples:
+            return 0.0
+        position = (len(samples) - 1) * min(1.0, max(0.0, float(quantile)))
+        lower = int(position)
+        upper = min(lower + 1, len(samples) - 1)
+        fraction = position - lower
+        return samples[lower] + (samples[upper] - samples[lower]) * fraction
+
+    def _log_present_metrics(self, fps: float, capture_target: int | None) -> None:
+        """Emit the same stable latency fields as the Vulkan local viewer."""
+        latency = sorted(self._latency_history)
+        parts = [
+            "backend=metal",
+            f"present_fps={float(fps):.2f}",
+            f"content_fps={self.content_fps():.2f}",
+            f"reuse={self.reuse_ratio():.4f}",
+            f"latency_ms={self.latency_ms():.2f}",
+            f"avg_latency_ms={self.avg_latency_ms():.2f}",
+            f"latency_samples={len(self._latency_history)}",
+            f"latency_anchor={self._latency_anchor}",
+            f"display_hz={int(self._display_refresh_hz)}",
+        ]
+        if self._upstream_fps > 0.0:
+            parts.append(f"upstream_fps={self._upstream_fps:.2f}")
+        if latency:
+            parts.extend(
+                (
+                    f"latency_p50_ms={self._sample_percentile(latency, 0.50):.2f}",
+                    f"latency_p95_ms={self._sample_percentile(latency, 0.95):.2f}",
+                    f"latency_p99_ms={self._sample_percentile(latency, 0.99):.2f}",
+                    f"latency_max_ms={latency[-1]:.2f}",
+                )
+            )
+        for name in (
+            "capture_to_runtime_start_ms",
+            "capture_to_runtime_ready_ms",
+            "capture_wait_ms",
+            "sck_callback_to_runtime_ms",
+            "runtime_execution_ms",
+            "runtime_gpu_wait_ms",
+            "runtime_completion_ms",
+            "depth_total_ms",
+            "depth_preprocess_ms",
+            "depth_model_ms",
+            "depth_postprocess_ms",
+            "synthesis_ms",
+            "pack_ms",
+            "macos_metal_output_pack_ms",
+            "macos_metal_pack_gpu_ms",
+            "macos_metal_pack_host_handoff_ms",
+            "metal_present_submit_cpu_ms",
+            "metal_present_gpu_ms",
+            "viewer_queue_ms",
+            "present_call_ms",
+        ):
+            samples = sorted(
+                item[name]
+                for item in self._latency_stage_history
+                if name in item
+            )
+            if samples:
+                parts.append(f"{name}_p95={self._sample_percentile(samples, 0.95):.2f}")
+        if capture_target is not None:
+            parts.append(f"capture_target={int(capture_target)}")
+        print(f"[D2S_METRICS] {' '.join(parts)}", flush=True)
+
+    def record_frame_latency(
+        self,
+        capture_start_time: float | None,
+        *,
+        stage_timing: dict[str, float] | None = None,
+        anchor_time: float | None = None,
+    ) -> None:
+        """Record frame age using the same capture-to-present metric as Vulkan."""
+        if capture_start_time is None:
+            return
+        try:
+            started = float(capture_start_time)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(started) or started <= 0.0:
+            return
+        timing = stage_timing or {}
+        try:
+            presented_at = float(timing.get("presented_at", time.perf_counter()))
+        except (TypeError, ValueError):
+            presented_at = time.perf_counter()
+        now = time.perf_counter()
+        if math.isfinite(presented_at) and started <= presented_at <= now:
+            now = presented_at
+        label = "poll"
+        if os.environ.get("D2S_LATENCY_ANCHOR", "callback").strip().lower() not in {
+            "poll",
+            "start",
+            "legacy",
+        }:
+            for candidate_label, value in (
+                ("sck_callback", timing.get("sck_callback_time")),
+                ("capture_return", timing.get("capture_poll_returned_at")),
+                ("callback", anchor_time),
+            ):
+                try:
+                    candidate = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(candidate) and started <= candidate <= now:
+                    started, label = candidate, candidate_label
+                    break
+        latency_ms = (now - started) * 1000.0
+        if not math.isfinite(latency_ms) or latency_ms <= 0.0 or latency_ms > 10_000.0:
+            return
+        if label != self._latency_anchor:
+            self._latency_history.clear()
+        self._latency_anchor = label
+        self._last_latency_ms = latency_ms
+        self._latency_history.append(latency_ms)
+        if len(self._latency_history) > self._latency_history_max:
+            del self._latency_history[0]
+        if timing:
+            sample: dict[str, float] = {}
+            for key in (
+                "capture_to_runtime_start_ms",
+                "capture_to_runtime_ready_ms",
+                "capture_wait_ms",
+                "sck_callback_to_runtime_ms",
+                "runtime_execution_ms",
+                "runtime_gpu_wait_ms",
+                "runtime_completion_ms",
+                "depth_total_ms",
+                "depth_preprocess_ms",
+                "depth_model_ms",
+                "depth_postprocess_ms",
+                "synthesis_ms",
+                "pack_ms",
+                "macos_metal_output_pack_ms",
+                "macos_metal_pack_gpu_ms",
+                "macos_metal_pack_host_handoff_ms",
+                "macos_metal_pack_warp_threads",
+                "metal_present_submit_cpu_ms",
+                "metal_present_gpu_ms",
+                "viewer_queue_ms",
+                "present_call_ms",
+            ):
+                try:
+                    value = float(timing[key])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if math.isfinite(value) and 0.0 <= value < 10_000.0:
+                    sample[key] = value
+            if sample:
+                self._latency_stage_history.append(sample)
+                if len(self._latency_stage_history) > self._latency_stage_history_max:
+                    del self._latency_stage_history[0]
+
+    def _refresh_system_metrics(self) -> None:
+        upstream_provider = getattr(self, "upstream_fps_provider", None)
+        if callable(upstream_provider):
+            try:
+                self._upstream_fps = max(0.0, float(upstream_provider()))
+            except (TypeError, ValueError, RuntimeError):
+                self._upstream_fps = 0.0
+        load_provider = getattr(self, "sys_load_provider", None)
+        if callable(load_provider):
+            try:
+                load = load_provider()
+                self._load_snapshot = dict(load) if load else {}
+                self._gpu_util = load.get("gpu")
+                self._gpu_util_max = load.get("gpu_max")
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                self._load_snapshot = {}
+                self._gpu_util = None
+                self._gpu_util_max = None
+
     def _report_present_fps(self, fps: float, frame_count: int) -> None:
+        self._refresh_content_rate()
+        self._refresh_system_metrics()
         capture_target = (
             self.config.on_sbs_fps(fps, frame_count)
             if self.config.on_sbs_fps is not None
             else None
         )
-        show_fps = (
-            bool(self.config.show_fps_provider())
-            if self.config.show_fps_provider is not None
-            else self.config.show_fps
+        show_fps = self._show_fps_enabled()
+        self._fps_overlay_visible = bool(
+            show_fps and self._fps_overlay_texture is not None
         )
         if not show_fps:
             return
@@ -1106,6 +1844,27 @@ class MetalLocalViewer:
             f"[MetalLocalViewer] Present FPS: {fps:.1f}{target_text}",
             flush=True,
         )
+        if hasattr(self, "_latency_stage_history"):
+            self._log_present_metrics(fps, capture_target)
+        panel_kwargs = {
+            "present_fps": fps,
+            "capture_target": capture_target,
+        }
+        # Keep this conditional so small unit-test doubles and older callers
+        # still receive the original two-field call shape.
+        if hasattr(self, "_content_fps"):
+            panel_kwargs.update(
+                content_fps=self.content_fps(),
+                reuse_ratio=self.reuse_ratio(),
+                latency_ms=self.latency_ms(),
+                avg_latency_ms=self.avg_latency_ms(),
+                source_fps=self._upstream_fps if self._upstream_fps > 0.0 else None,
+                gpu_util=self._gpu_util,
+                gpu_util_max=self._gpu_util_max,
+            )
+        panel = build_fps_panel_rgba(**panel_kwargs)
+        if self._upload_fps_overlay(panel):
+            self._fps_overlay_visible = True
 
     # ── window events ──
 
@@ -1178,6 +1937,17 @@ class MetalLocalViewer:
                     )
                 self._capture_window_registered = False
             self._staging_texture = None
+            self._last_present_texture = None
+            self._last_present_size = (0, 0)
+            if self._last_native_entry is not None:
+                entry = self._last_native_entry
+                entry["drop"] = True
+                self._retire_native_entry_if_ready(entry)
+            self._last_native_entry = None
+            self._last_native_frame = None
+            self._fps_overlay_texture = None
+            self._fps_overlay_size = (0, 0)
+            self._fps_overlay_visible = False
             self.pipeline = None
             self.queue = None
             self.device = None
@@ -1189,24 +1959,89 @@ class MetalLocalViewer:
             self.window = None
 
 
+def _has_cached_frame(target: MetalLocalViewer | None) -> bool:
+    """Return whether an idle redraw can reuse a packed or native frame."""
+    if target is None:
+        return False
+    return bool(
+        getattr(target, "_last_present_texture", None) is not None
+        or getattr(target, "_last_native_frame", None) is not None
+    )
+
+
 def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) -> None:
     """Metal variant of run_vulkan_local_viewer (macOS Local Viewer)."""
     viewer: MetalLocalViewer | None = None
     preview_logged = False
+    next_cached_present_at = 0.0
+
+    def _configure_metrics(target: MetalLocalViewer) -> None:
+        packer = getattr(runtime_q, "_d2s_packer", None)
+        if packer is not None:
+            target.upstream_fps_provider = getattr(
+                packer, "take_published_fps", None
+            )
+        try:
+            from utils.sys_load import install_system_load_sampler
+
+            sampler = install_system_load_sampler(cpu=False)
+            if sampler is not None:
+                target.sys_load_provider = sampler.snapshot
+        except (ImportError, RuntimeError):
+            pass
+
+    def _cached_present_interval() -> float:
+        if viewer is None:
+            return 1.0 / 60.0
+        provider = getattr(viewer, "cached_present_interval", None)
+        if callable(provider):
+            try:
+                return max(0.004, min(0.05, float(provider())))
+            except (TypeError, ValueError):
+                pass
+        return 1.0 / 60.0
+
     try:
         if getattr(config, "on_capture_windows_initialized", None) is not None:
             # Same-monitor ScreenCaptureKit must start after the Cocoa window
             # exists, otherwise its initial exclusion list is empty.
             viewer = MetalLocalViewer(config)
             viewer.initialize()
+            _configure_metrics(viewer)
             print("[MetalLocalViewer] Metal local window initialized", flush=True)
             config.on_capture_windows_initialized()
         while not shutdown_event.is_set():
+            queue_timeout = 0.05
+            if _has_cached_frame(viewer):
+                queue_timeout = min(
+                    queue_timeout,
+                    max(0.0, next_cached_present_at - time.perf_counter()),
+                )
             try:
-                result, _started = runtime_q.get(timeout=0.05)
+                result, _started = runtime_q.get(timeout=queue_timeout)
             except queue.Empty:
                 if viewer is not None:
-                    viewer.poll_events()
+                    now = time.perf_counter()
+                    cached_present = getattr(viewer, "present_cached", None)
+                    if (
+                        callable(cached_present)
+                        and _has_cached_frame(viewer)
+                        and now >= next_cached_present_at
+                    ):
+                        present_started = now
+                        presented = cached_present()
+                        if presented is not False:
+                            viewer.record_present(True)
+                        if config.on_breakdown_add_time is not None:
+                            config.on_breakdown_add_time(
+                                "local_present", time.perf_counter() - present_started
+                            )
+                        if presented is not False and config.on_breakdown_inc is not None:
+                            config.on_breakdown_inc("local_presented_frame", 1)
+                            config.on_breakdown_inc("local_reused_presented", 1)
+                        next_cached_present_at = time.perf_counter() + _cached_present_interval()
+                    else:
+                        viewer.poll_events()
                 continue
             if config.on_breakdown_inc is not None:
                 config.on_breakdown_inc("viewer_get", 1)
@@ -1235,6 +2070,7 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
             if viewer is None:
                 viewer = MetalLocalViewer(config)
                 viewer.initialize()
+                _configure_metrics(viewer)
                 print("[MetalLocalViewer] Metal local window initialized", flush=True)
             if getattr(config, "window_preview", False) and not preview_logged:
                 preview_logged = True
@@ -1245,6 +2081,69 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
                 )
             present_started = time.perf_counter()
             presented = viewer.present(frame)
+            presented_at = time.perf_counter()
+            if presented is not False:
+                debug_info = getattr(result, "debug_info", None)
+                stage_timing: dict[str, float] = {}
+                if isinstance(debug_info, dict):
+                    for key in (
+                        "capture_to_runtime_start_ms",
+                        "capture_to_runtime_ready_ms",
+                        "capture_wait_ms",
+                        "sck_callback_to_runtime_ms",
+                        "runtime_execution_ms",
+                        "runtime_gpu_wait_ms",
+                        "runtime_completion_ms",
+                        "depth_preprocess_ms",
+                        "depth_model_ms",
+                        "depth_postprocess_ms",
+                        "depth_total_ms",
+                        "synthesis_ms",
+                        "pack_ms",
+                        "metal_synthesis_gpu_ms",
+                        "metal_handoff_copy_ms",
+                        "macos_metal_output_pack_ms",
+                        "macos_metal_pack_gpu_ms",
+                        "macos_metal_pack_host_handoff_ms",
+                        "macos_metal_pack_warp_threads",
+                        "native_coreml_metal_vulkan_alias",
+                        "native_coreml_ring_fallback",
+                        "native_coreml_host_handoff_copy_count",
+                        "native_coreml_gpu_copy_count",
+                        "sck_presentation_time",
+                        "sck_callback_time",
+                        "capture_poll_returned_at",
+                    ):
+                        try:
+                            stage_timing[key] = float(debug_info[key])
+                        except (KeyError, TypeError, ValueError):
+                            pass
+                    ready_at = debug_info.get("viewer_ready_at")
+                    try:
+                        ready_at = float(ready_at)
+                    except (TypeError, ValueError):
+                        ready_at = None
+                    if ready_at is not None:
+                        stage_timing["viewer_ready_at"] = ready_at
+                        stage_timing["viewer_queue_ms"] = max(
+                            0.0, (present_started - ready_at) * 1000.0
+                        )
+                present_metrics = getattr(viewer, "_last_present_metrics", None)
+                if isinstance(present_metrics, dict):
+                    stage_timing.update(present_metrics)
+                stage_timing["present_call_ms"] = max(
+                    0.0, (presented_at - present_started) * 1000.0
+                )
+                stage_timing["presented_at"] = presented_at
+                viewer.record_frame_latency(
+                    _started,
+                    stage_timing=stage_timing,
+                    anchor_time=(
+                        stage_timing.get("sck_callback_time")
+                        or stage_timing.get("capture_poll_returned_at")
+                    ),
+                )
+                viewer.record_present(False)
             if config.on_breakdown_add_time is not None:
                 config.on_breakdown_add_time(
                     "local_present", time.perf_counter() - present_started
@@ -1253,6 +2152,7 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
                 config.on_breakdown_inc("local_presented_frame", 1)
                 if bool(getattr(result, "depth_complete", False)):
                     config.on_breakdown_inc("local_depth_presented_frame", 1)
+            next_cached_present_at = time.perf_counter() + _cached_present_interval()
     except StopIteration:
         shutdown_event.set()
     finally:
