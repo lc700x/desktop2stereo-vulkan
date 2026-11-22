@@ -288,6 +288,16 @@ def test_native_coreml_uses_documented_device_and_precision_configuration() -> N
     assert "slot->prediction_options.outputBackings" in source
 
 
+def test_native_coreml_marks_verified_shared_output_as_zero_copy() -> None:
+    source = _NATIVE_SOURCE.read_text()
+    prediction_start = source.index("MLMultiArray *returned_array")
+    prediction_end = source.index("// Normalization is encoded", prediction_start)
+    prediction = source[prediction_start:prediction_end]
+
+    assert "returned_array.dataPointer == slot->raw_depth_buffer.contents" in prediction
+    assert "result->output_zero_copy" in prediction
+
+
 def test_native_frame_pack_uses_destination_without_host_conversion() -> None:
     class RecordingBridge:
         def __init__(self):

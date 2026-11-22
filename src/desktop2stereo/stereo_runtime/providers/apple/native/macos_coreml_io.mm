@@ -2317,7 +2317,12 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
         result->depth_height = ctx->depth_height;
         result->input_shared = 1;
         result->output_backing_used = 1;
-        result->output_zero_copy = 0;
+        // output_array was created over raw_depth_buffer.contents and Core ML
+        // returned that same backing above. The native viewer can therefore
+        // sample the model output directly without a host readback or an
+        // intermediate tensor copy.
+        result->output_zero_copy =
+            (returned_array.dataPointer == slot->raw_depth_buffer.contents) ? 1 : 0;
         // Normalization is encoded together with the final warp in pack().
         // This keeps the depth publish path from waiting on a separate Metal
         // command and still sanitizes every value before sampling.

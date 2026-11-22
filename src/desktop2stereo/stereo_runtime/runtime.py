@@ -1610,9 +1610,12 @@ class StereoRuntime:
             provider_info = self.provider_report()
             debug = {
                 "backend": self.stereo_config.backend,
-                "sbs_backend": "native_coreml_metal_layered",
-                "runtime_output_pack_backend": "native_coreml_metal_layered_vulkan_gpu_warp_host_handoff",
-                "runtime_output_dtype": "native",
+                # The local Metal viewer samples the retained ScreenCaptureKit
+                # texture and Core ML depth buffer directly. No SBS pack or
+                # Metal-to-Vulkan handoff occurs on this path.
+                "sbs_backend": "native_coreml_metal_deferred_warp",
+                "runtime_output_pack_backend": "native_coreml_metal_deferred_warp",
+                "runtime_output_dtype": "native_metal",
                 "native_coreml_io": True,
                 "native_coreml_input_shared": int(bool(native_depth.input_shared)),
                 "native_coreml_output_backing": int(
@@ -1621,11 +1624,12 @@ class StereoRuntime:
                 "native_coreml_output_zero_copy": int(
                     bool(native_depth.output_zero_copy)
                 ),
-                # The native warp is GPU-side, but MoltenVK does not expose
-                # its mapped allocation as a Metal MTLBuffer on this host.
+                # The deferred local viewer does not use a Vulkan allocation;
+                # it samples the retained native Metal resources directly.
                 "native_coreml_metal_vulkan_alias": 0,
-                "native_coreml_host_handoff_copy_count": 1,
-                "native_coreml_gpu_copy_count": 1,
+                "native_coreml_host_handoff_copy_count": 0,
+                "native_coreml_gpu_copy_count": 0,
+                "native_coreml_deferred_warp": 1,
                 "native_coreml_nonfinite_count": int(native_depth.nonfinite_count),
                 "depth_finite": int(bool(native_depth.finite_depth)),
                 "native_coreml_normalize_lo": float(native_depth.normalize_lo),
@@ -1661,8 +1665,8 @@ class StereoRuntime:
                 output_eye_size=(int(width), int(height)),
                 output_display_size=(int(width), int(height)),
                 output_format=str(self.stereo_config.output_format),
-                output_dtype="native",
-                output_pack_backend="native_coreml_metal_layered_vulkan_gpu_warp_host_handoff",
+                output_dtype="native_metal",
+                output_pack_backend="native_coreml_metal_deferred_warp",
                 viewer_native=native_depth,
                 native_resource_handle=native_depth,
                 native_zero_copy=bool(native_depth.output_zero_copy),

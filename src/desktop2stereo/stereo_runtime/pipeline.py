@@ -1806,6 +1806,10 @@ class RuntimePipelineLoop:
                 "native_coreml_metal"
             )
         )
+        native_coreml_local_metal = bool(
+            native_coreml_vulkan
+            and debug_info.get("native_coreml_deferred_warp")
+        )
         fallback_reasons = []
         if provider_report.get("fallback_reason"):
             fallback_reasons.append(str(provider_report["fallback_reason"]))
@@ -1841,7 +1845,9 @@ class RuntimePipelineLoop:
         )
         if mac_fused_viewer and stereo_reason == "not_resolved":
             stereo_backend = "mps_fused_vulkan"
-        if native_coreml_vulkan:
+        if native_coreml_local_metal:
+            stereo_backend = "coreml_metal_local"
+        elif native_coreml_vulkan:
             stereo_backend = "coreml_metal_vulkan"
         payload = {
             "os": platform.system(),
@@ -1856,6 +1862,7 @@ class RuntimePipelineLoop:
             "stereo_backend": stereo_backend,
             "stereo_backend_reason": (
                 "mps_fused_vulkan" if mac_fused_viewer and stereo_reason == "not_resolved"
+                else "native_coreml_metal_deferred_warp" if native_coreml_local_metal
                 else "native_coreml_metal_vulkan_gpu_warp_host_handoff" if native_coreml_vulkan
                 else stereo_reason or "not_reported"
             ),
