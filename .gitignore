@@ -17,6 +17,9 @@ models/
 outputs/
 logs/
 src/python3/
+src/python3.staging.*/
+src/python3.backup.*/
+src/python3.failed.*/
 src/desktop2stereo/models/
 src/desktop2stereo/logs/
 src/desktop2stereo/gui/flet_clients/

@@ -8,6 +8,7 @@ inference path never materializes RGB or depth on the CPU.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -50,32 +51,49 @@ except Exception:  # MLX is an optional macOS-only dependency.
 _MlxModuleBase = nn.Module if nn is not None else object
 
 
+def _mlx_unavailability() -> tuple[str | None, Exception | None]:
+    if sys.platform != "darwin":
+        return "MLX is supported only on macOS", None
+    provider_initialized = mx is not None and nn is not None
+    mlx_core = mx
+    if not provider_initialized:
+        try:
+            mlx_core = importlib.import_module("mlx.core")
+            importlib.import_module("mlx.nn")
+        except Exception as exc:
+            return f"MLX import failed ({type(exc).__name__}: {exc})", exc
+    try:
+        if not mlx_core.is_available(mlx_core.gpu):
+            return "MLX imported, but its GPU device is unavailable", None
+        if not mlx_core.metal.is_available():
+            return "MLX imported, but its Metal device is unavailable", None
+    except Exception as exc:
+        return f"MLX Metal availability check failed ({type(exc).__name__}: {exc})", exc
+    return None, None
+
+
 def is_mlx_available() -> bool:
     """Return whether MLX can execute on the local Metal GPU."""
-    if sys.platform != "darwin":
-        return False
-    try:
-        import mlx.core as mlx_core
-
-        return bool(
-            mlx_core.is_available(mlx_core.gpu)
-            and mlx_core.metal.is_available()
-        )
-    except Exception:
-        return False
+    reason, _ = _mlx_unavailability()
+    return reason is None
 
 
 def _require_mlx() -> tuple[Any, Any]:
-    if not is_mlx_available():
-        raise RuntimeError(
-            "MLX Metal is unavailable; install the macOS MLX package and use an "
-            "Apple Silicon GPU"
+    reason, cause = _mlx_unavailability()
+    if reason is not None:
+        message = (
+            f"{reason}. Install the macOS dependencies with "
+            "`src/env_install/install-mps` using Python 3.12, then restart Desktop2Stereo."
         )
+        raise RuntimeError(message) from cause
     if mx is None or nn is None:
         # This can happen when the module was imported before an optional
         # environment was activated. Re-importing the module is the supported
         # recovery path, but keep the error actionable for embedded callers.
-        raise RuntimeError("MLX was not importable in this Python process")
+        raise RuntimeError(
+            "MLX became available after the provider was imported; restart "
+            "Desktop2Stereo so the MLX model classes can be initialized"
+        )
     return mx, nn
 
 

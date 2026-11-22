@@ -1,91 +1,136 @@
 #!/bin/bash
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$SCRIPT_DIR"
-echo "--- Desktop2Stereo Installer for Mac (for Apple Silicon Chips: M1, M2, M3, M4...) ---"
-echo "- Setting up the virtual environment"
 
-# Set paths
+echo "--- Desktop2Stereo Installer for Mac (Apple Silicon) ---"
+echo "- Preparing a Python 3.12 environment"
+
+PYTHON_CMD="python3.12"
+if ! command -v "$PYTHON_CMD" >/dev/null 2>&1; then
+    echo "Python 3.12 is required by this project but was not found."
+    echo "Install it with: brew install python@3.12"
+    exit 1
+fi
+PYTHON_VERSION="$($PYTHON_CMD -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+if [[ "$PYTHON_VERSION" != "3.12" ]]; then
+    echo "$PYTHON_CMD resolved to Python $PYTHON_VERSION; Python 3.12 is required."
+    echo "Install it with: brew install python@3.12"
+    exit 1
+fi
+PYTHON_EXE="$(command -v "$PYTHON_CMD")"
+
 VIRTUAL_ENV="$PROJECT_ROOT/python3"
-PYTHON_EXE="python3"
+STAGING_ENV="$PROJECT_ROOT/python3.staging.$$"
+PIP_CACHE_DIR="${TMPDIR:-/tmp}/desktop2stereo-mps-pip-cache"
 export PIP_RETRIES=10
 export PIP_TIMEOUT=180
-PIP_CACHE_DIR="$VIRTUAL_ENV/.pip-cache"
+mkdir -p "$PIP_CACHE_DIR"
 
-# Check if Python is available
-if ! command -v "$PYTHON_EXE" &> /dev/null
-then
-    echo "Python is not found in PATH. Please install Python 3.11 first."
-    read -p "Press enter to exit..."
+if [[ -e "$STAGING_ENV" ]]; then
+    echo "A staging environment already exists: $STAGING_ENV" >&2
+    echo "Remove that staging directory manually after checking it, then retry." >&2
     exit 1
 fi
 
-# Create virtual environment if it doesn't exist
-if [ ! -f "$VIRTUAL_ENV/bin/activate" ]; then
-    echo "Creating virtual environment..."
-    "$PYTHON_EXE" -m venv "$VIRTUAL_ENV"
-    if [ $? -ne 0 ]; then
-        echo "Failed to create virtual environment"
-        read -p "Press enter to exit..."
-        exit 1
+cleanup() {
+    if [[ -d "$STAGING_ENV" ]]; then
+        rm -rf "$STAGING_ENV"
     fi
-fi
-PYTHON_EXE="$VIRTUAL_ENV/bin/python"
+}
+trap cleanup EXIT
 
-# Activate virtual environment
-echo "- Virtual environment activation"
-source "$VIRTUAL_ENV/bin/activate"
-if [ $? -ne 0 ]; then
-    echo "Failed to activate virtual environment"
-    read -p "Press enter to exit..."
+echo "- Creating replacement environment at $STAGING_ENV"
+"$PYTHON_EXE" -m venv "$STAGING_ENV"
+STAGING_PYTHON="$STAGING_ENV/bin/python"
+
+echo "- Updating pip"
+"$STAGING_PYTHON" -m pip install --upgrade pip \
+    -r "$SCRIPT_DIR/requirements-pip-options.txt" \
+    --cache-dir "$PIP_CACHE_DIR" --prefer-binary \
+    --retries "$PIP_RETRIES" --timeout "$PIP_TIMEOUT"
+
+echo "- Installing macOS MPS and MLX requirements"
+"$STAGING_PYTHON" -m pip install -r "$SCRIPT_DIR/requirements-mps.txt" \
+    --cache-dir "$PIP_CACHE_DIR" --prefer-binary \
+    --retries "$PIP_RETRIES" --timeout "$PIP_TIMEOUT"
+"$STAGING_PYTHON" -m pip install -r "$SCRIPT_DIR/requirements.txt" \
+    --cache-dir "$PIP_CACHE_DIR" --prefer-binary \
+    --retries "$PIP_RETRIES" --timeout "$PIP_TIMEOUT"
+
+verify_macos_runtime() {
+    "$1" - <<'PY'
+import mlx.core as mx
+import mlx.nn  # noqa: F401
+import torch
+
+if not mx.is_available(mx.gpu) or not mx.metal.is_available():
+    raise SystemExit("MLX Metal GPU is unavailable")
+if not torch.backends.mps.is_available():
+    raise SystemExit("PyTorch MPS is unavailable")
+print(f"MLX Metal and PyTorch MPS are ready (MLX {mx.__version__ if hasattr(mx, '__version__') else 'installed'})")
+PY
+}
+
+echo "- Verifying MLX Metal and PyTorch MPS"
+if ! verify_macos_runtime "$STAGING_PYTHON"; then
+    echo "The replacement environment failed its MLX/MPS check; the current environment was kept." >&2
+    echo "Review the error above, then rerun src/env_install/install-mps." >&2
+    exit 1
+fi
+if ! "$STAGING_PYTHON" -m pip check; then
+    echo "The replacement environment has dependency conflicts; the current environment was kept." >&2
     exit 1
 fi
 
-# Update pip
-echo "- Updating the pip package"
-"$PYTHON_EXE" -m pip install --upgrade pip -r "$SCRIPT_DIR/requirements-pip-options.txt" --cache-dir "$PIP_CACHE_DIR" --prefer-binary --retries "$PIP_RETRIES" --timeout "$PIP_TIMEOUT"
-if [ $? -ne 0 ]; then
-    echo "Failed to update pip"
-    read -p "Press enter to exit..."
-    exit 1
-fi
-
-# Install requirements
-echo
-echo "- Installing the requirements"
-
-if ! "$PYTHON_EXE" -m pip install -r "$SCRIPT_DIR/requirements-mps.txt" --cache-dir "$PIP_CACHE_DIR" --prefer-binary --retries "$PIP_RETRIES" --timeout "$PIP_TIMEOUT"; then
-    echo "Failed to install MPS requirements"
-    read -p "Press enter to exit..."
-    exit 1
-fi
-if ! "$PYTHON_EXE" -m pip install -r "$SCRIPT_DIR/requirements.txt" --cache-dir "$PIP_CACHE_DIR" --prefer-binary --retries "$PIP_RETRIES" --timeout "$PIP_TIMEOUT"; then
-    echo "Failed to install requirements"
-    read -p "Press enter to exit..."
-    exit 1
-fi
-chmod a+x "$PROJECT_ROOT/run_mac" "$0"
-chmod -R 777 "$PROJECT_ROOT/desktop2stereo/streaming/rtmp"
-
-# Install the Vulkan loader (MoltenVK + vulkan-loader) required by the viewer
-echo
 echo "- Installing the Vulkan loader (MoltenVK)"
-if ! command -v brew &> /dev/null
-then
-    echo "Homebrew is not found in PATH. Please install it from https://brew.sh first."
-    read -p "Press enter to exit..."
+if ! command -v brew >/dev/null 2>&1; then
+    echo "Homebrew was not found. Install it from https://brew.sh, then rerun this installer." >&2
     exit 1
 fi
-if ! brew list --formula vulkan-loader &> /dev/null || ! brew list --formula molten-vk &> /dev/null; then
-    if ! brew install molten-vk vulkan-loader; then
-        echo "Failed to install the Vulkan loader (molten-vk, vulkan-loader)"
-        read -p "Press enter to exit..."
-        exit 1
-    fi
+if ! brew list --formula vulkan-loader >/dev/null 2>&1 || ! brew list --formula molten-vk >/dev/null 2>&1; then
+    brew install molten-vk vulkan-loader
 else
     echo "Vulkan loader already installed"
 fi
 
+BACKUP_ENV=""
+if [[ -e "$VIRTUAL_ENV" ]]; then
+    BACKUP_ENV="$VIRTUAL_ENV.backup.$(date +%Y%m%d%H%M%S)"
+    if [[ -e "$BACKUP_ENV" ]]; then
+        echo "Backup path already exists: $BACKUP_ENV" >&2
+        exit 1
+    fi
+    mv "$VIRTUAL_ENV" "$BACKUP_ENV"
+fi
+
+if ! mv "$STAGING_ENV" "$VIRTUAL_ENV"; then
+    if [[ -n "$BACKUP_ENV" && -e "$BACKUP_ENV" ]]; then
+        mv "$BACKUP_ENV" "$VIRTUAL_ENV"
+    fi
+    echo "Could not activate the replacement environment; the previous environment was restored." >&2
+    exit 1
+fi
+
+if ! verify_macos_runtime "$VIRTUAL_ENV/bin/python"; then
+    FAILED_ENV="$VIRTUAL_ENV.failed.$(date +%Y%m%d%H%M%S)"
+    mv "$VIRTUAL_ENV" "$FAILED_ENV"
+    if [[ -n "$BACKUP_ENV" && -e "$BACKUP_ENV" ]]; then
+        mv "$BACKUP_ENV" "$VIRTUAL_ENV"
+    fi
+    echo "The activated environment failed verification and was moved to $FAILED_ENV." >&2
+    echo "The previous environment was restored when one was available." >&2
+    exit 1
+fi
+
+chmod a+x "$PROJECT_ROOT/run_mac"
 echo "Python environment deployed successfully."
-read -p "You can close this terminal window to exit..."
-exit
+if [[ -n "$BACKUP_ENV" ]]; then
+    echo "Previous environment retained at: $BACKUP_ENV"
+fi
+if [[ -t 0 ]]; then
+    read -r -p "You can close this terminal window to exit... " _
+fi

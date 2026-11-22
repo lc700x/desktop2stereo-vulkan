@@ -78,3 +78,40 @@ def test_fp16_pipeline_depth_stays_finite() -> None:
     result = provider.predict_profile(frame)
     torch.mps.synchronize()
     assert torch.isfinite(result.depth).all(), "fp16 CoreML depth must be finite"
+
+
+@pytest.mark.skipif(MPS is None, reason="requires MPS")
+def test_fp16_mlx_depth_stays_finite(monkeypatch) -> None:
+    import os
+    from pathlib import Path
+
+    from stereo_runtime.providers.apple.mlx_depth import (
+        MlxDepthProvider,
+        is_mlx_available,
+    )
+
+    if not is_mlx_available():
+        pytest.skip("requires MLX Metal")
+    default_cache = Path(__file__).resolve().parents[1] / "src" / "desktop2stereo" / "models"
+    cache = Path(os.environ.get("D2S_BENCH_MODELS", default_cache))
+    if not cache.is_dir():
+        pytest.skip("Distill-Any-Depth model cache is not available")
+
+    monkeypatch.setenv("D2S_MLX_DTYPE", "float16")
+    provider = MlxDepthProvider(
+        model_id="xingyang1/Distill-Any-Depth-Small-hf",
+        model_name="Distill-Any-Depth-Small",
+        device="mps",
+        cache_dir=cache,
+        depth_resolution=336,
+        patch_size=14,
+        local_files_only=True,
+    )
+    frame = torch.rand(1, 3, 336, 336, device="mps")
+
+    result = provider.predict_profile(frame)
+    torch.mps.synchronize()
+
+    assert result.depth.shape == (1, 1, 336, 336)
+    assert torch.isfinite(result.depth).all(), "fp16 MLX depth must be finite"
+    assert result.finite_depth
