@@ -1,5 +1,5 @@
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import viewer.macos_metal_viewer as metal_viewer
 
@@ -7,15 +7,41 @@ import viewer.macos_metal_viewer as metal_viewer
 _VIEWER_SOURCE = Path(metal_viewer.__file__).read_text()
 
 
-def test_metal_viewer_keeps_display_referred_capture_in_unorm_space() -> None:
+def test_metal_viewer_decodes_capture_srgb_and_encodes_drawable_once() -> None:
     attach_start = _VIEWER_SOURCE.index("def _attach_metal_layer")
     attach_end = _VIEWER_SOURCE.index("def _register_capture_window", attach_start)
     attach = _VIEWER_SOURCE[attach_start:attach_end]
 
-    assert "self._drawable_pixel_format = Metal.MTLPixelFormatBGRA8Unorm" in attach
-    assert "self._source_pixel_format = Metal.MTLPixelFormatRGBA8Unorm" in attach
-    assert "MTLPixelFormatBGRA8Unorm_sRGB" not in attach
-    assert "MTLPixelFormatRGBA8Unorm_sRGB" not in attach
+    assert "self._drawable_pixel_format = Metal.MTLPixelFormatBGRA8Unorm_sRGB" in attach
+    assert "self._source_pixel_format = Metal.MTLPixelFormatRGBA8Unorm_sRGB" in attach
+    assert "layer.setColorspace_(Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB))" in attach
+
+
+def test_screencapture_texture_srgb_view_is_zero_copy(monkeypatch) -> None:
+    class Texture:
+        def __init__(self, pixel_format):
+            self.format = pixel_format
+            self.requested_format = None
+
+        def pixelFormat(self):
+            return self.format
+
+        def newTextureViewWithPixelFormat_(self, pixel_format):
+            self.requested_format = pixel_format
+            return "srgb-view"
+
+    unorm = Texture(1)
+    monkeypatch.setattr(
+        metal_viewer,
+        "Metal",
+        SimpleNamespace(MTLPixelFormatBGRA8Unorm=1, MTLPixelFormatBGRA8Unorm_sRGB=2),
+        raising=False,
+    )
+    assert metal_viewer._srgb_view_for_capture_texture(unorm) == "srgb-view"
+    assert unorm.requested_format == 2
+
+    already_srgb = Texture(2)
+    assert metal_viewer._srgb_view_for_capture_texture(already_srgb) is already_srgb
 
 
 def test_metal_fps_overlay_visibility_tracks_live_show_fps_provider() -> None:

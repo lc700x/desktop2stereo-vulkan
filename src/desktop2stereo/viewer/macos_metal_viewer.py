@@ -324,6 +324,20 @@ fragment float4 fragment_main(
 """
 
 
+def _srgb_view_for_capture_texture(texture: Any) -> Any:
+    """Interpret BGRA ScreenCaptureKit bytes as sRGB without copying them."""
+    srgb_format = Metal.MTLPixelFormatBGRA8Unorm_sRGB
+    pixel_format = texture.pixelFormat()
+    if pixel_format == srgb_format:
+        return texture
+    if pixel_format != Metal.MTLPixelFormatBGRA8Unorm:
+        raise RuntimeError(f"unsupported ScreenCaptureKit texture format: {pixel_format}")
+    view = texture.newTextureViewWithPixelFormat_(srgb_format)
+    if view is None:
+        raise RuntimeError("could not create an sRGB view of the ScreenCaptureKit texture")
+    return view
+
+
 class MetalLocalViewer:
     """GLFW window + CAMetalLayer renderer for packed SBS frames (macOS)."""
 
@@ -515,14 +529,13 @@ class MetalLocalViewer:
         if self.device is None:
             raise RuntimeError("No Metal device available")
         self.queue = self.device.newCommandQueue()
-        # ScreenCaptureKit and the native Core ML warp expose display-referred
-        # 8-bit pixels through BGRA8Unorm. Keep the drawable and every staged
-        # overlay in unorm as well; using an sRGB drawable here would encode
-        # those already-encoded samples a second time and wash out midtones.
-        self._drawable_pixel_format = Metal.MTLPixelFormatBGRA8Unorm
-        self._source_pixel_format = Metal.MTLPixelFormatRGBA8Unorm
+        # Decode sRGB inputs to linear values when sampled, then let the sRGB
+        # drawable encode them once. Tell WindowServer the layer uses sRGB too.
+        self._drawable_pixel_format = Metal.MTLPixelFormatBGRA8Unorm_sRGB
+        self._source_pixel_format = Metal.MTLPixelFormatRGBA8Unorm_sRGB
         layer.setDevice_(self.device)
         layer.setPixelFormat_(self._drawable_pixel_format)
+        layer.setColorspace_(Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB))
         layer.setFramebufferOnly_(True)
         layer.setContentsScale_(ns_window.backingScaleFactor())
         if hasattr(layer, "setDisplaySyncEnabled_"):
@@ -1342,6 +1355,8 @@ class MetalLocalViewer:
                     pass
 
         def _release_bgra(_cb=None):
+            _color_view = color_tex if zc_texture is not None else None
+            del _color_view
             try:
                 bgra.release()
             except Exception:
@@ -1402,7 +1417,10 @@ class MetalLocalViewer:
                 (width, height), (dw, dh), depth_u8=depth_is_u8
             )
         if zc_texture is not None:
-            color_tex = zc_texture
+            # CVMetalTextureCache exposes BGRA8Unorm, so sampling it directly
+            # treats encoded sRGB values as linear and washes out the output.
+            # This compatible view decodes sRGB from the same IOSurface.
+            color_tex = _srgb_view_for_capture_texture(zc_texture)
         else:
             color_region = Metal.MTLRegionMake2D(0, 0, width, height)
             self._warp_color_tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow_(
@@ -1547,7 +1565,9 @@ class MetalLocalViewer:
             except Exception:
                 _release_bgra()
         if native_frame is not None:
-            def _release_native(_cb=None):
+            def _release_native(_cb=None, _color_view=color_tex):
+                # Keep the borrowed IOSurface texture view alive through GPU use.
+                del _color_view
                 try:
                     if native_release_entry is None:
                         native_frame.release()
