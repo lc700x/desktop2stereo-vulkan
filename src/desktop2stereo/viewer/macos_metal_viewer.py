@@ -515,19 +515,12 @@ class MetalLocalViewer:
         if self.device is None:
             raise RuntimeError("No Metal device available")
         self.queue = self.device.newCommandQueue()
-        # Match Vulkan's sRGB swapchain. The native packer writes display-
-        # referred 8-bit RGB; an sRGB texture/layer keeps that data from being
-        # displayed with the paler linear-to-display interpretation.
-        self._drawable_pixel_format = getattr(
-            Metal,
-            "MTLPixelFormatBGRA8Unorm_sRGB",
-            Metal.MTLPixelFormatBGRA8Unorm,
-        )
-        self._source_pixel_format = getattr(
-            Metal,
-            "MTLPixelFormatRGBA8Unorm_sRGB",
-            Metal.MTLPixelFormatRGBA8Unorm,
-        )
+        # ScreenCaptureKit and the native Core ML warp expose display-referred
+        # 8-bit pixels through BGRA8Unorm. Keep the drawable and every staged
+        # overlay in unorm as well; using an sRGB drawable here would encode
+        # those already-encoded samples a second time and wash out midtones.
+        self._drawable_pixel_format = Metal.MTLPixelFormatBGRA8Unorm
+        self._source_pixel_format = Metal.MTLPixelFormatRGBA8Unorm
         layer.setDevice_(self.device)
         layer.setPixelFormat_(self._drawable_pixel_format)
         layer.setFramebufferOnly_(True)

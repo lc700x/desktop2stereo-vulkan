@@ -1,6 +1,21 @@
 from types import SimpleNamespace
+from pathlib import Path
 
 import viewer.macos_metal_viewer as metal_viewer
+
+
+_VIEWER_SOURCE = Path(metal_viewer.__file__).read_text()
+
+
+def test_metal_viewer_keeps_display_referred_capture_in_unorm_space() -> None:
+    attach_start = _VIEWER_SOURCE.index("def _attach_metal_layer")
+    attach_end = _VIEWER_SOURCE.index("def _register_capture_window", attach_start)
+    attach = _VIEWER_SOURCE[attach_start:attach_end]
+
+    assert "self._drawable_pixel_format = Metal.MTLPixelFormatBGRA8Unorm" in attach
+    assert "self._source_pixel_format = Metal.MTLPixelFormatRGBA8Unorm" in attach
+    assert "MTLPixelFormatBGRA8Unorm_sRGB" not in attach
+    assert "MTLPixelFormatRGBA8Unorm_sRGB" not in attach
 
 
 def test_metal_fps_overlay_visibility_tracks_live_show_fps_provider() -> None:
