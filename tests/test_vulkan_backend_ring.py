@@ -222,3 +222,70 @@ def test_cuda_input_ring_reuses_slots_with_device_side_semaphores(monkeypatch) -
 
     backend.close()
     assert waits == [4]
+
+
+def test_prebound_input_dispatch_elides_host_upload_and_output_readback(monkeypatch) -> None:
+    submissions = []
+
+    class FakeVk:
+        VK_IMAGE_LAYOUT_GENERAL = 1
+        VK_ACCESS_SHADER_WRITE_BIT = 2
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = 4
+
+    class FakeContext:
+        frame_context_count = 3
+        closed = False
+        queue_family_index = 0
+        vk = FakeVk()
+        device_info = SimpleNamespace(name="fake-vulkan")
+
+        @staticmethod
+        def register_image_state(_image, _state):
+            return None
+
+    class FakePass:
+        input_buffer_sizes = {"rgb": 48, "depth": 16}
+        depth_gaussian_enabled = False
+
+        def __init__(self, context, **_kwargs):
+            self.context = context
+
+        def submit(self, rgb, depth, left, right, **kwargs):
+            submissions.append((rgb, depth, left, right, kwargs))
+            return len(submissions)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(backend_module, "VulkanStereoImagePass", FakePass)
+
+    context = FakeContext()
+    backend = VulkanStereoImageComputeBackend(context)
+    rgb_buffer = SimpleNamespace(context=context, size=48)
+    depth_buffer = SimpleNamespace(context=context, size=16)
+    left = SimpleNamespace(context=context, width=2, height=2, image="left")
+    right = SimpleNamespace(context=context, width=2, height=2, image="right")
+
+    timeline, debug = backend.submit_prebound_to_images(
+        width=2,
+        height=2,
+        rgb_buffer=rgb_buffer,
+        depth_buffer=depth_buffer,
+        left_eye=left,
+        right_eye=right,
+        params=VulkanLayeredStereoParams(),
+        wait_semaphore="ready",
+        signal_semaphore="released",
+    )
+
+    assert timeline == 1
+    assert submissions[0][:4] == (rgb_buffer, depth_buffer, left, right)
+    assert submissions[0][4]["wait_semaphore"] == "ready"
+    assert submissions[0][4]["signal_semaphore"] == "released"
+    assert debug["vulkan_input_path"] == "prebound_vulkan_buffer"
+    assert debug["vulkan_input_upload_elided"] is True
+    assert debug["vulkan_input_upload_ms"] == 0.0
+    assert debug["vulkan_readback"] == "none"
+    assert debug["vulkan_zero_cpu_readback"] is True
+    assert debug["vulkan_zero_copy"] is False
+    assert debug["vulkan_zero_copy_reason"] == "prebound_input_buffer_provenance_unverified"

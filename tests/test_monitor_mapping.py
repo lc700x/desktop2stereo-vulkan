@@ -281,6 +281,28 @@ def test_3d_monitor_output_can_match_input_monitor():
     assert gui.stereo_monitor_dd.value == shared
 
 
+def test_local_viewer_keeps_custom_viture_output_selection(monkeypatch):
+    from gui.handlers import GUIHandlerMixin
+
+    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    input_display = "1: Built-in Retina Display 1920x1080"
+    output_display = "2: VITURE 1920x1080"
+    gui = FakeMonitorGui(monitor_value=input_display, stereo_value="")
+    gui.monitor_label_to_index = {input_display: 1, output_display: 2}
+    gui._get_monitor_count = lambda: 2
+    monitor_mixin = _load_monitor_methods([], primary_index=1)
+    gui._sync_visibility = lambda: monitor_mixin.update_stereo_monitor_menu(gui)
+
+    monitor_mixin._apply_stereo_output(gui, {"Stereo Output": 2})
+    assert gui.stereo_monitor_dd.value == output_display
+
+    GUIHandlerMixin._auto_select_stereo_monitor(gui)
+    assert gui.stereo_monitor_dd.value == output_display
+
+    GUIHandlerMixin._on_stereo_monitor_change(gui, None)
+    assert gui.stereo_monitor_dd.value == output_display
+
+
 def test_single_monitor_local_viewer_uses_same_monitor_3d_mode():
     # With a single display, Local Viewer + Monitor capture auto-enters the
     # same-monitor 3D mode (SBS replaces the captured frame in-place).
@@ -360,3 +382,5 @@ def test_same_monitor_local_3d_keeps_all_display_modes_available():
     ]
     assert gui.display_mode_dd.value == "Leia"
     assert gui._config["Display Mode"] == "Leia"
+    assert gui.stereo_output_label.visible is True
+    assert gui.stereo_monitor_dd.visible is True

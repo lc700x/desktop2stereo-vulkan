@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 import subprocess
 import webbrowser
 import flet as ft
@@ -21,6 +22,7 @@ from streaming.audio import (
 from stereo_runtime.render_size import _normalize_render_scale_tier
 from streaming.stream_calibration import automatic_peak_bitrate_mbps
 from streaming.wasapi_audio import query_soundcard_loopback_devices
+from capture.media_browser import is_disc_directory
 from utils.run_mode import target_fps_setting_key
 from utils.xr_headset_presets import display_to_xr_headset, xr_headset_options, xr_headset_to_display
 from xr_viewer.settings_menu import OPENXR_RENDER_SCALE_MAX, OPENXR_RENDER_SCALE_MIN
@@ -48,6 +50,102 @@ _MEDIA_VIDEO_EXTENSIONS = (
 _MEDIA_IMAGE_EXTENSIONS = (
     ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
 )
+
+
+def _apple_script_quote(value: str) -> str:
+    escaped = str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _native_media_picker(
+    *,
+    directory: bool,
+    title: str,
+    initial_directory: str | None = None,
+) -> str | None:
+    """Open the operating system file browser without starting another GUI toolkit."""
+    initial = str(initial_directory or "").strip()
+    if initial and not os.path.isdir(initial):
+        initial = os.path.dirname(initial)
+    if initial and not os.path.isdir(initial):
+        initial = ""
+
+    if OS_NAME == "Darwin" and shutil.which("osascript"):
+        chooser = "choose folder" if directory else "choose file"
+        location = (
+            f" default location POSIX file {_apple_script_quote(initial)}"
+            if initial
+            else ""
+        )
+        script = (
+            f"POSIX path of ({chooser} with prompt "
+            f"{_apple_script_quote(title)}{location})"
+        )
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.stdout.strip() or None
+
+    if OS_NAME == "Windows" and shutil.which("powershell.exe"):
+        env = os.environ.copy()
+        env["D2S_PICKER_TITLE"] = title
+        env["D2S_PICKER_INITIAL_DIRECTORY"] = initial
+        if directory:
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                "$dialog.Description = $env:D2S_PICKER_TITLE; "
+                "if ($env:D2S_PICKER_INITIAL_DIRECTORY) { "
+                "$dialog.SelectedPath = $env:D2S_PICKER_INITIAL_DIRECTORY }; "
+                "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
+                "[Console]::Out.Write($dialog.SelectedPath) }"
+            )
+        else:
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$dialog = New-Object System.Windows.Forms.OpenFileDialog; "
+                "$dialog.Title = $env:D2S_PICKER_TITLE; "
+                "$dialog.Filter = 'Media files|*.*'; "
+                "if ($env:D2S_PICKER_INITIAL_DIRECTORY) { "
+                "$dialog.InitialDirectory = $env:D2S_PICKER_INITIAL_DIRECTORY }; "
+                "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
+                "[Console]::Out.Write($dialog.FileName) }"
+            )
+        result = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-STA",
+                "-WindowStyle", "Hidden", "-Command", script,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=env,
+        )
+        return result.stdout.strip() or None
+
+    if shutil.which("zenity"):
+        command = ["zenity", "--file-selection", "--title", title]
+        if directory:
+            command.append("--directory")
+        if initial:
+            command.extend(["--filename", initial + os.sep])
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        return result.stdout.strip() or None
+
+    if shutil.which("kdialog"):
+        command = ["kdialog"]
+        if directory:
+            command.extend(["--getexistingdirectory", initial or os.path.expanduser("~")])
+        else:
+            command.extend(["--getopenfilename", initial or os.path.expanduser("~")])
+        command.extend(["--title", title])
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        return result.stdout.strip() or None
+    return None
 
 
 class GUIHandlerMixin:
@@ -242,10 +340,14 @@ class GUIHandlerMixin:
 
     def _sync_lsfg_visibility(self):
         self.lsfg_cb.visible = (
-            OS_NAME == "Windows"
+            OS_NAME in {"Windows", "Darwin"}
             and self.run_mode_key == "Local Viewer"
         )
         self.lsfg_cb.disabled = False
+        tooltip_key = "tooltip_lsfg_macos" if OS_NAME == "Darwin" else "tooltip_lsfg"
+        self.lsfg_cb.tooltip = UI_MESSAGES[self.locale].get(
+            tooltip_key, UI_MESSAGES[self.locale]["tooltip_lsfg"]
+        )
 
     def _update_accelerator_visibility(self, device_label):
         cuda = "CUDA" in device_label
@@ -485,7 +587,7 @@ class GUIHandlerMixin:
         self.window_dd.visible = mode == "Window"
         capture_tool_visible = OS_NAME in {"Windows", "Darwin"} and not is_media_player
         process = getattr(self, "process", None)
-        process_running = bool(
+        process_running = bool(getattr(self, "_starting", False)) or bool(
             process is not None and getattr(process, "returncode", None) is None
         )
         self.capture_tool_label.visible = capture_tool_visible
@@ -521,14 +623,24 @@ class GUIHandlerMixin:
             ("media_volume_label", video_controls_visible),
             ("media_volume_slider", video_controls_visible),
             ("media_status_text", gui_media_controls_visible),
+            ("media_input_row", is_media_player),
         ):
             control = getattr(self, attr, None)
             if control is not None:
                 control.visible = visible
                 controls.append(control)
+        for name in ("media_input_file_btn", "media_input_folder_btn"):
+            control = getattr(self, name, None)
+            if control is not None:
+                control.disabled = process_running
+                controls.append(control)
         path_control = getattr(self, "media_path_text", None)
         if path_control is not None:
-            path_control.value = str(getattr(self, "media_path", "") or "")
+            path_control.value = str(
+                getattr(self, "_media_display_path", None)
+                or getattr(self, "media_path", "")
+                or ""
+            )
         self._safe_update(*controls)
         self._fit_window_to_content()
 
@@ -564,7 +676,11 @@ class GUIHandlerMixin:
     # The process mixin owns _media_state_path polling and exposes _media_runtime_state;
     # this mixin only writes revisioned commands to _media_control_path.
     def _media_initial_directory(self):
-        media_path = str(getattr(self, "media_path", "") or "").strip()
+        media_path = str(
+            getattr(self, "media_path", "")
+            or getattr(self, "_media_display_path", "")
+            or ""
+        ).strip()
         if media_path and os.path.isdir(media_path):
             return media_path
         if media_path:
@@ -594,6 +710,15 @@ class GUIHandlerMixin:
             return False
 
         current_path = str(getattr(self, "media_path", "") or "").strip()
+        # A normal directory is a browser starting location. Disc folders
+        # remain direct video sources so existing ISO/Blu-ray playback keeps
+        # working through the same selector.
+        media_path = selected_path
+        browser_directory = (
+            selected_path if is_directory else os.path.dirname(selected_path)
+        )
+        if is_directory and not is_disc_directory(selected_path):
+            media_path = ""
         same_video = (
             current_path
             and not is_directory
@@ -610,23 +735,26 @@ class GUIHandlerMixin:
         except (TypeError, ValueError):
             position = 0.0
 
-        self.media_path = selected_path
-        self._media_path = selected_path
+        self.media_path = media_path
+        self._media_path = media_path
+        self._media_display_path = selected_path
         self.media_resume_position = position
         self._media_resume_position = position
         if getattr(self, "_config", None) is not None:
-            self._config["Media Path"] = selected_path
+            self._config["Media Path"] = media_path
             self._config["Media Playback Position"] = position
+            if browser_directory:
+                self._config["Media Browser Directory"] = browser_directory
         path_control = getattr(self, "media_path_text", None)
         if path_control is not None:
             path_control.value = selected_path
             self._safe_update(path_control)
-        self._persist_media_state(media_path=selected_path, position=position)
+        self._persist_media_state(media_path=media_path, position=position)
         if getattr(self, "_media_session_id", None):
             self._write_media_command(
                 "open",
                 {
-                    "path": selected_path,
+                    "path": media_path,
                     "mode": "File",
                     "position": position,
                 },
@@ -637,14 +765,15 @@ class GUIHandlerMixin:
     async def on_media_open_file(self, e=None):
         if self.capture_mode_key not in {"File", "Video", "Image"}:
             return
-        texts = UI_MESSAGES[self.locale]
         if not getattr(self, "_media_session_id", None):
-            self.set_status(
-                texts.get(
-                    "Start the player before browsing files",
-                    "Start the player before browsing files",
-                )
+            texts = UI_MESSAGES[self.locale]
+            selected_path = _native_media_picker(
+                directory=False,
+                title=texts.get("Select Video", "Select Video"),
+                initial_directory=self._media_initial_directory(),
             )
+            if selected_path and self._set_media_source(selected_path):
+                self.save_and_run(None)
             return
         state = self._read_media_state()
         self._write_media_command(
@@ -655,6 +784,16 @@ class GUIHandlerMixin:
 
     async def on_media_open_folder(self, e=None):
         if self.capture_mode_key not in {"File", "Video", "Image"}:
+            return
+        if not getattr(self, "_media_session_id", None):
+            texts = UI_MESSAGES[self.locale]
+            selected_path = _native_media_picker(
+                directory=True,
+                title=texts.get("Select Directory", "Select Directory"),
+                initial_directory=self._media_initial_directory(),
+            )
+            if selected_path and self._set_media_source(selected_path):
+                self.save_and_run(None)
             return
         state = self._read_media_state()
         self._write_media_command("browse", {"mode": "disc"}, state=state)
@@ -676,8 +815,9 @@ class GUIHandlerMixin:
         state = self._read_media_state() if state is None else state
         browse_actions = {
             "browse", "browse_up", "browse_refresh", "browse_close", "browse_open",
+            "browser_sort",
             "playlist_next", "playlist_previous", "playlist_select",
-            "playlist_clear", "playlist_remove",
+            "playlist_clear", "playlist_remove", "playlist_sort",
         }
         if action == "open" or action in browse_actions:
             session = str(getattr(self, "_media_session_id", "") or "")
@@ -830,18 +970,7 @@ class GUIHandlerMixin:
         self.set_status(f"{UI_MESSAGES[self.locale]['Selected input monitor:']} {e.control.value}")
 
     def _on_stereo_monitor_change(self, _e):
-        import platform
-
         self._missing_stereo_output_identity = False
-        same_monitor_local_viewer = (
-            platform.system() in {"Windows", "Darwin"}
-            and str(getattr(self, "run_mode_key", "")).strip().casefold()
-            in {"local viewer", "3d monitor"}
-            and str(getattr(self, "capture_mode_key", "")).strip().casefold()
-            == "monitor"
-        )
-        if same_monitor_local_viewer:
-            self.stereo_monitor_dd.value = self.monitor_dd.value
         self._sync_visibility()
 
     # ── run mode / visibility handlers ──
@@ -1680,19 +1809,15 @@ class GUIHandlerMixin:
             self.showfps_cb.visible = True
         self.display_fit_dd.visible = display_fit_visible
         mon_count = self._get_monitor_count()
-        import platform
-
-        same_monitor_local_viewer = (
-            platform.system() in {"Windows", "Darwin"}
-            and mode.casefold() == "local viewer"
-            and str(getattr(self, "capture_mode_key", "")).strip().casefold()
-            == "monitor"
-        )
         self.display_mode_dd.options = [
             "Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB",
             "Depth Map", "Anaglyph", "Interleaved", "Mono", "Leia",
         ]
-        stereo_full = mode == "Local Viewer" and mon_count > 1 and not same_monitor_local_viewer
+        # Keep the output selector available for Local Viewer even when the
+        # input and output are the same display. The same-monitor path now
+        # supports one-display setups, so hiding this row makes that setting
+        # impossible to inspect or change.
+        stereo_full = mode == "Local Viewer" and mon_count > 0
         self.stereo_output_label.visible = stereo_full
         self.stereo_monitor_dd.visible = stereo_full
         if hasattr(self, '_stereo_spacer'):
@@ -1788,7 +1913,12 @@ class GUIHandlerMixin:
             == "monitor"
         )
         if same_monitor_local_viewer:
-            self.stereo_monitor_dd.value = self.monitor_dd.value
+            if self.stereo_monitor_dd.value not in self.monitor_label_to_index:
+                self.stereo_monitor_dd.value = (
+                    self.monitor_dd.value
+                    if self.monitor_dd.value in self.monitor_label_to_index
+                    else ""
+                )
             return
         mon_count = self._get_monitor_count()
         if mon_count <= 1:
@@ -1852,6 +1982,13 @@ class GUIHandlerMixin:
 
     def _update_media_control_texts(self):
         messages = UI_MESSAGES[self.locale]
+        for name, key in (
+            ("media_input_file_label", "Select Video"),
+            ("media_input_folder_label", "Select Directory"),
+        ):
+            control = getattr(self, name, None)
+            if control is not None:
+                control.value = messages.get(key, key)
         open_file_label = getattr(self, "media_open_file_label", None)
         if open_file_label is not None:
             open_file_label.value = messages.get("Open File", "Open File")
@@ -2055,7 +2192,8 @@ class GUIHandlerMixin:
         self.lossless_cb.label = t["Lossless Scaling Support"]
         self.lossless_cb.tooltip = t["tooltip_nvfruc"]
         self.lsfg_cb.label = t["LSFG Support"]
-        self.lsfg_cb.tooltip = t["tooltip_lsfg"]
+        lsfg_tooltip = "tooltip_lsfg_macos" if OS_NAME == "Darwin" else "tooltip_lsfg"
+        self.lsfg_cb.tooltip = t.get(lsfg_tooltip, t["tooltip_lsfg"])
         self.controller_label.value = t["Controller:"]
         self.environment_label.value = t["Environment:"]
         self._refresh_environment_options()

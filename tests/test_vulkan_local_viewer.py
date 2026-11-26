@@ -25,6 +25,7 @@ from viewer.vulkan_local_viewer import (
     presentation_blit_regions,
     frame_to_cuda_rgba,
     frame_to_rgba_bytes,
+    _has_gpu_present_source,
     depth_preview_frame,
     depth_to_effective_disparity,
     depth_to_red_blue_rgb,
@@ -94,6 +95,26 @@ def test_display_refresh_warning_detects_slow_output_display() -> None:
     assert not display_refresh_warning_needed(60, 58.0)
     assert not display_refresh_warning_needed(120, 58.0)
     assert not display_refresh_warning_needed(0, 58.0)
+
+
+def test_vulkan_browser_wheel_uses_grid_scroll_extent() -> None:
+    viewer = object.__new__(VulkanLocalViewer)
+    viewer._media_state = {
+        "browser_visible": True,
+        "browser_view_mode": "grid",
+        "browser_entries": [
+            {"name": f"movie-{index}.mp4", "path": f"F:/movie-{index}.mp4", "kind": "video"}
+            for index in range(30)
+        ],
+    }
+    viewer._media_browser_scroll = 18
+    viewer._media_panel_hovered = True
+    viewer._media_last_activity = 0.0
+    viewer._refresh_media_textures = lambda: None
+
+    viewer._on_scroll(None, 0.0, -1.0)
+
+    assert viewer._media_browser_scroll == 21
 
 
 def test_capture_refresh_warning_detects_input_display_below_target() -> None:
@@ -394,7 +415,8 @@ def test_fullscreen_and_debug_preview_reset_independent_window_hints() -> None:
     assert glfw.hints[glfw.VISIBLE] == glfw.TRUE
     assert glfw.hints[glfw.DECORATED] == glfw.TRUE
     assert glfw.hints[glfw.FLOATING] == glfw.FALSE
-    assert glfw.hints[glfw.FOCUS_ON_SHOW] == glfw.TRUE
+    expected_focus = glfw.FALSE if sys.platform == "darwin" else glfw.TRUE
+    assert glfw.hints[glfw.FOCUS_ON_SHOW] == expected_focus
 
 
 def test_capture_protected_viewer_starts_hidden_until_first_present(monkeypatch) -> None:
@@ -430,59 +452,33 @@ def test_capture_protected_viewer_starts_hidden_until_first_present(monkeypatch)
     ]
 
 
-def test_cursor_texture_overlay_uploads_snapshot_and_maps_both_eyes(monkeypatch) -> None:
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Local Viewer cursor policy")
+@pytest.mark.parametrize("capture_mode", ["Monitor", "Window", "File", "Video"])
+def test_cursor_texture_overlay_is_not_created_for_standard_capture_modes(
+    monkeypatch, capture_mode
+) -> None:
+    created = []
+
+    class Overlay:
+        available = True
+
+        def __init__(self, _viewer):
+            created.append(True)
+
+    monkeypatch.setattr(local_viewer_module, "VulkanFpsOverlay", Overlay)
     viewer = VulkanLocalViewer(
-        VulkanLocalViewerConfig(display_mode="Half-SBS")
-    )
-    uploaded = []
-    viewer._win32_hwnd = 123
-    viewer.window = object()
-    viewer.glfw = SimpleNamespace(get_win32_window=lambda _window: 456)
-    viewer._cursor_texture_overlay = SimpleNamespace(
-        set_rgba=lambda rgba, size: uploaded.append((rgba, size)),
-    )
-    snapshot = SimpleNamespace(
-        rgba=b"rgba",
-        width=24,
-        height=48,
-        hotspot_x=2,
-        hotspot_y=3,
-    )
-    mapped = []
-    monkeypatch.setattr(
-        local_viewer_module,
-        "cursor_snapshot_key",
-        lambda _mode: (11, "half-sbs"),
-    )
-    monkeypatch.setattr(
-        local_viewer_module,
-        "capture_cursor_snapshot",
-        lambda _mode: snapshot,
-    )
-    monkeypatch.setattr(
-        local_viewer_module,
-        "cursor_screen_position",
-        lambda: (20, 30),
-    )
-    monkeypatch.setattr(
-        local_viewer_module,
-        "cursor_overlay_rects",
-        lambda owner, rects, snap, position: mapped.append(
-            (owner, rects, snap, position)
+        VulkanLocalViewerConfig(
+            display_mode="Half-SBS",
+            capture_mode=capture_mode,
+            cursor_passthrough=True,
+            hide_cursor_overlay=True,
         )
-        or ((1, 2, 24, 48), (100, 2, 24, 48)),
     )
 
-    rects = viewer._update_cursor_texture_overlay(((0, 0, 100, 200), (200, 0, 300, 200)))
+    viewer._init_cursor_texture_overlay()
 
-    assert rects == ((1, 2, 24, 48), (100, 2, 24, 48))
-    assert uploaded == [(b"rgba", (24, 48))]
-    assert mapped == [
-        (123, ((0, 0, 100, 200), (200, 0, 300, 200)), snapshot, (20, 30))
-    ]
-
-    viewer._update_cursor_texture_overlay(((0, 0, 100, 200), (200, 0, 300, 200)))
-    assert uploaded == [(b"rgba", (24, 48))]
+    assert created == []
+    assert viewer._cursor_texture_overlay is None
 
 
 def test_capture_protected_output_does_not_reshow_before_first_present() -> None:
@@ -1194,6 +1190,16 @@ def test_gpu_required_local_viewer_packs_cuda_tensors_without_host_fallback(monk
 
     assert viewer.present(SimpleNamespace(is_cuda=True)) is True
     assert calls == [(packed_cuda, {"direct": False})]
+
+
+def test_media_host_frame_satisfies_gpu_present_contract() -> None:
+    frame = SimpleNamespace(viewer_frame_np=(bytearray(32), 4, 2))
+    assert _has_gpu_present_source(
+        frame, VulkanLocalViewerConfig(capture_mode="Video")
+    )
+    assert not _has_gpu_present_source(
+        frame, VulkanLocalViewerConfig(capture_mode="Monitor")
+    )
 
 
 def test_cached_present_reuses_vulkan_image_without_pixel_conversion(monkeypatch) -> None:

@@ -14,6 +14,8 @@ class PollingCaptureRunner:
         self._source_factory = source_factory
         self._source = None
         self._source_stopped = False
+        self._control_stop = None
+        self._control_thread = None
         self._frame_id = 0
 
     def _target_fps(self) -> int:
@@ -34,6 +36,12 @@ class PollingCaptureRunner:
         return float(getattr(self._source, "_playback_fps", 0.0) or 0.0)
 
     def stop(self):
+        control_stop = self._control_stop
+        if control_stop is not None:
+            control_stop.set()
+        control_thread = self._control_thread
+        if control_thread is not None and control_thread is not threading.current_thread():
+            control_thread.join()
         if self._source is None or self._source_stopped:
             return
         stop = getattr(self._source, "stop", None)
@@ -58,6 +66,7 @@ class PollingCaptureRunner:
         self._source_stopped = False
         session_announced = False
         control_stop = threading.Event()
+        self._control_stop = control_stop
         control_thread = None
         try:
             self._source = self._source_factory()
@@ -74,10 +83,14 @@ class PollingCaptureRunner:
                                 on_error(exc)
                             control_stop.set()
                 control_thread = threading.Thread(target=poll_media_controls, name="MediaControls", daemon=True)
+                self._control_thread = control_thread
                 control_thread.start()
             if on_session_update is not None:
                 session_announced = True
-                on_session_update(self._source, None)
+                # Expose the runner as the control object so the runtime
+                # coordinator can stop both the source and its media-control
+                # worker during shutdown.
+                on_session_update(self._source, self)
             while not shutdown_event.is_set():
                 try:
                     if on_tick is not None:
@@ -186,12 +199,16 @@ class PollingCaptureRunner:
                                 "gpu_to_cpu": False if zero_copy_ready else None,
                                 "gpu_copy_count": 0 if zero_copy_ready else None,
                                 "resource_kind": (
-                                    "iosurface_metal" if zero_copy is not None
+                                    str(
+                                        getattr(zero_copy, "resource_kind", "iosurface_metal")
+                                    ) if zero_copy is not None
                                     else "cuda_tensor" if gpu_frame
                                     else None
                                 ),
                                 "resource_format": (
-                                    "BGRA8Unorm" if zero_copy is not None
+                                    str(
+                                        getattr(zero_copy, "resource_format", "BGRA8Unorm")
+                                    ) if zero_copy is not None
                                     else str(getattr(self._source, "frame_format", "") or "RGBP") if gpu_frame
                                     else None
                                 ),
@@ -222,10 +239,12 @@ class PollingCaptureRunner:
         finally:
             control_stop.set()
             if control_thread is not None:
-                control_thread.join(timeout=2.0)
+                control_thread.join()
+            self._control_thread = None
             try:
                 self.stop()
             finally:
+                self._control_stop = None
                 try:
                     if on_session_update is not None and session_announced:
                         on_session_update(None, None)

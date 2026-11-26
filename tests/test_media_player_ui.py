@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import sys
 import time
 from threading import Event
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import media_ui
 from media_ui import (
+    MEDIA_BAR_TEXTURE_SIZE,
+    MEDIA_BROWSER_LAYOUT_SIZE,
     MEDIA_BROWSER_TEXTURE_SIZE,
     MediaBrowserThumbnailCache,
     MediaHoverAnimation,
@@ -20,12 +24,17 @@ from media_ui import (
     media_bar_hit,
     media_bar_value_fraction,
     media_browser_hit,
+    media_browser_font_scale_for_eye,
     media_browser_scroll_metrics,
+    media_browser_scrollbar_metrics,
+    media_browser_scrollbar_offset,
     media_control_enabled,
     media_transport_icon,
 )
 from viewer.source_pointer import source_pointer_point
+import viewer.vulkan_local_viewer as vulkan_local_viewer
 from viewer.vulkan_local_viewer import VulkanLocalViewer
+from xr_viewer import overlay_textures
 from xr_viewer.settings_menu import OPENXR_MENU_COLORS, OPENXR_MENU_RADII
 
 
@@ -102,12 +111,106 @@ def test_media_bar_hover_changes_pixels_and_keeps_timeline_end_knob_visible():
     assert np.any(idle != hovered)
     # The preview knob at the far end must stay inside the texture and alter
     # the right-hand track region rather than being clipped by its edge.
-    right_edge = hovered[28:52, 940:1020, 3]
+    right_edge = hovered[56:104, 1880:2040, 3]
     assert right_edge.max() > 0
-    assert np.any(right_edge != idle[28:52, 940:1020, 3])
+    assert np.any(right_edge != idle[56:104, 1880:2040, 3])
 
 
-def test_media_volume_fill_uses_a_distinct_teal_hover_ramp():
+def test_media_bar_default_uses_a_2x_texture_with_the_same_hit_geometry():
+    rgba = build_media_bar_rgba(_state())
+
+    assert rgba.shape == (MEDIA_BAR_TEXTURE_SIZE[1], MEDIA_BAR_TEXTURE_SIZE[0], 4)
+    assert media_bar_hit(0.546, 0.72, _state()) == "play"
+
+
+def test_media_bar_uses_larger_bolder_action_text(monkeypatch):
+    font_calls = []
+    load_font = media_ui._font
+
+    def record_font(size, *, text="", bold=False):
+        font_calls.append((size, text, bold))
+        return load_font(size, text=text, bold=bold)
+
+    monkeypatch.setattr(media_ui, "_font", record_font)
+
+    build_media_bar_rgba({**_state(), "browser_visible": False})
+
+    assert (32, "Open File", True) in font_calls
+    assert (36, "00:15", False) in font_calls
+    assert (36, "02:00", False) in font_calls
+
+
+def test_vulkan_media_bar_overlay_upload_uses_hidpi_texture(monkeypatch):
+    uploads = []
+
+    class Overlay:
+        def set_rgba(self, _pixels, size):
+            uploads.append(size)
+
+    viewer = object.__new__(VulkanLocalViewer)
+    viewer.config = SimpleNamespace(locale="EN")
+    viewer._media_state = {**_state(), "browser_visible": False}
+    viewer._media_bar_overlay = Overlay()
+    viewer._media_browser_overlay = None
+    viewer._media_bar_hover = None
+    viewer._media_bar_texture_key = None
+    viewer._media_hover_animation = None
+    viewer._media_bar_visible = lambda: True
+    viewer._media_browser_visible = lambda: False
+    viewer._media_bar_expanded = lambda: True
+    monkeypatch.setattr(
+        vulkan_local_viewer,
+        "build_media_bar_rgba",
+        lambda *_args, **_kwargs: np.zeros((320, 2048, 4), dtype=np.uint8),
+    )
+
+    viewer._refresh_media_textures()
+
+    assert uploads == [MEDIA_BAR_TEXTURE_SIZE]
+
+
+def test_media_browser_font_scale_tracks_eye_output_size():
+    assert media_browser_font_scale_for_eye(1200, 1200) == pytest.approx(1.33, abs=0.01)
+    assert media_browser_font_scale_for_eye(2048, 2048) == 1.0
+
+
+def test_overlay_font_selection_uses_script_and_weight(monkeypatch):
+    calls = []
+
+    def fake_load(size, font_type=None, *, prefer_cjk=False, prefer_inter=False, bold=False):
+        calls.append((size, prefer_cjk, prefer_inter, bold))
+        return object()
+
+    monkeypatch.setattr(overlay_textures, "load_overlay_font", fake_load)
+
+    overlay_textures.load_overlay_font_for_text(24, "Media controls", bold=True)
+    overlay_textures.load_overlay_font_for_text(24, "媒体控制", bold=False)
+
+    assert calls == [(24, False, True, True), (24, True, False, False)]
+
+
+def test_macos_cjk_font_uses_regular_and_semibold_collection_faces(monkeypatch):
+    selected = []
+
+    class FakeFont:
+        pass
+
+    def fake_truetype(path, size, *, index=0):
+        if path == "/System/Library/Fonts/Hiragino Sans GB.ttc":
+            selected.append((size, index))
+            return FakeFont()
+        raise OSError(path)
+
+    monkeypatch.setattr(overlay_textures.ImageFont, "truetype", fake_truetype)
+
+    loader = overlay_textures._load_overlay_font_cached.__wrapped__
+    loader(24, None, True, False, False)
+    loader(24, None, True, True, False)
+
+    assert selected == [(24, 0), (24, 2)]
+
+
+def test_media_volume_fill_uses_a_light_blue_hover_ramp():
     state = _state()
     idle = build_media_bar_rgba(state, width=1024, height=160)
     hovered = build_media_bar_rgba(
@@ -123,8 +226,49 @@ def test_media_volume_fill_uses_a_distinct_teal_hover_ramp():
 
     assert tuple(idle[center_y, track_x, :3]) == _rgb("media_volume_fill")
     assert tuple(hovered[center_y, track_x, :3]) == _rgb("media_volume_fill_hover")
-    assert _rgb("media_volume_fill") != _rgb("primary")
-    assert _rgb("media_volume_fill_hover") != _rgb("primary_hover")
+
+
+def test_secondary_playback_controls_share_the_same_idle_background():
+    rgba = build_media_bar_rgba(_state(), width=1024, height=160)
+    rects = _button_rects(1024, 160)
+    samples = []
+    for key in (
+        "browse",
+        "browse_disc",
+        "previous",
+        "seek-10",
+        "seek+10",
+        "next",
+        "mute",
+        "volume",
+    ):
+        left, top, _right, bottom = rects[key]
+        samples.append(tuple(rgba[(top + bottom) // 2, left + 8, :3]))
+
+    assert len(set(samples)) == 1
+
+
+def test_media_bar_idle_button_backgrounds_are_opaque():
+    rgba = build_media_bar_rgba(_state(), width=1024, height=160)
+    rects = _button_rects(1024, 160)
+    points = []
+    for key in (
+        "browse",
+        "browse_disc",
+        "previous",
+        "seek-10",
+        "seek+10",
+        "next",
+        "mute",
+        "volume",
+        "media_exit",
+    ):
+        left, top, _right, bottom = rects[key]
+        points.append((left + 8, (top + bottom) // 2))
+    play_left, play_top, _play_right, play_bottom = rects["play"]
+    points.append((play_left + 20, (play_top + play_bottom) // 2))
+
+    assert all(int(rgba[y, x, 3]) == 255 for x, y in points)
 
 
 def test_media_bar_texture_and_hit_targets_are_stable():
@@ -136,7 +280,21 @@ def test_media_bar_texture_and_hit_targets_are_stable():
     assert media_bar_hit(0.08, 0.72, state) == "browse"
     assert media_bar_hit(0.22, 0.72, state) == "browse_disc"
     assert media_bar_hit(0.5, 0.25, state).startswith("seek:")
-    assert media_bar_hit(1000 / 1024, 0.25, state) == "seek:1.000000"
+    assert media_bar_hit(1000 / 1024, 0.25, state) == "media_exit"
+    assert media_bar_hit(930 / 1024, 0.25, state).startswith("seek:")
+
+
+def test_media_exit_is_enabled_only_outside_the_file_browser():
+    state = _state()
+    exit_rect = _button_rects(1024, 160)["media_exit"]
+    assert exit_rect == (964, 12, 1012, 60)
+    exit_u = (exit_rect[0] + exit_rect[2]) / 2 / 1024
+    exit_v = (exit_rect[1] + exit_rect[3]) / 2 / 160
+
+    assert media_control_enabled("media_exit", state)
+    assert media_bar_hit(exit_u, exit_v, state) == "media_exit"
+    assert not media_control_enabled("media_exit", {**state, "mode": "Browser"})
+    assert media_bar_hit(exit_u, exit_v, {**state, "ready": False}) is None
 
 
 def test_media_bar_previous_next_and_volume_hit_targets():
@@ -173,7 +331,7 @@ def test_disabled_media_controls_are_not_actionable():
 
 
 def _browser_uv(x: float, y: float) -> tuple[float, float]:
-    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    width, height = MEDIA_BROWSER_LAYOUT_SIZE
     return x / width, y / height
 
 
@@ -186,12 +344,12 @@ def test_browser_hover_progress_changes_hovered_row_and_button_surfaces():
     )
     assert hovered.shape == idle.shape
     assert np.any(hovered != idle)
-    open_hovered = build_media_browser_rgba(
+    close_hovered = build_media_browser_rgba(
         _state(),
-        hover="browse_open:C:/Videos/movie.mp4",
+        hover="browser_close",
         hover_progress=0.5,
     )
-    assert np.any(open_hovered != idle)
+    assert np.any(close_hovered != idle)
 
 
 def test_browser_texture_and_playlist_hit_targets():
@@ -221,14 +379,7 @@ def test_browser_texture_and_playlist_hit_targets():
         *_browser_uv(layout["sidebar_right"] - 24, recent_y), _state()
     ) == ("recent_remove", "F:/Videos/recent.mp4")
 
-    open_rect = rects["browse_open"]
-    assert media_browser_hit(
-        *_browser_uv(
-            (open_rect[0] + open_rect[2]) / 2,
-            (open_rect[1] + open_rect[3]) / 2,
-        ),
-        _state(),
-    ) == ("browse_open", "C:/Videos/movie.mp4")
+    assert "browse_open" not in rects
 
 
 def test_media_browser_uses_spatial_theme_radii_and_grid_list_controls():
@@ -260,6 +411,76 @@ def test_media_browser_uses_spatial_theme_radii_and_grid_list_controls():
         assert build_media_browser_rgba(view_state).shape == (height, width, 4)
 
 
+def test_media_browser_scrollbar_tracks_grid_offsets_and_is_hittable():
+    state = {
+        **_state(),
+        "browser_entries": [
+            {"name": f"movie-{index}.mp4", "path": f"F:/movie-{index}.mp4", "kind": "video"}
+            for index in range(30)
+        ],
+        "browser_view_mode": "grid",
+    }
+    track, top_thumb = media_browser_scrollbar_metrics(state, 0)
+    _step, _visible, maximum = media_browser_scroll_metrics(state)
+    _end_track, bottom_thumb = media_browser_scrollbar_metrics(state, maximum)
+
+    assert top_thumb is not None and bottom_thumb is not None
+    assert track[2] - track[0] == 28
+    assert top_thumb[1] == track[1]
+    assert bottom_thumb[3] == track[3]
+    assert media_browser_scrollbar_offset(state, track[1]) == 0
+    assert media_browser_scrollbar_offset(state, track[3]) == maximum
+
+    hit = media_browser_hit(
+        (track[0] + track[2]) / 2 / MEDIA_BROWSER_LAYOUT_SIZE[0],
+        (track[3] - track[1]) / 2 / MEDIA_BROWSER_LAYOUT_SIZE[1],
+        state,
+    )
+    assert hit is not None and hit[0] == "browser_scroll"
+
+
+def test_media_browser_file_sort_button_is_hittable():
+    state = {
+        **_state(),
+        "browser_entries": [
+            {"name": f"movie-{index}.mp4", "path": f"F:/movie-{index}.mp4", "kind": "video"}
+            for index in range(3)
+        ],
+    }
+    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    rect = _browser_button_rects(width, height)["browser_sort"]
+    assert media_browser_hit(
+        *_browser_uv((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2),
+        state,
+    ) == ("browser_sort", None)
+
+
+def test_media_browser_stop_hit_requests_local_viewer_shutdown():
+    state = {**_state(), "mode": "Browser", "browser_visible": True}
+    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    rect = _browser_button_rects(width, height)["viewer_stop"]
+    layout = _browser_layout(state, width, height)
+    assert rect[2] - rect[0] == 168
+    assert rect[3] - rect[1] == 64
+    assert rect[0] >= 32 and rect[1] >= 32
+    assert layout["locations_heading_y"] >= rect[3] + 18
+    assert layout["mount_top"] >= layout["locations_heading_y"] + 38
+    hit = media_browser_hit(
+        *_browser_uv((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2),
+        state,
+    )
+    assert hit == ("viewer_stop", None)
+
+    shutdown = Event()
+    viewer = object.__new__(VulkanLocalViewer)
+    viewer.config = SimpleNamespace(on_stop_requested=shutdown.set)
+    viewer._dispatch_media_hit(hit[0])
+
+    assert shutdown.is_set()
+    rendered = build_media_browser_rgba(state)
+    assert rendered.shape == (height, width, 4)
+
+
 def test_media_browser_grid_preview_and_add_button_share_card_geometry():
     entry = {"name": "movie.mp4", "path": "F:/movie.mp4", "kind": "video"}
     state = {**_state(), "browser_entries": [entry]}
@@ -268,7 +489,11 @@ def test_media_browser_grid_preview_and_add_button_share_card_geometry():
     preview = np.empty((8, 8, 3), dtype=np.uint8)
     preview[:] = (210, 32, 48)
     rgba = build_media_browser_rgba(state, thumbnails={entry["path"]: preview})
-    assert tuple(rgba[card[1] + 40, card[0] + 40, :3]) == (210, 32, 48)
+    scale_x = MEDIA_BROWSER_TEXTURE_SIZE[0] / MEDIA_BROWSER_LAYOUT_SIZE[0]
+    scale_y = MEDIA_BROWSER_TEXTURE_SIZE[1] / MEDIA_BROWSER_LAYOUT_SIZE[1]
+    sample_y = round((card[1] + 40) * scale_y)
+    sample_x = round((card[0] + 40) * scale_x)
+    assert tuple(rgba[sample_y, sample_x, :3]) == (210, 32, 48)
 
     add_x, add_y = card[2] - 32, card[3] - 32
     assert media_browser_hit(*_browser_uv(add_x, add_y), state) == (
@@ -280,7 +505,7 @@ def test_media_browser_grid_preview_and_add_button_share_card_geometry():
     list_layout = _browser_layout(list_state, *MEDIA_BROWSER_TEXTURE_SIZE)
     row_y = list_layout["file_rows_y"] + list_layout["file_row_height"] / 2
     assert media_browser_hit(
-        *_browser_uv(MEDIA_BROWSER_TEXTURE_SIZE[0] - 70, row_y), list_state
+        *_browser_uv(MEDIA_BROWSER_LAYOUT_SIZE[0] - 70, row_y), list_state
     ) == ("playlist_add", entry["path"])
 
 
@@ -316,19 +541,17 @@ def test_media_browser_thumbnail_cache_remembers_failed_previews(monkeypatch):
 
 
 def test_browser_footer_actions_use_content_inset_and_stable_group_gap():
-    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    width, height = MEDIA_BROWSER_LAYOUT_SIZE
     rects = _browser_button_rects(width, height)
     previous = rects["playlist_previous"]
     next_button = rects["playlist_next"]
     clear = rects["playlist_clear"]
-    open_button = rects["browse_open"]
 
     assert previous[0] == 48
     assert height - max(previous[3], next_button[3], clear[3]) == 48
     assert next_button[0] - previous[2] == 24
     assert clear[0] - next_button[2] == 24
-    assert open_button[2] == width - 48
-    assert open_button[3] == height - 48
+    assert "browse_open" not in rects
 
 
 def test_browser_mounts_and_row_bounds_are_clickable_only_inside_geometry():
@@ -406,7 +629,7 @@ def test_local_viewer_media_hit_dispatches_shared_actions():
     ]
 
 
-def test_local_viewer_dispatches_absolute_seek_volume_and_browser_select():
+def test_local_viewer_dispatches_absolute_seek_volume_and_browser_open():
     actions = []
     viewer = object.__new__(VulkanLocalViewer)
     viewer.config = SimpleNamespace(
@@ -418,12 +641,10 @@ def test_local_viewer_dispatches_absolute_seek_volume_and_browser_select():
     viewer._dispatch_media_hit("seek:0.5")
     viewer._dispatch_media_hit("volume:0.25")
     viewer._dispatch_media_hit("entry:F:/Videos/movie.mp4")
-    viewer._dispatch_media_hit("entry:F:/Videos/movie.mp4", double_click=True)
 
     assert actions == [
         ("seek", 60.0),
         ("volume", 0.25),
-        ("browse_select", {"path": "F:/Videos/movie.mp4"}),
         ("browse_open", {"path": "F:/Videos/movie.mp4"}),
     ]
 
@@ -439,6 +660,36 @@ def test_local_viewer_places_media_overlays_inside_each_eye():
     browser = viewer._media_rect_for_eye((0, 0, 960, 1080), browser=True)
     assert browser[2] - browser[0] >= int(960 * 0.95)
     assert browser[3] - browser[1] >= int(1080 * 0.60)
+
+
+def test_half_sbs_browser_fills_both_eyes_and_keeps_click_targets_aligned():
+    viewer = object.__new__(VulkanLocalViewer)
+    viewer.config = SimpleNamespace(display_mode="Half-SBS")
+    eye_rects = ((0, 0, 960, 1080), (960, 0, 1920, 1080))
+    browser_rects = tuple(
+        viewer._media_rect_for_eye(rect, browser=True) for rect in eye_rects
+    )
+    state = {
+        **_state(),
+        "browser_mounts": [
+            {"name": "User folder", "path": "C:/Users/test", "kind": "home"},
+        ],
+    }
+
+    for rect in browser_rects:
+        left, top, right, bottom = rect
+        width, height = right - left, bottom - top
+        assert width == 470
+        assert height == 705
+        click_x = left + (250 / 1600) * width
+        click_y = top + (186 / 1200) * height
+        hit_u = (click_x - left) / width
+        hit_v = (click_y - top) / height
+        assert media_browser_hit(hit_u, hit_v, state) == (
+            "mount",
+            "C:/Users/test",
+        )
+    assert browser_rects[1][0] > browser_rects[0][0]
 
 
 def test_media_transport_icon_matches_available_action():
@@ -485,6 +736,47 @@ def test_local_viewer_records_media_overlay_viewports_not_absolute_bounds():
     assert recorded == [
         (absolute[0], absolute[1], absolute[2] - absolute[0], absolute[3] - absolute[1])
     ]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Local Viewer cursor policy")
+def test_local_viewer_virtual_cursor_is_rendered_for_media_only():
+    pointer_rects = []
+
+    class PointerOverlay:
+        def record_rects(self, _cmd, _image, _index, rects, **_kwargs):
+            pointer_rects.append(rects)
+            return True
+
+    viewer = object.__new__(VulkanLocalViewer)
+    viewer.config = SimpleNamespace(
+        capture_mode="Monitor",
+        pointer_mapping_enabled=True,
+        display_mode="Half-SBS",
+    )
+    viewer.vk = SimpleNamespace(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR=1000001002)
+    viewer._media_bar_overlay = None
+    viewer._media_browser_overlay = None
+    viewer._media_pointer_overlay = PointerOverlay()
+    viewer._media_pointer_visible = lambda: True
+    viewer._media_pointer_uv = (0.5, 0.5)
+    viewer._media_browser_visible = lambda: False
+    viewer._media_bar_visible = lambda: False
+
+    eyes = ((0, 0, 960, 1080), (960, 0, 1920, 1080))
+    drawn, _layout = viewer._record_media_overlays(
+        None, None, 0, eyes, source_layout=0
+    )
+    assert drawn is False
+    assert pointer_rects == []
+
+    viewer.config.capture_mode = "Video"
+    drawn, layout = viewer._record_media_overlays(
+        None, None, 0, eyes, source_layout=0
+    )
+
+    assert drawn is True
+    assert layout == viewer.vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+    assert pointer_rects == [((468, 516, 24, 48), (1428, 516, 24, 48))]
 
 
 def test_local_viewer_dispatches_playlist_controls_from_bar_hits():
@@ -596,7 +888,7 @@ def test_playlist_controls_share_painted_geometry_and_page_offset():
     for action, x in (("playlist_move_up", right - 140), ("playlist_move_down", right - 88),
                       ("playlist_remove", right - 36), ("playlist_select", 160)):
         assert media_browser_hit(*_browser_uv(x, y), state) == (action, "F:/movie-4.mp4")
-    for action in ("playlist_add", "playlist_sort", "browse_open", "playlist_clear"):
+    for action in ("playlist_add", "playlist_sort", "playlist_clear"):
         rect = _browser_button_rects(width, height)[action]
         u, v = _browser_uv((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
         hit = media_browser_hit(u, v, state)
@@ -612,7 +904,7 @@ def test_add_button_does_not_open_selected_file():
     ], "browser_view_mode": "list"}
     width, height = MEDIA_BROWSER_TEXTURE_SIZE
     layout = _browser_layout(state, width, height)
-    x = width - 70
+    x = MEDIA_BROWSER_LAYOUT_SIZE[0] - 70
     y = layout["file_rows_y"] + (layout["file_row_height"] - 4) / 2
     assert media_browser_hit(*_browser_uv(x, y), state) == ("playlist_add", "F:/movie.mp4")
 
@@ -634,3 +926,16 @@ def test_local_playlist_controls_dispatch_shared_commands():
         ("playlist_sort", {"descending": True}),
         ("playlist_page", 4),
     ]
+
+
+def test_local_file_sort_control_dispatches_shared_command():
+    actions = []
+    viewer = object.__new__(VulkanLocalViewer)
+    viewer._media_state = {"browser_sort_descending": False}
+    viewer.config = SimpleNamespace(
+        media_action_callback=lambda action, value: actions.append((action, value)) or True
+    )
+
+    viewer._dispatch_media_hit("browser_sort")
+
+    assert actions == [("browser_sort", {"descending": True})]

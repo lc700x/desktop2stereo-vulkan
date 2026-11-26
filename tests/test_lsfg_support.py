@@ -9,12 +9,31 @@ def test_lsfg_support_is_visible_for_windows_local_viewer(monkeypatch):
     target = SimpleNamespace(
         lsfg_cb=control,
         run_mode_key="Local Viewer",
+        locale="EN",
     )
 
     handlers.GUIHandlerMixin._sync_lsfg_visibility(target)
 
     assert control.visible is True
     assert control.disabled is False
+
+
+def test_lsfg_support_is_visible_for_macos_local_viewer(monkeypatch):
+    from gui import handlers
+
+    monkeypatch.setattr(handlers, "OS_NAME", "Darwin")
+    control = SimpleNamespace(visible=False, disabled=True, tooltip="")
+    target = SimpleNamespace(
+        lsfg_cb=control,
+        run_mode_key="Local Viewer",
+        locale="EN",
+    )
+
+    handlers.GUIHandlerMixin._sync_lsfg_visibility(target)
+
+    assert control.visible is True
+    assert control.disabled is False
+    assert "macOS Dock" in control.tooltip
 
 
 def test_lsfg_support_is_visible_for_windows_local_3d_output(monkeypatch):
@@ -27,6 +46,7 @@ def test_lsfg_support_is_visible_for_windows_local_3d_output(monkeypatch):
     target = SimpleNamespace(
         lsfg_cb=control,
         run_mode_key="Local Viewer",
+        locale="EN",
     )
 
     handlers.GUIHandlerMixin._sync_lsfg_visibility(target)
@@ -43,6 +63,7 @@ def test_lsfg_support_is_hidden_outside_windows_desktop_viewer(monkeypatch):
     target = SimpleNamespace(
         lsfg_cb=control,
         run_mode_key="RTMP Streamer",
+        locale="EN",
     )
 
     handlers.GUIHandlerMixin._sync_lsfg_visibility(target)

@@ -77,6 +77,44 @@ def resolve_render_size(
     raise ValueError(f"unknown render size policy: {config.policy!r}")
 
 
+def processing_size_limit_for_display(
+    display_size: tuple[int, int],
+    output_format: str,
+) -> tuple[int, int]:
+    """Return per-eye processing bounds that keep the packed frame on-screen."""
+    width, height = _valid_size(display_size, name="display_size")
+    output_format = (
+        str(output_format or "")
+        .strip()
+        .casefold()
+        .replace("-", "_")
+        .replace(" ", "_")
+        .replace("side_by_side", "sbs")
+        .replace("top_bottom", "tab")
+    )
+    if output_format == "full_sbs":
+        width = max(2, width // 2)
+    elif output_format == "full_tab":
+        height = max(2, height // 2)
+    return width, height
+
+
+def fit_size_within_bounds(
+    size: tuple[int, int],
+    bounds: tuple[int, int],
+    *,
+    align: int = 2,
+) -> tuple[int, int]:
+    """Fit a size inside bounds without upscaling or changing its aspect ratio."""
+    width, height = _valid_size(size, name="size")
+    max_width, max_height = _valid_size(bounds, name="bounds")
+    alignment = max(1, int(align))
+    scale = min(1.0, max_width / float(width), max_height / float(height))
+    fitted_width = _align_down(width * scale, alignment)
+    fitted_height = _align_down(height * scale, alignment)
+    return fitted_width, fitted_height
+
+
 def runtime_output_size_text(size: tuple[int, int] | None) -> str:
     if size is None:
         return "unknown"
@@ -132,6 +170,10 @@ def _align_dimension(value: float, align: int) -> int:
     if align <= 1:
         return value
     return max(align, (value // align) * align)
+
+
+def _align_down(value: float, align: int) -> int:
+    return max(align, (int(value) // align) * align)
 
 
 def _valid_size(size: tuple[int, int], *, name: str) -> tuple[int, int]:

@@ -83,6 +83,153 @@ def test_media_runtime_metrics_report_pipe_read_and_buffer_pressure():
     assert metrics["decode_backend"] == "ffmpeg-amf"
 
 
+def test_media_stop_serializes_concurrent_audio_cleanup():
+    source = object.__new__(MediaCaptureSource)
+    source._media_control_lock = threading.RLock()
+    source._current_position = lambda: 0.0
+    source._video_process = None
+    source._displayed_frame = None
+    source._manifest_path = None
+    source._owns_iso_mount = False
+    source._mounted_iso_path = None
+    source.playing = True
+    source._ready = True
+    source._browser = SimpleNamespace(close=lambda: None)
+    source._stop_frame_pump = lambda: None
+    source._close_native_decoder = lambda: None
+    source._close_nvdec = lambda: None
+    source._close_opencv = lambda: None
+    source._reset_frame_buffer = lambda _position: None
+    source._publish_state = lambda **_kwargs: None
+
+    entered = threading.Event()
+    release = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def close_audio():
+        nonlocal active, maximum_active
+        with state_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        entered.set()
+        release.wait(timeout=1.0)
+        with state_lock:
+            active -= 1
+
+    source._close_audio = close_audio
+
+    workers = [threading.Thread(target=source.stop) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    assert entered.wait(timeout=1.0)
+    time.sleep(0.02)
+    release.set()
+    for worker in workers:
+        worker.join(timeout=1.0)
+
+    assert maximum_active == 1
+
+
+def test_polling_runner_stop_signals_media_control_worker_before_source_stop():
+    from capture.runners import PollingCaptureRunner
+
+    events = []
+    source = SimpleNamespace(
+        mode="video",
+        stop=lambda: events.append("source_stop"),
+    )
+    runner = PollingCaptureRunner(SimpleNamespace(), lambda: source)
+    runner._source = source
+    runner._source_stopped = False
+    control_stop = threading.Event()
+    runner._control_stop = control_stop
+
+    runner.stop()
+
+    assert control_stop.is_set()
+    assert events == ["source_stop"]
+
+
+def test_media_audio_cleanup_waits_for_audio_worker_before_portaudio(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    source = object.__new__(MediaCaptureSource)
+    source._audio_stop = threading.Event()
+    events = []
+
+    class Process:
+        stdout = None
+        _media_stderr = None
+
+        @staticmethod
+        def poll():
+            return None
+
+        def terminate(self):
+            events.append("process_terminate")
+
+        def wait(self, timeout=None):
+            events.append("process_wait")
+            return 0
+
+    class Stream:
+        def abort(self):
+            events.append("stream_abort")
+
+        def stop(self):
+            events.append("stream_stop")
+
+        def close(self):
+            events.append("stream_close")
+
+    source._audio_process = Process()
+    source._audio_stream = Stream()
+    source._audio_sync = SimpleNamespace(close=lambda: events.append("sync_close"))
+    source._audio_thread = None
+
+    source._close_audio()
+
+    assert events.index("process_terminate") < events.index("stream_stop")
+    assert "process_wait" not in events
+
+
+def test_media_audio_worker_owns_portaudio_teardown(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    events = []
+
+    class Pipe:
+        def read(self, _count):
+            return b""
+
+    class Process:
+        stdout = Pipe()
+
+        @staticmethod
+        def poll():
+            return 0
+
+    class Stream:
+        def stop(self):
+            events.append("stream_stop")
+
+        def close(self):
+            events.append("stream_close")
+
+    source = object.__new__(MediaCaptureSource)
+    source._audio_process = Process()
+    source._audio_stream = Stream()
+    source._audio_stop = threading.Event()
+    source._audio_sync = SimpleNamespace()
+    source.volume, source.muted = 1.0, False
+
+    source._audio_loop()
+
+    assert events == ["stream_close"]
+
+
 def test_ffmpeg_decoder_keeps_realtime_pacing_after_nvdec_is_disabled(monkeypatch):
     source = object.__new__(MediaCaptureSource)
     source._video_process = None
@@ -159,6 +306,26 @@ def test_hardware_unsupported_errors_are_distinguished_from_corrupt_media():
     assert not _is_hardware_decode_unavailable(ValueError("corrupt packet data"))
 
 
+def test_macos_media_decode_fails_closed_until_native_metal_path(monkeypatch):
+    source = _source_for_decode_start()
+    source._gpu_vendor = "apple"
+    source._nvdec_disabled = True
+    source._frame_pixel_format = "p010le"
+    source._nvdec_decoder = None
+    source._close_nvdec = lambda: None
+    source._close_opencv = lambda: None
+    source._close_native_decoder = lambda: None
+    source._start_ffmpeg_video = lambda *_args, **_kwargs: pytest.fail(
+        "macOS media must not return decoded frames through FFmpeg stdout"
+    )
+    monkeypatch.setattr("capture.media.sys.platform", "darwin")
+
+    with pytest.raises(RuntimeError, match="CPU frame readback is disabled"):
+        source._start_video(4.5, realtime=True)
+
+    assert source._decode_backend == "avfoundation-metal-unavailable"
+
+
 def test_amf_vpp_format_negotiation_errors_are_detected():
     assert _is_amf_vpp_unavailable(
         "[Parsed_vpp_amf_0 @ 0x1] Impossible to convert between the formats "
@@ -204,7 +371,8 @@ def test_video_decode_uses_amf_on_amd():
     assert source._nvdec_disabled is False
 
 
-def test_video_decode_falls_back_to_ffmpeg_for_unsupported_hardware():
+def test_video_decode_falls_back_to_ffmpeg_for_unsupported_hardware(monkeypatch):
+    monkeypatch.setattr("capture.media.sys.platform", "linux")
     source = _source_for_decode_start()
     software_starts = []
     source._start_ffmpeg_video = lambda position, *, realtime: software_starts.append(
@@ -224,6 +392,7 @@ def test_video_decode_falls_back_to_ffmpeg_for_unsupported_hardware():
 
 
 def test_nvdec_without_first_frame_falls_back_to_software(monkeypatch):
+    monkeypatch.setattr("capture.media.sys.platform", "linux")
     source = _source_for_decode_start()
     source._amf_decoder = None
     starts = []
@@ -320,6 +489,7 @@ def test_nvdec_prefers_threaded_decoder_and_maps_resume_position(monkeypatch):
 
 
 def test_nvdec_unsupported_preflight_falls_back_before_threaded_decoder(monkeypatch):
+    monkeypatch.setattr("capture.media.sys.platform", "linux")
     source = _source_for_decode_start()
     starts = []
     threaded_starts = []
@@ -815,7 +985,10 @@ def test_amf_scaled_p010_frame_uses_decoded_dimensions():
         ("arib-std-b67", "bt2020", "bgr24_hlg_bt2020"),
     ],
 )
-def test_hdr_ffmpeg_path_preserves_transfer_for_device_preprocess(transfer, primaries, frame_format):
+def test_hdr_ffmpeg_path_preserves_transfer_for_device_preprocess(
+    transfer, primaries, frame_format, monkeypatch
+):
+    monkeypatch.setattr("capture.media.sys.platform", "linux")
     source = _source_for_decode_start()
     source.hdr = True
     source.transfer = transfer
@@ -1070,6 +1243,50 @@ def test_browse_select_keeps_media_and_browse_close_restores_last_frame(tmp_path
     assert frame is source._frame
 
 
+def test_media_exit_stops_and_opens_current_file_directory(tmp_path):
+    control_path = tmp_path / "viewer-control.json"
+    media_path = tmp_path / "Movies" / "movie.mp4"
+    media_path.parent.mkdir()
+    opened = []
+    stopped = []
+    source = object.__new__(MediaCaptureSource)
+    source.config = SimpleNamespace(
+        media_control_path=None,
+        media_gui_control_path=None,
+        media_viewer_control_path=str(control_path),
+    )
+    source._session_id = "session-456"
+    source._last_control_revisions = {}
+    source._browser = SimpleNamespace(open=lambda path: opened.append(path))
+    source.path = str(media_path)
+    source._browser_mode = False
+    source._frame = object()
+    source._displayed_frame = object()
+    source.playing = True
+    source._ready = True
+    source.stop = lambda: stopped.append(True)
+    source._publish_state = lambda **_kwargs: None
+    control_path.write_text(
+        json.dumps(
+            {
+                "session": "session-456",
+                "revision": 1,
+                "action": "media_exit",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    source._read_control()
+
+    assert stopped == [True]
+    assert opened == [str(media_path.parent)]
+    assert source._browser_mode is True
+    assert source._frame is None
+    assert source._displayed_frame is None
+    assert source.playing is False
+
+
 def test_playlist_auto_advance_returns_next_frame_not_grab_tuple():
     next_frame = object()
     source = object.__new__(MediaCaptureSource)
@@ -1275,6 +1492,17 @@ def test_openxr_media_command_writer_serializes_session_revision_and_value(tmp_p
         "value": {"path": "F:/Videos/movie.mp4"},
     }
 
+    assert writer._write_openxr_media_command(
+        "browser_sort", {"descending": True}
+    ) is True
+    command = json.loads(control_path.read_text(encoding="utf-8"))
+    assert command == {
+        "session": "session-123",
+        "revision": 2,
+        "action": "browser_sort",
+        "value": {"descending": True},
+    }
+
 
 def test_preferred_audio_output_device_prefers_windows_wasapi(monkeypatch):
     class SoundDevice:
@@ -1306,7 +1534,10 @@ def test_audio_loop_records_device_failure_without_thread_exception():
             pass
 
     process = SimpleNamespace(
-        stdout=io.BytesIO(np.zeros(4096, dtype=np.float32).tobytes())
+        stdout=io.BytesIO(np.zeros(4096, dtype=np.float32).tobytes()),
+        terminated=False,
+        poll=lambda: None,
+        terminate=lambda: setattr(process, "terminated", True),
     )
     source = object.__new__(MediaCaptureSource)
     source._audio_stop = threading.Event()
@@ -1315,16 +1546,13 @@ def test_audio_loop_records_device_failure_without_thread_exception():
     source.volume = 1.0
     source.muted = False
     source.audio_error = ""
-    terminated = []
-    source._terminate = lambda value: terminated.append(value)
-
     source._audio_loop()
 
     assert "no audio driver" in source.audio_error
     assert source._audio_stop.is_set()
     assert source._audio_process is None
     assert source._audio_stream is None
-    assert terminated == [process]
+    assert process.terminated is True
 
 
 def test_media_state_publishes_session_and_playback_facts(tmp_path):
@@ -1702,7 +1930,10 @@ def test_media_cadence_matches_integral_display_ticks() -> None:
     assert select(120.0, 120.0, 40.0) == 40.0
 
 
-def test_frame_pump_applies_runtime_cadence_target() -> None:
+def test_frame_pump_applies_runtime_cadence_target(monkeypatch) -> None:
+    # Runtime cadence retargeting is an explicit opt-in. Keep this test on the
+    # legacy controller path so it still exercises the target application.
+    monkeypatch.setenv("D2S_MEDIA_CADENCE_ADAPTIVE", "1")
     source = object.__new__(MediaCaptureSource)
     source._source_fps = 120.0
     source.width = 3840
@@ -1814,6 +2045,45 @@ def test_frame_pump_is_bounded_and_pause_keeps_buffered_frames():
     assert all(isinstance(item[0], float) for item in source._frame_buffer)
 
 
+def test_wall_clock_frame_pump_drops_oldest_when_consumer_is_slow():
+    source = object.__new__(MediaCaptureSource)
+    source._image = False
+    source._ready = True
+    source.playing = True
+    source.config = SimpleNamespace(media_presentation_sync=True)
+    source._source_fps = 60.0
+    source._playback_fps = 60.0
+    source._frame_pump_decimation_step = 1
+    source._frame_buffer_capacity = 2
+    source._frame_buffer = deque()
+    source._frame_buffer_condition = threading.Condition()
+    source._frame_pump_stop = threading.Event()
+    source._frame_pump_done = False
+    source._frame_pump_error = ""
+    source._frame_pump_position = 12.0
+    source._source_frame_index = 0
+    source._frame_pump_thread = None
+    source._decode_lock = threading.RLock()
+    source._read_video_frame = lambda: object()
+    source._position_anchor = 12.0
+    source._position_anchor_time = None
+    source._current_position = lambda: 13.0
+    source._close_audio = lambda: None
+    source._frame_buffer_stale_drops = 0
+    source._frame_buffer_drop_log_at = 0.0
+
+    source._start_frame_pump()
+    try:
+        deadline = time.monotonic() + 1.0
+        while source._frame_buffer_stale_drops == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        source._stop_frame_pump()
+
+    assert source._frame_buffer_stale_drops > 0
+    assert len(source._frame_buffer) <= source._frame_buffer_capacity
+
+
 def test_file_mode_without_saved_path_opens_output_browser_without_error(tmp_path):
     source = MediaCaptureSource(SimpleNamespace(
         media_path="",
@@ -1866,6 +2136,8 @@ def test_file_mode_with_missing_saved_path_opens_configured_browser_directory(tm
         assert source.error.startswith("FileNotFoundError:")
         assert source._browser.snapshot()["browser_path"] == str(browser_directory)
         assert source._browser.snapshot()["browser_visible"] is True
+        frame, _size = source.grab()
+        assert frame is None
     finally:
         source.stop()
 
@@ -2078,6 +2350,8 @@ def test_native_media_decoder_is_retained_for_pause_resume():
 
 def test_media_audio_setup_uses_dac_callback_and_precise_seek_pts(monkeypatch):
     calls = []
+    monkeypatch.setattr(sys, "platform", "linux")
+
     class Stream:
         time = 100.0
         def __init__(self, **kwargs):
@@ -2109,6 +2383,47 @@ def test_media_audio_setup_uses_dac_callback_and_precise_seek_pts(monkeypatch):
     assert callable(calls[0]["callback"])
     assert source._audio_started_at is None
     assert source._audio_sync.generation == 3
+
+
+def test_media_audio_setup_uses_raw_stream_on_macos(monkeypatch):
+    calls = []
+
+    class Stream:
+        time = 100.0
+
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def start(self):
+            pass
+
+    class Worker:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        SimpleNamespace(OutputStream=Stream, RawOutputStream=Stream),
+    )
+    monkeypatch.setattr("capture.media._preferred_audio_output_device", lambda _sd: None)
+    monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_kw: SimpleNamespace())
+    monkeypatch.setattr(threading, "Thread", Worker)
+    source = object.__new__(MediaCaptureSource)
+    source.config = SimpleNamespace(media_presentation_sync=True)
+    source._ffmpeg = "ffmpeg"
+    source._input_args = ["-i", "movie.mp4"]
+    source._media_generation = 3
+    source._close_audio = lambda: pytest.fail("audio setup unexpectedly failed")
+
+    source._start_audio(0.0)
+
+    assert calls[0]["blocksize"] == 480
+    assert "callback" not in calls[0]
 
 
 def test_media_audio_reader_assembles_partial_samples_without_timestamp_loss():
@@ -2150,6 +2465,8 @@ def test_media_presentation_feedback_matches_generation_before_audio_clock():
 
 
 def test_audio_dac_mapping_does_not_inherit_delayed_callback_entry_time(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+
     class Stream:
         time = 100.0
         def __init__(self, **kwargs):
@@ -2223,7 +2540,8 @@ def test_native_decode_failure_keeps_software_fallback_without_tensor_clone(monk
     assert source._read_buffered_video_frame() is host_frame
 
 
-def test_native_cadence_change_does_not_launch_unused_ffmpeg_pipe():
+def test_native_cadence_change_does_not_launch_unused_ffmpeg_pipe(monkeypatch):
+    monkeypatch.setenv("D2S_MEDIA_CADENCE_ADAPTIVE", "1")
     source = object.__new__(MediaCaptureSource)
     source._source_fps = 120.0
     source.width, source.height = 3840, 1920
@@ -2242,7 +2560,8 @@ def test_native_cadence_change_does_not_launch_unused_ffmpeg_pipe():
     assert source._frame_pump_decimation_step == 4
 
 
-def test_adaptive_cadence_drains_selected_frames_before_changing_divisor():
+def test_adaptive_cadence_drains_selected_frames_before_changing_divisor(monkeypatch):
+    monkeypatch.setenv("D2S_MEDIA_CADENCE_ADAPTIVE", "1")
     source = object.__new__(MediaCaptureSource)
     source._source_fps = 120.0
     source.width, source.height = 3840, 1920
@@ -2292,6 +2611,7 @@ def test_nvdec_discards_intermediate_surface_batch_before_next_fetch():
 
 
 def test_media_preroll_does_not_advance_source_until_first_successful_presentation(monkeypatch):
+    monkeypatch.setenv("D2S_MEDIA_CADENCE_ADAPTIVE", "1")
     source = object.__new__(MediaCaptureSource)
     source.config = SimpleNamespace(media_presentation_sync=True, fps=60.0)
     source._source_fps = 120.0
@@ -2348,6 +2668,7 @@ def test_media_preroll_uses_hardware_cost_and_retains_explicit_ceiling(monkeypat
     source._presentation_clock_pending = True
     source._media_cadence_calibrated = False
     source._frame_buffer_condition = threading.Condition()
+    monkeypatch.setenv("D2S_MEDIA_CADENCE_ADAPTIVE", "1")
     monkeypatch.delenv("D2S_MEDIA_DECIMATION_TARGET_FPS", raising=False)
     reset_media_playback_cadence_target()
     source.calibrate_media_cadence(6.0)
@@ -2366,6 +2687,48 @@ def test_media_preroll_uses_hardware_cost_and_retains_explicit_ceiling(monkeypat
     source._media_cadence_calibrated = False
     source.calibrate_media_cadence(23.95)
     assert source._playback_fps == 40.0
+
+
+def test_media_preroll_keeps_requested_rate_when_adaptive_cadence_is_disabled(monkeypatch):
+    source = object.__new__(MediaCaptureSource)
+    source.config = SimpleNamespace(fps=60.0)
+    source._source_fps = 120.0
+    source.width, source.height = 3840, 1920
+    source._playback_fps = 60.0
+    source._frame_pump_decimation_step = 2
+    source._presentation_clock_pending = True
+    source._media_cadence_calibrated = False
+    source._frame_buffer_condition = threading.Condition()
+    monkeypatch.setenv("D2S_MEDIA_CADENCE_ADAPTIVE", "0")
+
+    source.calibrate_media_cadence(60.0)
+
+    assert source._playback_fps == 60.0
+    assert source._frame_pump_decimation_step == 2
+    assert source._last_source_frame_duration == pytest.approx(1.0 / 60.0)
+    assert source._media_prepare_lead_s == pytest.approx(1.0 / 60.0 + 0.06)
+
+
+def test_media_runtime_target_is_ignored_when_adaptive_cadence_is_disabled(monkeypatch):
+    source = object.__new__(MediaCaptureSource)
+    source._source_fps = 120.0
+    source.width, source.height = 3840, 1920
+    source.config = SimpleNamespace(fps=60.0)
+    source._playback_fps = 60.0
+    source._frame_pump_decimation_step = 2
+    source._frame_pump_stop = threading.Event()
+    source._frame_buffer = deque()
+    source._frame_buffer_condition = threading.Condition()
+    monkeypatch.setenv("D2S_MEDIA_CADENCE_ADAPTIVE", "0")
+
+    try:
+        set_media_playback_cadence_target(24.0)
+        source._apply_media_playback_cadence_target()
+    finally:
+        reset_media_playback_cadence_target()
+
+    assert source._playback_fps == 60.0
+    assert source._frame_pump_decimation_step == 2
 
 
 def test_media_preparation_lead_uses_fresh_measured_latency_not_repeated_frame_age():
@@ -2456,6 +2819,27 @@ def test_presentation_synced_decimation_uses_pts_not_a_second_emit_phase(monkeyp
     # to preparation without an additional relative wait or any discard.
     assert source._take_buffered_frame(10.05) == (10.0 + 1 / 24, "next", 5)
     assert source._last_decimated_emit_at == 100.0
+
+
+def test_presentation_sync_drops_stale_frames_to_keep_wall_clock(monkeypatch):
+    source = object.__new__(MediaCaptureSource)
+    source.config = SimpleNamespace(media_presentation_sync=True)
+    source._playback_fps = 60.0
+    source._source_fps = 60.0
+    source._last_source_frame_duration = 1.0 / 60.0
+    source._frame_pump_decimation_step = 1
+    source._frame_buffer = deque(
+        [(10.00, "stale", 0), (10.50, "due", 30), (11.00, "future", 60)]
+    )
+    source._frame_buffer_condition = threading.Condition()
+    source._frame_pump_done = False
+    source._frame_buffer_stale_drops = 0
+    source._frame_buffer_drop_log_at = 0.0
+    monkeypatch.setattr("capture.media.time.perf_counter", lambda: 100.0)
+
+    assert source._take_buffered_frame(10.75) == (10.50, "due", 30)
+    assert source._frame_buffer_stale_drops == 1
+    assert list(source._frame_buffer) == [(11.00, "future", 60)]
 
 
 def test_pause_resume_preserves_the_remaining_source_frame_interval(monkeypatch):

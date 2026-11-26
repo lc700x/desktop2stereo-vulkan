@@ -27,6 +27,19 @@ def direct_staging_enabled() -> bool:
     )
 
 
+def native_pack_error_is_recoverable(error: BaseException) -> bool:
+    """Identify a native frame whose Core ML slot no longer owns its target."""
+    message = str(error).casefold()
+    return any(
+        text in message
+        for text in (
+            "native coreml pack slot is not ready",
+            "native coreml pack slot or destination is invalid",
+            "native coreml frame was already released",
+        )
+    )
+
+
 class DirectSinkRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()

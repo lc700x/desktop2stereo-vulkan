@@ -100,24 +100,30 @@ def resolve_viewer_settings(settings: dict) -> ViewerSettings:
         )
     display_mode = settings["Display Mode"]
     capture_mode = settings["Capture Mode"]
-    same_monitor_local_3d = is_local_same_monitor_3d_mode(
-        settings.get("Run Mode", "Local Viewer"),
-        os_name=platform.system(),
-        monitor_count=len(displays),
-        capture_mode=capture_mode,
-        input_monitor_index=monitor_index,
-        output_monitor_index=monitor_index,
-    )
-    if same_monitor_local_3d:
-        stereo_display_index = monitor_index
-        stereo_display_selection = True
-    elif len(displays) == 1:
-        # Ignore old output selections when single-display auto-3D does not
-        # apply, such as window capture or platforms without same-monitor mode.
+    # Resolve the explicitly selected output before deciding whether this is
+    # same-monitor 3D. Passing the input index here unconditionally makes
+    # every multi-monitor configuration look like same-monitor mode and
+    # silently moves the SBS window back to the input/primary display.
+    single_monitor_same_mode = False
+    if len(displays) == 1:
+        # A single monitor can display SBS in place of the captured frame.
+        # Keep window capture and unsupported platforms opt-in by checking the
+        # same-monitor policy rather than enabling it for every single-screen
+        # configuration.
+        single_monitor_same_mode = is_local_same_monitor_3d_mode(
+            settings.get("Run Mode", "Local Viewer"),
+            os_name=platform.system(),
+            monitor_count=len(displays),
+            capture_mode=capture_mode,
+            input_monitor_index=monitor_index,
+            output_monitor_index=monitor_index,
+        )
+
+    saved_stereo_display_index = settings.get("Stereo Output")
+    if len(displays) == 1 and not single_monitor_same_mode:
+        # Ignore stale output selections for single-display window capture.
         stereo_display_index = None
-        stereo_display_selection = False
     else:
-        saved_stereo_display_index = settings.get("Stereo Output")
         stereo_display_index = (
             _resolve_available_display_index(
                 saved_stereo_display_index,
@@ -128,7 +134,10 @@ def resolve_viewer_settings(settings: dict) -> ViewerSettings:
             if saved_stereo_display_index is not None
             else None
         )
-        stereo_display_selection = stereo_display_index is not None
+    stereo_display_selection = stereo_display_index is not None
+    if stereo_display_index is None and single_monitor_same_mode:
+        stereo_display_index = monitor_index
+        stereo_display_selection = True
     same_monitor_local_3d = is_local_same_monitor_3d_mode(
         settings.get("Run Mode", "Local Viewer"),
         os_name=platform.system(),

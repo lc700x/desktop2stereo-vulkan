@@ -14,8 +14,27 @@ from typing import Any
 from capture import capture_frame_to_rgb, prepare_rgb_for_stereo_runtime
 from capture.adaptive_rate import AdaptiveCaptureRate, adaptive_capture_enabled_for_mode
 from capture.session import CaptureSessionLoop
+from stereo_runtime.nvfruc import probe_nvfruc
+from stereo_runtime.nvfruc_calibration import (
+    NvFrucCalibrationCache,
+    NvFrucCalibrationController,
+    calibration_fingerprint,
+    output_base_fps,
+)
+from stereo_runtime.nvfruc_stage import NvFrucStage
 from stereo_runtime.pipeline import RuntimePipelineLoop, _resolve_pipeline_render_size
-from stereo_runtime.render_size import RenderSizePolicy
+from stereo_runtime.render_size import (
+    RenderSizePolicy,
+    processing_size_limit_for_display,
+)
+from streaming.stream_session import (
+    CALIBRATABLE_STREAM_MODES,
+    NetworkStreamSessionConfig,
+    is_network_stream_mode,
+    resolve_network_video_backend,
+    resolve_stream_audio_device,
+    supports_network_calibration,
+)
 from utils import (
     CAPTURE_MODE,
     CAPTURE_TOOL,
@@ -51,14 +70,6 @@ from utils.xr_headset_presets import (
     resolve_xr_headset_preset,
 )
 from xr_viewer.settings_menu import OPENXR_RENDER_SCALE_MAX, OPENXR_RENDER_SCALE_MIN
-from streaming.stream_session import (
-    CALIBRATABLE_STREAM_MODES,
-    NetworkStreamSessionConfig,
-    is_network_stream_mode,
-    resolve_stream_audio_device,
-    resolve_network_video_backend,
-    supports_network_calibration,
-)
 
 from .runtime_callbacks import RuntimeCallbacks
 from .runtime_context import (
@@ -67,14 +78,6 @@ from .runtime_context import (
     create_runtime_context,
 )
 from .runtime_output import VulkanRuntimeOutputConsumer
-from stereo_runtime.nvfruc import probe_nvfruc
-from stereo_runtime.nvfruc_calibration import (
-    NvFrucCalibrationCache,
-    NvFrucCalibrationController,
-    calibration_fingerprint,
-    output_base_fps,
-)
-from stereo_runtime.nvfruc_stage import NvFrucStage
 
 
 def _openxr_auto_capture_floor(base_fps: int) -> int:
@@ -494,6 +497,40 @@ def _resolve_local_output_monitor_index(
     )
 
 
+def _resolve_local_viewer_render_size_limit(
+    run_mode,
+    output_monitor_index,
+    display_mode,
+    *,
+    displays=None,
+):
+    if normalize_run_mode(run_mode) not in {"Local Viewer", "Viewer"}:
+        return None
+    try:
+        monitor_index = int(output_monitor_index)
+    except (TypeError, ValueError):
+        return None
+    try:
+        available_displays = list(displays if displays is not None else enumerate_displays())
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    target = next(
+        (
+            display
+            for display in available_displays
+            if int(getattr(display, "capture_index", -1)) == monitor_index
+        ),
+        None,
+    )
+    if target is None:
+        return None
+    try:
+        display_size = (int(target.width), int(target.height))
+        return processing_size_limit_for_display(display_size, display_mode)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def _local_viewer_cursor_passthrough(
     settings: dict,
     *,
@@ -627,7 +664,7 @@ def _local_viewer_vsync_enabled(configured_vsync: bool, capture_mode: object) ->
 
 
 def _resolve_local_viewer_render_size_config(settings, run_mode, device):
-    """Honor Quality Scale unless the explicit legacy source override is set."""
+    """Honor the configured Quality Scale for every local viewer input."""
     if platform.system() == "Darwin" or run_mode not in {"Local Viewer", "Viewer"}:
         return RENDER_SIZE_CONFIG
     if str(getattr(device, "type", device)).strip().lower() != "cuda":
@@ -697,6 +734,9 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
     configured_run_mode = normalize_run_mode(
         settings.get("Run Mode", "Local Viewer")
     )
+    media_capture = str(settings.get("Capture Mode", "")).strip().casefold() in {
+        "file", "video",
+    }
     if configured_run_mode in {"Local Viewer", "Viewer"}:
         # Local presentation already fits the processed eyes to the display.
         # A headset-tier upscale here can undo Quality Scale and turn reduced
@@ -709,9 +749,43 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             "yes",
             "on",
         }
+        media_capture = str(settings.get("Capture Mode", "")).strip().casefold() in {
+            "file", "video",
+        }
+        if media_capture and not coreml_requested:
+            # Native VideoToolbox P010 frames have no CPU representation in
+            # the strict media path. Force the Metal/Core ML provider so the
+            # IOSurface can stay GPU resident from decode through inference.
+            settings = dict(settings)
+            settings["CoreML"] = True
+            coreml_requested = True
+            print(
+                "[Main] Enabling native CoreML/Metal for GPU-only media playback",
+                flush=True,
+            )
+        if media_capture:
+            # Keep VideoToolbox P010 IOSurfaces on the native Metal/Core ML
+            # path. A CPU conversion is never an implicit fallback.
+            os.environ["D2S_MEDIA_P010_CPU"] = "0"
+            # Media PTS is wall-clock driven. Do not change playback cadence
+            # to match a temporary inference bottleneck unless explicitly
+            # requested for a legacy experiment.
+            os.environ.setdefault("D2S_MEDIA_CADENCE_ADAPTIVE", "0")
+            # Reuse the most recent GPU depth profile while the next source
+            # frame is decoded. The presentation clock still selects frames
+            # by PTS, so this affects stereo freshness rather than playback
+            # duration. Users can tighten or disable it with the env override.
+            os.environ.setdefault("D2S_MEDIA_DEPTH_REUSE_MAX_AGE_MS", "5000")
         if coreml_requested:
-            os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")
+            if media_capture:
+                os.environ["D2S_COREML_COMPUTE_UNITS"] = "all"
+            else:
+                os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")
             os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")
+            if media_capture:
+                # The media decoder also publishes a retained CVPixelBuffer;
+                # native IO accepts that same IOSurface without a host copy.
+                os.environ["D2S_COREML_NATIVE_IO"] = "1"
         # Ship packed uint8 SBS so the viewer skips float32 transport
         # and re-quantization (pack once in the runtime, upload once in the
         # viewer). setdefault keeps an explicit user override authoritative.
@@ -730,8 +804,19 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         # explicitly set. "0"/"false"/"off" disable it explicitly as well.
         # Keep native ScreenCaptureKit/CoreML output resident through Metal presentation.
         os.environ.setdefault("D2S_MAC_VIEWER", "metal")
+        media_capture = str(settings.get("Capture Mode", "")).strip().casefold() in {
+            "file", "video",
+        }
         # Keep the presentation image in GPU memory for the GPU-only pipeline.
-        os.environ.setdefault("D2S_VIEWER_HOST_FRAME", "0")
+        # Native media/Core ML frames are presented from retained Metal
+        # resources. Do not enable the host RGBA8 pack for local media.
+        os.environ["D2S_VIEWER_HOST_FRAME"] = "0" if media_capture else os.environ.get(
+            "D2S_VIEWER_HOST_FRAME", "0"
+        )
+        if media_capture:
+            # The shader-warp compatibility path uploads depth through the
+            # host; native media always uses the Metal resource path.
+            os.environ["D2S_METAL_SHADER_WARP"] = "0"
         # Wrap every SCK frame as an owned CVPixelBuffer+CVMetalTexture so
         # the warp viewer can sample the capture directly (zero-copy).
         os.environ.setdefault("D2S_SCK_ZEROCOPY_TEX", "1")
@@ -801,6 +886,17 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         input_monitor_index,
         output_monitor_index,
     )
+    render_size_limit = _resolve_local_viewer_render_size_limit(
+        configured_run_mode,
+        effective_output_monitor_index,
+        DISPLAY_MODE,
+    )
+    if render_size_limit is not None:
+        print(
+            "[Main] Local Viewer processing limit from target display: "
+            f"{render_size_limit[0]}x{render_size_limit[1]} ({DISPLAY_MODE})",
+            flush=True,
+        )
     window_capture_exclusion_active = False
     runtime_capture_tool = CAPTURE_TOOL
     if _should_use_monitor_window_exclusion(
@@ -871,6 +967,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         device_info=DEVICE_INFO,
         output_resolution=OUTPUT_RESOLUTION,
         render_size_config=effective_render_size_config,
+        render_size_limit=render_size_limit,
         fps=base_runtime_fps,
         window_title=WINDOW_TITLE,
         capture_mode=CAPTURE_MODE,
@@ -888,7 +985,8 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             # Strict mode must use the native Metal warp/pack route. The deferred
             # shader-warp compatibility path copies depth through CPU memory.
             os.environ["D2S_METAL_SHADER_WARP"] = "0"
-            os.environ["D2S_VIEWER_HOST_FRAME"] = "0"
+            if not media_capture:
+                os.environ["D2S_VIEWER_HOST_FRAME"] = "0"
     if context.capture_config.gpu_required and configured_run_mode == "MJPEG Streamer":
         raise RuntimeError(
             "MJPEG streaming is unavailable on this GPU-only runtime because "
@@ -1232,8 +1330,8 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             "MJPEG Streamer",
         }:
             from streaming.direct_sbs import (
-                DirectSbsOutputConsumer,
                 AmdAmfDirectSbsOutput,
+                DirectSbsOutputConsumer,
                 FfmpegDirectSbsOutput,
                 IntelD3D11DirectSbsOutput,
                 IntelQsvDirectSbsOutput,
@@ -1260,9 +1358,10 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                         title_stream = str(settings.get("Window Title", "")).strip()
                         if title_stream and OS_NAME == "Windows":
                             try:
-                                import win32gui
                                 import ctypes
                                 from ctypes import wintypes
+
+                                import win32gui
 
                                 hwnd_stream = win32gui.FindWindow(None, title_stream)
                                 if hwnd_stream:
@@ -1605,9 +1704,14 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     cursor_capture=False,
                 )
             if cursor_passthrough:
+                cursor_behavior = (
+                    "hiding the OS cursor without an SBS cursor overlay"
+                    if OS_NAME == "Darwin"
+                    else "drawing the native cursor overlay"
+                )
                 print(
                     "[VulkanLocalViewer] Cursor passthrough enabled for "
-                    "same-monitor Local Viewer; drawing the native cursor overlay",
+                    f"same-monitor Local Viewer; {cursor_behavior}",
                     flush=True,
                 )
             # tex_w,tex_h in legacy viewer: original capture size before packing,
@@ -1677,6 +1781,11 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     and configured_run_mode == "Local Viewer"
                     and bool(settings.get("LSFG Support", False))
                 ),
+                show_in_app_switcher=(
+                    OS_NAME == "Darwin"
+                    and configured_run_mode == "Local Viewer"
+                    and bool(settings.get("LSFG Support", False))
+                ),
                 cursor_passthrough=cursor_passthrough,
                 hide_cursor_overlay=hide_cursor_overlay,
                 input_size=input_size,
@@ -1686,9 +1795,14 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 media_state_path=getattr(context.capture_config, "media_state_path", None),
                 media_session_id=getattr(context.capture_config, "media_session_id", None),
                 media_action_callback=callbacks.write_viewer_media_command,
+                on_stop_requested=shutdown_event.set,
                 pointer_mapping_enabled=(
-                    str(settings.get("Capture Mode", "")).casefold() in {"monitor", "window"}
-                    and int(input_monitor_index) != int(effective_output_monitor_index)
+                    (
+                        str(settings.get("Capture Mode", "")).casefold()
+                        in {"monitor", "window"}
+                        and int(input_monitor_index) != int(effective_output_monitor_index)
+                    )
+                    or str(settings.get("Capture Mode", "")).casefold() in {"file", "video"}
                 ),
                 locale=str(os.environ.get("DESKTOP2STEREO_LOCALE", "EN")),
                 vsync=local_viewer_vsync,
@@ -1750,11 +1864,11 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 # wait loop below is parked on a helper thread instead and the
                 # viewer owns the main thread.
                 #
-                # Default viewer on macOS is the CAMetalLayer deferred-warp
-                # path. It keeps ScreenCaptureKit/Core ML resources on the GPU
-                # and avoids the synchronous SBS pack. Set
-                # D2S_MAC_VIEWER=vulkan to use the compatibility viewer; a
-                # Metal initialization failure still falls back to Vulkan.
+                # Default viewer on macOS is the CAMetalLayer path. Native
+                # CoreML/Metal frames use the full DIBR pack; if native IO is
+                # unavailable, the runtime sends the canonical synthesized
+                # SBS frame instead of switching to an approximate fragment
+                # warp. Set D2S_MAC_VIEWER=vulkan for the compatibility viewer.
                 use_metal_viewer = (
                     os.environ.get("D2S_MAC_VIEWER", "metal").strip().lower()
                     == "metal"
@@ -1764,7 +1878,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     try:
                         if use_metal_viewer:
                             try:
-                                os.environ.setdefault("D2S_METAL_SHADER_WARP", "1")
+                                os.environ.pop("D2S_METAL_SHADER_WARP", None)
                                 from viewer.macos_metal_viewer import (
                                     run_metal_local_viewer,
                                 )
@@ -1857,6 +1971,9 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         restore_gc_settings()
         if stop_request_thread is not None:
             stop_request_thread.join(timeout=0.2)
+        # Stop media/capture workers before waiting on the stereo pipeline.
+        # A media source owns FFmpeg and PortAudio handles; leaving it active
+        # while Vulkan/CoreML is unwinding widens the native shutdown race.
         callbacks.stop_active_capture_session()
         _queue_clear(context.raw_q)
         _queue_clear(context.runtime_q)
@@ -1865,8 +1982,17 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             nvfruc_stage.close()
         if nvfruc_thread is not None:
             nvfruc_thread.join(timeout=2.0)
-        pipeline_thread.join(timeout=2.0)
         capture_thread.join(timeout=2.0)
+        if capture_thread.is_alive():
+            # A decoder or native capture callback may still be blocking after
+            # shutdown. Ask the source to break that wait only after the normal
+            # runner exit path has had a chance to perform its own cleanup.
+            callbacks.stop_active_capture_session()
+            capture_thread.join()
+        # CoreML/MPS and Vulkan calls run on these workers. Do not close the
+        # shared stereo runtime while either worker can still be inside a
+        # native call; a bounded join would turn shutdown into a use-after-close.
+        pipeline_thread.join()
         if output_thread is not None:
             output_thread.join(timeout=2.0)
         if output_consumer is not None:

@@ -52,6 +52,7 @@ class _DirectSource:
 
 def test_direct_sink_claim_is_single_use_until_fence_completion(monkeypatch) -> None:
     monkeypatch.setattr("viewer.direct_sink.sys.platform", "darwin")
+    monkeypatch.setenv("D2S_MAC_VIEWER", "vulkan")
     source = _DirectSource()
     registry = DirectSinkRegistry()
     registry.register(source)
@@ -71,6 +72,7 @@ def test_direct_sink_claim_is_single_use_until_fence_completion(monkeypatch) -> 
 
 def test_direct_sink_release_makes_claimed_slot_available(monkeypatch) -> None:
     monkeypatch.setattr("viewer.direct_sink.sys.platform", "darwin")
+    monkeypatch.setenv("D2S_MAC_VIEWER", "vulkan")
     source = _DirectSource()
     registry = DirectSinkRegistry()
     registry.register(source)
@@ -80,6 +82,16 @@ def test_direct_sink_release_makes_claimed_slot_available(monkeypatch) -> None:
     registry.release(source)
     claimed, _ = registry.acquire(4, 2)
     assert claimed is source
+
+
+def test_direct_sink_remains_enabled_for_vulkan_fallback_from_metal(monkeypatch) -> None:
+    from viewer.direct_sink import direct_staging_enabled
+
+    monkeypatch.setattr("viewer.direct_sink.sys.platform", "darwin")
+    monkeypatch.setenv("D2S_MAC_VIEWER", "metal")
+    monkeypatch.setenv("D2S_VK_DIRECT_STAGING", "1")
+
+    assert direct_staging_enabled() is True
 
 
 def test_dropping_a_queue_item_releases_its_direct_source() -> None:
@@ -178,6 +190,7 @@ def test_gpu_only_native_pack_uses_metal_buffer_without_cpu_pack(monkeypatch) ->
     import pytest
 
     monkeypatch.setattr("viewer.direct_sink.sys.platform", "darwin")
+    monkeypatch.setenv("D2S_MAC_VIEWER", "metal")
     source = _DirectSource()
     source._metal_buffer = object()
     source._metal_buffer_capacity = len(source.direct_view)
@@ -294,18 +307,17 @@ def test_packer_reports_ready_frame_rate_without_warmup_dilution(monkeypatch) ->
     assert packer.take_published_fps() == 60.0
 
 
-@pytest.mark.parametrize(("output_format", "expected"), [
-    ("half_sbs", (4, 2)), ("full_sbs", (8, 2)),
-    ("half_tab", (4, 2)), ("full_tab", (4, 4)),
-])
-def test_native_packer_uses_processing_eye_size_not_original_source(monkeypatch, output_format, expected):
+@pytest.mark.parametrize("output_format", ["half_sbs", "full_sbs", "half_tab", "full_tab"])
+def test_native_packer_uses_output_eye_size(monkeypatch, output_format):
     from viewer.direct_sink import DIRECT_SINK
+    from stereo_runtime._fused_warp_mps import pack_target
 
     source = _DirectSource()
-    source.size = expected
     calls = []
     native = SimpleNamespace(source_size=(40, 20), release=lambda: calls.append("release"))
     result = SimpleNamespace(viewer_native=native, output_eye_size=(4, 2), output_format=output_format)
+    expected = pack_target(*result.output_eye_size, output_format)
+    source.size = expected
 
     def pack(frame, size, fmt):
         calls.append((size, fmt))
@@ -327,13 +339,11 @@ def test_native_packer_uses_processing_eye_size_not_original_source(monkeypatch,
     assert result.viewer_frame_direct is source
 
 
-@pytest.mark.parametrize(("output_format", "expected"), [
-    ("half_sbs", (4, 2)), ("full_sbs", (8, 2)),
-    ("half_tab", (4, 2)), ("full_tab", (4, 4)),
-])
 @pytest.mark.parametrize("processing", [(4, 2), None])
-def test_vulkan_native_present_sizes_staging_from_runtime_eyes(monkeypatch, output_format, expected, processing):
+@pytest.mark.parametrize("output_format", ["half_sbs", "full_sbs", "half_tab", "full_tab"])
+def test_vulkan_native_present_sizes_staging_from_output_eye_size(monkeypatch, output_format, processing):
     from viewer import vulkan_local_viewer as module
+    from stereo_runtime._fused_warp_mps import pack_target
 
     monkeypatch.delenv("D2S_GPU_IMAGE_PIPELINE_REQUIRED", raising=False)
     viewer = module.VulkanLocalViewer(module.VulkanLocalViewerConfig())
@@ -341,6 +351,7 @@ def test_vulkan_native_present_sizes_staging_from_runtime_eyes(monkeypatch, outp
     viewer.poll_events = lambda: None
     calls = []
     source_size = (40, 20) if processing is not None else (4, 2)
+    expected = pack_target(*(processing or source_size), output_format)
     native = SimpleNamespace(source_size=source_size, last_pack_metrics={}, release=lambda: calls.append("release"))
     result = SimpleNamespace(viewer_native=native, output_eye_size=processing, output_format=output_format)
 
@@ -361,24 +372,24 @@ def test_vulkan_native_present_sizes_staging_from_runtime_eyes(monkeypatch, outp
     assert calls.count("release") == 1
 
 
-@pytest.mark.parametrize(("output_format", "expected"), [
-    ("half_sbs", (4, 2)), ("full_sbs", (8, 2)),
-    ("half_tab", (4, 2)), ("full_tab", (4, 4)),
-])
 @pytest.mark.parametrize("processing", [(4, 2), None])
-def test_metal_native_present_sizes_gpu_pack_from_runtime_eyes(monkeypatch, output_format, expected, processing):
+@pytest.mark.parametrize("output_format", ["half_sbs", "full_sbs", "half_tab", "full_tab"])
+def test_metal_native_present_sizes_gpu_pack_from_output_eye_size(monkeypatch, output_format, processing):
     from viewer import macos_metal_viewer as module
+    from stereo_runtime._fused_warp_mps import pack_target
 
     monkeypatch.setitem(sys.modules, "objc", SimpleNamespace(pyobjc_id=lambda value: 123))
     monkeypatch.setattr(module, "Metal", SimpleNamespace(MTLResourceStorageModeShared=0), raising=False)
     viewer = object.__new__(module.MetalLocalViewer)
+    source_size = (40, 20) if processing is not None else (4, 2)
+    expected = pack_target(*(processing or source_size), output_format)
     viewer._native_pack_size = expected
     viewer._native_pack_cursor = 0
     texture = object()
     viewer._native_pack_slots = [{"buffer": object(), "texture": texture, "busy": False}]
     calls = []
     native = SimpleNamespace(
-        source_size=(40, 20) if processing is not None else (4, 2),
+        source_size=source_size,
         pack_metal=lambda *args: calls.append(args),
         release=lambda: calls.append("release"),
     )
@@ -388,3 +399,95 @@ def test_metal_native_present_sizes_gpu_pack_from_runtime_eyes(monkeypatch, outp
     assert calls == [(123, expected[0] * expected[1] * 4, expected, output_format), "release"]
     assert packed_texture is texture and slot["busy"]
     assert result.viewer_native is None
+
+
+def test_metal_local_half_sbs_preserves_exact_warp_configuration(monkeypatch):
+    from viewer import macos_metal_viewer as module
+
+    monkeypatch.setitem(sys.modules, "objc", SimpleNamespace(pyobjc_id=lambda value: 123))
+    monkeypatch.setattr(module, "Metal", SimpleNamespace(MTLResourceStorageModeShared=0), raising=False)
+    viewer = object.__new__(module.MetalLocalViewer)
+    viewer._native_pack_size = (4, 2)
+    viewer._native_pack_cursor = 0
+    viewer._native_pack_slots = [{"buffer": object(), "texture": object(), "busy": False}]
+    native = SimpleNamespace(
+        source_size=(4, 2),
+        warp_config={"edge_aa_enabled": 1},
+        pack_metal=lambda *_args: None,
+        release=lambda: None,
+    )
+    result = SimpleNamespace(viewer_native=native, output_eye_size=(4, 2), output_format="half_sbs")
+
+    viewer._pack_native_coreml_frame(result)
+
+    assert native.warp_config == {"edge_aa_enabled": 1}
+
+
+def test_metal_native_pack_drops_invalid_slot_without_raising(monkeypatch):
+    from viewer import macos_metal_viewer as module
+
+    monkeypatch.setitem(sys.modules, "objc", SimpleNamespace(pyobjc_id=lambda value: 123))
+    monkeypatch.setattr(module, "Metal", SimpleNamespace(MTLResourceStorageModeShared=0), raising=False)
+    viewer = object.__new__(module.MetalLocalViewer)
+    viewer._native_pack_size = (4, 2)
+    viewer._native_pack_cursor = 0
+    slot = {"buffer": object(), "texture": object(), "busy": False}
+    viewer._native_pack_slots = [slot]
+    released = []
+
+    def fail_pack(*_args):
+        raise RuntimeError("native CoreML pack slot or destination is invalid")
+
+    native = SimpleNamespace(
+        source_size=(4, 2),
+        pack_metal=fail_pack,
+        release=lambda: released.append(True),
+    )
+    result = SimpleNamespace(
+        viewer_native=native,
+        output_eye_size=(4, 2),
+        output_format="half_sbs",
+    )
+
+    assert viewer._pack_native_coreml_frame(result) is None
+    assert result.viewer_native is None
+    assert released == [True]
+    assert slot["busy"] is False
+
+
+def test_vulkan_native_pack_drops_invalid_slot_without_raising(monkeypatch):
+    from viewer import vulkan_local_viewer as module
+
+    viewer = module.VulkanLocalViewer(module.VulkanLocalViewerConfig())
+    viewer.window = object()
+    viewer.poll_events = lambda: None
+    viewer._reset_sources = lambda *_args: setattr(
+        viewer,
+        "_source",
+        SimpleNamespace(
+            size=(4, 2),
+            format=viewer.source_format,
+            present=lambda *_a, **_k: True,
+        ),
+    )
+    released = []
+    native = SimpleNamespace(
+        source_size=(4, 2),
+        last_pack_metrics={},
+        release=lambda: released.append(True),
+    )
+    result = SimpleNamespace(
+        viewer_native=native,
+        output_eye_size=(4, 2),
+        output_format="half_sbs",
+        debug_info={},
+    )
+
+    def fail_pack(*_args, **_kwargs):
+        raise RuntimeError("native CoreML pack slot or destination is invalid")
+
+    monkeypatch.setattr(module.DIRECT_SINK, "pack_native", fail_pack)
+
+    assert viewer.present(result) is False
+    assert result.viewer_native is None
+    assert released == [True]

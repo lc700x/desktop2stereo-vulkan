@@ -34,7 +34,10 @@ from stereo_runtime.pipeline import (
     _save_preprocess_image_diagnostic,
     _unpack_raw_queue_item,
 )
-from stereo_runtime.render_size import RenderSizeConfig
+from stereo_runtime.render_size import (
+    RenderSizeConfig,
+    processing_size_limit_for_display,
+)
 
 
 def test_pipeline_uses_captured_dimensions_when_render_scale_is_4k():
@@ -109,6 +112,21 @@ def test_parallel_depth_scheduler_can_wait_for_the_current_preroll_job():
         assert scheduler.pending == []
     finally:
         worker.join(timeout=1.0)
+
+
+def test_parallel_depth_scheduler_waits_for_native_workers_on_close():
+    calls = []
+
+    class Executor:
+        def shutdown(self, *, wait, cancel_futures):
+            calls.append((wait, cancel_futures))
+
+    scheduler = object.__new__(_ParallelDepthScheduler)
+    scheduler.executor = Executor()
+
+    scheduler.close()
+
+    assert calls == [(True, True)]
 
 
 def test_media_depth_reuse_is_bounded_to_media_generation_and_age():
@@ -464,6 +482,28 @@ def test_scaled_render_size_preserves_source_aspect_ratio(source_size, scale, ex
         source_size,
         RenderSizeConfig(scale_factor=scale),
     ) == expected
+
+
+def test_pipeline_caps_render_size_to_target_display_without_distorting_aspect_ratio():
+    assert _resolve_pipeline_render_size(
+        (3840, 1920),
+        RenderSizeConfig(),
+        (1920, 1080),
+    ) == (1920, 960)
+
+
+@pytest.mark.parametrize(
+    ("display_mode", "expected_limit"),
+    [
+        ("Half-SBS", (1920, 1080)),
+        ("Full-SBS", (960, 1080)),
+        ("Full Side by Side", (960, 1080)),
+        ("Half-TAB", (1920, 1080)),
+        ("Full-TAB", (1920, 540)),
+    ],
+)
+def test_display_size_limit_accounts_for_stereo_packing_direction(display_mode, expected_limit):
+    assert processing_size_limit_for_display((1920, 1080), display_mode) == expected_limit
 
 
 def test_save_preprocess_image_diagnostic_exports_exact_pre_inference_rgb(tmp_path):

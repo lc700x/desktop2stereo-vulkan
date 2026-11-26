@@ -29,17 +29,26 @@ from .devices import DEVICES
 logger = logging.getLogger(__name__)
 
 
+# Keep the spacing between grouped panels and the inline spacing between
+# action controls tied to the same values used by the left-hand controls.
+ROW_GAP = S(8)
+SECTION_GAP = S(8)
+COMPONENT_GAP = S(8)
+ACTION_GAP = S(12)
+PANEL_PADDING_X = S(14)
+PANEL_PADDING_Y = S(8)
+
+
 def _main_menu_action_style(variant: str) -> ft.ButtonStyle:
     state = ft.ControlState
     neutral_background = color("surface")
-    disabled_side = ft.BorderSide(1, color("text_disabled"))
 
     if variant == "primary":
         backgrounds = {
             state.DEFAULT: color("primary"),
             state.HOVERED: color("primary_hover"),
             state.PRESSED: color("primary"),
-            state.FOCUSED: color("primary"),
+            state.FOCUSED: color("primary_hover"),
             state.DISABLED: neutral_background,
         }
         foregrounds = {
@@ -49,56 +58,35 @@ def _main_menu_action_style(variant: str) -> ft.ButtonStyle:
             state.FOCUSED: color("primary_state_text"),
             state.DISABLED: color("text_disabled"),
         }
-        borders = {
-            state.DEFAULT: ft.BorderSide(1, color("primary")),
-            state.HOVERED: ft.BorderSide(1, color("outline")),
-            state.PRESSED: ft.BorderSide(1, color("primary")),
-            state.FOCUSED: ft.BorderSide(2, color("outline")),
-            state.DISABLED: disabled_side,
-        }
     elif variant == "danger":
         backgrounds = {
-            state.DEFAULT: color("destructive"),
-            state.HOVERED: color("destructive_hover"),
-            state.PRESSED: color("destructive"),
-            state.FOCUSED: color("destructive"),
+            state.DEFAULT: color("action_destructive"),
+            state.HOVERED: color("action_destructive_hover"),
+            state.PRESSED: color("action_destructive_pressed"),
+            state.FOCUSED: color("action_destructive_hover"),
             state.DISABLED: neutral_background,
         }
         foregrounds = {
-            state.DEFAULT: color("destructive_text"),
-            state.HOVERED: color("destructive_text"),
-            state.PRESSED: color("destructive_text"),
-            state.FOCUSED: color("destructive_text"),
+            state.DEFAULT: color("action_destructive_text"),
+            state.HOVERED: color("action_destructive_text"),
+            state.PRESSED: color("action_destructive_text"),
+            state.FOCUSED: color("action_destructive_text"),
             state.DISABLED: color("text_disabled"),
-        }
-        borders = {
-            state.DEFAULT: ft.BorderSide(1, color("destructive")),
-            state.HOVERED: ft.BorderSide(1, color("destructive_outline")),
-            state.PRESSED: ft.BorderSide(1, color("destructive")),
-            state.FOCUSED: ft.BorderSide(2, color("destructive_outline")),
-            state.DISABLED: disabled_side,
         }
     elif variant == "secondary":
         backgrounds = {
-            state.DEFAULT: color("surface_header"),
-            state.HOVERED: color("surface_container_high"),
-            state.PRESSED: color("primary_container"),
-            state.FOCUSED: color("surface_header"),
+            state.DEFAULT: color("primary_container"),
+            state.HOVERED: color("primary_hover"),
+            state.PRESSED: color("primary"),
+            state.FOCUSED: color("primary_hover"),
             state.DISABLED: neutral_background,
         }
         foregrounds = {
-            state.DEFAULT: color("text_primary"),
-            state.HOVERED: color("text_primary"),
+            state.DEFAULT: color("primary_state_text"),
+            state.HOVERED: color("surface"),
             state.PRESSED: color("primary_state_text"),
-            state.FOCUSED: color("text_primary"),
+            state.FOCUSED: color("surface"),
             state.DISABLED: color("text_disabled"),
-        }
-        borders = {
-            state.DEFAULT: ft.BorderSide(1, color("outline")),
-            state.HOVERED: ft.BorderSide(1, color("outline")),
-            state.PRESSED: ft.BorderSide(1, color("primary_hover")),
-            state.FOCUSED: ft.BorderSide(2, color("primary_hover")),
-            state.DISABLED: disabled_side,
         }
     else:
         raise ValueError(f"Unknown main-menu button variant: {variant}")
@@ -106,9 +94,11 @@ def _main_menu_action_style(variant: str) -> ft.ButtonStyle:
     return ft.ButtonStyle(
         bgcolor=backgrounds,
         color=foregrounds,
-        side=borders,
         elevation=0,
-        shape=ft.RoundedRectangleBorder(radius=10),
+        # Keep actions visually distinct from the pill-shaped dropdowns.
+        shape=ft.RoundedRectangleBorder(radius=S(7)),
+        padding=ft.Padding(S(12), S(4), S(12), S(4)),
+        text_style=ft.TextStyle(weight=ft.FontWeight.W_600),
         animation_duration=120,
     )
 
@@ -302,7 +292,7 @@ class GUIBuilderMixin:
         if getattr(self, "log_panel", None) and self.log_panel.visible:
             content_width += S(500)
         page_padding = (getattr(self.page, "padding", 0) or 0) * 2
-        spacing = S(10) if getattr(self, "log_panel", None) and self.log_panel.visible else 0
+        spacing = SECTION_GAP if getattr(self, "log_panel", None) and self.log_panel.visible else 0
         safety_margin = S(12)
         return content_width + page_padding + spacing + safety_margin
 
@@ -330,30 +320,29 @@ class GUIBuilderMixin:
         if visible_rows <= 0:
             return 0
         row_height = S(34)
-        row_spacing = getattr(content, "spacing", S(6)) or 0
-        padding_v = S(24)
+        row_spacing = getattr(content, "spacing", ROW_GAP) or 0
+        padding_v = PANEL_PADDING_Y * 2
         border_v = 2
-        margin_v = S(8) if include_margin else 0
-        return padding_v + visible_rows * row_height + max(0, visible_rows - 1) * row_spacing + border_v + margin_v
+        return padding_v + visible_rows * row_height + max(0, visible_rows - 1) * row_spacing + border_v
 
     def _estimate_window_height(self):
         if not getattr(self, "depth_group", None):
             return S(768)
-        scroll_spacing = getattr(getattr(self, "_scroll_area", None), "spacing", S(6)) or 0
         visible_sections = []
         for section in [self.lang_group, self.depth_group, self.device_group]:
             if section is not None and getattr(section, "visible", True):
                 visible_sections.append(section)
         scroll_height = sum(self._estimate_group_height(section) for section in visible_sections)
+        scroll_height += max(0, len(visible_sections) - 1) * SECTION_GAP
         if getattr(self, "stream_container", None) and self.stream_container.visible:
-            scroll_height += scroll_spacing
+            scroll_height += SECTION_GAP
             scroll_height += self._estimate_group_height(self.stream_container, include_margin=False)
         page_padding = (getattr(self.page, "padding", 0) or 0) * 2
         # The footer contains a default-height Flet button row, the status row,
         # their spacing, and the footer's top padding.  S(58) only covered the
         # buttons and clipped the status row after the native window was fitted.
         # Footer height (status bars + buttons outside scroll area)
-        footer_height = S(40)
+        footer_height = S(40) + SECTION_GAP * 2
         window_chrome = S(42)
         safety_margin = S(0)
         min_height = S(560)
@@ -691,9 +680,9 @@ class GUIBuilderMixin:
         self.recompile_coreml_cb = ft.Checkbox(scale=SCALE, visual_density=ft.VisualDensity.COMPACT, label="Recompile CoreML")
         self.recompile_openvino_cb = ft.Checkbox(scale=SCALE, visual_density=ft.VisualDensity.COMPACT, label="Recompile OpenVINO")
         self.recompile_migraphx_cb = ft.Checkbox(scale=SCALE, visual_density=ft.VisualDensity.COMPACT, label="Recompile MIGraphX")
-        accel_row1 = ft.Row([self.torch_compile_cb, self.tensorrt_cb, self.recompile_trt_cb], spacing=S(20))
-        accel_row2 = ft.Row([self.coreml_cb, self.recompile_coreml_cb, self.openvino_cb, self.recompile_openvino_cb], spacing=S(20))
-        accel_row4 = ft.Row([self.migraphx_cb, self.recompile_migraphx_cb], spacing=S(20))
+        accel_row1 = ft.Row([self.torch_compile_cb, self.tensorrt_cb, self.recompile_trt_cb], spacing=ACTION_GAP)
+        accel_row2 = ft.Row([self.coreml_cb, self.recompile_coreml_cb, self.openvino_cb, self.recompile_openvino_cb], spacing=ACTION_GAP)
+        accel_row4 = ft.Row([self.migraphx_cb, self.recompile_migraphx_cb], spacing=ACTION_GAP)
         self._accel_spacer = ft.Container(width=0)
         self.row4a = ft.Row([self.acceleration_label, accel_row1], spacing=1)
         self.row4b = ft.Row([self._accel_spacer, accel_row2], spacing=1)
@@ -904,8 +893,10 @@ class GUIBuilderMixin:
             ],
             value=capture_mode_messages.get("Input Screen", "Input Screen"),
             on_select=self.on_capture_mode_change,
-            # Source modes use the same aligned width as the labels above.
+            # Source modes use the aligned source column and reserve a small
+            # gap before the monitor/window list.
             dyna_width=True,
+            dyna_width_gap=S(8),
         )
         self._capture_mode_spacer = ft.Container(width=0)
         self.monitor_dd = CompactDropdown(on_select=self._on_monitor_change, max_width=S(230))
@@ -965,9 +956,57 @@ class GUIBuilderMixin:
             no_wrap=True,
             overflow=ft.TextOverflow.ELLIPSIS,
         )
+        self.media_input_file_label = ft.Text(
+            media_messages.get("Select Video", "Select Video"),
+            size=FONT_SIZE,
+            no_wrap=True,
+        )
+        self.media_input_file_btn = ft.Button(
+            content=ft.Row(
+                [
+                    ft.Icon(ft.Icons.VIDEO_FILE, size=S(16)),
+                    self.media_input_file_label,
+                ],
+                spacing=S(6),
+                tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            width=S(200),
+            tooltip=media_messages.get("Select Video", "Select Video"),
+            disabled=True,
+            on_click=self.on_media_open_file,
+        )
+        self.media_input_folder_label = ft.Text(
+            media_messages.get("Select Directory", "Select Directory"),
+            size=FONT_SIZE,
+            no_wrap=True,
+        )
+        self.media_input_folder_btn = ft.Button(
+            content=ft.Row(
+                [
+                    ft.Icon(ft.Icons.FOLDER_OPEN, size=S(16)),
+                    self.media_input_folder_label,
+                ],
+                spacing=S(6),
+                tight=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            width=S(220),
+            tooltip=media_messages.get("Select Directory", "Select Directory"),
+            disabled=True,
+            on_click=self.on_media_open_folder,
+        )
+        self.media_input_row = ft.Row(
+            [self.media_input_file_btn, self.media_input_folder_btn],
+            spacing=COMPONENT_GAP,
+            tight=True,
+            visible=False,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
         row8 = ft.Row(
             [
                 self.capture_mode_dd,
+                self.media_input_row,
                 self._capture_mode_spacer,
                 ft.Row(
                     [
@@ -976,7 +1015,7 @@ class GUIBuilderMixin:
                         self.media_path_text,
                         self.refresh_btn,
                     ],
-                    spacing=S(12),
+                    spacing=ACTION_GAP,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
             ],
@@ -1064,7 +1103,7 @@ class GUIBuilderMixin:
         )
         self.media_open_group = ft.Row(
             [self.media_open_file_btn, self.media_open_folder_btn],
-            spacing=S(6),
+            spacing=ACTION_GAP,
             tight=True,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
@@ -1073,7 +1112,7 @@ class GUIBuilderMixin:
                 self.media_position_text,
                 self.media_seek_slider,
             ],
-            spacing=S(12),
+            spacing=ACTION_GAP,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         self.media_transport_row = ft.Row(
@@ -1089,7 +1128,7 @@ class GUIBuilderMixin:
                 self.media_volume_label,
                 self.media_volume_slider,
             ],
-            spacing=S(8),
+            spacing=COMPONENT_GAP,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         panel_border = ft.Border(
@@ -1104,10 +1143,10 @@ class GUIBuilderMixin:
                     self.media_seek_row,
                     self.media_transport_row,
                 ],
-                spacing=S(8),
+                spacing=ROW_GAP,
                 tight=True,
             ),
-            padding=ft.Padding(S(12), S(8), S(12), S(8)),
+            padding=ft.Padding(PANEL_PADDING_X, PANEL_PADDING_Y, PANEL_PADDING_X, PANEL_PADDING_Y),
             bgcolor=color("surface"),
             border=panel_border,
             border_radius=S(14),
@@ -1178,11 +1217,10 @@ class GUIBuilderMixin:
         depth_group = ft.Container(
             ft.Column([self._depth_stereo_group_heading, row0, row1, stereo_row0, hole_fill_row, advanced_stereo_row,
                        convergence_depth_row, depth_strength_row, row2b, stereo_row1, stereo_row3,
-                       stereo_row3b, stereo_row3c, stereo_row4, self.row4a, self.row4b, self.row4d], spacing=S(6)),
-            margin=ft.Margin(0, 0, 0, S(6)),
+                       stereo_row3b, stereo_row3c, stereo_row4, self.row4a, self.row4b, self.row4d], spacing=ROW_GAP),
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
-            border_radius=6, padding=ft.Padding(S(14), S(8), S(14), S(8)))
+            border_radius=6, padding=ft.Padding(PANEL_PADDING_X, PANEL_PADDING_Y, PANEL_PADDING_X, PANEL_PADDING_Y))
         self._build_streamer_rows()
         # Device group is OUTSIDE the scroll area so it can stretch to fill the
         # leftover height (like the log panel). Its own content scrolls when the
@@ -1197,14 +1235,13 @@ class GUIBuilderMixin:
                        self.row7a, self.xr_headset_row, self.row7b, row8, self.media_controls_row,
                        self.row6c, self.row9,
                        self.moonlight_controls_row,
-                       self.stream_url_row], spacing=S(6), scroll=ft.ScrollMode.AUTO,
+                       self.stream_url_row], spacing=ROW_GAP, scroll=ft.ScrollMode.AUTO,
                        tight=True)
         device_group = ft.Container(
             device_content,
-            margin=ft.Margin(0, 0, 0, S(6)),
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
-            border_radius=6, padding=ft.Padding(S(14), S(8), S(14), S(8)),
+            border_radius=6, padding=ft.Padding(PANEL_PADDING_X, PANEL_PADDING_Y, PANEL_PADDING_X, PANEL_PADDING_Y),
             expand=True,
         )
         self.device_group = device_group
@@ -1216,18 +1253,17 @@ class GUIBuilderMixin:
             color=ft.Colors.ON_SURFACE,
         )
         lang_group = ft.Container(
-            ft.Column([self._appearance_group_heading, lang_row], spacing=S(6)),
-            margin=ft.Margin(0, 0, 0, S(6)),
+            ft.Column([self._appearance_group_heading, lang_row], spacing=ROW_GAP),
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
-            border_radius=6, padding=ft.Padding(S(14), S(8), S(14), S(8)))
+            border_radius=6, padding=ft.Padding(PANEL_PADDING_X, PANEL_PADDING_Y, PANEL_PADDING_X, PANEL_PADDING_Y))
         self.lang_group = lang_group
         self.depth_group = depth_group
 
         # Scrollable top section (small groups); device fills leftover below.
         self._scroll_area = ft.Column([
             self.lang_group, self.depth_group,
-        ], scroll=ft.ScrollMode.AUTO, tight=True, spacing=S(6),
+        ], scroll=ft.ScrollMode.AUTO, tight=True, spacing=SECTION_GAP,
           alignment=ft.CrossAxisAlignment.START)
         self.log_level_dd = CompactDropdown(
             options=["ALL", "STATUS", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -1268,7 +1304,7 @@ class GUIBuilderMixin:
                 ft.Row([self.download_progress_title, ft.Container(expand=True), self.download_progress_percent]),
                 self.download_progress_bar,
                 self.download_progress_detail,
-            ], spacing=S(2)),
+            ], spacing=ROW_GAP),
             padding=ft.Padding(S(6), S(4), S(6), S(4)),
             bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
             border_radius=6,
@@ -1281,22 +1317,35 @@ class GUIBuilderMixin:
             overflow=ft.TextOverflow.VISIBLE,
             size=12,
         )
-        self.log_scroll_row = ft.Row(
-            [self.log_text],
-            scroll=ft.Scrollbar(orientation=ft.ScrollbarOrientation.BOTTOM),
-            tight=True,
-            vertical_alignment=ft.CrossAxisAlignment.START,
-        )
         self.log_viewport = ft.Column(
-            [self.log_scroll_row],
-            scroll=ft.Scrollbar(orientation=ft.ScrollbarOrientation.RIGHT),
-            auto_scroll=True,
+            [self.log_text],
+            width=S(900),
+            scroll=ft.Scrollbar(
+                orientation=ft.ScrollbarOrientation.RIGHT,
+                thumb_visibility=True,
+                thickness=S(6),
+                radius=S(3),
+            ),
             expand=True,
-            tight=True,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             spacing=0,
         )
+        self.log_scroll_row = ft.Row(
+            [self.log_viewport],
+            # The horizontal scroller owns the full body height, so its track
+            # stays on the panel's bottom edge instead of following the text.
+            expand=True,
+            scroll=ft.Scrollbar(
+                orientation=ft.ScrollbarOrientation.BOTTOM,
+                thumb_visibility=True,
+                track_visibility=True,
+                thickness=S(6),
+                radius=S(3),
+            ),
+            vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
         self.log_body = ft.Container(
-            content=self.log_viewport,
+            content=self.log_scroll_row,
             expand=True,
             visible=True,
         )
@@ -1305,16 +1354,13 @@ class GUIBuilderMixin:
                 ft.Row([
                     self.report_issue_btn, self.open_log_file_btn, ft.Container(expand=True),
                     self.log_level_dd,
-                ], spacing=S(6), vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ], spacing=ACTION_GAP, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 self.download_progress_panel,
                 self.log_body,
-            ], spacing=S(4), expand=True),
+            ], spacing=ROW_GAP, expand=True),
             visible=False,
             expand=True,
-            # Match the Computing Device group's bottom inset so both panel
-            # borders end on the same horizontal line in the stretched row.
-            margin=ft.Margin(0, 0, 0, S(6)),
-            padding=ft.Padding(S(8), S(6), S(8), S(6)),
+            padding=ft.Padding(PANEL_PADDING_X, PANEL_PADDING_Y, PANEL_PADDING_X, PANEL_PADDING_Y),
             bgcolor=ft.Colors.SURFACE_CONTAINER,
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
@@ -1327,7 +1373,7 @@ class GUIBuilderMixin:
             ft.Container(expand=True),
             self.stop_btn,
             self.run_btn,
-        ], spacing=S(20))
+        ], spacing=ACTION_GAP)
         self._btn_bar = btn_row
         self._status_bar = ft.Row([
             ft.Container(content=self.status_text, bgcolor=ft.Colors.SURFACE_CONTAINER,
@@ -1346,7 +1392,7 @@ class GUIBuilderMixin:
             self._scroll_area,
             self.device_group,
             self.stream_container,
-        ], spacing=0, tight=False, expand=True)
+        ], spacing=SECTION_GAP, tight=False, expand=True)
         self._main_panel = ft.Container(
             content=main_col,
             expand=True,
@@ -1356,12 +1402,12 @@ class GUIBuilderMixin:
             [self._main_panel, self.log_panel],
             expand=True,
             tight=False,
-            spacing=S(8),
+            spacing=SECTION_GAP,
             vertical_alignment=ft.CrossAxisAlignment.STRETCH,
         )
         # Status bars outside scrollable region
         self._status_bar_contain = ft.Container(
-            ft.Column([self._status_bar, self._backend_status_bar], spacing=0),
+            ft.Column([self._status_bar, self._backend_status_bar], spacing=ROW_GAP),
             padding=0,
         )
         # Buttons fixed at bottom, outside scroll area - right aligned with log panel
@@ -1370,12 +1416,10 @@ class GUIBuilderMixin:
             padding=ft.Padding(S(4), S(1), S(4), S(1)),
             alignment=ft.alignment.Alignment(1, 0),  # right-center
         )
-        # Gap between log panel and status
-        self._log_status_gap = ft.Container(height=S(4))
         # Content with status bars and buttons outside scroll area
         self._content_with_buttons = ft.Column(
-            [self._root_row, self._log_status_gap, self._status_bar_contain, self._btn_container],
-            spacing=0,
+            [self._root_row, self._status_bar_contain, self._btn_container],
+            spacing=SECTION_GAP,
             expand=True,
             tight=False,
         )
@@ -1393,7 +1437,7 @@ class GUIBuilderMixin:
         self.preview_btn = ft.Button(content=ft.Text("Preview", size=FONT_SIZE),
             width=S(130), on_click=self.preview_in_browser)
         self.stream_url_row = ft.Row(
-            [self.stream_url_label, self.stream_url_tf, ft.Container(width=S(10)), self.preview_btn], spacing=2)
+            [self.stream_url_label, self.stream_url_tf, ft.Container(width=S(10)), self.preview_btn], spacing=1)
         self.stream_port_label = ft.Text("Streamer Port:", size=FONT_SIZE, width=S(150))
         self.stream_port_tf = CompactTextField(value=str(DEFAULT_PORT), width=S(130),
             on_change=self.update_stream_url, filter=r"[0-9]", max_length=5)
@@ -1604,8 +1648,8 @@ class GUIBuilderMixin:
             self.stream_bitrate_row,
         ]
         self.stream_container = ft.Container(
-            ft.Column([], spacing=S(6)), visible=False,
-            padding=ft.Padding(S(14), S(8), S(14), S(8)),
+            ft.Column([], spacing=ROW_GAP), visible=False,
+            padding=ft.Padding(PANEL_PADDING_X, PANEL_PADDING_Y, PANEL_PADDING_X, PANEL_PADDING_Y),
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
             border_radius=6)
@@ -1722,22 +1766,8 @@ class GUIBuilderMixin:
             return
 
     def _apply_stereo_output(self, cfg):
-        import platform
-
-        same_monitor_local_viewer = (
-            platform.system() in {"Windows", "Darwin"}
-            and str(getattr(self, "run_mode_key", "")).strip().casefold()
-            in {"local viewer", "3d monitor"}
-            and str(getattr(self, "capture_mode_key", "")).strip().casefold()
-            == "monitor"
-        )
         mon_count = self._get_monitor_count()
         input_label = self.monitor_dd.value
-        if same_monitor_local_viewer:
-            self.stereo_monitor_dd.value = (
-                input_label if input_label in self.monitor_label_to_index else ""
-            )
-            return
         if mon_count <= 1 or getattr(
             self, "_missing_stereo_output_identity", False
         ):
@@ -1776,23 +1806,12 @@ class GUIBuilderMixin:
     def update_stereo_monitor_menu(self):
         if not hasattr(self, 'stereo_monitor_dd'):
             return
-        import platform
-
         opts = list(self.monitor_label_to_index)
         input_label = self.monitor_dd.value
         current = self.stereo_monitor_dd.value
         valid = current in opts
         self.stereo_monitor_dd.options = opts
-        same_monitor_local_viewer = (
-            platform.system() in {"Windows", "Darwin"}
-            and str(getattr(self, "run_mode_key", "")).strip().casefold()
-            in {"local viewer", "3d monitor"}
-            and str(getattr(self, "capture_mode_key", "")).strip().casefold()
-            == "monitor"
-        )
-        if same_monitor_local_viewer:
-            self.stereo_monitor_dd.value = input_label if input_label in opts else ""
-        elif getattr(self, "_missing_stereo_output_identity", False):
+        if getattr(self, "_missing_stereo_output_identity", False):
             self.stereo_monitor_dd.value = ""
         else:
             self.stereo_monitor_dd.value = current if valid else next(

@@ -12,6 +12,10 @@ MOONLIGHT_BLUE_COLORS = {
     "primary_hover": "#39A9FF",
     "primary_state_text": "#FFFFFF",
     "primary_container": "#1C5B9A",
+    "action_destructive": "#B4232C",
+    "action_destructive_hover": "#C93641",
+    "action_destructive_pressed": "#8F1E28",
+    "action_destructive_text": "#FFFFFF",
     "switch_track_active": "#39A9FF",
     "primary_hover_container": "#39A9FF",
     "selection_container": "#0879EE",
@@ -24,9 +28,9 @@ MOONLIGHT_BLUE_COLORS = {
     "destructive_hover": "#FFB8AD",
     "destructive_text": "#091A32",
     "destructive_outline": "#FFB8AD",
-    # Volume intentionally leaves the blue accent family. The control surface
-    # may glow blue on hover, while the filled level remains easy to read.
+    # Keep volume distinct from the dark control surface while matching the
+    # Moonlight blue accent family.
     "media_volume_track": "#52718D",
-    "media_volume_fill": "#57D6C6",
-    "media_volume_fill_hover": "#9AF3E5",
+    "media_volume_fill": "#8ED2FF",
+    "media_volume_fill_hover": "#B9E4FF",
 }

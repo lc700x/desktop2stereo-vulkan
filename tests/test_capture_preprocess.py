@@ -1,7 +1,11 @@
 import numpy as np
 import pytest
-
 from capture import capture_frame_to_rgb, prepare_rgb_for_depth_runtime
+from capture.preprocess import (
+    _mps_bt2020_to_bt709_gamut,
+    _mps_p010_color_conversion_size,
+    _prepare_mps_transfer_tensor,
+)
 
 
 def test_capture_frame_to_rgb_converts_bgr_numpy():
@@ -90,6 +94,29 @@ def test_mps_tensor_keeps_raw_cpu_capture_for_coreml_staging():
     assert isinstance(raw, torch.Tensor)
     assert raw.device.type == "cpu"
     assert tuple(raw.shape) == (4, 6, 4)
+
+
+@pytest.mark.skipif(
+    not __import__("torch").backends.mps.is_available(),
+    reason="requires MPS",
+)
+def test_prepare_rgb_for_stereo_runtime_stages_uint16_before_mps_transfer():
+    torch = pytest.importorskip("torch")
+    raw = torch.tensor(
+        [
+            [[0, 255], [512, 1023]],
+            [[1023, 512], [255, 0]],
+            [[128, 256], [768, 900]],
+        ],
+        dtype=torch.uint16,
+    )
+
+    prepared = prepare_rgb_for_depth_runtime(raw, device="mps")
+
+    assert prepared.device.type == "mps"
+    assert prepared.dtype == torch.float32
+    expected = raw.float().div(255.0).clamp(0.0, 1.0).unsqueeze(0)
+    torch.testing.assert_close(prepared.cpu(), expected)
 
 
 def test_capture_frame_to_rgb_tensor_path_accepts_torch_hwc():
@@ -367,6 +394,195 @@ def test_p010_hdr_cpu_preprocess_retains_adjacent_10_bit_levels():
 
     assert first_rgb.dtype == torch.float32
     assert not torch.equal(first_rgb, second_rgb)
+
+
+def test_p010_hdr_downsample_uses_area_filter_after_color_conversion():
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as F
+
+    frame_format = "p010le_pq_bt2020_bt2020nc_tv_center"
+    raw = np.empty((6, 4), dtype="<u2")
+    raw[:4] = np.array(
+        [[220, 360, 560, 780], [280, 430, 620, 820], [340, 490, 680, 860], [400, 540, 720, 900]],
+        dtype=np.uint16,
+    ) << 6
+    raw[4:] = 512 << 6
+
+    full = capture_frame_to_rgb(
+        raw, (4, 4), device="cpu", output="tensor", original_format=frame_format
+    )
+    expected = F.interpolate(full, size=(2, 2), mode="area")
+    actual = capture_frame_to_rgb(
+        raw, (2, 2), device="cpu", output="tensor", original_format=frame_format
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=1e-6)
+
+
+def test_uint16_mps_transfer_stages_on_cpu_without_changing_samples():
+    torch = pytest.importorskip("torch")
+    raw = torch.tensor([0, 1, 1023, 65535], dtype=torch.uint16)
+
+    prepared = _prepare_mps_transfer_tensor(raw, "mps", torch)
+
+    assert prepared.device.type == "cpu"
+    assert prepared.dtype == torch.int32
+    torch.testing.assert_close(prepared, raw.to(dtype=torch.int32))
+
+
+def test_mps_p010_hdr_color_grid_keeps_full_target_resolution(monkeypatch):
+    monkeypatch.delenv("D2S_MEDIA_P010_MPS_COLOR_SCALE", raising=False)
+
+    assert _mps_p010_color_conversion_size(4, 4) == (4, 4)
+    assert _mps_p010_color_conversion_size(1920, 3840) == (1920, 3840)
+
+
+def test_mps_p010_hdr_color_grid_ignores_legacy_downscale_setting(monkeypatch):
+    monkeypatch.setenv("D2S_MEDIA_P010_MPS_COLOR_SCALE", "0.5")
+
+    assert _mps_p010_color_conversion_size(1920, 3840) == (1920, 3840)
+
+
+@pytest.mark.parametrize("device", ["cpu", "mps"])
+def test_mps_bt2020_gamut_transform_matches_matrix_reference(device):
+    torch = pytest.importorskip("torch")
+    if device == "mps" and not torch.backends.mps.is_available():
+        pytest.skip("requires MPS")
+    linear = torch.tensor(
+        [
+            [[0.0, 0.2, 1.0], [25.0, 3.0, 60.0]],
+            [[0.5, 1.0, 0.0], [12.0, 40.0, 5.0]],
+            [[1.0, 0.0, 0.4], [2.0, 8.0, 80.0]],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    matrix = torch.tensor(
+        (
+            (1.660491, -0.587641, -0.072850),
+            (-0.124550, 1.132900, -0.008349),
+            (-0.018151, -0.100579, 1.118730),
+        ),
+        dtype=linear.dtype,
+        device=linear.device,
+    )
+    converted = torch.matmul(matrix, linear.reshape(3, -1)).reshape_as(linear)
+    luminance = (
+        converted
+        * torch.tensor(
+            (0.2126, 0.7152, 0.0722), dtype=linear.dtype, device=linear.device
+        ).view(3, 1, 1)
+    ).sum(dim=0, keepdim=True)
+    minimum = converted.min(dim=0, keepdim=True).values
+    compression = torch.where(
+        minimum < 0.0,
+        (-minimum / (luminance - minimum).clamp_min(1e-6)).clamp(0.0, 1.0),
+        torch.zeros_like(minimum),
+    )
+    expected = (converted + compression * (luminance - converted)).clamp_min(0.0)
+
+    actual = _mps_bt2020_to_bt709_gamut(linear, torch)
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=3e-5)
+    if device == "mps":
+        torch.mps.synchronize()
+
+
+def test_p010_hdr_mps_preprocess_converts_uint16_before_device_transfer():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("requires MPS")
+    frame_format = "p010le_pq_bt2020_bt2020nc_tv_center"
+    raw = np.empty((6, 4), dtype="<u2")
+    raw[:4] = 400 << 6
+    raw[4:] = 512 << 6
+
+    expected = capture_frame_to_rgb(
+        raw, (4, 4), device="cpu", output="tensor", original_format=frame_format
+    )
+    actual = capture_frame_to_rgb(
+        raw, (4, 4), device="mps", output="tensor", original_format=frame_format
+    )
+
+    assert actual.device.type == "mps"
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(
+    not __import__("torch").backends.mps.is_available(),
+    reason="requires MPS",
+)
+def test_p010_hdr_mps_preprocess_antialias_resizes_to_requested_output():
+    torch = pytest.importorskip("torch")
+    frame_format = "p010le_pq_bt2020_bt2020nc_tv_center"
+    raw = np.empty((6, 4), dtype="<u2")
+    raw[:4] = np.array(
+        [[220, 360, 560, 780], [280, 430, 620, 820], [340, 490, 680, 860], [400, 540, 720, 900]],
+        dtype=np.uint16,
+    ) << 6
+    raw[4:] = 512 << 6
+
+    expected = capture_frame_to_rgb(
+        raw,
+        (2, 2),
+        device="cpu",
+        output="tensor",
+        original_format=frame_format,
+    )
+    actual = capture_frame_to_rgb(
+        raw,
+        (2, 2),
+        device="mps",
+        output="tensor",
+        original_format=frame_format,
+    )
+
+    assert actual.device.type == "mps"
+    assert tuple(actual.shape) == (1, 3, 2, 2)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    not __import__("torch").backends.mps.is_available(),
+    reason="requires MPS",
+)
+def test_p010_hdr_mps_area_resize_supports_non_divisible_target_sizes():
+    torch = pytest.importorskip("torch")
+    frame_format = "p010le_pq_bt2020_bt2020nc_tv_center"
+    raw = np.empty((9, 8), dtype="<u2")
+    raw[:6] = np.array(
+        [
+            [180, 250, 340, 450, 570, 680, 780, 860],
+            [210, 290, 380, 490, 600, 710, 800, 900],
+            [250, 330, 420, 530, 640, 740, 830, 930],
+            [290, 370, 460, 570, 670, 780, 870, 960],
+            [330, 410, 500, 610, 710, 820, 910, 990],
+            [370, 450, 540, 650, 750, 860, 950, 1000],
+        ],
+        dtype=np.uint16,
+    ) << 6
+    raw[6:] = 512 << 6
+
+    expected = capture_frame_to_rgb(
+        raw,
+        (6, 4),
+        device="cpu",
+        output="tensor",
+        original_format=frame_format,
+    )
+    actual = capture_frame_to_rgb(
+        raw,
+        (6, 4),
+        device="mps",
+        output="tensor",
+        original_format=frame_format,
+    )
+    torch.mps.synchronize()
+
+    assert actual.device.type == "mps"
+    assert tuple(actual.shape) == (1, 3, 4, 6)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize(

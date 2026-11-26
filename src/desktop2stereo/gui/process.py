@@ -723,6 +723,13 @@ class GUIProcessMixin:
                 if bool(getattr(control, "disabled", False)) != desired:
                     control.disabled = desired
                     controls.append(control)
+        for name in ("media_input_file_btn", "media_input_folder_btn"):
+            control = getattr(self, name, None)
+            if control is not None:
+                desired = bool(running)
+                if bool(getattr(control, "disabled", False)) != desired:
+                    control.disabled = desired
+                    controls.append(control)
         if controls:
             self._safe_update(*controls)
 
@@ -2005,7 +2012,12 @@ class GUIProcessMixin:
             changed_controls.append(play_button)
         path_control = getattr(self, "media_path_text", None)
         if path_control is not None:
-            path_control.value = media_path
+            path_control.value = str(
+                media_path
+                or state.get("browser_path")
+                or getattr(self, "_media_display_path", "")
+                or ""
+            )
             changed_controls.append(path_control)
         safe_update = getattr(self, "_safe_update", None)
         if changed_controls and callable(safe_update):
@@ -2315,16 +2327,70 @@ class GUIProcessMixin:
             except Exception:
                 pass
         else:
+            process_group = None
             try:
                 import signal
-                os.killpg(os.getpgid(pid), signal.SIGTERM)
+                process_group = os.getpgid(pid)
+            except ProcessLookupError:
+                process_group = None
             except Exception:
-                pass
+                logger.exception("Failed to signal runtime process group %s", pid)
+            if process_group is not None:
+                for process_signal, timeout in (
+                    (signal.SIGINT, _GRACEFUL_PROCESS_STOP_TIMEOUT_S),
+                    (signal.SIGTERM, 2.0),
+                ):
+                    try:
+                        os.killpg(process_group, process_signal)
+                    except ProcessLookupError:
+                        process_group = None
+                        break
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline:
+                        try:
+                            os.killpg(process_group, 0)
+                        except ProcessLookupError:
+                            process_group = None
+                            break
+                        except PermissionError:
+                            pass
+                        await asyncio.sleep(0.05)
+                    if process_group is None:
+                        break
+                if process_group is not None:
+                    try:
+                        os.killpg(process_group, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except Exception:
+                        logger.exception("Failed to kill runtime process group %s", process_group)
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        try:
+                            os.killpg(process_group, 0)
+                        except ProcessLookupError:
+                            process_group = None
+                            break
+                        except PermissionError:
+                            pass
+                        await asyncio.sleep(0.05)
+                    if process_group is not None:
+                        logger.error("Runtime process group %s remained after SIGKILL", process_group)
         if proc.returncode is None:
             try:
                 proc.kill()
             except Exception:
-                pass
+                logger.exception("Failed to kill runtime process %s", pid)
+        wait = getattr(proc, "wait", None)
+        if callable(wait):
+            try:
+                await asyncio.wait_for(wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    logger.exception("Failed to kill unresponsive runtime process %s", pid)
+                await wait()
 
     async def _async_stop(self):
         self._user_stop_requested = True

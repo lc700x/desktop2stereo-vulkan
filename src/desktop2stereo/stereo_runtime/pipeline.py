@@ -14,7 +14,12 @@ from typing import Callable
 from capture.types import CapturedFrame, compatibility_frame
 
 from .cadence_governor import StableCadenceGovernor
-from .render_size import RenderSizeConfig, resolve_render_size, runtime_output_size_text
+from .render_size import (
+    RenderSizeConfig,
+    fit_size_within_bounds,
+    resolve_render_size,
+    runtime_output_size_text,
+)
 from .settings_snapshot import (
     RuntimeSettingsPipelineRebuildRequired,
     RuntimeSettingsRestartRequired,
@@ -114,7 +119,10 @@ class _ParallelDepthScheduler:
                 self.dropped += 1
 
     def close(self) -> None:
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        # CoreML/MPS work owns native execution streams. The runtime must not
+        # release its provider while a depth worker is still unwinding those
+        # streams during interpreter shutdown.
+        self.executor.shutdown(wait=True, cancel_futures=True)
 
 _OPENXR_FULL_SYNTHESIS_PRESETS = {"cinema", "game_low_latency", "still_image_hq", "debug_export"}
 
@@ -349,6 +357,7 @@ class RuntimePipelineContext:
     # never a borrowed previous-frame depth.
     media_depth_reuse_disabled: bool = False
     capture_mode: str | None = None
+    render_size_limit: tuple[int, int] | None = None
 
 
 class GPURequiredError(RuntimeError):
@@ -466,7 +475,11 @@ def _prewarm_gpu_runtime_before_capture(ctx, render_config: RenderSizeConfig | N
         device = torch.device(device)
         if device.type != "cuda" or not torch.cuda.is_available():
             return
-        width, height = _resolve_pipeline_render_size(capture_hint, render_config)
+        width, height = _resolve_pipeline_render_size(
+            capture_hint,
+            render_config,
+            getattr(ctx, "render_size_limit", None),
+        )
         if width <= 0 or height <= 0:
             return
         rgb = torch.zeros((1, 3, height, width), device=device, dtype=torch.float32)
@@ -582,13 +595,24 @@ def _prepare_frame_input(ctx, captured_frame, frame_raw):
     return prepared
 
 
-def _resolve_pipeline_render_size(size, config: RenderSizeConfig | None):
+def _resolve_pipeline_render_size(
+    size,
+    config: RenderSizeConfig | None,
+    render_size_limit: tuple[int, int] | None = None,
+):
     if isinstance(size, (tuple, list)) and len(size) == 2:
         config = config or RenderSizeConfig()
         # Capture preprocessing requires even dimensions. Resolve that constraint
         # together with the user's alignment, before preflight and diagnostics.
         config = replace(config, align=math.lcm(2, max(1, int(config.align))))
-        return resolve_render_size((int(size[0]), int(size[1])), config)
+        render_size = resolve_render_size((int(size[0]), int(size[1])), config)
+        if render_size_limit is not None:
+            render_size = fit_size_within_bounds(
+                render_size,
+                render_size_limit,
+                align=config.align,
+            )
+        return render_size
     return size
 
 
@@ -1564,7 +1588,7 @@ class RuntimePipelineLoop:
             )
         except (TypeError, ValueError):
             value_ms = 250.0
-        return max(0.0, min(1000.0, value_ms)) / 1000.0
+        return max(0.0, min(10000.0, value_ms)) / 1000.0
 
     @staticmethod
     def _media_depth_temporal_reuse_enabled(ctx: RuntimePipelineContext) -> bool:
@@ -2175,7 +2199,11 @@ class RuntimePipelineLoop:
         ):
             capture_hint = getattr(ctx, "capture_size_hint", None)
             try:
-                native_preflight_key = _resolve_pipeline_render_size(capture_hint, render_config)
+                native_preflight_key = _resolve_pipeline_render_size(
+                    capture_hint,
+                    render_config,
+                    getattr(ctx, "render_size_limit", None),
+                )
             except (TypeError, ValueError):
                 native_preflight_key = None
             if native_preflight_key is not None and min(native_preflight_key) > 0:
@@ -2430,7 +2458,11 @@ class RuntimePipelineLoop:
                 loop_start_time = time.perf_counter()
 
                 process_start_time = time.perf_counter()
-                render_size = _resolve_pipeline_render_size(size, ctx.render_size_config)
+                render_size = _resolve_pipeline_render_size(
+                    size,
+                    ctx.render_size_config,
+                    ctx.render_size_limit,
+                )
                 render_size_changed = self._last_render_size is not None and render_size != self._last_render_size
                 source_target_key = _source_target_key(captured_frame)
                 source_target_changed = (
@@ -2453,6 +2485,21 @@ class RuntimePipelineLoop:
                     and getattr(captured_frame, "sck_zero_copy", None) is not None
                     and _native_coreml_capture_enabled(ctx)
                 )
+                native_media = bool(
+                    native_sck
+                    and str(getattr(captured_frame, "capture_mode", "") or "")
+                    .strip()
+                    .casefold()
+                    == "video"
+                    and getattr(captured_frame, "metadata", {}).get(
+                        "media_zero_copy", False
+                    )
+                )
+                if native_media and ctx.run_mode == "OpenXR":
+                    raise GPURequiredError(
+                        "macOS media requires a Metal-to-Vulkan IOSurface import path for OpenXR; "
+                        "CPU frame readback is disabled"
+                    )
                 if _gpu_capture_input_requires_device_residency(ctx, captured_frame) and not native_sck:
                     input_device = getattr(getattr(frame_input, "device", None), "type", None)
                     if input_device not in {"cuda", "mps"}:
@@ -2485,7 +2532,7 @@ class RuntimePipelineLoop:
                         f"reason={getattr(info, 'native_io_reason', None)!r}",
                         flush=True,
                     )
-                if native_sck and ctx.gpu_required and not native_ready:
+                if native_sck and (ctx.gpu_required or native_media) and not native_ready:
                     provider = getattr(ctx.stereo_runtime, "depth_provider", None)
                     info = getattr(provider, "info", None)
                     reason = getattr(info, "native_io_reason", None)
@@ -2503,9 +2550,10 @@ class RuntimePipelineLoop:
                     setattr(frame_rgb, "_d2s_preprocess_backend", "native_coreml_metal")
                 else:
                     if native_sck:
-                        if ctx.gpu_required:
+                        if ctx.gpu_required or native_media:
                             raise GPURequiredError(
-                                "ScreenCaptureKit GPU capture requires native CoreML/Metal inference"
+                                "GPU-native capture requires native CoreML/Metal inference; "
+                                "CPU frame readback is disabled"
                             )
                         # Capability preflight failed, so make the explicitly
                         # retained IOSurface available to the existing Python
@@ -2524,7 +2572,28 @@ class RuntimePipelineLoop:
                         capture_zero_copy=_capture_zero_copy(captured_frame),
                     )
                 frame_device = getattr(getattr(frame_rgb, "device", None), "type", None)
-                if ctx.gpu_required and frame_device not in {"cuda", "mps", "meta"}:
+                media_p010_cpu_fallback = bool(
+                    captured_frame is not None
+                    and str(getattr(captured_frame, "capture_mode", "") or "")
+                    .strip()
+                    .casefold()
+                    == "video"
+                    and str(
+                        os.environ.get("D2S_MEDIA_P010_CPU", "0") or "0"
+                    )
+                    .strip()
+                    .lower()
+                    in {"1", "true", "yes", "on"}
+                    and str(getattr(captured_frame, "original_format", "") or "")
+                    .strip()
+                    .casefold()
+                    .startswith("p010le_")
+                )
+                if (
+                    ctx.gpu_required
+                    and frame_device not in {"cuda", "mps", "meta"}
+                    and not media_p010_cpu_fallback
+                ):
                     raise GPURequiredError(
                         f"GPU preprocessing is required, but produced {frame_device or 'host'} data"
                     )
@@ -2895,7 +2964,7 @@ class RuntimePipelineLoop:
                     except Exception as exc:
                         if not native_sck or native_capture is None:
                             raise
-                        if ctx.gpu_required:
+                        if ctx.gpu_required or native_media:
                             native_capture.release()
                             raise GPURequiredError(
                                 f"native Metal processing failed: {type(exc).__name__}: {exc}"
@@ -2953,8 +3022,20 @@ class RuntimePipelineLoop:
                 cache_profile = depth_profile or getattr(runtime_result, "depth_profile", None)
                 if cache_profile is None:
                     self._clear_cursor_depth_cache()
-                self._clear_media_depth_cache()
-                self._media_depth_cache_reason = "fresh_only"
+                if self._is_video_media_frame(captured_frame):
+                    self._commit_media_depth_cache(
+                        ctx,
+                        captured_frame,
+                        frame_rgb,
+                        render_size,
+                        source_target_key,
+                        runtime_result,
+                        reused=media_depth_reused,
+                        depth_profile=cache_profile,
+                    )
+                else:
+                    self._clear_media_depth_cache()
+                    self._media_depth_cache_reason = "fresh_only"
                 if cache_profile is not None and cursor_depth_candidate is not None:
                     if cursor_depth_reused:
                         ctx.source_stat_inc("runtime_cursor_depth_reused")

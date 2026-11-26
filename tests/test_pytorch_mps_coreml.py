@@ -1,6 +1,7 @@
 """CoreML provider plumbing tests (ported macOS behavior)."""
 
 from types import SimpleNamespace
+import threading
 
 import pytest
 import torch
@@ -189,3 +190,27 @@ def test_coreml_engine_sanitizes_nonfinite_output():
     assert output.nonfinite_count == 3
     assert output.finite_depth is True
     assert bool(torch.isfinite(output.predicted_depth).all())
+
+
+def test_coreml_engine_keeps_preprocessed_model_input_shape():
+    provider = object.__new__(GenericAutoDepthMpsProvider)
+    provider.model_id = "lc700x/Distill-Any-Depth-Base-hf"
+    provider.depth_resolution = 336
+    provider.patch_size = 14
+    provider._coreml_engines = {}
+    provider._coreml_engine_lock = threading.Lock()
+    created = []
+
+    def create(key, engines):
+        created.append(key)
+        engine = object()
+        engines[key] = engine
+        return engine
+
+    provider._coreml_engine_create_locked = create
+    model_input = torch.empty((1, 3, 266, 518))
+
+    engine = provider._coreml_engine_for_frame(model_input, model_input=True)
+
+    assert engine is provider._coreml_engines[(266, 518)]
+    assert created == [(266, 518)]

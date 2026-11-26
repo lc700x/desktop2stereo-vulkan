@@ -229,7 +229,18 @@ class CoreMLEngine:
             np_input = pixel_values.numpy()
         else:
             np_input = pixel_values.detach().cpu().numpy()
-        out = self.model.predict({"pixel_values": np_input})
+        # Core ML is invoked from the long-lived stereo pipeline thread. PyObjC
+        # otherwise leaves autoreleased Objective-C objects pending on that
+        # thread; high-rate media playback eventually tears down one of those
+        # objects while Python still holds the prediction buffer.
+        try:
+            import objc
+        except Exception:
+            autorelease_pool = contextlib.nullcontext
+        else:
+            autorelease_pool = objc.autorelease_pool
+        with autorelease_pool():
+            out = self.model.predict({"pixel_values": np_input})
         value = next(iter(out.values())) if isinstance(out, dict) else out
         # from_numpy wraps the prediction buffer without a copy; only pay the
         # device transfer when postprocessing actually runs off-CPU.
@@ -238,10 +249,16 @@ class CoreMLEngine:
         if self.device.type != "cpu":
             if tensor.is_floating_point():
                 nonfinite_count = int((~torch.isfinite(tensor)).sum().item())
-            # CoreML returns a host tensor. Enqueue its small transfer to MPS
-            # instead of blocking the runtime thread behind the active MPS
-            # render queue; the fused viewer consumer synchronizes on use.
-            tensor = tensor.to(self.device, non_blocking=True)
+            # CoreML returns a host tensor. The media path can immediately
+            # release and reuse the NumPy/CPU output buffer on the next frame.
+            # MPS does not retain that host storage for an asynchronous copy,
+            # so the transfer must complete before this local tensor dies.
+            # This is also required for the P010 video path, which can submit
+            # frames much faster than the CoreML/ANE result is consumed.
+            tensor = tensor.to(
+                self.device,
+                non_blocking=self.device.type not in {"mps", "cpu"},
+            )
         if tensor.is_floating_point():
             # fp16/fp32 engines can emit NaN/Inf on pathological inputs
             # (denormal overflow, 0/0 in attention). Sanitize here so depth
@@ -520,6 +537,11 @@ class _CoreMLMixin:
             mode=self.depth_upsample,
             edge_strength=self.depth_upsample_edge_strength,
         )
+        # CoreML returns a host prediction, then the canonical depth
+        # postprocess/upsample runs on MPS. Drain that queue before the source
+        # media frame and CoreML output buffers can be reused for the next tick.
+        if self.device.type == "mps":
+            torch.mps.synchronize()
         postprocess_ms = (time.perf_counter() - start) * 1000.0
         return DepthProfileResult(
             depth,
@@ -539,6 +561,10 @@ class _CoreMLMixin:
                 return self._predict_profile_coreml(rgb, raw_bgr=raw_bgr)
             if isinstance(cpu_rgb, torch.Tensor) and cpu_rgb.device.type == "cpu":
                 return self._predict_profile_coreml(rgb, cpu_rgb)
+            result = super().predict_profile(rgb)
+            if self.device.type == "mps":
+                torch.mps.synchronize()
+            return result
         return super().predict_profile(rgb)
 
     def predict_profile_native(
@@ -602,7 +628,9 @@ class _CoreMLMixin:
         if callable(parent_close):
             parent_close()
 
-    def _coreml_engine_for_frame(self, rgb: torch.Tensor):
+    def _coreml_engine_for_frame(
+        self, rgb: torch.Tensor, *, model_input: bool = False
+    ):
         from stereo_runtime.depth_provider import (
             DISTILL_ANY_DEPTH_BASE_RESOLUTION,
             _model_input_size_for_model,
@@ -615,9 +643,12 @@ class _CoreMLMixin:
             getattr(self, "depth_resolution", None) or DISTILL_ANY_DEPTH_BASE_RESOLUTION
         )
         patch_size = int(getattr(self, "patch_size", None) or 14)
-        input_h, input_w = _model_input_size_for_model(
-            height, width, resolution, patch_size, self.model_id
-        )
+        if model_input:
+            input_h, input_w = height, width
+        else:
+            input_h, input_w = _model_input_size_for_model(
+                height, width, resolution, patch_size, self.model_id
+            )
 
         engines = getattr(self, "_coreml_engines", None)
         if engines is None:
@@ -733,7 +764,7 @@ class _CoreMLMixin:
         # parallel depth slots).
         if not self._coreml_enabled():
             return super()._run_depth_model(tensor)
-        engine = self._coreml_engine_for_frame(tensor)
+        engine = self._coreml_engine_for_frame(tensor, model_input=True)
         if engine is None:
             return self._run_torch_model_for_coreml(tensor)
         with torch.inference_mode():

@@ -291,6 +291,97 @@ kernel void d2s_preprocess(
     output[2u * plane + offset] = (pixel.b - p.mean2) / p.std2;
 }
 
+static inline float d2s_pq_to_linear(float value) {
+    const float encoded = powr(clamp(value, 0.0f, 1.0f), 32.0f / 2523.0f);
+    const float numerator = max(encoded - 3424.0f / 4096.0f, 0.0f);
+    const float denominator = max(
+        2413.0f / 128.0f - (2392.0f / 128.0f) * encoded,
+        1.0e-6f);
+    return powr(numerator / denominator, 16384.0f / 2610.0f) * 100.0f;
+}
+
+static inline float d2s_hable(float value) {
+    return ((value * (0.15f * value + 0.05f) + 0.004f)
+        / (value * (0.15f * value + 0.50f) + 0.06f)) - 0.02f / 0.30f;
+}
+
+static inline float d2s_linear_to_srgb(float value) {
+    value = clamp(value, 0.0f, 1.0f);
+    return value < 0.0031308f
+        ? value * 12.92f
+        : 1.055f * powr(value, 1.0f / 2.4f) - 0.055f;
+}
+
+static inline float3 d2s_srgb_to_linear(float3 value) {
+    value = clamp(value, float3(0.0f), float3(1.0f));
+    float3 low = value / 12.92f;
+    float3 high = powr((value + 0.055f) / 1.055f, float3(2.4f));
+    return select(low, high, value > 0.04045f);
+}
+
+static inline float3 d2s_p010_display_rgb(float y_code, float2 uv_code) {
+    float y_value = clamp((y_code - 64.0f) / 876.0f, 0.0f, 1.0f);
+    float2 chroma_value = (uv_code - 512.0f) / 896.0f;
+    float3 rgb = clamp(float3(
+        y_value + 1.4746f * chroma_value.y,
+        y_value - 0.164553f * chroma_value.x - 0.571353f * chroma_value.y,
+        y_value + 1.8814f * chroma_value.x), 0.0f, 1.0f);
+    float3 hdr = float3(
+        d2s_pq_to_linear(rgb.r), d2s_pq_to_linear(rgb.g), d2s_pq_to_linear(rgb.b));
+    float3 bt709 = float3(
+        1.660491f * hdr.r - 0.587641f * hdr.g - 0.072850f * hdr.b,
+        -0.124550f * hdr.r + 1.132900f * hdr.g - 0.008349f * hdr.b,
+        -0.018151f * hdr.r - 0.100579f * hdr.g + 1.118730f * hdr.b);
+    float luminance = dot(bt709, float3(0.2126f, 0.7152f, 0.0722f));
+    float minimum = min(bt709.r, min(bt709.g, bt709.b));
+    float compression = minimum < 0.0f
+        ? clamp(-minimum / max(luminance - minimum, 1.0e-6f), 0.0f, 1.0f)
+        : 0.0f;
+    float3 gamut_mapped = max(bt709 + compression * (luminance - bt709), 0.0f);
+    float3 tone_mapped = float3(
+        d2s_hable(gamut_mapped.r), d2s_hable(gamut_mapped.g), d2s_hable(gamut_mapped.b))
+        / d2s_hable(11.2f);
+    return float3(
+        d2s_linear_to_srgb(tone_mapped.r),
+        d2s_linear_to_srgb(tone_mapped.g),
+        d2s_linear_to_srgb(tone_mapped.b));
+}
+
+kernel void d2s_convert_p010(
+    texture2d<float, access::sample> luma [[texture(0)]],
+    texture2d<float, access::sample> chroma [[texture(1)]],
+    texture2d<float, access::write> output [[texture(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+    constexpr sampler s(address::clamp_to_edge, filter::linear);
+    float2 uv = (float2(gid) + 0.5f) /
+        float2(output.get_width(), output.get_height());
+    float3 pixel = d2s_srgb_to_linear(d2s_p010_display_rgb(
+        luma.sample(s, uv).r * 1023.0f,
+        chroma.sample(s, uv).rg * 1023.0f));
+    output.write(float4(pixel, 1.0f), gid);
+}
+
+kernel void d2s_preprocess_p010(
+    texture2d<float, access::sample> luma [[texture(0)]],
+    texture2d<float, access::sample> chroma [[texture(1)]],
+    device float *output [[buffer(0)]],
+    constant PreprocessParams& p [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.input_width || gid.y >= p.input_height) return;
+    constexpr sampler s(address::clamp_to_edge, filter::linear);
+    float2 uv = (float2(gid) + 0.5f) /
+        float2(p.input_width, p.input_height);
+    float3 pixel = d2s_p010_display_rgb(
+        luma.sample(s, uv).r * 1023.0f,
+        chroma.sample(s, uv).rg * 1023.0f);
+    uint plane = p.input_width * p.input_height;
+    uint offset = gid.y * p.input_width + gid.x;
+    output[offset] = (pixel.r - p.mean0) / p.std0;
+    output[plane + offset] = (pixel.g - p.mean1) / p.std1;
+    output[2u * plane + offset] = (pixel.b - p.mean2) / p.std2;
+}
+
 kernel void d2s_normalize_half(
     device half *source [[buffer(0)]],
     device float *output [[buffer(1)]],
@@ -463,6 +554,13 @@ static inline float2 clamp_source(float2 point, constant WarpParams& p) {
                         max(float(p.source_height) - 1.0f, 0.0f)));
 }
 
+static inline float3 linear_to_srgb(float3 value) {
+    value = clamp(value, float3(0.0f), float3(1.0f));
+    float3 low = value * 12.92f;
+    float3 high = 1.055f * powr(value, float3(1.0f / 2.4f)) - 0.055f;
+    return select(low, high, value > 0.0031308f);
+}
+
 static inline float3 sample_color(texture2d<float, access::sample> color,
                                   float x, float y, constant WarpParams& p) {
     constexpr sampler s(address::clamp_to_edge, filter::linear);
@@ -498,8 +596,7 @@ kernel void d2s_warp_pack_half_sbs_fast(
     constant WarpParams& p [[buffer(2)]],
     uint gid [[thread_position_in_grid]]) {
     uint total = p.output_width * p.output_height;
-    if (gid >= total || p.output_format != 0u ||
-        p.source_width != p.output_width || p.output_width < 2u) return;
+    if (gid >= total || p.output_format != 0u || p.output_width < 2u) return;
     uint x = gid % p.output_width;
     uint y = gid / p.output_width;
     uint eye_width = p.output_width / 2u;
@@ -507,10 +604,12 @@ kernel void d2s_warp_pack_half_sbs_fast(
     uint eye_x = left ? x : x - eye_width;
     float source_x = (float(eye_x) + 0.5f) *
                          (float(p.source_width) / float(eye_width)) - 0.5f;
+    float source_y = (float(y) + 0.5f) *
+                         (float(p.source_height) / float(p.output_height)) - 0.5f;
     float3 pixel = fast_warp_at(
-        color, depth, source_x + 0.5f, float(y),
+        color, depth, source_x + 0.5f, source_y,
         left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f), p);
-    pixel = finite_color(pixel);
+    pixel = linear_to_srgb(finite_color(pixel));
     uint offset = gid * p.output_channels;
     output[offset + 0u] = uchar(clamp(
         (p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f + 0.5f, 0.0f, 255.0f));
@@ -596,8 +695,7 @@ kernel void d2s_warp_pack_half_sbs_fast_float(
     constant WarpParams& p [[buffer(2)]],
     uint gid [[thread_position_in_grid]]) {
     uint total = p.output_width * p.output_height;
-    if (gid >= total || p.output_format != 0u ||
-        p.source_width != p.output_width || p.output_width < 2u) return;
+    if (gid >= total || p.output_format != 0u || p.output_width < 2u) return;
     uint x = gid % p.output_width;
     uint y = gid / p.output_width;
     uint eye_width = p.output_width / 2u;
@@ -605,10 +703,12 @@ kernel void d2s_warp_pack_half_sbs_fast_float(
     uint eye_x = left ? x : x - eye_width;
     float source_x = (float(eye_x) + 0.5f) *
                          (float(p.source_width) / float(eye_width)) - 0.5f;
+    float source_y = (float(y) + 0.5f) *
+                         (float(p.source_height) / float(p.output_height)) - 0.5f;
     float3 pixel = fast_raw_warp_at_float(
-        color, depth, source_x + 0.5f, float(y),
+        color, depth, source_x + 0.5f, source_y,
         left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f), p);
-    pixel = finite_color(pixel);
+    pixel = linear_to_srgb(finite_color(pixel));
     uint offset = gid * p.output_channels;
     output[offset + 0u] = uchar(clamp(
         (p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f + 0.5f, 0.0f, 255.0f));
@@ -625,8 +725,7 @@ kernel void d2s_warp_pack_half_sbs_fast_half(
     constant WarpParams& p [[buffer(2)]],
     uint gid [[thread_position_in_grid]]) {
     uint total = p.output_width * p.output_height;
-    if (gid >= total || p.output_format != 0u ||
-        p.source_width != p.output_width || p.output_width < 2u) return;
+    if (gid >= total || p.output_format != 0u || p.output_width < 2u) return;
     uint x = gid % p.output_width;
     uint y = gid / p.output_width;
     uint eye_width = p.output_width / 2u;
@@ -634,10 +733,12 @@ kernel void d2s_warp_pack_half_sbs_fast_half(
     uint eye_x = left ? x : x - eye_width;
     float source_x = (float(eye_x) + 0.5f) *
                          (float(p.source_width) / float(eye_width)) - 0.5f;
+    float source_y = (float(y) + 0.5f) *
+                         (float(p.source_height) / float(p.output_height)) - 0.5f;
     float3 pixel = fast_raw_warp_at_half(
-        color, depth, source_x + 0.5f, float(y),
+        color, depth, source_x + 0.5f, source_y,
         left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f), p);
-    pixel = finite_color(pixel);
+    pixel = linear_to_srgb(finite_color(pixel));
     uint offset = gid * p.output_channels;
     output[offset + 0u] = uchar(clamp(
         (p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f + 0.5f, 0.0f, 255.0f));
@@ -1150,24 +1251,36 @@ kernel void d2s_warp_pack(
     uint y = gid / p.output_width;
     float3 pixel = float3(0.0f);
     if (p.output_format == 5u) {
-        float value = processed_depth_at(depth, float(x), float(y), p);
+        float source_x = (float(x) + 0.5f) *
+                         (float(p.source_width) / float(p.output_width)) - 0.5f;
+        float source_y = (float(y) + 0.5f) *
+                         (float(p.source_height) / float(p.output_height)) - 0.5f;
+        float value = processed_depth_at(depth, source_x, source_y, p);
         pixel = float3(isfinite(value) ? value : 1.0f);
     } else if (p.output_format == 4u) {
         uint edge = min(uint(max(p.screen_edge_suppression, 0)),
-                        min(p.source_width, p.source_height));
+                        min(p.output_width, p.output_height));
+        float source_x = (float(x) + 0.5f) *
+                         (float(p.source_width) / float(p.output_width)) - 0.5f;
+        float source_y = (float(y) + 0.5f) *
+                         (float(p.source_height) / float(p.output_height)) - 0.5f;
         bool screen_edge = edge > 0u &&
-            (x < edge || y < edge || x >= p.source_width - edge ||
-             y >= p.source_height - edge);
-        pixel = eye_pixel(color, depth, float(x), float(y), 1.0f, screen_edge, p);
+            (x < edge || y < edge || x >= p.output_width - edge ||
+             y >= p.output_height - edge);
+        pixel = eye_pixel(color, depth, source_x, source_y, 1.0f, screen_edge, p);
     } else if (p.output_format == 6u) {
         uint edge = min(uint(max(p.screen_edge_suppression, 0)),
-                        min(p.source_width, p.source_height));
+                        min(p.output_width, p.output_height));
+        float source_x = (float(x) + 0.5f) *
+                         (float(p.source_width) / float(p.output_width)) - 0.5f;
+        float source_y = (float(y) + 0.5f) *
+                         (float(p.source_height) / float(p.output_height)) - 0.5f;
         bool screen_edge = edge > 0u &&
-            (x < edge || y < edge || x >= p.source_width - edge ||
-             y >= p.source_height - edge);
-        float3 left_pixel = eye_pixel(color, depth, float(x), float(y), 1.0f,
+            (x < edge || y < edge || x >= p.output_width - edge ||
+             y >= p.output_height - edge);
+        float3 left_pixel = eye_pixel(color, depth, source_x, source_y, 1.0f,
                                       screen_edge, p);
-        float3 right_pixel = eye_pixel(color, depth, float(x), float(y),
+        float3 right_pixel = eye_pixel(color, depth, source_x, source_y,
                                        p.symmetric != 0 ? -1.0f : -0.9f,
                                        screen_edge, p);
         if (p.anaglyph_method == 1) {
@@ -1183,24 +1296,28 @@ kernel void d2s_warp_pack(
         }
     } else if (p.output_format == 7u || p.output_format == 8u) {
         uint edge = min(uint(max(p.screen_edge_suppression, 0)),
-                        min(p.source_width, p.source_height));
+                        min(p.output_width, p.output_height));
+        float source_x = (float(x) + 0.5f) *
+                         (float(p.source_width) / float(p.output_width)) - 0.5f;
+        float source_y = (float(y) + 0.5f) *
+                         (float(p.source_height) / float(p.output_height)) - 0.5f;
         bool screen_edge = edge > 0u &&
-            (x < edge || y < edge || x >= p.source_width - edge ||
-             y >= p.source_height - edge);
+            (x < edge || y < edge || x >= p.output_width - edge ||
+             y >= p.output_height - edge);
         // Match CUDA Triton: Interleaved is row-interleaved, Leia is
         // column-interleaved.
         bool left = p.output_format == 7u ? (y % 2u == 0u) : (x % 2u == 0u);
-        pixel = eye_pixel(color, depth, float(x), float(y),
+        pixel = eye_pixel(color, depth, source_x, source_y,
                           left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f),
                           screen_edge, p);
     } else if (p.output_format == 2u || p.output_format == 3u) {
         uint eye_height = p.output_height / 2u;
         bool left = y < eye_height;
         uint eye_y = left ? y : y - eye_height;
-        float source_x = float(x);
-        float source_y = p.output_format == 2u
-            ? (float(eye_y) + 0.5f) * (float(p.source_height) / float(eye_height)) - 0.5f
-            : float(eye_y);
+        float source_x = (float(x) + 0.5f) *
+                         (float(p.source_width) / float(p.output_width)) - 0.5f;
+        float source_y = (float(eye_y) + 0.5f) *
+                         (float(p.source_height) / float(eye_height)) - 0.5f;
         uint actual_eye_height = left ? eye_height : p.output_height - eye_height;
         uint edge = min(uint(max(p.screen_edge_suppression, 0)),
                         min(p.output_width, actual_eye_height));
@@ -1217,10 +1334,10 @@ kernel void d2s_warp_pack(
         uint eye_x = left ? x : x - eye_width;
         float source_x = (float(eye_x) + 0.5f) *
                              (float(p.source_width) / float(eye_width)) - 0.5f;
-        float source_y = float(y);
-        uint display_eye_width = eye_width;
+        float source_y = (float(y) + 0.5f) *
+                         (float(p.source_height) / float(p.output_height)) - 0.5f;
         uint edge = min(uint(max(p.screen_edge_suppression, 0)),
-                        min(display_eye_width, p.output_height));
+                        min(eye_width, p.output_height));
         uint horizontal_edge = edge;
         bool screen_edge = edge > 0u &&
             (eye_x < horizontal_edge || y < edge ||
@@ -1231,6 +1348,9 @@ kernel void d2s_warp_pack(
             screen_edge, p);
     }
     pixel = finite_color(pixel);
+    if (p.output_format != 5u) {
+        pixel = linear_to_srgb(pixel);
+    }
     uint offset = gid * p.output_channels;
     output[offset + 0u] = uchar(clamp(
         (p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f + 0.5f, 0.0f, 255.0f));
@@ -1240,6 +1360,42 @@ kernel void d2s_warp_pack(
     if (p.output_channels == 4u) output[offset + 3u] = 255u;
 }
 
+kernel void d2s_warp_pack_half_sbs_2d(
+    texture2d<float, access::sample> color [[texture(0)]],
+    device float *depth [[buffer(0)]],
+    device uchar *output [[buffer(1)]],
+    constant WarpParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint x = gid.x;
+    uint y = gid.y;
+    if (x >= p.output_width || y >= p.output_height ||
+        p.output_format != 0u) return;
+
+    uint eye_width = p.output_width / 2u;
+    bool left = x < eye_width;
+    uint eye_x = left ? x : x - eye_width;
+    float source_x = (float(eye_x) + 0.5f) *
+                     (float(p.source_width) / float(eye_width)) - 0.5f;
+    float source_y = (float(y) + 0.5f) *
+                     (float(p.source_height) / float(p.output_height)) - 0.5f;
+    uint edge = min(uint(max(p.screen_edge_suppression, 0)),
+                    min(eye_width, p.output_height));
+    bool screen_edge = edge > 0u &&
+        (eye_x < edge || y < edge ||
+         eye_x >= eye_width - edge || y >= p.output_height - edge);
+    float3 pixel = output_eye_pixel(
+        color, depth, source_x, source_y,
+        left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f), screen_edge, p);
+    pixel = finite_color(pixel);
+    pixel = linear_to_srgb(pixel);
+    uint offset = (y * p.output_width + x) * p.output_channels;
+    output[offset + 0u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 1u] = uchar(clamp(pixel.g * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 2u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.r : pixel.b) * 255.0f + 0.5f, 0.0f, 255.0f));
+    if (p.output_channels == 4u) output[offset + 3u] = 255u;
+}
 
 )D2S";
 
@@ -1532,16 +1688,27 @@ typedef struct {
     __strong id<MTLBuffer> status_buffer;
     __strong id<MTLBuffer> packed_buffer;
     __strong id<MTLTexture> color_texture;
+    __strong id<MTLTexture> color_srgb_texture;
+    // P010 sources are converted to this GPU-only texture for depth-guided
+    // warp sampling. It survives slot release and is resized only on format
+    // or source-dimension changes.
+    __strong id<MTLTexture> warp_color_texture;
+    __strong id<MTLTexture> luma_texture;
+    __strong id<MTLTexture> chroma_texture;
     __strong MLMultiArray *input_array;
     __strong MLMultiArray *output_array;
     __strong id<MLFeatureProvider> features;
     __strong MLPredictionOptions *prediction_options;
     __strong id<MLFeatureProvider> prediction;
     CVMetalTextureRef color_cv_texture;
+    CVMetalTextureRef color_srgb_cv_texture;
+    CVMetalTextureRef luma_cv_texture;
+    CVMetalTextureRef chroma_cv_texture;
     CVPixelBufferRef pixel_buffer;
     int32_t state;
     uint64_t frame_id;
     int32_t output_is_float16;
+    int32_t input_is_p010;
     float normalize_lo;
     float normalize_hi;
 } D2SSlot;
@@ -1551,7 +1718,11 @@ typedef struct {
     __strong id<MTLDevice> device;
     __strong id<MTLCommandQueue> queue;
     __strong id<MTLCommandQueue> pack_queue;
+    __strong id<MTLSharedEvent> pack_completion_event;
+    uint64_t pack_completion_value;
     __strong id<MTLComputePipelineState> preprocess_pipeline;
+    __strong id<MTLComputePipelineState> p010_color_pipeline;
+    __strong id<MTLComputePipelineState> preprocess_p010_pipeline;
     __strong id<MTLComputePipelineState> normalize_half_pipeline;
     __strong id<MTLComputePipelineState> normalize_float_pipeline;
     __strong id<MTLComputePipelineState> depth_range_reset_pipeline;
@@ -1564,6 +1735,7 @@ typedef struct {
     __strong id<MTLComputePipelineState> depth_upsample_pipeline;
     __strong id<MTLComputePipelineState> depth_global_gaussian_pipeline;
     __strong id<MTLComputePipelineState> warp_pipeline;
+    __strong id<MTLComputePipelineState> half_sbs_2d_pipeline;
     __strong id<MTLComputePipelineState> fast_half_sbs_pipeline;
     __strong id<MTLComputePipelineState> fast_half_sbs_float_pipeline;
     __strong id<MTLComputePipelineState> fast_half_sbs_half_pipeline;
@@ -1590,6 +1762,8 @@ typedef struct {
     float depth_range_hi;
     int32_t depth_range_initialized;
     uint32_t depth_range_interval;
+    double last_pack_gpu_ms;
+    int32_t last_pack_gpu_valid;
     char error[512];
 } D2SCoreMLIO;
 
@@ -1655,9 +1829,24 @@ static void d2s_release_slot(D2SSlot *slot, BOOL preserve_bindings) {
         slot->status_buffer = nil;
     }
     slot->color_texture = nil;
+    slot->color_srgb_texture = nil;
+    slot->luma_texture = nil;
+    slot->chroma_texture = nil;
     if (slot->color_cv_texture != NULL) {
         CFRelease(slot->color_cv_texture);
         slot->color_cv_texture = NULL;
+    }
+    if (slot->color_srgb_cv_texture != NULL) {
+        CFRelease(slot->color_srgb_cv_texture);
+        slot->color_srgb_cv_texture = NULL;
+    }
+    if (slot->luma_cv_texture != NULL) {
+        CFRelease(slot->luma_cv_texture);
+        slot->luma_cv_texture = NULL;
+    }
+    if (slot->chroma_cv_texture != NULL) {
+        CFRelease(slot->chroma_cv_texture);
+        slot->chroma_cv_texture = NULL;
     }
     if (slot->pixel_buffer != NULL) {
         CVPixelBufferRelease(slot->pixel_buffer);
@@ -1674,6 +1863,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     for (int i = 0; i < 3; ++i) {
         d2s_release_slot(&ctx->slots[i], NO);
         ctx->slots[i].packed_buffer = nil;
+        ctx->slots[i].warp_color_texture = nil;
         ctx->slots[i].filtered_depth_buffer = nil;
         ctx->slots[i].filter_intermediate_buffer = nil;
     }
@@ -1685,7 +1875,10 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     ctx->device = nil;
     ctx->queue = nil;
     ctx->pack_queue = nil;
+    ctx->pack_completion_event = nil;
     ctx->preprocess_pipeline = nil;
+    ctx->p010_color_pipeline = nil;
+    ctx->preprocess_p010_pipeline = nil;
     ctx->normalize_half_pipeline = nil;
     ctx->normalize_float_pipeline = nil;
     ctx->depth_range_reset_pipeline = nil;
@@ -1700,6 +1893,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     ctx->upsampled_depth_buffer = nil;
     ctx->global_gaussian_depth_buffer = nil;
     ctx->warp_pipeline = nil;
+    ctx->half_sbs_2d_pipeline = nil;
     ctx->fast_half_sbs_pipeline = nil;
     ctx->fast_half_sbs_float_pipeline = nil;
     ctx->fast_half_sbs_half_pipeline = nil;
@@ -1725,6 +1919,8 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
         [NSString stringWithUTF8String:D2SMetalSource] options:nil error:error];
     if (library == nil) return NO;
     id<MTLFunction> preprocess = [library newFunctionWithName:@"d2s_preprocess"];
+    id<MTLFunction> p010_color = [library newFunctionWithName:@"d2s_convert_p010"];
+    id<MTLFunction> preprocess_p010 = [library newFunctionWithName:@"d2s_preprocess_p010"];
     id<MTLFunction> norm_half = [library newFunctionWithName:@"d2s_normalize_half"];
     id<MTLFunction> norm_float = [library newFunctionWithName:@"d2s_normalize_float"];
     id<MTLFunction> range_reset = [library newFunctionWithName:@"d2s_depth_range_reset"];
@@ -1734,16 +1930,22 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     id<MTLFunction> range_histogram_float = [library newFunctionWithName:@"d2s_depth_range_histogram_float"];
     id<MTLFunction> range_reduce = [library newFunctionWithName:@"d2s_depth_range_reduce"];
     id<MTLFunction> warp = [library newFunctionWithName:@"d2s_warp_pack"];
+    id<MTLFunction> half_sbs_2d =
+        [library newFunctionWithName:@"d2s_warp_pack_half_sbs_2d"];
     id<MTLFunction> fast_half_sbs = [library newFunctionWithName:@"d2s_warp_pack_half_sbs_fast"];
     id<MTLFunction> fast_half_sbs_float =
         [library newFunctionWithName:@"d2s_warp_pack_half_sbs_fast_float"];
     id<MTLFunction> fast_half_sbs_half =
         [library newFunctionWithName:@"d2s_warp_pack_half_sbs_fast_half"];
-    if (!preprocess || !norm_half || !norm_float || !range_reset ||
+    if (!preprocess || !p010_color || !preprocess_p010 || !norm_half || !norm_float || !range_reset ||
         !range_minmax_half || !range_minmax_float || !range_histogram_half ||
-        !range_histogram_float || !range_reduce || !warp || !fast_half_sbs ||
+        !range_histogram_float || !range_reduce || !warp || !half_sbs_2d || !fast_half_sbs ||
         !fast_half_sbs_float || !fast_half_sbs_half) return NO;
     ctx->preprocess_pipeline = [ctx->device newComputePipelineStateWithFunction:preprocess error:error];
+    ctx->p010_color_pipeline = [ctx->device
+        newComputePipelineStateWithFunction:p010_color error:error];
+    ctx->preprocess_p010_pipeline = [ctx->device
+        newComputePipelineStateWithFunction:preprocess_p010 error:error];
     ctx->normalize_half_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_half error:error];
     ctx->normalize_float_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_float error:error];
     ctx->depth_range_reset_pipeline = [ctx->device newComputePipelineStateWithFunction:range_reset error:error];
@@ -1753,17 +1955,22 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     ctx->depth_range_histogram_float_pipeline = [ctx->device newComputePipelineStateWithFunction:range_histogram_float error:error];
     ctx->depth_range_reduce_pipeline = [ctx->device newComputePipelineStateWithFunction:range_reduce error:error];
     ctx->warp_pipeline = [ctx->device newComputePipelineStateWithFunction:warp error:error];
+    ctx->half_sbs_2d_pipeline = [ctx->device
+        newComputePipelineStateWithFunction:half_sbs_2d error:error];
     ctx->fast_half_sbs_pipeline = [ctx->device
         newComputePipelineStateWithFunction:fast_half_sbs error:error];
     ctx->fast_half_sbs_float_pipeline = [ctx->device
         newComputePipelineStateWithFunction:fast_half_sbs_float error:error];
     ctx->fast_half_sbs_half_pipeline = [ctx->device
         newComputePipelineStateWithFunction:fast_half_sbs_half error:error];
-    if (!(ctx->preprocess_pipeline && ctx->normalize_half_pipeline &&
+    if (!(ctx->preprocess_pipeline && ctx->p010_color_pipeline &&
+           ctx->preprocess_p010_pipeline &&
+           ctx->normalize_half_pipeline &&
            ctx->normalize_float_pipeline && ctx->depth_range_reset_pipeline &&
            ctx->depth_range_minmax_half_pipeline && ctx->depth_range_minmax_float_pipeline &&
            ctx->depth_range_histogram_half_pipeline && ctx->depth_range_histogram_float_pipeline &&
            ctx->depth_range_reduce_pipeline && ctx->warp_pipeline &&
+           ctx->half_sbs_2d_pipeline &&
            ctx->fast_half_sbs_pipeline && ctx->fast_half_sbs_float_pipeline &&
            ctx->fast_half_sbs_half_pipeline)) return NO;
 
@@ -1917,6 +2124,7 @@ void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
                 return NULL;
             }
         }
+        ctx->pack_completion_event = [ctx->device newSharedEvent];
         NSError *error = nil;
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:model_path]];
         MLModelConfiguration *configuration = [MLModelConfiguration new];
@@ -1980,15 +2188,36 @@ static int32_t d2s_find_slot(D2SCoreMLIO *ctx) {
 static BOOL d2s_dispatch_preprocess(D2SCoreMLIO *ctx, D2SSlot *slot,
                                     uint32_t source_width, uint32_t source_height) {
     id<MTLCommandBuffer> command = [ctx->queue commandBuffer];
+    if (command == nil) return NO;
+    if (slot->input_is_p010) {
+        id<MTLComputeCommandEncoder> color_encoder = [command computeCommandEncoder];
+        if (color_encoder == nil || slot->warp_color_texture == nil ||
+            ctx->p010_color_pipeline == nil) return NO;
+        [color_encoder setComputePipelineState:ctx->p010_color_pipeline];
+        [color_encoder setTexture:slot->luma_texture atIndex:0];
+        [color_encoder setTexture:slot->chroma_texture atIndex:1];
+        [color_encoder setTexture:slot->warp_color_texture atIndex:2];
+        MTLSize color_grid = MTLSizeMake(source_width, source_height, 1);
+        [color_encoder dispatchThreads:color_grid
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [color_encoder endEncoding];
+    }
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-    [encoder setComputePipelineState:ctx->preprocess_pipeline];
+    if (encoder == nil) return NO;
+    [encoder setComputePipelineState:slot->input_is_p010
+        ? ctx->preprocess_p010_pipeline : ctx->preprocess_pipeline];
     D2SPreprocessParams params = {
         source_width, source_height,
         (uint32_t)ctx->input_width, (uint32_t)ctx->input_height,
         0.485f, 0.456f, 0.406f,
         0.229f, 0.224f, 0.225f,
     };
-    [encoder setTexture:slot->color_texture atIndex:0];
+    if (slot->input_is_p010) {
+        [encoder setTexture:slot->luma_texture atIndex:0];
+        [encoder setTexture:slot->chroma_texture atIndex:1];
+    } else {
+        [encoder setTexture:slot->color_texture atIndex:0];
+    }
     [encoder setBuffer:slot->input_buffer offset:0 atIndex:0];
     [encoder setBytes:&params length:sizeof(params) atIndex:1];
     NSUInteger w = 8;
@@ -2166,17 +2395,67 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
         CVPixelBufferRef buffer = (CVPixelBufferRef)pixel_buffer;
         size_t width = CVPixelBufferGetWidth(buffer);
         size_t height = CVPixelBufferGetHeight(buffer);
-        CVMetalTextureRef cv_texture = NULL;
-        CVReturn texture_status = CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault, ctx->texture_cache, buffer, NULL,
-            MTLPixelFormatBGRA8Unorm, width, height, 0, &cv_texture);
-        if (texture_status != kCVReturnSuccess || cv_texture == NULL) {
-            d2s_set_error(ctx, @"ScreenCaptureKit pixel buffer could not become a Metal texture");
+        OSType pixel_format = CVPixelBufferGetPixelFormatType(buffer);
+        slot->input_is_p010 =
+            pixel_format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+            pixel_format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+        CVReturn texture_status = kCVReturnSuccess;
+        if (slot->input_is_p010) {
+            texture_status = CVMetalTextureCacheCreateTextureFromImage(
+                kCFAllocatorDefault, ctx->texture_cache, buffer, NULL,
+                MTLPixelFormatR16Unorm, width, height, 0, &slot->luma_cv_texture);
+            if (texture_status == kCVReturnSuccess) {
+                texture_status = CVMetalTextureCacheCreateTextureFromImage(
+                    kCFAllocatorDefault, ctx->texture_cache, buffer, NULL,
+                    MTLPixelFormatRG16Unorm, width / 2, height / 2, 1,
+                    &slot->chroma_cv_texture);
+            }
+            if (texture_status == kCVReturnSuccess && slot->luma_cv_texture != NULL &&
+                slot->chroma_cv_texture != NULL) {
+                slot->luma_texture = CVMetalTextureGetTexture(slot->luma_cv_texture);
+                slot->chroma_texture = CVMetalTextureGetTexture(slot->chroma_cv_texture);
+            }
+            if (texture_status == kCVReturnSuccess && slot->luma_texture != nil &&
+                slot->chroma_texture != nil &&
+                (slot->warp_color_texture == nil ||
+                 slot->warp_color_texture.width != width ||
+                 slot->warp_color_texture.height != height)) {
+                MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+                    texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                    width:width height:height mipmapped:NO];
+                descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+                descriptor.storageMode = MTLStorageModePrivate;
+                slot->warp_color_texture = [ctx->device
+                    newTextureWithDescriptor:descriptor];
+            }
+        } else {
+            texture_status = CVMetalTextureCacheCreateTextureFromImage(
+                kCFAllocatorDefault, ctx->texture_cache, buffer, NULL,
+                MTLPixelFormatBGRA8Unorm, width, height, 0, &slot->color_cv_texture);
+            if (texture_status == kCVReturnSuccess && slot->color_cv_texture != NULL) {
+                slot->color_texture = CVMetalTextureGetTexture(slot->color_cv_texture);
+            }
+            if (texture_status == kCVReturnSuccess) {
+                texture_status = CVMetalTextureCacheCreateTextureFromImage(
+                    kCFAllocatorDefault, ctx->texture_cache, buffer, NULL,
+                    MTLPixelFormatBGRA8Unorm_sRGB, width, height, 0,
+                    &slot->color_srgb_cv_texture);
+            }
+            if (texture_status == kCVReturnSuccess &&
+                slot->color_srgb_cv_texture != NULL) {
+                slot->color_srgb_texture =
+                    CVMetalTextureGetTexture(slot->color_srgb_cv_texture);
+            }
+        }
+        const BOOL textures_ready = slot->input_is_p010
+            ? slot->luma_texture != nil && slot->chroma_texture != nil &&
+              slot->warp_color_texture != nil
+            : slot->color_texture != nil && slot->color_srgb_texture != nil;
+        if (texture_status != kCVReturnSuccess || !textures_ready) {
+            d2s_set_error(ctx, @"CVPixelBuffer could not become linear-sRGB Metal textures");
             d2s_release_slot(slot, NO);
             return D2S_COREML_ERROR;
         }
-        slot->color_cv_texture = cv_texture;
-        slot->color_texture = CVMetalTextureGetTexture(slot->color_cv_texture);
         slot->pixel_buffer = CVPixelBufferRetain(buffer);
         size_t input_bytes =
             (size_t)(3 * ctx->input_width * ctx->input_height * sizeof(float));
@@ -2207,7 +2486,7 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
                 options:MTLResourceStorageModeShared];
         }
         slot->output_is_float16 = ctx->output_type == MLMultiArrayDataTypeFloat16;
-        if (!slot->color_texture || !slot->input_buffer || !slot->raw_depth_buffer ||
+        if (!textures_ready || !slot->input_buffer || !slot->raw_depth_buffer ||
             !slot->normalized_depth_buffer || !slot->status_buffer ||
             !slot->depth_range_buffer) {
             d2s_set_error(ctx, @"native CoreML Metal buffer allocation failed");
@@ -2360,7 +2639,15 @@ static int32_t d2s_coreml_io_pack_internal(
         D2SSlot *slot = &ctx->slots[slot_index];
         uint32_t source_width;
         uint32_t source_height;
-        BOOL expected_size = NO;
+        id<MTLTexture> warp_color_texture = nil;
+        const BOOL packed_width_even =
+            (output_format != D2S_OUTPUT_HALF_SBS &&
+             output_format != D2S_OUTPUT_FULL_SBS) || output_width % 2 == 0;
+        const BOOL packed_height_even =
+            (output_format != D2S_OUTPUT_HALF_TAB &&
+             output_format != D2S_OUTPUT_FULL_TAB) || output_height % 2 == 0;
+        const size_t required_destination_size =
+            (size_t)output_width * (size_t)output_height * output_channels;
         {
             D2SLockGuard lock(&ctx->mutex);
             if (slot->state != 1 || slot->pixel_buffer == NULL) {
@@ -2369,25 +2656,14 @@ static int32_t d2s_coreml_io_pack_internal(
             }
             source_width = (uint32_t)CVPixelBufferGetWidth(slot->pixel_buffer);
             source_height = (uint32_t)CVPixelBufferGetHeight(slot->pixel_buffer);
-            switch (output_format) {
-                case D2S_OUTPUT_FULL_SBS:
-                    expected_size = (output_width == (int32_t)(source_width * 2u) &&
-                                     output_height == (int32_t)source_height);
-                    break;
-                case D2S_OUTPUT_FULL_TAB:
-                    expected_size = (output_width == (int32_t)source_width &&
-                                     output_height == (int32_t)(source_height * 2u));
-                    break;
-                default:
-                    expected_size = (output_width == (int32_t)source_width &&
-                                     output_height == (int32_t)source_height);
-                    break;
+            warp_color_texture = slot->input_is_p010
+                ? slot->warp_color_texture : slot->color_srgb_texture;
+            if (warp_color_texture == nil) {
+                d2s_set_error(ctx, @"native CoreML warp color texture is unavailable");
+                return D2S_COREML_ERROR;
             }
-            if (
-                destination_size < (size_t)output_width * output_height * output_channels ||
-                !expected_size ||
-                ((output_format == D2S_OUTPUT_HALF_SBS ||
-                  output_format == D2S_OUTPUT_FULL_SBS) && output_width % 2 != 0)) {
+            if (destination_size < required_destination_size ||
+                !packed_width_even || !packed_height_even) {
                 d2s_set_error(ctx, @"native CoreML pack slot or destination is invalid");
                 return D2S_COREML_ERROR;
             }
@@ -2395,7 +2671,7 @@ static int32_t d2s_coreml_io_pack_internal(
         // Output-resolution depth buffers are shared by the pack queue. Keep
         // allocation and command use ordered if more than one caller packs.
         D2SLockGuard pack_lock(&ctx->pack_mutex);
-        size_t output_bytes = (size_t)output_width * (size_t)output_height * output_channels;
+        size_t output_bytes = required_destination_size;
         id<MTLBuffer> destination_buffer = nil;
         if (metal_destination != NULL) {
             destination_buffer = (__bridge id<MTLBuffer>)metal_destination;
@@ -2558,7 +2834,7 @@ static int32_t d2s_coreml_io_pack_internal(
                 id<MTLComputeCommandEncoder> upsample_encoder =
                     [command computeCommandEncoder];
                 [upsample_encoder setComputePipelineState:ctx->depth_upsample_pipeline];
-                [upsample_encoder setTexture:slot->color_texture atIndex:0];
+                [upsample_encoder setTexture:warp_color_texture atIndex:0];
                 [upsample_encoder setBuffer:warp_depth_buffer offset:0 atIndex:0];
                 [upsample_encoder setBuffer:ctx->upsampled_depth_buffer offset:0 atIndex:1];
                 [upsample_encoder setBytes:&upsample_params
@@ -2599,22 +2875,28 @@ static int32_t d2s_coreml_io_pack_internal(
             output_channels == 4u &&
             params.stereo.half_sbs_single_sample >= 2 &&
             params.stereo.antialias_strength <= 0.0f;
+        BOOL half_sbs_2d =
+            !fast_half_sbs_raw && !fast_half_sbs &&
+            ctx->half_sbs_2d_pipeline != nil &&
+            output_format == D2S_OUTPUT_HALF_SBS;
         id<MTLComputePipelineState> warp_pipeline =
             fast_half_sbs_raw
                 ? (slot->output_is_float16
                     ? ctx->fast_half_sbs_half_pipeline
                     : ctx->fast_half_sbs_float_pipeline)
-                : (fast_half_sbs ? ctx->fast_half_sbs_pipeline : ctx->warp_pipeline);
+                : (fast_half_sbs ? ctx->fast_half_sbs_pipeline
+                                 : (half_sbs_2d
+                                        ? ctx->half_sbs_2d_pipeline
+                                        : ctx->warp_pipeline));
         [encoder setComputePipelineState:warp_pipeline];
-        [encoder setTexture:slot->color_texture atIndex:0];
+        [encoder setTexture:warp_color_texture atIndex:0];
         [encoder setBuffer:warp_depth_buffer offset:0 atIndex:0];
         [encoder setBuffer:warp_destination offset:0 atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
-        // Apple GPUs sustain a little more occupancy with 128 scalar lanes
-        // for this one-dimensional output kernel. Keep a conservative clamp
-        // for devices exposing a smaller per-group limit.
+        // 64 lanes gave the best aggregate 4K half-SBS latency on Apple
+        // Silicon; larger groups remain available for device-specific tuning.
         NSUInteger max_threads = warp_pipeline.maxTotalThreadsPerThreadgroup;
-        NSUInteger threads = max_threads > 0 ? MIN((NSUInteger)128, max_threads) : 64;
+        NSUInteger threads = max_threads > 0 ? MIN((NSUInteger)64, max_threads) : 64;
         const char *thread_override = getenv("D2S_METAL_WARP_THREADS");
         if (thread_override != NULL && thread_override[0] != '\0') {
             char *end = NULL;
@@ -2627,20 +2909,66 @@ static int32_t d2s_coreml_io_pack_internal(
             }
         }
         if (result != NULL) result->warp_threads = (int32_t)threads;
-        MTLSize grid = MTLSizeMake((NSUInteger)output_width * output_height, 1, 1);
+        MTLSize grid = half_sbs_2d
+            ? MTLSizeMake((NSUInteger)output_width, (NSUInteger)output_height, 1)
+            : MTLSizeMake((NSUInteger)output_width * output_height, 1, 1);
+        // The full-quality 2D kernel is faster with a 64-lane tile.
+        MTLSize threadgroup = half_sbs_2d && threads == 64
+            ? MTLSizeMake(8, 8, 1)
+            : MTLSizeMake(threads, 1, 1);
         [encoder dispatchThreads:grid
-          threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+          threadsPerThreadgroup:threadgroup];
         [encoder endEncoding];
-        [command commit];
-        [command waitUntilCompleted];
-        if (command.status != MTLCommandBufferStatusCompleted) {
-            d2s_set_error(ctx, @"Metal native warp command failed");
-            return D2S_COREML_ERROR;
+        const char *async_setting = getenv("D2S_METAL_ASYNC_PACK");
+        BOOL async_metal = metal_destination != NULL &&
+            ctx->pack_completion_event != nil;
+        if (async_setting != NULL &&
+            (strcmp(async_setting, "0") == 0 ||
+             strcasecmp(async_setting, "false") == 0 ||
+             strcasecmp(async_setting, "off") == 0 ||
+             strcasecmp(async_setting, "no") == 0)) {
+            async_metal = NO;
         }
-        if (result != NULL && command.GPUEndTime >= command.GPUStartTime &&
-            command.GPUStartTime > 0.0) {
-            result->metal_gpu_ms =
-                (command.GPUEndTime - command.GPUStartTime) * 1000.0;
+        uint64_t completion_value = 0;
+        if (async_metal) {
+            completion_value = ++ctx->pack_completion_value;
+            [command encodeSignalEvent:ctx->pack_completion_event
+                                 value:completion_value];
+            [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                double gpu_start = completed.GPUStartTime;
+                double gpu_end = completed.GPUEndTime;
+                if (gpu_end >= gpu_start && gpu_start > 0.0) {
+                    D2SLockGuard lock(&ctx->mutex);
+                    ctx->last_pack_gpu_ms = (gpu_end - gpu_start) * 1000.0;
+                    ctx->last_pack_gpu_valid = 1;
+                }
+            }];
+            if (result != NULL) {
+                D2SLockGuard lock(&ctx->mutex);
+                if (ctx->last_pack_gpu_valid) {
+                    result->metal_gpu_ms = ctx->last_pack_gpu_ms;
+                }
+            }
+        }
+        [command commit];
+        if (async_metal) {
+            if (result != NULL) {
+                result->completion_event =
+                    (__bridge void *)ctx->pack_completion_event;
+                result->completion_value = completion_value;
+                result->asynchronous = 1;
+            }
+        } else {
+            [command waitUntilCompleted];
+            if (command.status != MTLCommandBufferStatusCompleted) {
+                d2s_set_error(ctx, @"Metal native warp command failed");
+                return D2S_COREML_ERROR;
+            }
+            if (result != NULL && command.GPUEndTime >= command.GPUStartTime &&
+                command.GPUStartTime > 0.0) {
+                result->metal_gpu_ms =
+                    (command.GPUEndTime - command.GPUStartTime) * 1000.0;
+            }
         }
         if (metal_destination == NULL) {
             d2s_set_error(ctx, @"GPU-only output requires a Metal-compatible destination buffer");
@@ -2703,10 +3031,12 @@ void *d2s_coreml_io_frame_color_texture(void *handle, int32_t slot_index) {
     if (ctx == NULL || slot_index < 0 || slot_index >= 3) return NULL;
     D2SLockGuard lock(&ctx->mutex);
     D2SSlot *slot = &ctx->slots[slot_index];
-    if (slot->state != 1 || slot->color_texture == nil) return NULL;
+    id<MTLTexture> texture = slot->input_is_p010
+        ? slot->warp_color_texture : slot->color_srgb_texture;
+    if (slot->state != 1 || texture == nil) return NULL;
     // Borrowed for the lifetime of the retained NativeCoreMLFrame. The caller
     // must release the frame only after its Metal command buffer completes.
-    return (__bridge void *)slot->color_texture;
+    return (__bridge void *)texture;
 }
 
 void *d2s_coreml_io_frame_depth_buffer(void *handle, int32_t slot_index) {

@@ -48,6 +48,9 @@ typedef struct {
     double host_handoff_copy_ms;
     int32_t metal_buffer_alias;
     int32_t warp_threads;
+    void *completion_event;
+    uint64_t completion_value;
+    int32_t asynchronous;
 } D2SCoreMLIOPackResult;
 
 typedef struct {

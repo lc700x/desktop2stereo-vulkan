@@ -8,16 +8,25 @@ from threading import Lock
 
 import numpy as np
 from gui.localization import gettext_for, normalize_locale
-from xr_viewer.overlay_textures import load_overlay_font
+from xr_viewer.overlay_textures import load_overlay_font_for_text
 from xr_viewer.settings_menu import OPENXR_MENU_COLORS, OPENXR_MENU_RADII
 
 _FONT_PATH = Path(__file__).resolve().parent / "xr_viewer" / "fonts" / "InterVariable.ttf"
-_MEDIA_BAR_SIZE = (1024, 160)
-MEDIA_BROWSER_TEXTURE_SIZE = (1600, 1200)
+MEDIA_BAR_LAYOUT_SIZE = (1024, 160)
+MEDIA_BAR_TEXTURE_SIZE = (2048, 320)
+_MEDIA_BAR_SIZE = MEDIA_BAR_LAYOUT_SIZE
+MEDIA_BROWSER_LAYOUT_SIZE = (1600, 1200)
+MEDIA_BROWSER_TEXTURE_SIZE = (2048, 1536)
 MEDIA_BROWSER_TEXTURE_ASPECT = (
     MEDIA_BROWSER_TEXTURE_SIZE[0] / MEDIA_BROWSER_TEXTURE_SIZE[1]
 )
-_MEDIA_BROWSER_SIZE = MEDIA_BROWSER_TEXTURE_SIZE
+MEDIA_BROWSER_XR_MAX_WIDTH_FRACTION = 0.94
+MEDIA_BROWSER_XR_MAX_HEIGHT_FRACTION = 0.90
+MEDIA_BROWSER_FONT_SCALE_MIN = 1.0
+MEDIA_BROWSER_FONT_SCALE_MAX = 2.6
+# A 705px panel is the 1080p Half-SBS eye layout; keep its text at 1.6x.
+MEDIA_BROWSER_FONT_BOOST = 0.94
+_MEDIA_BROWSER_SIZE = MEDIA_BROWSER_LAYOUT_SIZE
 MEDIA_BROWSER_VISIBLE_ROWS = 10
 _BROWSER_VISIBLE_ROWS = MEDIA_BROWSER_VISIBLE_ROWS
 _BROWSER_GRID_COLUMNS = 3
@@ -27,8 +36,129 @@ _BROWSER_THUMBNAIL_SIZE = (384, 216)
 _BROWSER_THUMBNAIL_CACHE_ITEMS = 32
 _BROWSER_THUMBNAIL_MAX_PENDING = 8
 MEDIA_HOVER_DURATION_S = 0.16
+MEDIA_POINTER_IDLE_SECONDS = 3.0
 _MEDIA_HOVER_BUTTON_SCALE = 0.035
 _MEDIA_HOVER_ROW_SCALE = 0.010
+
+
+def media_browser_font_scale(panel_height: int | float) -> float:
+    """Keep browser text legible as the GPU panel is fit into each eye."""
+    try:
+        height = max(1.0, float(panel_height))
+    except (TypeError, ValueError):
+        height = float(MEDIA_BROWSER_LAYOUT_SIZE[1])
+    scale = max(
+        MEDIA_BROWSER_FONT_SCALE_MIN,
+        MEDIA_BROWSER_LAYOUT_SIZE[1] / height,
+    )
+    return max(
+        MEDIA_BROWSER_FONT_SCALE_MIN,
+        min(MEDIA_BROWSER_FONT_SCALE_MAX, scale * MEDIA_BROWSER_FONT_BOOST),
+    )
+
+
+def media_browser_font_scale_for_eye(eye_width: int, eye_height: int) -> float:
+    """Scale text for a browser quad fitted into one XR eye viewport."""
+    width = max(1.0, float(eye_width))
+    height = max(1.0, float(eye_height))
+    panel_width = min(
+        width * MEDIA_BROWSER_XR_MAX_WIDTH_FRACTION,
+        height * MEDIA_BROWSER_XR_MAX_HEIGHT_FRACTION * MEDIA_BROWSER_TEXTURE_ASPECT,
+    )
+    return media_browser_font_scale(panel_width / MEDIA_BROWSER_TEXTURE_ASPECT)
+
+
+class _ScaledImageDraw:
+    """Draw logical browser coordinates onto a denser texture."""
+
+    def __init__(self, draw, scale_x: float, scale_y: float) -> None:
+        self._draw = draw
+        self._scale_x = float(scale_x)
+        self._scale_y = float(scale_y)
+        self._stroke_scale = min(self._scale_x, self._scale_y)
+
+    def _point(self, point):
+        return (
+            round(float(point[0]) * self._scale_x),
+            round(float(point[1]) * self._scale_y),
+        )
+
+    def _rect(self, rect):
+        left, top, right, bottom = rect
+        return (
+            round(float(left) * self._scale_x),
+            round(float(top) * self._scale_y),
+            round(float(right) * self._scale_x),
+            round(float(bottom) * self._scale_y),
+        )
+
+    def rounded_rectangle(self, xy, **kwargs):
+        kwargs["radius"] = max(
+            1, round(float(kwargs.get("radius", 0)) * self._stroke_scale)
+        )
+        kwargs["width"] = max(
+            1, round(float(kwargs.get("width", 1)) * self._stroke_scale)
+        )
+        return self._draw.rounded_rectangle(self._rect(xy), **kwargs)
+
+    def rectangle(self, xy, **kwargs):
+        kwargs["width"] = max(
+            1, round(float(kwargs.get("width", 1)) * self._stroke_scale)
+        )
+        return self._draw.rectangle(self._rect(xy), **kwargs)
+
+    def ellipse(self, xy, **kwargs):
+        if "width" in kwargs:
+            kwargs["width"] = max(
+                1, round(float(kwargs["width"]) * self._stroke_scale)
+            )
+        return self._draw.ellipse(self._rect(xy), **kwargs)
+
+    def arc(self, xy, start, end, **kwargs):
+        if "width" in kwargs:
+            kwargs["width"] = max(
+                1, round(float(kwargs["width"]) * self._stroke_scale)
+            )
+        return self._draw.arc(self._rect(xy), start, end, **kwargs)
+
+    def line(self, xy, **kwargs):
+        if xy and isinstance(xy[0], (tuple, list)):
+            points = [self._point(point) for point in xy]
+        else:
+            points = [
+                coordinate
+                for index in range(0, len(xy), 2)
+                for coordinate in self._point((xy[index], xy[index + 1]))
+            ]
+        kwargs["width"] = max(
+            1, round(float(kwargs.get("width", 1)) * self._stroke_scale)
+        )
+        return self._draw.line(points, **kwargs)
+
+    def polygon(self, xy, **kwargs):
+        return self._draw.polygon([self._point(point) for point in xy], **kwargs)
+
+    def text(self, xy, text, **kwargs):
+        return self._draw.text(self._point(xy), text, **kwargs)
+
+    def textbbox(self, xy, text, **kwargs):
+        return self._draw.textbbox(self._point(xy), text, **kwargs)
+
+    def textlength(self, text, **kwargs):
+        return self._draw.textlength(text, **kwargs)
+
+
+def _browser_layout_dimensions(width: int, height: int) -> tuple[int, int]:
+    """Use logical coordinates for the shared 2K browser texture."""
+    if (int(width), int(height)) == MEDIA_BROWSER_TEXTURE_SIZE:
+        return MEDIA_BROWSER_LAYOUT_SIZE
+    return int(width), int(height)
+
+
+def _media_bar_layout_dimensions(width: int, height: int) -> tuple[int, int]:
+    if (int(width), int(height)) == MEDIA_BAR_TEXTURE_SIZE:
+        return MEDIA_BAR_LAYOUT_SIZE
+    return int(width), int(height)
 
 
 def _load_media_browser_thumbnail(
@@ -265,6 +395,7 @@ def _draw_control_surface(
     primary: bool = False,
     idle_alpha: int = 220,
     disabled_alpha: int = 105,
+    hover_alpha: int = 230,
     radius: int = OPENXR_MENU_RADII["control"],
 ) -> tuple[int, int, int, int]:
     amount = _clamp01(progress) if hovered and enabled else 0.0
@@ -278,7 +409,7 @@ def _draw_control_surface(
         "primary_container" if primary else "surface_container_high",
         idle_alpha if enabled else disabled_alpha,
     )
-    hover = _rgba("primary_hover", 230 if enabled else disabled_alpha)
+    hover = _rgba("primary_hover", hover_alpha if enabled else disabled_alpha)
     fill = _mix_rgba(base, hover, amount)
     outline = _rgba(
         "primary_hover" if primary else "outline",
@@ -301,11 +432,11 @@ def _draw_control_surface(
     return target
 
 
-def _font(size: int, *, bold: bool = False):
+def _font(size: int, *, text: str = "", bold: bool = False):
     try:
-        return load_overlay_font(
+        return load_overlay_font_for_text(
             int(size),
-            prefer_cjk=True,
+            str(text or ""),
             bold=bool(bold),
         )
     except Exception:
@@ -321,7 +452,7 @@ def _text(draw, xy, text, size=20, *, fill=None, bold=False, anchor="la"):
     draw.text(
         xy,
         str(text),
-        font=_font(size, bold=bold),
+        font=_font(size, text=str(text), bold=bold),
         fill=fill or _rgba("text_primary"),
         anchor=anchor,
     )
@@ -331,7 +462,7 @@ def _fit_text(draw, text: str, size: int, max_width: float, *, bold: bool = Fals
     value = str(text or "")
     if max_width <= 0:
         return ""
-    font = _font(size, bold=bold)
+    font = _font(size, text=value, bold=bold)
     if draw.textlength(value, font=font) <= max_width:
         return value
     low, high = 0, len(value)
@@ -466,12 +597,17 @@ def _paste_browser_thumbnail(
     kind: str,
     *,
     radius: int,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
 ) -> None:
     from PIL import Image, ImageDraw as PillowImageDraw, ImageOps
 
     left, top, right, bottom = rect
-    width = max(1, right - left)
-    height = max(1, bottom - top)
+    pixel_left = round(left * scale_x)
+    pixel_top = round(top * scale_y)
+    width = max(1, round((right - left) * scale_x))
+    height = max(1, round((bottom - top) * scale_y))
+    pixel_radius = max(1, round(radius * min(scale_x, scale_y)))
     draw.rounded_rectangle(
         rect,
         radius=radius,
@@ -484,9 +620,9 @@ def _paste_browser_thumbnail(
             source = ImageOps.fit(source, (width, height), method=resampling)
             mask = Image.new("L", (width, height), 0)
             PillowImageDraw.Draw(mask).rounded_rectangle(
-                (0, 0, width - 1, height - 1), radius=radius, fill=255
+                (0, 0, width - 1, height - 1), radius=pixel_radius, fill=255
             )
-            image.paste(source, (left, top), mask)
+            image.paste(source, (pixel_left, pixel_top), mask)
             draw.rounded_rectangle(
                 rect,
                 radius=radius,
@@ -620,12 +756,18 @@ def media_control_enabled(action: str, state: dict) -> bool:
     audio = video and bool(state.get("audio_enabled", True))
     playlist_size = len(state.get("playlist_entries") or [])
     action = str(action or "").casefold()
+    if action == "viewer_stop":
+        return True
     if action in {"browse", "browse_disc", "browser_close"}:
         return ready
+    if action == "media_exit":
+        return ready and mode != "Browser"
     if action == "browser_up":
         return ready and bool(state.get("browser_parent"))
     if action == "browser_refresh":
         return ready and bool(state.get("browser_path"))
+    if action == "browser_sort":
+        return ready and len(state.get("browser_entries") or []) > 1
     if action == "browse_open":
         return ready and bool(state.get("browser_selection"))
     if action in {"recent", "recent_remove"}:
@@ -659,20 +801,25 @@ def media_control_enabled(action: str, state: dict) -> bool:
 
 def _seek_track_rect(width: int, height: int) -> tuple[int, int, int, int]:
     track_y = max(26, int(height * 0.20))
-    return (24, track_y - 10, width - 24, track_y + 16)
+    return (24, track_y - 10, width - 78, track_y + 16)
 
 
 def _browser_layout(state: dict, width: int, height: int) -> dict[str, int | str]:
     """Keep browser painting and hit testing on one shared geometry."""
+    width, height = _browser_layout_dimensions(width, height)
     mounts = list(state.get("browser_mounts") or [])
     recent = list(state.get("recent_entries") or [])
     playlist = list(state.get("playlist_entries") or [])
     sidebar_right = max(480, min(520, int(width * 0.31)))
-    mount_count = min(3, len(mounts))
+    mount_count = min(4, len(mounts))
     recent_count = min(2, len(recent))
     playlist_offset = max(0, min(int(state.get("playlist_offset", 0) or 0), max(0, len(playlist) - 1)))
     playlist_count = min(4, len(playlist) - playlist_offset)
-    mount_top = max(150, int(height * 0.125))
+    locations_heading_y = max(
+        132,
+        max(32, int(width * 0.018)) + 64 + 20,
+    )
+    mount_top = max(150, int(height * 0.125), locations_heading_y + 38)
     mount_row_height = 72
     recent_heading_y = mount_top + mount_count * mount_row_height + 34
     recent_rows_y = recent_heading_y + 36
@@ -688,7 +835,7 @@ def _browser_layout(state: dict, width: int, height: int) -> dict[str, int | str
     file_rows_y = max(168, int(height * 0.14))
     file_row_height = max(84, (height - file_rows_y - 120) // _BROWSER_VISIBLE_ROWS)
     grid_left = sidebar_right + 18
-    grid_right = width - 38
+    grid_right = width - 48
     grid_width = max(_BROWSER_GRID_COLUMNS, grid_right - grid_left)
     grid_card_width = (
         grid_width - _BROWSER_GRID_GAP * (_BROWSER_GRID_COLUMNS - 1)
@@ -707,6 +854,7 @@ def _browser_layout(state: dict, width: int, height: int) -> dict[str, int | str
     )
     return {
         "sidebar_right": sidebar_right,
+        "locations_heading_y": locations_heading_y,
         "mount_top": mount_top,
         "mount_count": mount_count,
         "mount_row_height": mount_row_height,
@@ -732,12 +880,22 @@ def _browser_layout(state: dict, width: int, height: int) -> dict[str, int | str
         "grid_card_width": grid_card_width,
         "grid_card_height": grid_card_height,
         "grid_preview_height": grid_preview_height,
+        "scrollbar_left": width - 44,
+        "scrollbar_right": width - 16,
+        "scrollbar_top": file_rows_y,
+        "scrollbar_bottom": max(file_rows_y + 1, height - 132),
+        "file_content_right": width - 48,
     }
 
 
-def media_browser_scroll_metrics(state: dict) -> tuple[int, int, int]:
+def media_browser_scroll_metrics(
+    state: dict,
+    *,
+    width: int = MEDIA_BROWSER_TEXTURE_SIZE[0],
+    height: int = MEDIA_BROWSER_TEXTURE_SIZE[1],
+) -> tuple[int, int, int]:
     """Return the current scroll step, visible count, and maximum item offset."""
-    layout = _browser_layout(state, *_MEDIA_BROWSER_SIZE)
+    layout = _browser_layout(state, width, height)
     entries = list(state.get("browser_entries") or [])
     visible_count = layout["visible_entry_count"]
     if layout["view_mode"] == "grid":
@@ -750,6 +908,66 @@ def media_browser_scroll_metrics(state: dict) -> tuple[int, int, int]:
         visible_count,
         max_offset,
     )
+
+
+def media_browser_scrollbar_metrics(
+    state: dict,
+    scroll_offset: int = 0,
+    *,
+    width: int = MEDIA_BROWSER_TEXTURE_SIZE[0],
+    height: int = MEDIA_BROWSER_TEXTURE_SIZE[1],
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int] | None]:
+    """Return scrollbar geometry in logical browser pixels."""
+    layout = _browser_layout(state, width, height)
+    _step, visible_count, max_offset = media_browser_scroll_metrics(
+        state, width=width, height=height
+    )
+    track = (
+        layout["scrollbar_left"],
+        layout["scrollbar_top"],
+        layout["scrollbar_right"],
+        layout["scrollbar_bottom"],
+    )
+    entries = list(state.get("browser_entries") or [])
+    if max_offset <= 0 or not entries:
+        return track, None
+    track_height = max(1, track[3] - track[1])
+    thumb_height = min(
+        track_height,
+        max(52, int(round(track_height * min(1.0, visible_count / len(entries))))),
+    )
+    travel = max(0, track_height - thumb_height)
+    offset = max(0, min(int(scroll_offset), max_offset))
+    thumb_top = track[1] + int(round(travel * offset / max_offset))
+    return track, (track[0], thumb_top, track[2], thumb_top + thumb_height)
+
+
+def media_browser_scrollbar_offset(
+    state: dict,
+    y: float,
+    *,
+    width: int = MEDIA_BROWSER_TEXTURE_SIZE[0],
+    height: int = MEDIA_BROWSER_TEXTURE_SIZE[1],
+) -> int:
+    """Map a pointer y coordinate to the nearest valid browser offset."""
+    track, thumb = media_browser_scrollbar_metrics(
+        state, width=width, height=height
+    )
+    if thumb is None:
+        return 0
+    step, _visible, max_offset = media_browser_scroll_metrics(
+        state, width=width, height=height
+    )
+    thumb_height = thumb[3] - thumb[1]
+    travel = max(1, (track[3] - track[1]) - thumb_height)
+    center = max(
+        track[1] + thumb_height / 2,
+        min(track[3] - thumb_height / 2, float(y)),
+    )
+    fraction = (center - track[1] - thumb_height / 2) / travel
+    aligned_step = max(1, step)
+    offset = int(round(fraction * max_offset / aligned_step)) * aligned_step
+    return max(0, min(max_offset, offset))
 
 
 def _browser_grid_card_rect(
@@ -782,13 +1000,14 @@ def _browser_button_rects(
     width: int, height: int
 ) -> dict[str, tuple[int, int, int, int]]:
     """Return MetaXR-sized browser actions with at least 48 px targets."""
-    top_margin = max(24, int(width * 0.018))
+    width, height = _browser_layout_dimensions(width, height)
+    top_margin = max(32, int(width * 0.018))
     footer_margin = max(48, int(width * 0.030))
     top_gap = max(10, int(width * 0.008))
     footer_gap = max(24, int(width * 0.015))
-    button_w = 112
+    button_w = 168
     footer_button_w = 112
-    button_h = 56
+    button_h = 64
     footer_y = height - footer_margin - button_h
     refresh_x = width - top_margin - button_w
     up_x = refresh_x - top_gap - button_w
@@ -797,10 +1016,18 @@ def _browser_button_rects(
     view_gap = 8
     view_list_x = close_x - view_gap - view_size
     view_grid_x = view_list_x - view_gap - view_size
+    sort_w = 96
+    sort_x = view_grid_x - top_gap - sort_w
     previous_x = footer_margin
     next_x = previous_x + footer_button_w + footer_gap
     clear_x = next_x + footer_button_w + footer_gap
     return {
+        "viewer_stop": (
+            top_margin,
+            top_margin,
+            top_margin + button_w,
+            top_margin + button_h,
+        ),
         "browser_view_grid": (
             view_grid_x,
             top_margin,
@@ -812,6 +1039,12 @@ def _browser_button_rects(
             top_margin,
             view_list_x + view_size,
             top_margin + view_size,
+        ),
+        "browser_sort": (
+            sort_x,
+            top_margin,
+            sort_x + sort_w,
+            top_margin + button_h,
         ),
         "browser_close": (
             close_x,
@@ -830,12 +1063,6 @@ def _browser_button_rects(
             top_margin,
             refresh_x + button_w,
             top_margin + button_h,
-        ),
-        "browse_open": (
-            width - footer_margin - 176,
-            footer_y,
-            width - footer_margin,
-            footer_y + button_h,
         ),
         "playlist_previous": (
             previous_x,
@@ -915,6 +1142,7 @@ def _button_rects(width: int, height: int) -> dict[str, tuple[int, int, int, int
         "next": (next_left, y0, next_left + previous_w, bottom),
         "mute": (mute_left, y0, mute_left + mute_w, bottom),
         "volume": (volume_left, y0, volume_left + volume_w, bottom),
+        "media_exit": (width - 60, 12, width - 12, 60),
         "browser_up": (browser_up_x, browser_button_y, browser_up_x + browser_button_w, browser_button_bottom),
         "browser_refresh": (
             browser_refresh_x,
@@ -933,8 +1161,8 @@ def _button_rects(width: int, height: int) -> dict[str, tuple[int, int, int, int
 def build_media_bar_rgba(
     state: dict,
     *,
-    width: int = 1024,
-    height: int = 160,
+    width: int = MEDIA_BAR_TEXTURE_SIZE[0],
+    height: int = MEDIA_BAR_TEXTURE_SIZE[1],
     hover: str | None = None,
     hover_progress: float = 1.0,
     alpha: int = 188,
@@ -946,9 +1174,24 @@ def build_media_bar_rgba(
     def translate(message):
         return gettext_for(normalize_locale(lang), message)
 
-    image = Image.new("RGBA", (int(width), int(height)), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    width, height = image.size
+    render_width, render_height = int(width), int(height)
+    width, height = _media_bar_layout_dimensions(render_width, render_height)
+    scale_x = render_width / max(1, width)
+    scale_y = render_height / max(1, height)
+    raster_scale = min(scale_x, scale_y)
+    image = Image.new("RGBA", (render_width, render_height), (0, 0, 0, 0))
+    draw = _ScaledImageDraw(ImageDraw.Draw(image), scale_x, scale_y)
+
+    def bar_text(draw, xy, text, size=20, *, fill=None, bold=False, anchor="la"):
+        _text(
+            draw,
+            xy,
+            text,
+            max(1, round(float(size) * raster_scale)),
+            fill=fill,
+            bold=bold,
+            anchor=anchor,
+        )
     if collapsed:
         # The controls fully disappear when idle. Pointer/ray movement still
         # reveals them through the invisible wake zone below.
@@ -967,18 +1210,18 @@ def build_media_bar_rgba(
     duration = max(0.0, float(state.get("duration", 0.0) or 0.0))
     position = max(0.0, min(float(state.get("position", 0.0) or 0.0), duration or 1e12))
     fraction = position / duration if duration > 0 else 0.0
-    track_left, track_right = 24, width - 24
+    track_left, track_right = 24, width - 78
     track_y = max(26, int(height * 0.20))
     # Keep endpoint thumb/glow inside a label gutter so hover scaling never
     # crowds the elapsed/duration timecodes at either end of the timeline.
     time_label_inset = 22
     seek_enabled = media_control_enabled("seek", state)
-    _text(draw, (track_left + time_label_inset, 10), _format_time(position), 16, fill=_rgba("text_secondary"))
-    _text(
+    bar_text(draw, (track_left + time_label_inset, 10), _format_time(position), 18, fill=_rgba("text_secondary"))
+    bar_text(
         draw,
         (track_right - time_label_inset, 10),
         _format_time(duration),
-        16,
+        18,
         fill=_rgba("text_secondary"),
         anchor="ra",
     )
@@ -1059,7 +1302,7 @@ def build_media_bar_rgba(
             active_hover = hover_action == mapped_hover.casefold()
         active = bool(enabled and active_hover)
         progress = hover_amount if active else 0.0
-        color = _rgba("text_primary", 255 if enabled else 104)
+        color = _rgba("primary_state_text" if enabled else "text_secondary")
         if key == "play":
             draw_rect = _scaled_rect(
                 source,
@@ -1069,8 +1312,8 @@ def build_media_bar_rgba(
             )
             x0, y0, x1, y1 = draw_rect
             ring = _mix_rgba(
-                _rgba("primary", 255 if enabled else 105),
-                _rgba("primary_hover", 255 if enabled else 105),
+                _rgba("primary" if enabled else "surface_container_high"),
+                _rgba("primary_hover"),
                 progress,
             )
             if progress > 0.0 and enabled:
@@ -1088,7 +1331,7 @@ def build_media_bar_rgba(
             )
             draw.ellipse(
                 inner,
-                fill=_rgba("surface_container_high", 245 if enabled else 130),
+                fill=_rgba("surface_container_high"),
             )
         else:
             draw_rect = _draw_control_surface(
@@ -1097,8 +1340,9 @@ def build_media_bar_rgba(
                 enabled=enabled,
                 hovered=active,
                 progress=progress,
-                idle_alpha=220 if key in {"browse", "browse_disc"} else 74,
-                disabled_alpha=34,
+                idle_alpha=255,
+                disabled_alpha=255,
+                hover_alpha=255,
                 radius=OPENXR_MENU_RADII["control"],
             )
             x0, y0, x1, y1 = draw_rect
@@ -1106,10 +1350,10 @@ def build_media_bar_rgba(
         center_y = (y0 + y1) // 2
         if icon_kind == "file":
             _draw_file_icon(draw, x0 + 22, center_y, color)
-            _text(draw, (x0 + 44, center_y), label, 14, fill=color, anchor="lm")
+            bar_text(draw, (x0 + 44, center_y), label, 16, fill=color, bold=True, anchor="lm")
         elif icon_kind == "disc":
             _draw_disc_icon(draw, x0 + 22, center_y, color)
-            _text(draw, (x0 + 44, center_y), label, 14, fill=color, anchor="lm")
+            bar_text(draw, (x0 + 44, center_y), label, 16, fill=color, bold=True, anchor="lm")
         elif icon_kind in {"previous", "next"}:
             _draw_skip_icon(
                 draw,
@@ -1135,17 +1379,17 @@ def build_media_bar_rgba(
                 muted=icon_kind == "muted",
             )
         elif icon:
-            _text(draw, ((x0 + x1) // 2, center_y), icon, 25, fill=color, anchor="mm")
+            bar_text(draw, ((x0 + x1) // 2, center_y), icon, 25, fill=color, anchor="mm")
         elif label:
-            size = 18 if (x1 - x0) >= 90 else 16
-            _text(
+            size = 20 if (x1 - x0) >= 90 else 18
+            bar_text(
                 draw,
                 ((x0 + x1) // 2, (y0 + y1) // 2),
                 label,
                 size,
                 fill=color,
                 anchor="mm",
-                bold=key == "play",
+                bold=True,
             )
 
     button("browse", translate("Open File"), icon_kind="file")
@@ -1175,8 +1419,9 @@ def build_media_bar_rgba(
         enabled=volume_enabled,
         hovered=volume_active,
         progress=volume_progress,
-        idle_alpha=74,
-        disabled_alpha=34,
+        idle_alpha=255,
+        disabled_alpha=255,
+        hover_alpha=255,
         radius=OPENXR_MENU_RADII["control"],
     )
     center_y = (y0 + y1) // 2
@@ -1187,8 +1432,8 @@ def build_media_bar_rgba(
         radius=max(4, track_height // 2),
         fill=_mix_rgba(
             _rgba("media_volume_track", 220 if volume_enabled else 105),
-            _rgba("primary", 230),
-            volume_progress * 0.28,
+            _rgba("media_volume_track", 255),
+            volume_progress,
         ),
     )
     vx = int(track_x0 + (track_x1 - track_x0) * volume)
@@ -1205,9 +1450,36 @@ def build_media_bar_rgba(
         )
     draw.ellipse(
         (vx - knob_radius, center_y - knob_radius, vx + knob_radius, center_y + knob_radius),
-        fill=_rgba("text_primary", 255 if volume_enabled else 104),
+        fill=_rgba(
+            "media_volume_fill_hover" if volume_active else "media_volume_fill",
+            255 if volume_enabled else 104,
+        ),
         outline=_rgba("primary_hover", int(255 * volume_progress)) if volume_active else None,
         width=2 if volume_active else 1,
+    )
+    exit_enabled = media_control_enabled("media_exit", state)
+    exit_hovered = bool(exit_enabled and hover_action == "media_exit")
+    exit_progress = hover_amount if exit_hovered else 0.0
+    exit_rect = rects["media_exit"]
+    draw.rounded_rectangle(
+        exit_rect,
+        radius=OPENXR_MENU_RADII["control"],
+        fill=_rgba("destructive", 255 if exit_enabled else 96),
+        outline=_rgba("destructive_hover", int(220 * exit_progress)) if exit_hovered else None,
+        width=2 if exit_hovered else 1,
+    )
+    center_x = (exit_rect[0] + exit_rect[2]) // 2
+    center_y = (exit_rect[1] + exit_rect[3]) // 2
+    arm = 9
+    draw.line(
+        (center_x - arm, center_y - arm, center_x + arm, center_y + arm),
+        fill=_rgba("destructive_text", 255 if exit_enabled else 140),
+        width=4,
+    )
+    draw.line(
+        (center_x + arm, center_y - arm, center_x - arm, center_y + arm),
+        fill=_rgba("destructive_text", 255 if exit_enabled else 140),
+        width=4,
     )
     return np.asarray(image, dtype=np.uint8)
 
@@ -1233,6 +1505,9 @@ def media_bar_hit(
         )
         x0, y0, x1, y1 = wake_zone
         return "wake" if x0 <= x <= x1 and y0 <= y <= y1 else None
+    exit_left, exit_top, exit_right, exit_bottom = _button_rects(width, height)["media_exit"]
+    if exit_left <= x <= exit_right and exit_top <= y <= exit_bottom:
+        return "media_exit" if media_control_enabled("media_exit", state) else None
     track_x0, track_y0, track_x1, track_y1 = _seek_track_rect(width, height)
     if (
         media_control_enabled("seek", state)
@@ -1286,13 +1561,56 @@ def media_bar_value_fraction(u: float, *, action: str) -> float | None:
         return None
     action = str(action or "").casefold()
     if action == "seek":
-        start, end = 24.0, float(width - 24)
+        start, end = 24.0, float(width - 78)
     elif action == "volume":
         start, _, end, _ = _button_rects(width, height)["volume"]
         start, end = float(start + 12), float(end - 12)
     else:
         return None
     return max(0.0, min(1.0, (x - start) / max(1.0, end - start)))
+
+
+def media_bar_rect_for_eye(
+    eye_rect: tuple[int, int, int, int], display_mode: str = ""
+) -> tuple[int, int, int, int]:
+    """Return the shared playback bar bounds for one eye in drawable pixels."""
+    left, top, right, bottom = (int(value) for value in eye_rect)
+    eye_width = max(1, right - left)
+    eye_height = max(1, bottom - top)
+    panel_width = min(int(eye_width * 0.92), _MEDIA_BAR_SIZE[0])
+    panel_height = max(
+        70,
+        int(panel_width * _MEDIA_BAR_SIZE[1] / _MEDIA_BAR_SIZE[0]),
+    )
+    normalized_mode = str(display_mode or "").strip().casefold().replace("_", "-")
+    if normalized_mode == "half-sbs":
+        panel_width = max(1, panel_width // 2)
+    x = left + (eye_width - panel_width) // 2
+    y = top + eye_height - panel_height - max(10, int(eye_height * 0.035))
+    return (x, y, x + panel_width, y + panel_height)
+
+
+def media_browser_rect_for_eye(
+    eye_rect: tuple[int, int, int, int], display_mode: str = ""
+) -> tuple[int, int, int, int]:
+    """Return the shared browser panel bounds for one eye in drawable pixels."""
+    left, top, right, bottom = (int(value) for value in eye_rect)
+    eye_width = max(1, right - left)
+    eye_height = max(1, bottom - top)
+    max_width = max(1, int(eye_width * 0.98))
+    max_height = max(1, int(eye_height * 0.88))
+    if max_width / max_height > MEDIA_BROWSER_TEXTURE_ASPECT:
+        panel_height = max_height
+        panel_width = max(1, int(panel_height * MEDIA_BROWSER_TEXTURE_ASPECT))
+    else:
+        panel_width = max_width
+        panel_height = max(1, int(panel_width / MEDIA_BROWSER_TEXTURE_ASPECT))
+    normalized_mode = str(display_mode or "").strip().casefold().replace("_", "-")
+    if normalized_mode == "half-sbs":
+        panel_width = max(1, panel_width // 2)
+    x = left + (eye_width - panel_width) // 2
+    y = top + (eye_height - panel_height) // 2
+    return (x, y, x + panel_width, y + panel_height)
 
 
 def build_pointer_rgba(size: int = 48) -> np.ndarray:
@@ -1323,12 +1641,50 @@ def build_media_browser_rgba(
     scroll_offset: int = 0,
     thumbnails: dict[str, np.ndarray] | None = None,
     lang: str = "EN",
+    font_scale: float = 1.0,
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
 
-    image = Image.new("RGBA", (int(width), int(height)), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    width, height = image.size
+    try:
+        font_scale = max(0.75, min(MEDIA_BROWSER_FONT_SCALE_MAX, float(font_scale)))
+    except (TypeError, ValueError):
+        font_scale = 1.0
+
+    render_width, render_height = int(width), int(height)
+    width, height = _browser_layout_dimensions(render_width, render_height)
+    scale_x = render_width / max(1, width)
+    scale_y = render_height / max(1, height)
+    raster_scale = min(scale_x, scale_y)
+
+    def browser_font(size: int, *, text: str = "", bold: bool = False):
+        return _font(
+            max(1, round(float(size) * font_scale * raster_scale)),
+            text=text,
+            bold=bold,
+        )
+
+    def browser_text(draw, xy, text, size=20, *, fill=None, bold=False, anchor="la"):
+        _text(
+            draw,
+            xy,
+            text,
+            max(1, round(float(size) * font_scale * raster_scale)),
+            fill=fill,
+            bold=bold,
+            anchor=anchor,
+        )
+
+    def browser_fit(draw, text: str, size: int, max_width: float, *, bold: bool = False) -> str:
+        return _fit_text(
+            draw,
+            text,
+            max(1, round(float(size) * font_scale * raster_scale)),
+            max_width * raster_scale,
+            bold=bold,
+        )
+
+    image = Image.new("RGBA", (render_width, render_height), (0, 0, 0, 0))
+    draw = _ScaledImageDraw(ImageDraw.Draw(image), scale_x, scale_y)
     layout = _browser_layout(state, width, height)
     rects = _browser_button_rects(width, height)
     thumbnails = thumbnails or {}
@@ -1344,9 +1700,9 @@ def build_media_browser_rgba(
         return gettext_for(normalize_locale(lang), message)
 
     draw.text(
-        (48, 84),
+        (48, layout["locations_heading_y"]),
         translate("Locations"),
-        font=_font(22, bold=True),
+        font=browser_font(22, text=translate("Locations"), bold=True),
         fill=_rgba("text_secondary"),
     )
     mounts = list(state.get("browser_mounts") or [])
@@ -1374,19 +1730,25 @@ def build_media_browser_rgba(
                     hover_amount if active else 0.0,
                 ),
             )
+        mount_kind = str(mount.get("kind") or "drive")
+        mount_name = (
+            translate("User folder")
+            if mount_kind == "home"
+            else str(mount.get("name") or mount.get("path") or "")
+        )
         _draw_kind_icon(
             draw,
-            str(mount.get("kind") or "drive"),
+            "directory" if mount_kind == "home" else mount_kind,
             58,
             center_y,
             _rgba("text_primary"),
         )
-        _text(
+        browser_text(
             draw,
             (84, center_y),
-            _fit_text(
+            browser_fit(
                 draw,
-                str(mount.get("name") or mount.get("path") or ""),
+                mount_name,
                 21,
                 sidebar_right - 120,
             ),
@@ -1399,7 +1761,7 @@ def build_media_browser_rgba(
     draw.text(
         (48, layout["recent_heading_y"]),
         translate("Recent"),
-        font=_font(22, bold=True),
+        font=browser_font(22, text=translate("Recent"), bold=True),
         fill=_rgba("text_secondary"),
     )
     if recent:
@@ -1435,10 +1797,10 @@ def build_media_browser_rgba(
                 center_y,
                 _rgba("text_primary"),
             )
-            _text(
+            browser_text(
                 draw,
                 (84, center_y),
-                _fit_text(
+                browser_fit(
                     draw,
                     str(entry.get("name") or Path(path).name or path),
                     21,
@@ -1467,7 +1829,7 @@ def build_media_browser_rgba(
                 _rgba("text_primary" if remove_hover else "text_secondary"),
             )
     else:
-        _text(
+        browser_text(
             draw,
             (84, layout["recent_rows_y"] + 18),
             translate("No recent media"),
@@ -1480,7 +1842,7 @@ def build_media_browser_rgba(
     draw.text(
         (48, layout["playlist_heading_y"]),
         translate("Playlist"),
-        font=_font(22, bold=True),
+        font=browser_font(22, text=translate("Playlist"), bold=True),
         fill=_rgba("text_secondary"),
     )
     playlist_index = int(state.get("playlist_index", -1) if state.get("playlist_index") is not None else -1)
@@ -1509,7 +1871,7 @@ def build_media_browser_rgba(
                     hover_amount if row_hovered else 0.0,
                 ),
             )
-        _text(
+        browser_text(
             draw,
             (52, center_y),
             f"{index + playlist_offset + 1:02d}",
@@ -1517,10 +1879,10 @@ def build_media_browser_rgba(
             fill=_rgba("text_secondary"),
             anchor="lm",
         )
-        _text(
+        browser_text(
             draw,
             (82, center_y),
-            _fit_text(
+            browser_fit(
                 draw,
                 Path(item.get("path", "")).name,
                 21,
@@ -1551,7 +1913,7 @@ def build_media_browser_rgba(
                 disabled_alpha=100,
                 radius=OPENXR_MENU_RADII["control"],
             )
-            _text(draw, ((action_rect[0] + action_rect[2]) // 2, (action_rect[1] + action_rect[3]) // 2),
+            browser_text(draw, ((action_rect[0] + action_rect[2]) // 2, (action_rect[1] + action_rect[3]) // 2),
                 label, 22, fill=_rgba("text_primary", 255 if enabled else 104), anchor="mm")
     for action, label, left in (
         ("playlist_page_previous", "‹", sidebar_right - 112),
@@ -1570,7 +1932,7 @@ def build_media_browser_rgba(
             disabled_alpha=100,
             radius=OPENXR_MENU_RADII["control"],
         )
-        _text(draw, ((action_rect[0] + action_rect[2]) // 2, (action_rect[1] + action_rect[3]) // 2),
+        browser_text(draw, ((action_rect[0] + action_rect[2]) // 2, (action_rect[1] + action_rect[3]) // 2),
             label, 22, fill=_rgba("text_primary", 255 if enabled else 104), anchor="mm")
 
     playlist_rects = rects
@@ -1593,36 +1955,54 @@ def build_media_browser_rgba(
             disabled_alpha=105,
             radius=8,
         )
-        _text(
+        browser_text(
             draw,
             ((action_rect[0] + action_rect[2]) // 2, (action_rect[1] + action_rect[3]) // 2),
             label,
-            21,
+            14,
             fill=_rgba("text_primary", 255 if enabled else 104),
             anchor="mm",
         )
 
-    open_enabled = media_control_enabled("browse_open", state)
-    open_hovered = hover_action == "browse_open"
-    open_rect = _draw_control_surface(
-        draw,
-        playlist_rects["browse_open"],
-        enabled=open_enabled,
-        hovered=open_hovered,
-        progress=hover_amount,
-        primary=True,
-        idle_alpha=230,
-        disabled_alpha=105,
-        radius=8,
+    stop_progress = hover_amount if hover_action == "viewer_stop" else 0.0
+    stop_rect = _scaled_rect(
+        rects["viewer_stop"],
+        stop_progress,
+        scale=_MEDIA_HOVER_BUTTON_SCALE,
+        lift=1.0,
     )
-    _text(
+    stop_fill = _mix_rgba(
+        _rgba("destructive"),
+        _rgba("destructive_hover"),
+        stop_progress,
+    )
+    draw.rounded_rectangle(
+        stop_rect,
+        radius=10,
+        fill=stop_fill,
+        outline=_rgba("destructive_hover", 220 if stop_progress else 145),
+        width=2 if stop_progress else 1,
+    )
+    stop_center_x = stop_rect[0] + 36
+    stop_center_y = (stop_rect[1] + stop_rect[3]) // 2
+    draw.rounded_rectangle(
+        (
+            stop_center_x - 8,
+            stop_center_y - 8,
+            stop_center_x + 8,
+            stop_center_y + 8,
+        ),
+        radius=3,
+        fill=_rgba("destructive_text"),
+    )
+    browser_text(
         draw,
-        ((open_rect[0] + open_rect[2]) // 2, (open_rect[1] + open_rect[3]) // 2),
-        translate("Open"),
+        (stop_rect[0] + 62, stop_center_y),
+        translate("Stop"),
         17,
-        fill=_rgba("text_primary", 255 if open_enabled else 104),
-        anchor="mm",
+        fill=_rgba("destructive_text"),
         bold=True,
+        anchor="lm",
     )
 
     path_text = str(state.get("browser_path") or "")
@@ -1630,18 +2010,26 @@ def build_media_browser_rgba(
     draw.text(
         (header_left, 42),
         translate("Files"),
-        font=_font(28, bold=True),
+        font=browser_font(28, text=translate("Files"), bold=True),
         fill=_rgba("text_primary"),
     )
     header_actions_left = rects["browser_view_grid"][0] - 24
-    _text(
+    browser_text(
         draw,
         (header_left, 94),
-        _fit_text(draw, path_text, 19, header_actions_left - header_left),
+        browser_fit(draw, path_text, 19, header_actions_left - header_left),
         19,
         fill=_rgba("text_secondary"),
     )
     for key, label in (
+        (
+            "browser_sort",
+            translate(
+                "Sort A–Z"
+                if state.get("browser_sort_descending") is True
+                else "Sort Z–A"
+            ),
+        ),
         ("browser_close", translate("Close")),
         ("browser_up", translate("Up")),
         ("browser_refresh", translate("Refresh")),
@@ -1658,11 +2046,11 @@ def build_media_browser_rgba(
             disabled_alpha=105,
             radius=8,
         )
-        _text(
+        browser_text(
             draw,
             ((action_rect[0] + action_rect[2]) // 2, (action_rect[1] + action_rect[3]) // 2),
             label,
-            18,
+            15,
             fill=_rgba("text_primary", 255 if enabled else 104),
             anchor="mm",
         )
@@ -1689,7 +2077,9 @@ def build_media_browser_rgba(
     selected_path = str(state.get("browser_selection") or "")
     row_top = layout["file_rows_y"]
     visible_count = layout["visible_entry_count"]
-    _scroll_step, _visible_count, max_offset = media_browser_scroll_metrics(state)
+    _scroll_step, _visible_count, max_offset = media_browser_scroll_metrics(
+        state, width=width, height=height
+    )
     scroll_offset = max(0, min(int(scroll_offset), max_offset))
     visible = entries[scroll_offset : scroll_offset + visible_count]
     if layout["view_mode"] == "grid":
@@ -1732,11 +2122,13 @@ def build_media_browser_rgba(
                 thumbnails.get(path),
                 kind,
                 radius=OPENXR_MENU_RADII["control"],
+                scale_x=scale_x,
+                scale_y=scale_y,
             )
-            _text(
+            browser_text(
                 draw,
                 (card[0] + 14, preview_rect[3] + 14),
-                _fit_text(
+                browser_fit(
                     draw,
                     str(entry.get("name") or path),
                     24,
@@ -1756,7 +2148,7 @@ def build_media_browser_rgba(
                     idle_alpha=220,
                     radius=OPENXR_MENU_RADII["control"],
                 )
-                _text(
+                browser_text(
                     draw,
                     (
                         (add_rect[0] + add_rect[2]) // 2,
@@ -1776,7 +2168,7 @@ def build_media_browser_rgba(
             hovered = hover_action == "entry" and path == hover_path
             if path == selected_path or hovered:
                 row = _scaled_rect(
-                    (sidebar_right + 18, y0, width - 38, y1),
+                    (sidebar_right + 18, y0, layout["file_content_right"], y1),
                     hover_amount if hovered else 0.0,
                     scale=_MEDIA_HOVER_ROW_SCALE,
                     lift=0.8,
@@ -1798,14 +2190,14 @@ def build_media_browser_rgba(
                 center_y,
                 _rgba("text_primary"),
             )
-            _text(
+            browser_text(
                 draw,
                 (sidebar_right + 76, center_y),
-                _fit_text(
+                browser_fit(
                     draw,
                     str(entry.get("name") or path),
                     24,
-                    width - sidebar_right - 204,
+                    layout["file_content_right"] - sidebar_right - 124,
                 ),
                 24,
                 fill=_rgba("text_primary"),
@@ -1822,7 +2214,7 @@ def build_media_browser_rgba(
                     idle_alpha=220,
                     radius=OPENXR_MENU_RADII["control"],
                 )
-                _text(
+                browser_text(
                     draw,
                     (
                         (add_rect[0] + add_rect[2]) // 2,
@@ -1833,8 +2225,30 @@ def build_media_browser_rgba(
                     fill=_rgba("text_primary"),
                     anchor="mm",
                 )
+    scrollbar_track, scrollbar_thumb = media_browser_scrollbar_metrics(
+        state,
+        scroll_offset,
+        width=width,
+        height=height,
+    )
+    if scrollbar_thumb is not None:
+        draw.rounded_rectangle(
+            scrollbar_track,
+            radius=max(4, (scrollbar_track[2] - scrollbar_track[0]) // 2),
+            fill=_rgba("surface_container_high", 190),
+        )
+        scrollbar_hovered = hover_action == "browser_scroll"
+        draw.rounded_rectangle(
+            scrollbar_thumb,
+            radius=max(4, (scrollbar_thumb[2] - scrollbar_thumb[0]) // 2),
+            fill=_mix_rgba(
+                _rgba("text_secondary", 210),
+                _rgba("primary_hover", 255),
+                hover_amount if scrollbar_hovered else 0.0,
+            ),
+        )
     if not entries:
-        _text(
+        browser_text(
             draw,
             ((sidebar_right + width) // 2, height // 2),
             translate("No playable media in this folder"),
@@ -1843,19 +2257,27 @@ def build_media_browser_rgba(
             anchor="mm",
         )
     error = str(state.get("browser_error") or state.get("error") or "")
+    footer_y = rects["playlist_previous"][1]
+    footer_left = sidebar_right + 36
+    footer_right = width - 24
     if error:
-        _text(
+        browser_text(
             draw,
-            (sidebar_right + 36, height - 88),
-            _fit_text(draw, error, 16, width - sidebar_right - 190),
+            (footer_left, footer_y - 20),
+            browser_fit(draw, error, 16, footer_right - footer_left),
             16,
             fill=_rgba("destructive_outline"),
         )
-    open_x0, open_y0, _open_x1, _open_y1 = rects["browse_open"]
-    _text(
+    instruction_right = footer_right
+    browser_text(
         draw,
-        (open_x0 - 18, open_y0 + 28),
-        translate("Click to select · Double-click to open"),
+        (instruction_right, footer_y + 28),
+        browser_fit(
+            draw,
+            translate("Click to open"),
+            18,
+            max(80, instruction_right - footer_left),
+        ),
         18,
         fill=_rgba("text_secondary"),
         anchor="rm",
@@ -1874,12 +2296,13 @@ def media_browser_hit(
     x, y = float(u) * width, float(v) * height
     rects = _browser_button_rects(width, height)
     for key in (
+        "viewer_stop",
         "browser_up",
         "browser_refresh",
         "browser_close",
         "browser_view_grid",
         "browser_view_list",
-        "browse_open",
+        "browser_sort",
         "playlist_previous",
         "playlist_next",
         "playlist_clear",
@@ -1888,7 +2311,7 @@ def media_browser_hit(
     ):
         x0, y0, x1, y1 = rects[key]
         if x0 <= x <= x1 and y0 <= y <= y1:
-            if key in {"browse_open", "playlist_add"}:
+            if key == "playlist_add":
                 selected = str(state.get("browser_selection") or "")
                 return (
                     (key, selected)
@@ -1951,7 +2374,25 @@ def media_browser_hit(
                     else None
                 )
     entries = list(state.get("browser_entries") or [])
-    _scroll_step, visible_count, max_offset = media_browser_scroll_metrics(state)
+    _scroll_step, visible_count, max_offset = media_browser_scroll_metrics(
+        state, width=width, height=height
+    )
+    track, thumb = media_browser_scrollbar_metrics(
+        state,
+        scroll_offset,
+        width=width,
+        height=height,
+    )
+    if thumb is not None and track[0] <= x <= track[2] and track[1] <= y <= track[3]:
+        return (
+            "browser_scroll",
+            media_browser_scrollbar_offset(
+                state,
+                y,
+                width=width,
+                height=height,
+            ),
+        )
     offset = max(0, min(int(scroll_offset), max_offset))
     visible = entries[offset : offset + visible_count]
     if layout["view_mode"] == "grid":
@@ -1969,7 +2410,7 @@ def media_browser_hit(
         row_top = layout["file_rows_y"]
         row_height = layout["file_row_height"]
         row_bottom = row_top + visible_count * row_height
-        if sidebar_right + 18 <= x <= width - 38 and row_top <= y < row_bottom:
+        if sidebar_right + 18 <= x <= layout["file_content_right"] and row_top <= y < row_bottom:
             index = int((y - row_top) // row_height)
             if 0 <= index < len(visible):
                 entry = visible[index]

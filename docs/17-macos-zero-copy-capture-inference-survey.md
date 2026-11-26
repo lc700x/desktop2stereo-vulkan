@@ -345,11 +345,35 @@ macos_metal_mpsgraph
 - MPSGraph/Metal 路线开发成本高，但控制力最好。
 - 原生 bridge 打包要处理 macOS 架构、签名、framework 链接。
 
+## 媒体文件播放的 Apple 路径
+
+本节针对本地 HEVC Main 10 / P010 HDR 文件。Apple 在 [WWDC22: Display HDR video in EDR with AVFoundation and Metal](https://developer.apple.com/videos/play/wwdc2022/110565/) 建议尽可能使用较高层的媒体框架，让框架管理播放和时序；需要逐帧处理时，示例用 `AVPlayerItemVideoOutput` 按播放时间取 `CVPixelBuffer`，再通过 Core Video 和 Metal 做处理。该结构适合 Desktop2Stereo 的“解码、深度推理、合成立体帧”流程。
+
+Apple 的示例通过 `CVMetalTextureCacheCreateTextureFromImage` 将 `CVPixelBuffer` 映射为 Metal texture，并要求 Metal command buffer 完成前保持 `CVMetalTexture` 存活。结合 [CVPixelBuffer](https://developer.apple.com/documentation/corevideo/cvpixelbuffer) 和 [CVMetalTextureCache](https://developer.apple.com/documentation/corevideo/cvmetaltexturecache)，目标媒体路径应保留解码 surface，避免锁定 CPU base address、逐帧复制到 NumPy，再上传到 MPS。这里承诺的是避免 CPU 图像回读；Metal 颜色转换、缩放和模型输入写入仍会产生 GPU 工作。
+
+如果必须直接控制解码，可用 [VideoToolbox `VTDecompressionSessionCreate`](https://developer.apple.com/documentation/videotoolbox/vtdecompressionsessioncreate(allocator:formatdescription:decoderspecification:imagebufferattributes:outputcallback:decompressionsessionout:))，并用 [`VTIsHardwareDecodeSupported`](https://developer.apple.com/documentation/videotoolbox/vtishardwaredecodesupported(_:)) 探测当前系统对 HEVC 的硬解能力。该探测只表示 codec 级支持，不保证当前机器、Main 10 profile、分辨率、帧率都能由硬件解码；运行时必须验证真实解码路径，并保留软件回退。优先先做 `AVPlayerItemVideoOutput` 原型，只有它无法满足取帧或同步需求时再下沉到 VideoToolbox。
+
+HDR 输入应从解码到 Metal 预处理都保留其色彩语义。Apple 提供的 [`kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange`](https://developer.apple.com/documentation/corevideo/kcvpixelformattype_420ypcbcr10biplanarvideorange) 对应 10-bit bi-planar video-range YCbCr；WWDC 示例也明确使用 10-bit 配合 PQ/HLG transfer function。Desktop2Stereo 应读取并传递实际的 primaries、transfer function 和 range，在 Metal 中执行 P010 range 展开、BT.2020/PQ 转换及所需缩放，输出与当前模型输入一致的浮点数据。不要为了追 FPS 提前转成 8-bit RGB、跳过 PQ 转换，或更改模型输入尺寸和精度。
+
+`AVPlayerItemVideoOutput` 的 item time 可用于按 PTS 取新帧；显示 link 用于跟随呈现时钟。OpenXR 应继续按目标呈现时间消费到期帧，处理赶不上时复用最新有效立体帧，而不是让视频时钟随推理延迟变慢。分别统计解码、预处理、推理、合成、唯一内容帧率和显示提交帧率，才能确认 1080p 内容帧率持续达到 30 FPS。
+
+Core ML 的 [`MLComputeUnits`](https://developer.apple.com/documentation/coreml/mlcomputeunits) 可约束模型允许使用的计算单元；`cpuAndNeuralEngine` 明确包含 CPU 且不含 GPU，所以它不是“无 CPU 处理”保证。可把 Core ML 与 MPS 并发作为真机 A/B 变量，但 Apple 的 API 文档不保证特定模型实际落在哪个单元，也不保证更快。若严格要求视频像素数据不经 CPU，必须避免 CPU pixel-buffer 映射；推理计算单元仍需根据模型支持、实际调度和设备 profile 单独验证。
+
+### 对当前实现的影响
+
+- 当前 FFmpeg raw P010 pipe 会把整帧字节交给 Python，再进入 NumPy/MPS；仅打开 FFmpeg 的 VideoToolbox 解码不会去掉这条 CPU 管线。
+- AVFoundation/VideoToolbox surface + `CVMetalTextureCache` + Metal shader 是适配当前 macOS 的方向，但现有 PyTorch MPS provider 接收 tensor，并没有把 `MTLTexture` 直接作为模型输入的接口。完整零 CPU 回读需要原生 Swift/Objective-C++ bridge，并将预处理、模型调用和资源同步留在同一 Metal/Core ML 路径中。
+- Apple API 让这条路线可实现，但不等于 30 FPS 保证。HEVC Main 10/4K 硬解能力、Core ML 模型转换和精度、GPU/ANE 调度、OpenXR 合成仍需在目标 Apple Silicon 设备上分别测量。
+
 ## 参考资料
 
 - ScreenCaptureKit: https://developer.apple.com/documentation/screencapturekit
+- AVPlayerItemVideoOutput: https://developer.apple.com/documentation/avfoundation/avplayeritemvideooutput
+- VideoToolbox hardware decode capability: https://developer.apple.com/documentation/videotoolbox/vtishardwaredecodesupported(_:)
+- Core Video 10-bit bi-planar video-range pixel format: https://developer.apple.com/documentation/corevideo/kcvpixelformattype_420ypcbcr10biplanarvideorange
+- Core ML compute units: https://developer.apple.com/documentation/coreml/mlcomputeunits
+- WWDC22 EDR video and Metal workflow: https://developer.apple.com/videos/play/wwdc2022/110565/
 - CoreVideo CVMetalTextureCache: https://developer.apple.com/documentation/corevideo/cvmetaltexturecache
-- CVMetalTextureCacheCreateTextureFromImage: https://developer.apple.com/documentation/corevideo/cvmetaltexturecachecreatetexturefromimage
 - Metal Performance Shaders MPSImage: https://developer.apple.com/documentation/metalperformanceshaders/mpsimage
 - Core ML: https://developer.apple.com/documentation/coreml
 - PyObjC: https://pyobjc.readthedocs.io/

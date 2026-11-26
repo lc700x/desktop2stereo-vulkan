@@ -245,7 +245,15 @@ class _SCKFrameReceiver(NSObject):
         self._latest_frame = None
         self._latest_mtl_texture = None
         self._latest_owned = None
-        self._native_only = False
+        self._native_only = os.environ.get("D2S_SCK_NATIVE_ONLY", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        self._zero_copy_enabled = self._native_only or os.environ.get(
+            "D2S_SCK_ZEROCOPY_TEX", "1"
+        ) != "0"
+        self._texture_diag_enabled = (
+            os.environ.get("D2S_SCK_METAL_TEXTURE_DIAG") == "1"
+        )
         self._latest_texture_size = (0, 0)
         self._frame_count = 0
         self._frame_status_counts = {}
@@ -256,6 +264,8 @@ class _SCKFrameReceiver(NSObject):
 
     def set_native_only(self, required):
         self._native_only = bool(required)
+        if self._native_only:
+            self._zero_copy_enabled = True
 
     def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, outputType):
         callback_time = time.perf_counter()
@@ -288,15 +298,11 @@ class _SCKFrameReceiver(NSObject):
                 # Status is diagnostic only; an OS-version-specific attachment
                 # shape must never discard an otherwise valid IOSurface.
                 frame_status = None
-            with self._condition:
-                status_key = (
-                    str(frame_status)
-                    if frame_status is not None
-                    else "unknown"
-                )
-                self._frame_status_counts[status_key] = (
-                    self._frame_status_counts.get(status_key, 0) + 1
-                )
+            status_key = (
+                str(frame_status)
+                if frame_status is not None
+                else "unknown"
+            )
 
             # Zero-copy Metal texture path (survey doc milestone 5): every
             # frame is wrapped as an owned CVPixelBuffer+CVMetalTexture pair
@@ -304,11 +310,9 @@ class _SCKFrameReceiver(NSObject):
             # skipping the 8MB device->host->device color round-trip.
             # D2S_SCK_ZEROCOPY_TEX=0 reverts to v2.5 parity (CPU readout only;
             # the old D2S_SCK_METAL_TEXTURE_DIAG=1 diagnostic still prints).
-            native_only = self._native_only or os.environ.get("D2S_SCK_NATIVE_ONLY", "0").strip().lower() in {
-                "1", "true", "yes", "on"
-            }
-            zc_enabled = native_only or os.environ.get("D2S_SCK_ZEROCOPY_TEX", "1") != "0"
-            diag_enabled = os.environ.get("D2S_SCK_METAL_TEXTURE_DIAG") == "1"
+            native_only = self._native_only
+            zc_enabled = self._zero_copy_enabled
+            diag_enabled = self._texture_diag_enabled
             if native_only and zc_enabled:
                 # Native Core ML creates the CVMetalTexture from this same
                 # IOSurface at consumption time. Avoid wrapping it once here
@@ -321,6 +325,9 @@ class _SCKFrameReceiver(NSObject):
                 with self._condition:
                     replaced = self._latest_owned
                     self._latest_owned = owned
+                    self._frame_status_counts[status_key] = (
+                        self._frame_status_counts.get(status_key, 0) + 1
+                    )
                     self._latest_texture_size = (
                         CV.CVPixelBufferGetWidth(imageBuffer),
                         CV.CVPixelBufferGetHeight(imageBuffer),
@@ -376,6 +383,9 @@ class _SCKFrameReceiver(NSObject):
                                     with self._condition:
                                         replaced = self._latest_owned
                                         self._latest_owned = owned
+                                        self._frame_status_counts[status_key] = (
+                                            self._frame_status_counts.get(status_key, 0) + 1
+                                        )
                                         self._latest_texture_size = (w, h)
                                     # Release AFTER the swap so a concurrent
                                     # taker never sees a freed ref.
@@ -419,6 +429,9 @@ class _SCKFrameReceiver(NSObject):
 
             with self._condition:
                 self._latest_frame = frame
+                self._frame_status_counts[status_key] = (
+                    self._frame_status_counts.get(status_key, 0) + 1
+                )
                 self._frame_count += 1
                 self._condition.notify_all()
             try:

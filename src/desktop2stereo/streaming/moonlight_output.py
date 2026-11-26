@@ -658,20 +658,20 @@ class MoonlightSbsOutput:
             return
 
     def _client_ready_response(self, config: MoonlightClientConfig) -> dict[str, Any]:
-        """Describe the actual per-eye viewport for full SBS and TAB absolute input."""
+        """Configure 2x width feedback or packed eye regions for absolute input."""
         response = {"accepted_width": config.width, "accepted_height": config.height}
         mode = self.display_mode.strip().casefold().replace("_", "-")
-        if mode not in {"full-sbs", "half-tab", "full-tab"}:
-            return response  # Half-SBS clients retain their established input contract.
+        is_16_9 = config.width * 9 == config.height * 16
+        if mode in {"half-sbs", "half-tab"} or is_16_9:
+            response["input_width"] = config.width * 2
+            return response
+        if mode not in {"full-sbs", "full-tab"}:
+            return response
+        width, height = config.source_width, config.source_height
         from streaming.aspect import presentation_blit_regions
 
-        width, height = config.source_width, config.source_height
         is_tab = mode.endswith("tab")
-        source = (
-            (width * 2, height) if mode == "full-sbs"
-            else (width, height * 2) if mode == "full-tab"
-            else (width, height)
-        )
+        source = (width * 2, height) if mode == "full-sbs" else (width, height * 2)
         regions = presentation_blit_regions(
             source, (config.width, config.height), self.fit_mode, self.display_mode, (width, height),
         )
@@ -680,9 +680,13 @@ class MoonlightSbsOutput:
         mapping = []
         for index, (crop, viewport) in enumerate(regions):
             ox, oy = (0, index * eye_height) if is_tab else (index * eye_width, 0)
-            mapping.append([*viewport,
-                (crop[0] - ox) * width / eye_width, (crop[1] - oy) * height / eye_height,
-                (crop[2] - ox) * width / eye_width, (crop[3] - oy) * height / eye_height])
+            source_crop = (
+                (crop[0] - ox) * width / eye_width,
+                (crop[1] - oy) * height / eye_height,
+                (crop[2] - ox) * width / eye_width,
+                (crop[3] - oy) * height / eye_height,
+            )
+            mapping.append([*viewport, *source_crop])
         response["input_regions"] = mapping
         return response
 

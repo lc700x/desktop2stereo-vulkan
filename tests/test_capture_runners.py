@@ -161,3 +161,27 @@ def test_polling_capture_runner_polls_media_controls_while_hard_idle():
 
     assert source.control_polls == 1
     assert source.frames == 1
+
+
+def test_polling_capture_runner_exposes_runner_as_shutdown_control():
+    source = FakeMediaPollingSource()
+    shutdown = threading.Event()
+    controls = []
+    runner = PollingCaptureRunner(
+        CaptureConfig(output_resolution=(8, 4), fps=60, os_name="Darwin"),
+        lambda: source,
+    )
+
+    def on_session_update(_session, control):
+        controls.append(control)
+
+    def on_frame(_frame):
+        shutdown.set()
+
+    runner.run(
+        shutdown_event=shutdown,
+        on_frame=on_frame,
+        on_session_update=on_session_update,
+    )
+
+    assert controls == [runner, None]

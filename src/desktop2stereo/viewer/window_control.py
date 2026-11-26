@@ -43,10 +43,14 @@ if OS_NAME == "Windows":
 
     set_per_monitor_dpi_v2()
 
-    def configure_macos_viewer_window(window, *, fullscreen=False):
+    def configure_macos_viewer_window(
+        window, *, fullscreen=False, show_in_app_switcher=False
+    ):
         return None
 
-    def pin_macos_viewer_window(window, *, fullscreen=False):
+    def pin_macos_viewer_window(
+        window, *, fullscreen=False, show_in_app_switcher=False
+    ):
         return None
 
     user32 = ctypes.windll.user32
@@ -755,9 +759,13 @@ elif OS_NAME == "Darwin":
 
     _cursor_passthrough_windows: dict[int, tuple[object, bool]] = {}
     _macos_window_pin_times: dict[int, float] = {}
+    _macos_activation_policy: int | None = None
     _hidden_cursor_display_id: int | None = None
     _cursor_suppression_target_display_id: int | None = None
+    _cursor_suppression_cursor_position: tuple[int, int] | None = None
     _appkit_cursor_hidden = False
+    _cursor_background_control_attempted = False
+    _cursor_background_control_configured = False
     _cursor_snapshot_error_logged = False
 
     def _cocoa_window(window):
@@ -770,28 +778,48 @@ elif OS_NAME == "Darwin":
 
         return objc.objc_object(c_void_p=ptr)
 
-    def configure_macos_viewer_window(window, *, fullscreen=False):
-        """Configure the SBS window to survive native fullscreen Space changes."""
+    def configure_macos_viewer_window(
+        window, *, fullscreen=False, show_in_app_switcher=False
+    ):
+        """Configure output visibility while preserving fullscreen overlay behavior."""
+        global _macos_activation_policy
+        try:
+            application = AppKit.NSApplication.sharedApplication()
+            policy_name = (
+                "NSApplicationActivationPolicyRegular"
+                if show_in_app_switcher
+                else "NSApplicationActivationPolicyAccessory"
+            )
+            activation_policy = getattr(AppKit, policy_name, None)
+            if (
+                activation_policy is not None
+                and hasattr(application, "setActivationPolicy_")
+                and _macos_activation_policy != int(activation_policy)
+            ):
+                changed = application.setActivationPolicy_(activation_policy)
+                if changed is not False:
+                    _macos_activation_policy = int(activation_policy)
+        except Exception:
+            # The window can still be pinned if AppKit rejects policy changes.
+            pass
         ns_window = _cocoa_window(window)
         # A normal Cocoa window belongs to the Space in which it was created.
         # Native video fullscreen creates a different Space, so ordering the
         # same window again is not enough. The output must join the active
         # Space without activating or stealing focus from the video player.
         behavior = getattr(AppKit, "NSWindowCollectionBehaviorDefault", 0)
-        # AppKit treats CanJoinAllApplications as a full-screen participation
-        # mode, not an additional decoration on FullScreenAuxiliary. Setting
-        # both makes the GLFW window ineligible to join another app's full-
-        # screen Space on current macOS releases.
+        # Keep the explicit full-screen auxiliary bit even when this viewer is
+        # itself borderless fullscreen. CanJoinAllApplications covers another
+        # app's Space; FullScreenAuxiliary keeps AppKit from dropping the
+        # window during the Space transition. They are distinct from the
+        # Stage Manager auxiliary behavior and can be combined here.
         behavior_names = [
             "NSWindowCollectionBehaviorCanJoinAllSpaces",
-            "NSWindowCollectionBehaviorIgnoresCycle",
+            "NSWindowCollectionBehaviorFullScreenAuxiliary",
+            "NSWindowCollectionBehaviorCanJoinAllApplications",
         ]
-        if fullscreen:
-            behavior_names.append(
-                "NSWindowCollectionBehaviorCanJoinAllApplications"
-            )
-        else:
-            behavior_names.append("NSWindowCollectionBehaviorFullScreenAuxiliary")
+        if not show_in_app_switcher:
+            behavior_names.append("NSWindowCollectionBehaviorIgnoresCycle")
         for name in behavior_names:
             behavior |= int(getattr(AppKit, name, 0))
         if fullscreen:
@@ -804,21 +832,34 @@ elif OS_NAME == "Darwin":
         if hasattr(ns_window, "setCanHide_"):
             ns_window.setCanHide_(False)
         ns_window.setHidesOnDeactivate_(False)
-        level = (
-            getattr(AppKit, "NSStatusWindowLevel", AppKit.NSFloatingWindowLevel)
-            if fullscreen
-            else AppKit.NSNormalWindowLevel
+        level = getattr(
+            AppKit,
+            "NSStatusWindowLevel",
+            getattr(AppKit, "NSFloatingWindowLevel", AppKit.NSNormalWindowLevel),
+        ) if fullscreen else getattr(
+            AppKit,
+            "NSFloatingWindowLevel",
+            AppKit.NSNormalWindowLevel,
         )
         ns_window.setLevel_(level)
         return ns_window
 
-    def pin_macos_viewer_window(window, *, fullscreen=False):
+    def pin_macos_viewer_window(
+        window, *, fullscreen=False, show_in_app_switcher=False
+    ):
         """Keep SBS output above native fullscreen apps without activating it."""
-        ns_window = configure_macos_viewer_window(window, fullscreen=fullscreen)
+        ns_window = configure_macos_viewer_window(
+            window,
+            fullscreen=fullscreen,
+            show_in_app_switcher=show_in_app_switcher,
+        )
         window_id = int(ns_window.windowNumber())
         now = time.monotonic()
         last_pin = _macos_window_pin_times.get(window_id, 0.0)
-        if fullscreen and (now - last_pin >= 0.10 or not bool(ns_window.isVisible())):
+        # During a Space transition AppKit can report the window as hidden
+        # even though it still exists. Re-order that state explicitly so it
+        # can join the newly active fullscreen Space.
+        if not bool(ns_window.isVisible()) or now - last_pin >= 0.10:
             ns_window.orderFrontRegardless()
             _macos_window_pin_times[window_id] = now
         return ns_window
@@ -890,9 +931,11 @@ elif OS_NAME == "Darwin":
                 )
             hotspot = cursor.hotSpot()
             hotspot_x = round(float(hotspot.x) * scale)
-            hotspot_y = round(
-                (float(image.size().height) - float(hotspot.y)) * scale
-            )
+            # AppKit's NSCursor hotspot uses the same top-left image origin
+            # used by the TIFF pixels. Do not invert Y here; the compositor
+            # converts the screen point into the Metal/Vulkan top-left output
+            # coordinates when it builds each eye rectangle.
+            hotspot_y = round(float(hotspot.y) * scale)
             if mode == "half-sbs":
                 half_width = max(1, round(rgba_image.width * 0.5))
                 rgba_image = rgba_image.resize(
@@ -955,10 +998,11 @@ elif OS_NAME == "Darwin":
 
     def _restore_hidden_cursor() -> None:
         global _appkit_cursor_hidden, _cursor_suppression_target_display_id
-        global _hidden_cursor_display_id
+        global _hidden_cursor_display_id, _cursor_suppression_cursor_position
         display_id = _hidden_cursor_display_id
         _hidden_cursor_display_id = None
         _cursor_suppression_target_display_id = None
+        _cursor_suppression_cursor_position = None
         if display_id is not None:
             try:
                 Quartz.CGDisplayShowCursor(display_id)
@@ -971,6 +1015,100 @@ elif OS_NAME == "Darwin":
                 NSCursor.unhide()
             except Exception:
                 pass
+
+    def _configure_background_cursor_control() -> bool:
+        """Allow this accessory app to hide the WindowServer cursor in the background.
+
+        ``CGDisplayHideCursor`` is a real public API, but macOS ignores its
+        hide request when the calling process is inactive unless this
+        WindowServer connection property is enabled. The SBS window must stay
+        inactive so mouse events can pass through to the source application.
+        This private connection property is the same bridge used by native
+        macOS cursor utilities; if it is unavailable, the public API remains
+        the best fallback.
+        """
+        global _cursor_background_control_attempted
+        global _cursor_background_control_configured
+        if _cursor_background_control_attempted:
+            return _cursor_background_control_configured
+        _cursor_background_control_attempted = True
+        try:
+            core_graphics = ctypes.CDLL(
+                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+            )
+            core_foundation = ctypes.CDLL(
+                "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+            )
+            main_connection = core_graphics.CGSMainConnectionID
+            main_connection.restype = ctypes.c_uint32
+            connection_id = int(main_connection())
+            if connection_id == 0:
+                return False
+
+            set_property = core_graphics.CGSSetConnectionProperty
+            set_property.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+            set_property.restype = ctypes.c_int32
+
+            create_string = core_foundation.CFStringCreateWithCString
+            create_string.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_uint32,
+            ]
+            create_string.restype = ctypes.c_void_p
+            release = core_foundation.CFRelease
+            release.argtypes = [ctypes.c_void_p]
+            key = create_string(
+                None,
+                b"SetsCursorInBackground",
+                0x08000100,  # kCFStringEncodingUTF8
+            )
+            true_value = ctypes.c_void_p.in_dll(
+                core_foundation, "kCFBooleanTrue"
+            ).value
+            if not key or not true_value:
+                return False
+            try:
+                result = int(
+                    set_property(
+                        connection_id,
+                        connection_id,
+                        key,
+                        true_value,
+                    )
+                )
+            finally:
+                release(key)
+            _cursor_background_control_configured = result == 0
+        except Exception:
+            _cursor_background_control_configured = False
+        return _cursor_background_control_configured
+
+    def _hide_display_cursor(display_id: int) -> bool:
+        try:
+            _configure_background_cursor_control()
+            result = Quartz.CGDisplayHideCursor(display_id)
+        except Exception:
+            return False
+        return result in (None, 0)
+
+    def _reassert_display_cursor_hidden(display_id: int) -> bool:
+        """Refresh one owned Quartz hide count after a pointer movement.
+
+        Quartz tracks display cursor hiding as a reference count. Pairing a
+        show/hide here keeps exactly one count owned by this process instead
+        of adding a count on every polling tick.
+        """
+        try:
+            Quartz.CGDisplayShowCursor(display_id)
+        except Exception:
+            pass
+        return _hide_display_cursor(display_id)
 
     def _cursor_display_id() -> int | None:
         """Return the display currently under the pointer when available."""
@@ -991,9 +1129,18 @@ elif OS_NAME == "Darwin":
             pass
         return None
 
+    def _cursor_is_visible() -> bool | None:
+        try:
+            return bool(Quartz.CGCursorIsVisible())
+        except Exception:
+            return None
+
     def _update_native_cursor_suppression() -> None:
         global _appkit_cursor_hidden, _cursor_suppression_target_display_id
-        global _hidden_cursor_display_id
+        global _hidden_cursor_display_id, _cursor_suppression_cursor_position
+        # The hide request is global on macOS (the CGDisplay argument is
+        # ignored). Keep the window display as the logical owner so the
+        # reference-counted show/hide pair remains stable across Spaces.
         target_display = None
         for window, should_hide in tuple(_cursor_passthrough_windows.values()):
             if not should_hide:
@@ -1016,25 +1163,39 @@ elif OS_NAME == "Darwin":
             target_display == _cursor_suppression_target_display_id
             and (target_display is None or native_cursor_suppressed())
         ):
-            # Mouse movement can release AppKit's temporary hidden state. This
-            # flag reasserts it without incrementing NSCursor's hide counter.
+            position = None
             try:
-                NSCursor.setHiddenUntilMouseMoves_(True)
+                position = cursor_screen_position()
             except Exception:
                 pass
+            moved = (
+                position is not None
+                and position != _cursor_suppression_cursor_position
+            )
+            _cursor_suppression_cursor_position = position
+            visible = _cursor_is_visible()
+            if (moved or visible is True) and target_display is not None and (
+                _hidden_cursor_display_id == target_display
+            ):
+                if _reassert_display_cursor_hidden(target_display):
+                    _hidden_cursor_display_id = target_display
             return
         _restore_hidden_cursor()
         _cursor_suppression_target_display_id = target_display
+        try:
+            _cursor_suppression_cursor_position = cursor_screen_position()
+        except Exception:
+            _cursor_suppression_cursor_position = None
         if target_display is not None:
-            try:
-                result = Quartz.CGDisplayHideCursor(target_display)
-            except Exception:
-                result = -1
-            if result in (None, 0):
+            if _hide_display_cursor(target_display):
                 _hidden_cursor_display_id = target_display
             try:
+                # Do not use setHiddenUntilMouseMoves_(True): macOS reveals
+                # that temporary state on the next pointer event. The Quartz
+                # display hide above is persistent; AppKit hide covers cursors
+                # managed by the active application without auto-showing them.
+                NSCursor.setHiddenUntilMouseMoves_(False)
                 NSCursor.hide()
-                NSCursor.setHiddenUntilMouseMoves_(True)
                 _appkit_cursor_hidden = True
             except Exception:
                 pass
@@ -1122,10 +1283,14 @@ else:
     def update_native_cursor_suppression():
         return None
 
-    def configure_macos_viewer_window(window, *, fullscreen=False):
+    def configure_macos_viewer_window(
+        window, *, fullscreen=False, show_in_app_switcher=False
+    ):
         return None
 
-    def pin_macos_viewer_window(window, *, fullscreen=False):
+    def pin_macos_viewer_window(
+        window, *, fullscreen=False, show_in_app_switcher=False
+    ):
         return None
 
     class StereoCursorOverlay:

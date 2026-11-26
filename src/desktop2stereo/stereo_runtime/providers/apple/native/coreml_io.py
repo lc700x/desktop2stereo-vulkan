@@ -11,17 +11,16 @@ import ctypes
 import hashlib
 import logging
 import os
-from pathlib import Path
 import platform
 import shutil
 import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from ....output import output_edge_aa_enabled
-
 
 _NATIVE_DIR = Path(__file__).resolve().parent
 _SOURCE = _NATIVE_DIR / "macos_coreml_io.mm"
@@ -78,6 +77,9 @@ class _NativePackResult(ctypes.Structure):
         ("host_handoff_copy_ms", ctypes.c_double),
         ("metal_buffer_alias", ctypes.c_int32),
         ("warp_threads", ctypes.c_int32),
+        ("completion_event", ctypes.c_void_p),
+        ("completion_value", ctypes.c_uint64),
+        ("asynchronous", ctypes.c_int32),
     ]
 
 
@@ -202,7 +204,7 @@ def _build_library() -> tuple[Path | None, str | None]:
                 sdk,
             ]
         try:
-            result = subprocess.run(command, check=True, capture_output=True, text=True)
+            subprocess.run(command, check=True, capture_output=True, text=True)
         except (OSError, subprocess.CalledProcessError) as exc:
             detail = getattr(exc, "stderr", None) or str(exc)
             return None, f"native CoreML bridge build failed: {detail.strip()}"
@@ -228,7 +230,7 @@ def _buffer_pointer(value: Any) -> tuple[ctypes.c_void_p, memoryview]:
 class NativeCoreMLFrame:
     """A native depth result retained by one bridge resource-ring slot."""
 
-    bridge: "NativeCoreMLIOBridge"
+    bridge: NativeCoreMLIOBridge
     slot: int
     frame_id: int
     source_width: int
@@ -318,7 +320,7 @@ class NativeCoreMLFrame:
             self.last_pack_metrics = metrics
             return metrics
 
-    def configure_warp(self, **values: float | int | str) -> None:
+    def configure_warp(self, **values: float | str) -> None:
         """Attach the shared stereo parameters before presenter-side packing."""
         self.warp_config = dict(values)
 
@@ -471,13 +473,17 @@ class NativeCoreMLIOBridge:
             self._library.d2s_coreml_io_destroy(handle)
 
     def predict(self, sck_frame: Any, frame_id: int) -> NativeCoreMLFrame:
-        pixel_buffer = getattr(sck_frame, "pixel_buffer", None) or sck_frame
-        try:
-            import objc
+        native_pointer = getattr(sck_frame, "pixel_buffer_pointer", None)
+        if native_pointer:
+            pointer = ctypes.c_void_p(int(native_pointer))
+        else:
+            pixel_buffer = getattr(sck_frame, "pixel_buffer", None) or sck_frame
+            try:
+                import objc
 
-            pointer = ctypes.c_void_p(int(objc.pyobjc_id(pixel_buffer)))
-        except Exception as exc:
-            raise RuntimeError(f"cannot obtain CVPixelBuffer pointer: {exc}") from exc
+                pointer = ctypes.c_void_p(int(objc.pyobjc_id(pixel_buffer)))
+            except Exception as exc:
+                raise RuntimeError(f"cannot obtain CVPixelBuffer pointer: {exc}") from exc
         result = _NativeResult()
         handle = self._begin_call()
         native_frame = None
@@ -644,6 +650,9 @@ class NativeCoreMLIOBridge:
                 "host_handoff_copy_ms": float(pack_result.host_handoff_copy_ms),
                 "metal_buffer_alias": bool(pack_result.metal_buffer_alias),
                 "warp_threads": int(pack_result.warp_threads),
+                "completion_event": int(pack_result.completion_event or 0),
+                "completion_value": int(pack_result.completion_value),
+                "asynchronous": bool(pack_result.asynchronous),
             }
         finally:
             self._end_call()

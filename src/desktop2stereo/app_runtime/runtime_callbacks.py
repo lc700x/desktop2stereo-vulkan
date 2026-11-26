@@ -561,8 +561,8 @@ class RuntimeCallbacks:
         allowed_actions = {
             "play", "pause", "seek", "seek_relative", "volume", "mute",
             "browse", "browse_up", "browse_refresh", "browse_close", "browse_select",
-            "browse_open", "recent_remove", "playlist_next", "playlist_previous", "playlist_select",
-            "playlist_clear", "playlist_remove",
+            "browse_open", "browser_sort", "media_exit", "recent_remove", "playlist_next", "playlist_previous",
+            "playlist_select", "playlist_clear", "playlist_remove", "playlist_sort",
         }
         if not control_path or not session_id or media_action not in allowed_actions:
             return False
@@ -608,7 +608,8 @@ class RuntimeCallbacks:
         }
         if media_action in {
             "seek", "seek_relative", "volume", "mute", "browse", "browse_select",
-            "browse_open", "recent_remove", "playlist_select", "playlist_remove",
+            "browse_open", "browser_sort", "recent_remove", "playlist_select", "playlist_remove",
+            "playlist_sort",
         }:
             command["value"] = value
         control_path = os.path.abspath(os.path.expanduser(control_path))

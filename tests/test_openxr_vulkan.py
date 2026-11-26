@@ -38,6 +38,7 @@ from viewer.vulkan_context import (
 )
 from viewer.vulkan_resources import VulkanImageResource
 from viewer.vulkan_projection_screen import VulkanProjectionScreenPass
+from media_ui import MEDIA_BAR_TEXTURE_SIZE
 from xr_viewer.core_openxr_vulkan import (
     OpenXrCompositionBuilder,
     OpenXrVulkanConfig,
@@ -1576,6 +1577,20 @@ def test_settings_menu_stop_requests_shared_shutdown_once_and_beats_device_loss(
     presenter._request_fatal_device_loss()
     assert presenter.fatal_device_loss is False
     assert shutdown.is_set()
+
+
+def test_media_browser_stop_requests_shared_runtime_shutdown() -> None:
+    presenter = OpenXrVulkanPresenter()
+    shutdown = threading.Event()
+    presenter._shutdown_event = shutdown
+    presenter._media_overlay_state = {"ready": True, "browser_visible": True}
+
+    presenter._dispatch_media_overlay_hit("viewer_stop")
+
+    assert shutdown.is_set()
+    assert presenter._runtime_stop_requested is True
+    assert presenter._settings_menu.stopping is True
+    assert presenter._accept_output is False
 
 
 def test_right_stick_scroll_sign_changes_only_vertical_axis() -> None:
@@ -3624,7 +3639,7 @@ def test_pooled_settings_menu_uses_content_subrect_for_aspect_and_hits() -> None
 
 def test_msdf_osd_canvas_width_follows_text_advance() -> None:
     atlas = MsdfFontAtlas()
-    short_width, short_height, _ = _layout_msdf_osd_runs(
+    short_width, short_height, short_runs = _layout_msdf_osd_runs(
         atlas,
         (
             {"text": "Preset", "color": (255, 255, 255, 255)},
@@ -3641,6 +3656,7 @@ def test_msdf_osd_canvas_width_follows_text_advance() -> None:
 
     assert long_width > short_width
     assert long_height == short_height
+    assert short_runs[0]["scale"] == pytest.approx(0.84)
 
 
 def test_vulkan_reset_screen_restores_only_initial_size_and_position() -> None:
@@ -7838,7 +7854,7 @@ def test_settings_menu_plus_button_applies_exact_slider_step() -> None:
     )
 
 
-def test_openxr_media_overlay_entry_action_dispatches_browse_select():
+def test_openxr_media_overlay_entry_action_dispatches_browse_open():
     actions = []
     presenter = OpenXrVulkanPresenter(
         on_controller_shortcut=lambda action, **values: actions.append(
@@ -7853,7 +7869,7 @@ def test_openxr_media_overlay_entry_action_dispatches_browse_select():
         (
             "media_control",
             {
-                "media_action": "browse_select",
+                "media_action": "browse_open",
                 "value": {"path": "F:/Videos/movie.mkv"},
             },
         )
@@ -7924,7 +7940,7 @@ def test_openxr_media_overlay_dispatches_shared_player_actions():
         ("media_control", {"media_action": "playlist_next"}),
         (
             "media_control",
-            {"media_action": "browse_select", "value": {"path": "F:/Videos/a.mp4"}},
+            {"media_action": "browse_open", "value": {"path": "F:/Videos/a.mp4"}},
         ),
         (
             "media_control",
@@ -7935,6 +7951,50 @@ def test_openxr_media_overlay_dispatches_shared_player_actions():
             {"media_action": "playlist_select", "value": {"path": "F:/Videos/a.mp4"}},
         ),
     ]
+
+
+def test_openxr_media_exit_dispatches_to_shared_player():
+    actions = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda action, **values: actions.append(
+            (action, values)
+        ) or True
+    )
+    presenter._media_overlay_state = {"ready": True, "mode": "Video"}
+
+    presenter._dispatch_media_overlay_hit("media_exit")
+
+    assert actions == [("media_control", {"media_action": "media_exit"})]
+
+
+def test_openxr_media_browser_scrollbar_drag_updates_shared_offset():
+    presenter = OpenXrVulkanPresenter()
+    presenter._media_overlay_state = {
+        "ready": True,
+        "mode": "Browser",
+        "browser_visible": True,
+        "browser_entries": [
+            {"name": f"movie-{index}.mp4", "path": f"F:/movie-{index}.mp4", "kind": "video"}
+            for index in range(30)
+        ],
+        "browser_mounts": [],
+        "recent_entries": [],
+        "playlist_entries": [],
+    }
+    presenter._media_overlay_view_mode = "grid"
+    presenter._controller_inputs = ({}, {"trigger": 1.0})
+    presenter._media_overlay_ray_hit = (
+        lambda hand, browser=False: (0.99, 0.15) if hand == 1 and browser else None
+    )
+
+    assert presenter._handle_media_overlay_input() is True
+    assert presenter._media_overlay_scroll == 0
+
+    presenter._media_overlay_ray_hit = (
+        lambda hand, browser=False: (0.99, 0.88) if hand == 1 and browser else None
+    )
+    assert presenter._handle_media_overlay_input() is True
+    assert presenter._media_overlay_scroll == 21
 
 
 def test_openxr_media_browser_trigger_click_dispatches_entry_on_release():
@@ -8049,15 +8109,25 @@ def test_openxr_media_browser_fits_texture_aspect_inside_screen():
     assert size[1] <= screen_height * 0.90 + 1e-6
 
 
+def test_openxr_media_browser_font_scale_uses_eye_render_extent():
+    presenter = object.__new__(OpenXrVulkanPresenter)
+    presenter._projection_eye_extents = lambda: ((1200, 1200), (1200, 1200))
+
+    assert presenter._media_browser_font_scale() == pytest.approx(1.33, abs=0.01)
+
+
 def test_openxr_media_overlays_are_precreated_for_vdxr_safe_uploads():
     pool = (1024, 1024)
 
     assert OpenXrVulkanPresenter._tool_quad_precreate_size(
         "media_bar", pool
-    ) == (1024, 1024)
+    ) == (
+        max(pool[0], MEDIA_BAR_TEXTURE_SIZE[0]),
+        max(pool[1], MEDIA_BAR_TEXTURE_SIZE[1]),
+    )
     assert OpenXrVulkanPresenter._tool_quad_precreate_size(
         "media_browser", pool
-    ) == (1600, 1200)
+    ) == (2048, 1536)
 
 
 def test_openxr_media_state_and_controls_use_the_active_capture_session(tmp_path):
@@ -9661,14 +9731,13 @@ def test_openxr_media_mount_action_dispatches_browse_on_trigger():
     assert actions == [("media_control", {"media_action": "browse", "value": "F:/"})]
 
 
-def test_openxr_different_file_clicks_do_not_become_an_accidental_double_click(monkeypatch):
-    monkeypatch.setattr(core_openxr_vulkan.time, "monotonic", lambda: 10.0)
+def test_openxr_file_clicks_open_immediately():
     actions = []
     presenter = OpenXrVulkanPresenter(on_controller_shortcut=lambda action, **values: actions.append(values) or True)
     presenter._media_overlay_state = {"ready": True}
     presenter._dispatch_media_overlay_hit("entry", "F:/a.mp4")
     presenter._dispatch_media_overlay_hit("entry", "F:/b.mp4")
-    assert [item["media_action"] for item in actions] == ["browse_select", "browse_select"]
+    assert [item["media_action"] for item in actions] == ["browse_open", "browse_open"]
     presenter._dispatch_media_overlay_hit("entry", "F:/b.mp4")
     assert actions[-1]["media_action"] == "browse_open"
 
@@ -9689,8 +9758,25 @@ def test_openxr_playlist_controls_dispatch_shared_management_actions():
     ]
 
 
+def test_openxr_file_sort_control_dispatches_shared_command():
+    actions = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda action, **values: actions.append(values) or True
+    )
+    presenter._media_overlay_state = {"ready": True, "browser_sort_descending": False}
+
+    presenter._dispatch_media_overlay_hit("browser_sort")
+
+    assert actions == [
+        {"media_action": "browser_sort", "value": {"descending": True}}
+    ]
+
+
 def test_openxr_disk_trigger_dispatches_complete_browser_hit_route():
-    from media_ui import MEDIA_BROWSER_TEXTURE_SIZE, _browser_layout
+    from media_ui import (
+        MEDIA_BROWSER_LAYOUT_SIZE,
+        _browser_layout,
+    )
 
     actions = []
     presenter = OpenXrVulkanPresenter(
@@ -9698,7 +9784,7 @@ def test_openxr_disk_trigger_dispatches_complete_browser_hit_route():
     )
     presenter._media_overlay_state = {"ready": True, "browser_visible": True,
         "browser_mounts": [{"name": "媒体 (F:)", "path": "F:/", "kind": "drive"}]}
-    width, height = MEDIA_BROWSER_TEXTURE_SIZE
+    width, height = MEDIA_BROWSER_LAYOUT_SIZE
     layout = _browser_layout(presenter._media_overlay_state, width, height)
     uv = (160.0 / width, (layout["mount_top"] + layout["mount_row_height"] / 2) / height)
     presenter._media_overlay_ray_hit = lambda hand, browser=False: uv if hand == 1 else None

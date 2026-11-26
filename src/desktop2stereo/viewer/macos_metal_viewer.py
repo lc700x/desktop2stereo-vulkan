@@ -5,7 +5,8 @@ Replaces the MoltenVK swapchain chain with a native GPU path:
     CoreML/Metal warp-pack -> shared MTLBuffer texture view
     -> CAMetalLayer textured-quad draw
 
-The strict macOS runtime rejects host-frame fallback presentation.
+Desktop capture stays GPU-only; local media playback may use a prepared host
+RGBA8 frame because file sources do not provide a borrowed CoreML/Metal surface.
 
 Interface matches VulkanLocalViewer so the runtime can switch viewers without
 touching the pipeline: initialize() / present(frame) / poll_events() / close().
@@ -25,10 +26,22 @@ from typing import Any
 
 from utils.display_info import resolve_glfw_monitor_index
 from media_ui import (
+    MEDIA_BAR_TEXTURE_SIZE,
     MEDIA_BROWSER_TEXTURE_SIZE,
+    MEDIA_POINTER_IDLE_SECONDS,
+    MediaHoverAnimation,
+    build_media_bar_rgba,
     build_media_browser_rgba,
+    build_pointer_rgba,
+    media_bar_hit,
+    media_bar_rect_for_eye,
+    media_bar_value_fraction,
     media_browser_hit,
+    media_browser_font_scale,
+    media_browser_rect_for_eye,
     media_browser_scroll_metrics,
+    media_browser_scrollbar_offset,
+    media_control_enabled,
 )
 
 if sys.platform == "darwin":
@@ -39,20 +52,19 @@ from viewer.vulkan_local_viewer import (
     VulkanLocalViewerConfig,
     fit_rect,
     frame_to_rgba_bytes,
+    _has_gpu_present_source,
     is_exclusive_fullscreen_toggle,
+    is_media_capture_mode,
     pack_frame_to_rgba8,
     present_fps_if_due,
 )
+from viewer.direct_sink import native_pack_error_is_recoverable
 from viewer.vulkan_fps_overlay import (
     build_fps_panel_rgba,
     overlay_rect_for_eye,
     overlay_size_for_display_mode,
 )
 from viewer.window_control import (
-    capture_cursor_snapshot,
-    cursor_overlay_rects,
-    cursor_screen_position,
-    cursor_snapshot_key,
     pin_macos_viewer_window,
     set_window_mouse_passthrough,
     update_native_cursor_suppression,
@@ -143,12 +155,12 @@ fragment float4 quad_fragment(
         return float4(0.0, 0.0, 0.0, 1.0);
     }
     float4 color = tex.sample(smp, uv);
-    color = blend_cursor(color, in.position.xy, cursor_rect_left, cursorTex, smp);
-    color = blend_cursor(color, in.position.xy, cursor_rect_right, cursorTex, smp);
     color = blend_overlay(color, in.position.xy, fps_rect_left, fpsTex, smp);
     color = blend_overlay(color, in.position.xy, fps_rect_right, fpsTex, smp);
     color = blend_overlay(color, in.position.xy, media_rect_left, mediaTex, smp);
     color = blend_overlay(color, in.position.xy, media_rect_right, mediaTex, smp);
+    color = blend_cursor(color, in.position.xy, cursor_rect_left, cursorTex, smp);
+    color = blend_cursor(color, in.position.xy, cursor_rect_right, cursorTex, smp);
     return color;
 }
 """
@@ -330,10 +342,10 @@ fragment float4 fragment_main(
         float2 src = float2(uv.x < 0.5 ? uv.x * 2.0 : (uv.x - 0.5) * 2.0, uv.y);
         color = colorTex.sample(s, displaced_uv(src, eye, depthTex, s, u));
     }
-    color = blend_cursor(color, frag, u.cursorRectLeft, cursorTex, s);
-    color = blend_cursor(color, frag, u.cursorRectRight, cursorTex, s);
     color = blend_overlay(color, frag, u.fpsRect, fpsTex, s);
     color = blend_overlay(color, frag, u.mediaRect, mediaTex, s);
+    color = blend_cursor(color, frag, u.cursorRectLeft, cursorTex, s);
+    color = blend_cursor(color, frag, u.cursorRectRight, cursorTex, s);
     return color;
 }
 """
@@ -355,8 +367,13 @@ class MetalLocalViewer:
         self._ns_view = None
         self._capture_window_registered = False
         self._cursor_texture = None
-        self._cursor_snapshot = None
-        self._cursor_snapshot_key = None
+        self._virtual_pointer_texture = None
+        self._virtual_pointer_uv: tuple[float, float] | None = (
+            (0.5, 0.5)
+            if bool(getattr(config, "pointer_mapping_enabled", False))
+            else None
+        )
+        self._blank_texture = None
         self._cursor_hide_enabled = False
         self._fps_overlay_texture = None
         self._fps_overlay_size = (0, 0)
@@ -367,10 +384,22 @@ class MetalLocalViewer:
         self._media_state: dict[str, Any] = {}
         self._media_state_read_at = 0.0
         self._media_browser_scroll = 0
+        self._media_browser_scroll_drag = False
         self._media_browser_hover: str | None = None
         self._media_browser_rects: tuple[tuple[int, int, int, int], ...] = ()
+        self._media_bar_hover: str | None = None
+        self._media_hover_animation = MediaHoverAnimation()
+        self._media_hover_hit: str | None = None
+        self._media_hover_progress = 0.0
+        self._media_bar_rects: tuple[tuple[int, int, int, int], ...] = ()
+        self._media_bar_hit_uv: tuple[float, float] | None = None
+        self._media_drag_action: str | None = None
+        self._media_drag_eye: int | None = None
+        self._media_drag_last_sent_at = 0.0
+        self._media_panel_hovered = False
         self._last_eye_rects: tuple[tuple[int, int, int, int], ...] = ()
         self._media_last_cursor_position: tuple[float, float] | None = None
+        self._media_last_activity = 0.0
         self._media_passthrough_active = False
         self._staging_texture = None
         self._staging_size = (0, 0)
@@ -490,7 +519,11 @@ class MetalLocalViewer:
             self._exclusive_fullscreen = True
         glfw.set_window_pos(self.window, x, y)
         pin_macos_viewer_window(
-            self.window, fullscreen=exclusive_fullscreen
+            self.window,
+            fullscreen=exclusive_fullscreen,
+            show_in_app_switcher=bool(
+                getattr(self.config, "show_in_app_switcher", False)
+            ),
         )
         # Match the Vulkan/Windows viewer: the first OSD interval starts after
         # the window, Metal layer, and pipelines are ready.
@@ -505,10 +538,26 @@ class MetalLocalViewer:
         self._register_capture_window()
         self._build_pipeline()
         self._cursor_texture = self._new_cursor_texture(1, 1, b"\x00\x00\x00\x00")
+        self._blank_texture = self._new_cursor_texture(1, 1, b"\x00\x00\x00\xff")
         self._fps_overlay_texture = self._new_cursor_texture(1, 1, b"\x00\x00\x00\x00")
         self._fps_overlay_size = (1, 1)
         self._media_overlay_texture = self._new_cursor_texture(1, 1, b"\x00\x00\x00\x00")
         self._media_overlay_size = (1, 1)
+        if (
+            bool(getattr(self.config, "pointer_mapping_enabled", False))
+            and is_media_capture_mode(self.config.capture_mode)
+        ):
+            try:
+                pointer_rgba = build_pointer_rgba(48)
+                self._virtual_pointer_texture = self._new_cursor_texture(
+                    48, 48, pointer_rgba.tobytes()
+                )
+            except Exception as exc:
+                print(
+                    "[MetalLocalViewer] Virtual pointer texture unavailable: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
         if self.config.cursor_passthrough:
             self._cursor_hide_enabled = set_window_mouse_passthrough(
                 self.window,
@@ -517,7 +566,11 @@ class MetalLocalViewer:
             )
             self._media_passthrough_active = True
         pin_macos_viewer_window(
-            self.window, fullscreen=exclusive_fullscreen
+            self.window,
+            fullscreen=exclusive_fullscreen,
+            show_in_app_switcher=bool(
+                getattr(self.config, "show_in_app_switcher", False)
+            ),
         )
 
         if exclusive_fullscreen:
@@ -689,87 +742,151 @@ class MetalLocalViewer:
         if not isinstance(state, dict) or (session and state.get("session") != session):
             return state_cache
         if state != state_cache:
+            if not state_cache:
+                self._media_last_activity = now
             self._media_state = state
             self._media_overlay_key = None
         return state
 
     def _media_browser_visible(self) -> bool:
         state = self._read_media_state()
-        visible = (
+        return (
             str(state.get("mode", "")).casefold() == "browser"
             and bool(state.get("ready", True))
             and bool(state.get("browser_visible"))
         )
-        if getattr(self.config, "cursor_passthrough", False) and self.window is not None:
-            want_passthrough = not visible
-            if want_passthrough != getattr(self, "_media_passthrough_active", False):
-                set_window_mouse_passthrough(
-                    self.window,
-                    want_passthrough,
-                    hide_cursor_overlay=bool(
-                        want_passthrough
-                        and bool(getattr(self.config, "hide_cursor_overlay", False))
-                    ),
-                )
-                self._media_passthrough_active = want_passthrough
-        return visible
+
+    def _media_bar_expanded(self) -> bool:
+        last_activity = float(getattr(self, "_media_last_activity", 0.0) or 0.0)
+        return (
+            self._media_browser_visible()
+            or time.monotonic() - last_activity <= MEDIA_POINTER_IDLE_SECONDS
+        )
 
     @staticmethod
     def _media_browser_rect_for_eye(
-        eye_rect: tuple[int, int, int, int]
+        eye_rect: tuple[int, int, int, int], display_mode: str = ""
     ) -> tuple[int, int, int, int]:
-        left, top, right, bottom = (int(value) for value in eye_rect)
-        eye_w = max(1, right - left)
-        eye_h = max(1, bottom - top)
-        aspect = MEDIA_BROWSER_TEXTURE_SIZE[0] / MEDIA_BROWSER_TEXTURE_SIZE[1]
-        max_w = max(1, int(eye_w * 0.98))
-        max_h = max(1, int(eye_h * 0.88))
-        if max_w / max_h > aspect:
-            panel_h = max_h
-            panel_w = max(1, int(panel_h * aspect))
-        else:
-            panel_w = max_w
-            panel_h = max(1, int(panel_w / aspect))
-        x = left + (eye_w - panel_w) // 2
-        y = top + (eye_h - panel_h) // 2
-        return (x, y, x + panel_w, y + panel_h)
+        return media_browser_rect_for_eye(eye_rect, display_mode)
 
     def _media_overlay_rects(
         self, eye_rects: tuple[tuple[int, int, int, int], ...]
     ) -> tuple[tuple[float, float, float, float], ...]:
-        if not self._media_browser_visible() or self._media_overlay_texture is None:
+        if self._media_overlay_texture is None:
             return tuple((0.0, 0.0, 0.0, 0.0) for _ in eye_rects) or (
                 (0.0, 0.0, 0.0, 0.0),
             )
-        rects = tuple(self._media_browser_rect_for_eye(rect) for rect in eye_rects)
-        self._media_browser_rects = rects
-        return tuple(tuple(float(value) for value in rect) for rect in rects) or (
+        if self._media_browser_visible():
+            display_mode = getattr(self.config, "display_mode", "")
+            rects = tuple(
+                self._media_browser_rect_for_eye(rect, display_mode)
+                for rect in eye_rects
+            )
+            self._media_browser_rects = rects
+            self._media_bar_rects = ()
+        elif self._media_state:
+            display_mode = str(getattr(self.config, "display_mode", ""))
+            rects = tuple(
+                media_bar_rect_for_eye(rect, display_mode)
+                for rect in eye_rects
+            )
+            self._media_bar_rects = rects
+            self._media_browser_rects = ()
+        else:
+            return tuple((0.0, 0.0, 0.0, 0.0) for _ in eye_rects) or (
+                (0.0, 0.0, 0.0, 0.0),
+            )
+        return tuple(
+            (
+                float(left),
+                float(top),
+                float(right - left),
+                float(bottom - top),
+            )
+            for left, top, right, bottom in rects
+        ) or (
             (0.0, 0.0, 0.0, 0.0),
         )
 
-    def _refresh_media_overlay(self) -> None:
-        if not self._media_browser_visible():
-            return
-        state = self._media_state
-        key = (
-            state.get("browser_revision"),
-            state.get("browser_path"),
-            state.get("browser_selection"),
-            state.get("browser_error"),
-            self._media_browser_scroll,
-            getattr(self.config, "locale", "EN"),
+    def _media_browser_font_scale(
+        self, eye_rects: tuple[tuple[int, int, int, int], ...] | None = None
+    ) -> float:
+        rects = eye_rects or getattr(self, "_last_eye_rects", ())
+        if not rects:
+            return 1.0
+        panel = self._media_browser_rect_for_eye(
+            rects[0], getattr(self.config, "display_mode", "")
         )
-        if key == self._media_overlay_key:
+        return media_browser_font_scale(panel[3] - panel[1])
+
+    def _refresh_media_overlay(
+        self, eye_rects: tuple[tuple[int, int, int, int], ...] | None = None
+    ) -> None:
+        state = self._read_media_state()
+        if not state:
             return
+        hover = self._media_browser_hover if self._media_browser_visible() else self._media_bar_hover
+        animator = getattr(self, "_media_hover_animation", None)
+        if animator is None:
+            self._media_hover_hit = hover
+            self._media_hover_progress = 1.0 if hover else 0.0
+        else:
+            self._media_hover_hit, self._media_hover_progress = animator.update(
+                hover, time.perf_counter()
+            )
         lang = "CN" if str(getattr(self.config, "locale", "EN")).upper() == "CN" else "EN"
-        rgba = build_media_browser_rgba(
-            state,
-            width=MEDIA_BROWSER_TEXTURE_SIZE[0],
-            height=MEDIA_BROWSER_TEXTURE_SIZE[1],
-            hover=self._media_browser_hover,
-            scroll_offset=self._media_browser_scroll,
-            lang=lang,
-        )
+        if self._media_browser_visible():
+            key = (
+                "browser",
+                state.get("browser_revision"),
+                state.get("browser_path"),
+                state.get("browser_selection"),
+                state.get("browser_error"),
+                self._media_browser_scroll,
+                self._media_hover_hit,
+                round(self._media_hover_progress * 8) / 8,
+                lang,
+                round(self._media_browser_font_scale(eye_rects), 3),
+            )
+            if key == self._media_overlay_key:
+                return
+            rgba = build_media_browser_rgba(
+                state,
+                width=MEDIA_BROWSER_TEXTURE_SIZE[0],
+                height=MEDIA_BROWSER_TEXTURE_SIZE[1],
+                hover=self._media_hover_hit,
+                hover_progress=self._media_hover_progress,
+                scroll_offset=self._media_browser_scroll,
+                lang=lang,
+                font_scale=self._media_browser_font_scale(eye_rects),
+            )
+        else:
+            key = (
+                "bar",
+                self._media_bar_expanded(),
+                state.get("mode"),
+                state.get("ready"),
+                state.get("playing"),
+                state.get("muted"),
+                int(float(state.get("position", 0.0) or 0.0)),
+                int(float(state.get("duration", 0.0) or 0.0)),
+                round(float(state.get("volume", 1.0) or 0.0), 2),
+                state.get("audio_enabled"),
+                self._media_hover_hit,
+                round(self._media_hover_progress * 8) / 8,
+                lang,
+            )
+            if key == self._media_overlay_key:
+                return
+            rgba = build_media_bar_rgba(
+                state,
+                width=MEDIA_BAR_TEXTURE_SIZE[0],
+                height=MEDIA_BAR_TEXTURE_SIZE[1],
+                hover=self._media_hover_hit,
+                hover_progress=self._media_hover_progress,
+                lang=lang,
+                collapsed=not self._media_bar_expanded(),
+            )
         width, height = (int(value) for value in rgba.shape[1::-1])
         if self._media_overlay_texture is None or self._media_overlay_size != (width, height):
             self._media_overlay_texture = self._make_texture(
@@ -782,6 +899,202 @@ class MetalLocalViewer:
         )
         self._media_overlay_key = key
 
+    def _sync_media_passthrough(self) -> None:
+        if not getattr(self.config, "cursor_passthrough", False) or self.window is None:
+            return
+        interactive = self._media_browser_visible() or self._media_panel_hovered or bool(
+            self._media_drag_action
+        )
+        want_passthrough = not interactive
+        if want_passthrough == getattr(self, "_media_passthrough_active", False):
+            return
+        set_window_mouse_passthrough(
+            self.window,
+            want_passthrough,
+            hide_cursor_overlay=bool(
+                want_passthrough
+                and bool(getattr(self.config, "hide_cursor_overlay", False))
+            ),
+        )
+        self._media_passthrough_active = want_passthrough
+
+    def _media_bar_rect_for_eye(
+        self, eye_rect: tuple[int, int, int, int]
+    ) -> tuple[int, int, int, int]:
+        return media_bar_rect_for_eye(
+            eye_rect, str(getattr(self.config, "display_mode", ""))
+        )
+
+    def _media_hit_from_point(self, x: float, y: float):
+        panels = self._media_browser_rects if self._media_browser_visible() else self._media_bar_rects
+        for index, panel in enumerate(panels):
+            left, top, right, bottom = panel
+            if not (left <= x < right and top <= y < bottom):
+                continue
+            u = (x - left) / max(1, right - left)
+            v = (y - top) / max(1, bottom - top)
+            if self._media_browser_visible():
+                hit = media_browser_hit(
+                    u,
+                    v,
+                    self._media_state,
+                    scroll_offset=self._media_browser_scroll,
+                )
+                return ("browser", index, u, v, hit)
+            hit = media_bar_hit(
+                u,
+                v,
+                self._media_state,
+                collapsed=not self._media_bar_expanded(),
+            )
+            return ("bar", index, u, v, hit)
+        return None
+
+    def _media_bar_hit_from_cursor(self, xpos: float, ypos: float):
+        try:
+            client_w, client_h = self.glfw.get_window_size(self.window)
+            fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
+        except Exception:
+            return None
+        x = float(xpos) * max(1, int(fb_w)) / max(1, int(client_w))
+        y = float(ypos) * max(1, int(fb_h)) / max(1, int(client_h))
+        virtual_uv = getattr(self, "_virtual_pointer_uv", None)
+        if (
+            bool(getattr(self.config, "pointer_mapping_enabled", False))
+            and virtual_uv is not None
+            and self._last_eye_rects
+        ):
+            left, top, right, bottom = self._last_eye_rects[0]
+            u, v = virtual_uv
+            x = left + u * (right - left)
+            y = top + v * (bottom - top)
+        return self._media_hit_from_point(x, y)
+
+    def _dispatch_media_bar_hit(self, hit: str | None) -> None:
+        if not hit:
+            return
+        if hit.startswith("seek:"):
+            try:
+                fraction = max(0.0, min(1.0, float(hit.split(":", 1)[1])))
+            except (TypeError, ValueError):
+                return
+            duration = float(self._media_state.get("duration", 0.0) or 0.0)
+            if duration > 0.0 and media_control_enabled("seek", self._media_state):
+                self._media_state = {**self._media_state, "position": fraction * duration}
+                self._media_action("seek", fraction * duration)
+            return
+        if hit.startswith("volume:"):
+            try:
+                volume = max(0.0, min(1.0, float(hit.split(":", 1)[1])))
+            except (TypeError, ValueError):
+                return
+            if media_control_enabled("volume", self._media_state):
+                self._media_state = {**self._media_state, "volume": volume}
+                self._media_action("volume", volume)
+            return
+        if hit.startswith("seek_relative:"):
+            try:
+                value = float(hit.split(":", 1)[1])
+            except (TypeError, ValueError):
+                return
+            if media_control_enabled("seek_relative", self._media_state):
+                self._media_action("seek_relative", value)
+            return
+        if hit in {"browse", "browse_disc"}:
+            self._media_action("browse", {"mode": "disc"} if hit == "browse_disc" else None)
+        elif hit == "media_exit":
+            self._media_browser_scroll = 0
+            self._media_browser_scroll_drag = False
+            self._media_action("media_exit")
+        elif hit == "play" and media_control_enabled("play", self._media_state):
+            was_playing = bool(self._media_state.get("playing", False))
+            action = "pause" if was_playing else "play"
+            if self._media_action(action):
+                self._media_state = {**self._media_state, "playing": not was_playing}
+                self._media_overlay_key = None
+        elif hit in {"playlist_previous", "playlist_next"}:
+            if media_control_enabled(hit, self._media_state):
+                self._media_action(hit)
+        elif hit == "mute" and media_control_enabled("mute", self._media_state):
+            self._media_action("mute", not bool(self._media_state.get("muted", False)))
+
+    def _update_media_drag(self, u: float) -> None:
+        now = time.monotonic()
+        if now - self._media_drag_last_sent_at < 0.05:
+            return
+        action = str(self._media_drag_action or "")
+        fraction = media_bar_value_fraction(u, action=action)
+        if fraction is None:
+            return
+        if action == "seek":
+            duration = float(self._media_state.get("duration", 0.0) or 0.0)
+            if duration <= 0.0 or not media_control_enabled("seek", self._media_state):
+                return
+            value = fraction * duration
+            self._media_state = {**self._media_state, "position": value}
+            self._media_action("seek", value)
+        elif action == "volume":
+            if not media_control_enabled("volume", self._media_state):
+                return
+            self._media_state = {**self._media_state, "volume": fraction}
+            self._media_action("volume", fraction)
+        else:
+            return
+        self._media_drag_last_sent_at = now
+        self._media_overlay_key = None
+
+    def _update_media_hover(self, xpos: float, ypos: float) -> None:
+        hit = self._media_bar_hit_from_cursor(xpos, ypos)
+        previous_hovered = self._media_panel_hovered
+        self._media_panel_hovered = hit is not None
+        previous_bar = self._media_bar_hover
+        previous_browser = self._media_browser_hover
+        if hit is None:
+            self._media_bar_hover = None
+            self._media_browser_hover = None
+            if self._media_drag_action and self._media_drag_eye is not None:
+                try:
+                    client_w, client_h = self.glfw.get_window_size(self.window)
+                    fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
+                    x = float(xpos) * max(1, int(fb_w)) / max(1, int(client_w))
+                    rect = self._media_bar_rects[self._media_drag_eye]
+                    u = (x - rect[0]) / max(1, rect[2] - rect[0])
+                    self._media_bar_hit_uv = (u, self._media_bar_hit_uv[1])
+                    self._update_media_drag(u)
+                except (IndexError, TypeError, ValueError):
+                    pass
+        elif hit[0] == "bar":
+            self._media_bar_hover = hit[4]
+            self._media_bar_hit_uv = (hit[2], hit[3])
+            self._media_browser_hover = None
+            if self._media_bar_hover == "wake":
+                self._media_last_activity = time.monotonic()
+                self._media_panel_hovered = True
+        else:
+            self._media_bar_hover = None
+            browser_hit = hit[4]
+            if (
+                self._media_browser_scroll_drag
+                and browser_hit is not None
+                and browser_hit[0] == "browser_scroll"
+            ):
+                self._media_browser_scroll = int(browser_hit[1])
+                self._media_overlay_key = None
+            self._media_browser_hover = (
+                f"{browser_hit[0]}:{browser_hit[1]}"
+                if browser_hit is not None
+                else None
+            )
+        if (
+            previous_hovered != self._media_panel_hovered
+            or previous_bar != self._media_bar_hover
+            or previous_browser != self._media_browser_hover
+        ):
+            self._media_overlay_key = None
+        if self._media_drag_action and self._media_panel_hovered and hit and hit[0] == "bar":
+            self._update_media_drag(hit[2])
+        self._sync_media_passthrough()
+
     def _media_action(self, action: str, value: Any = None) -> bool:
         callback = getattr(self.config, "media_action_callback", None)
         if not callable(callback):
@@ -792,69 +1105,156 @@ class MetalLocalViewer:
         if hit is None:
             return
         action, value = hit
-        if action in {"entry", "recent"}:
+        if action == "viewer_stop":
+            callback = getattr(self.config, "on_stop_requested", None)
+            if callable(callback):
+                callback()
+        elif action == "entry":
+            path = str(value or "")
+            self._media_state = {
+                **self._media_state,
+                "browser_selection": path,
+                "browser_revision": int(
+                    self._media_state.get("browser_revision", 0) or 0
+                ) + 1,
+            }
+            self._media_overlay_key = None
+            self._media_action("browse_open", {"path": path})
+        elif action == "recent":
             self._media_action("browse_open", {"path": value})
         elif action == "mount":
             self._media_action("browse", value)
         elif action in {"browse_open", "playlist_add", "playlist_select", "playlist_remove", "recent_remove"}:
             self._media_action(action, {"path": value} if value else None)
+        elif action == "browser_scroll":
+            self._media_browser_scroll = int(value or 0)
+            self._media_overlay_key = None
+        elif action == "browser_sort":
+            self._media_action(
+                "browser_sort",
+                {"descending": self._media_state.get("browser_sort_descending") is not True},
+            )
         else:
             self._media_action(action, value)
 
-    def _media_hit_from_cursor(self, xpos: float, ypos: float) -> tuple[str, Any] | None:
-        if not self._media_browser_visible() or not self._media_browser_rects:
-            return None
+    def _on_cursor_pos(self, _window: Any, xpos: float, ypos: float) -> None:
+        position = (float(xpos), float(ypos))
+        moved = position != self._media_last_cursor_position
+        self._media_last_cursor_position = position
+        if moved:
+            self._media_last_activity = time.monotonic()
+        self._update_virtual_pointer_uv(xpos, ypos)
+        self._update_media_hover(xpos, ypos)
+        self._refresh_media_overlay()
+
+    def _poll_virtual_pointer(self) -> None:
+        """Poll coordinates while the SBS window ignores mouse events."""
+        try:
+            xpos, ypos = self.glfw.get_cursor_pos(self.window)
+            client_w, client_h = self.glfw.get_window_size(self.window)
+        except Exception:
+            return
+        self._on_cursor_pos(self.window, float(xpos), float(ypos))
+
+    def _update_virtual_pointer_uv(self, xpos: float, ypos: float) -> None:
+        """Map the complete packed-frame ray to one source coordinate for both eyes."""
+        if not bool(getattr(self.config, "pointer_mapping_enabled", False)):
+            return
+        eye_rects = getattr(self, "_last_eye_rects", ())
+        if not eye_rects:
+            return
         try:
             client_w, client_h = self.glfw.get_window_size(self.window)
             fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
+            x = float(xpos) * max(1, int(fb_w)) / max(1, int(client_w))
+            y = float(ypos) * max(1, int(fb_h)) / max(1, int(client_h))
         except Exception:
-            return None
-        x = float(xpos) * max(1, int(fb_w)) / max(1, int(client_w))
-        y = float(ypos) * max(1, int(fb_h)) / max(1, int(client_h))
-        for rect, panel in zip(self._last_eye_rects, self._media_browser_rects):
-            left, top, right, bottom = panel
-            if not (left <= x < right and top <= y < bottom):
-                continue
+            return
+        mode = str(getattr(self.config, "display_mode", ""))
+        packed_mode = mode.strip().casefold().replace("_", "-")
+        frame_left = min(rect[0] for rect in eye_rects)
+        frame_top = min(rect[1] for rect in eye_rects)
+        frame_right = max(rect[2] for rect in eye_rects)
+        frame_bottom = max(rect[3] for rect in eye_rects)
+        if not (frame_left <= x < frame_right and frame_top <= y < frame_bottom):
+            self._virtual_pointer_uv = None
+            return
+
+        # The ray is measured in the complete packed output. A ray at the
+        # SBS midpoint therefore maps to source u=0.5 in both eyes, which
+        # places the markers at 25% and 75% of the full frame.
+        if packed_mode.endswith("sbs"):
+            u = (x - frame_left) / max(1, frame_right - frame_left)
+            eye_top = max(rect[1] for rect in eye_rects)
+            eye_bottom = min(rect[3] for rect in eye_rects)
+            v = (y - eye_top) / max(1, eye_bottom - eye_top)
+        elif packed_mode.endswith("tab"):
+            eye_left = max(rect[0] for rect in eye_rects)
+            eye_right = min(rect[2] for rect in eye_rects)
+            u = (x - eye_left) / max(1, eye_right - eye_left)
+            v = (y - frame_top) / max(1, frame_bottom - frame_top)
+        else:
+            left, top, right, bottom = eye_rects[0]
             u = (x - left) / max(1, right - left)
             v = (y - top) / max(1, bottom - top)
-            hit = media_browser_hit(
-                u,
-                v,
-                self._media_state,
-                scroll_offset=self._media_browser_scroll,
-            )
-            if hit is None:
-                return None
-            return hit
-        return None
-
-    def _on_cursor_pos(self, _window: Any, xpos: float, ypos: float) -> None:
-        self._media_last_cursor_position = (float(xpos), float(ypos))
-        hit = self._media_hit_from_cursor(xpos, ypos)
-        next_hover = f"{hit[0]}:{hit[1]}" if hit is not None else None
-        if next_hover != self._media_browser_hover:
-            self._media_browser_hover = next_hover
-            self._media_overlay_key = None
-            self._refresh_media_overlay()
+        self._virtual_pointer_uv = (u, v)
 
     def _on_mouse_button(self, _window: Any, button: int, action: int, _mods: int) -> None:
-        if int(button) != int(getattr(self.glfw, "MOUSE_BUTTON_LEFT", 0)):
+        left_button = int(getattr(self.glfw, "MOUSE_BUTTON_LEFT", 0))
+        release = int(getattr(self.glfw, "RELEASE", 0))
+        if int(action) == release:
+            self._media_browser_scroll_drag = False
+            if self._media_drag_action is not None and self._media_bar_hit_uv is not None:
+                self._media_drag_last_sent_at = 0.0
+                self._update_media_drag(self._media_bar_hit_uv[0])
+            self._media_drag_action = None
+            self._media_drag_eye = None
+            self._sync_media_passthrough()
             return
-        if int(action) != int(getattr(self.glfw, "PRESS", 1)):
+        if int(button) != left_button or int(action) != int(getattr(self.glfw, "PRESS", 1)):
             return
         try:
             xpos, ypos = self.glfw.get_cursor_pos(self.window)
         except Exception:
             return
-        self._dispatch_media_hit(self._media_hit_from_cursor(xpos, ypos))
+        self._on_cursor_pos(self.window, xpos, ypos)
+        hit = self._media_bar_hit_from_cursor(xpos, ypos)
+        if hit is None:
+            return
+        self._media_last_activity = time.monotonic()
+        if hit[0] == "browser":
+            browser_hit = hit[4]
+            if browser_hit is None:
+                self._dispatch_media_hit(("browse_close", None))
+            else:
+                if browser_hit[0] == "browser_scroll":
+                    self._media_browser_scroll_drag = True
+                self._dispatch_media_hit(browser_hit)
+        else:
+            value = hit[4]
+            if value == "wake":
+                self._media_last_activity = time.monotonic()
+                self._media_overlay_key = None
+                return
+            self._dispatch_media_bar_hit(value)
+            if value and value.startswith(("seek:", "volume:")):
+                self._media_drag_action = value.split(":", 1)[0]
+                self._media_drag_eye = hit[1]
+                self._media_drag_last_sent_at = 0.0
+                self._media_bar_hit_uv = (hit[2], hit[3])
+                self._update_media_drag(hit[2])
+        self._media_overlay_key = None
+        self._refresh_media_overlay()
 
     def _on_scroll(self, _window: Any, _xoffset: float, yoffset: float) -> None:
         if not self._media_browser_visible():
             return
-        _step, _visible, maximum = media_browser_scroll_metrics(self._media_state)
+        if not self._media_panel_hovered:
+            return
+        step, _visible, maximum = media_browser_scroll_metrics(self._media_state)
         self._media_browser_scroll = max(
             0,
-            min(maximum, self._media_browser_scroll + (-3 if yoffset > 0 else 3)),
+            min(maximum, self._media_browser_scroll + (-step * 3 if yoffset > 0 else step * 3)),
         )
         self._media_overlay_key = None
         self._refresh_media_overlay()
@@ -913,27 +1313,6 @@ class MetalLocalViewer:
             for eye_rect in eye_rects
         ) or (empty,)
 
-    def _refresh_cursor_texture(self) -> None:
-        mode = str(getattr(self.config, "display_mode", ""))
-        if (
-            not self.config.cursor_passthrough
-            or not self.config.hide_cursor_overlay
-            or mode.strip().casefold().replace("_", "-")
-            not in {"half-sbs", "full-sbs"}
-        ):
-            return
-        key = cursor_snapshot_key(mode)
-        if key is None or (key == self._cursor_snapshot_key and self._cursor_snapshot):
-            return
-        snapshot = capture_cursor_snapshot(mode)
-        if snapshot is None:
-            return
-        self._cursor_texture = self._new_cursor_texture(
-            snapshot.width, snapshot.height, snapshot.rgba
-        )
-        self._cursor_snapshot = snapshot
-        self._cursor_snapshot_key = key
-
     def _enable_native_cursor_hiding(self) -> None:
         if not self.config.hide_cursor_overlay or self._cursor_hide_enabled:
             return
@@ -946,62 +1325,69 @@ class MetalLocalViewer:
     def _cursor_overlay_rects(
         self, eye_rects: tuple[tuple[int, int, int, int], ...]
     ) -> tuple[tuple[float, float, float, float], ...]:
-        self._refresh_cursor_texture()
         empty = (0.0, 0.0, 0.0, 0.0)
-        if self._cursor_snapshot is None or not self.config.hide_cursor_overlay:
+        if (
+            is_media_capture_mode(getattr(self.config, "capture_mode", ""))
+            and bool(getattr(self.config, "pointer_mapping_enabled", False))
+        ):
+            return self._virtual_cursor_rects(eye_rects)
+        return (empty, empty)
+
+    def _virtual_cursor_rects(
+        self, eye_rects: tuple[tuple[int, int, int, int], ...]
+    ) -> tuple[tuple[float, float, float, float], ...]:
+        empty = (0.0, 0.0, 0.0, 0.0)
+        last_activity = float(getattr(self, "_media_last_activity", 0.0) or 0.0)
+        if (
+            getattr(self, "_virtual_pointer_texture", None) is None
+            or getattr(self, "_virtual_pointer_uv", None) is None
+            or not eye_rects
+            or (
+                last_activity > 0.0
+                and time.monotonic() - last_activity > MEDIA_POINTER_IDLE_SECONDS
+            )
+        ):
             return (empty, empty)
-        rects = cursor_overlay_rects(
-            self._ns_window,
-            eye_rects,
-            self._cursor_snapshot,
-            cursor_screen_position(),
-        )
-        normalized = [tuple(float(value) for value in rect) for rect in rects[:2]]
-        while len(normalized) < 2:
-            normalized.append(empty)
-        return tuple(normalized)
+        u, v = self._virtual_pointer_uv
+        mode = str(getattr(self.config, "display_mode", ""))
+        packed_mode = mode.strip().casefold().replace("_", "-")
+        pointer_width = 24 if packed_mode == "half-sbs" else 48
+        rects = []
+        for left, top, right, bottom in eye_rects:
+            x = int(round(left + u * (right - left))) - pointer_width // 2
+            y = int(round(top + v * (bottom - top))) - 24
+            rects.append((float(x), float(y), float(pointer_width), 48.0))
+        while len(rects) < 2:
+            rects.append(empty)
+        return tuple(rects[:2])
+
+    def _cursor_texture_for_present(self) -> Any:
+        if bool(getattr(self.config, "pointer_mapping_enabled", False)):
+            if self._virtual_pointer_texture is not None:
+                return self._virtual_pointer_texture
+        return self._cursor_texture
 
     def _pack_native_coreml_frame(self, frame: Any):
         native_frame = getattr(frame, "viewer_native", None)
         if native_frame is None:
             return None
-        source_size = getattr(frame, "output_eye_size", None)
-        if source_size is None:
-            source_size = getattr(native_frame, "source_size", None)
-        if not isinstance(source_size, (tuple, list)) or len(source_size) != 2:
-            raise RuntimeError("native CoreML frame has no source dimensions")
-        source_width, source_height = map(int, source_size)
+        output_size = getattr(frame, "output_eye_size", None)
+        if not isinstance(output_size, (tuple, list)) or len(output_size) != 2:
+            output_size = getattr(native_frame, "source_size", None)
+        if not isinstance(output_size, (tuple, list)) or len(output_size) != 2:
+            raise RuntimeError("native CoreML frame has no output dimensions")
+        output_width, output_height = map(int, output_size)
         output_format = str(getattr(frame, "output_format", "half_sbs") or "half_sbs")
         normalized_format = output_format.strip().casefold().replace("-", "_")
-        low_latency = os.environ.get("D2S_METAL_LOW_LATENCY", "1").strip().lower() not in {
-            "0",
-            "false",
-            "off",
-            "no",
-        }
-        if normalized_format == "half_sbs" and low_latency:
-            # A Half-SBS output pixel represents one pixel in each eye. The
-            # local viewer uses the direct inverse-warp variant to avoid the
-            # full per-pixel DIBR gather while keeping all work on Metal.
-            warp_config = dict(getattr(native_frame, "warp_config", None) or {})
-            # Value 2 selects the local viewer's direct inverse warp. The
-            # streaming path keeps value 1 for its existing DIBR center sample.
-            warp_config["half_sbs_single_sample"] = 2
-            # The fast warp has no edge supersampling or hole-fill gather.
-            # Disable the separate full-resolution Gaussian pass as well;
-            # otherwise it adds several milliseconds without affecting the
-            # direct output branch.
-            warp_config["edge_aa_enabled"] = 0
-            configure_warp = getattr(native_frame, "configure_warp", None)
-            if callable(configure_warp):
-                configure_warp(**warp_config)
-            else:
-                try:
-                    native_frame.warp_config = warp_config
-                except (AttributeError, TypeError):
-                    pass
-        width = source_width * 2 if normalized_format == "full_sbs" else source_width
-        height = source_height * 2 if normalized_format == "full_tab" else source_height
+        # Keep the local viewer on the same native DIBR implementation as the
+        # original display path. The former low-latency half-SBS shortcut used
+        # a center sample and disabled edge AA, which necessarily changed
+        # silhouettes and occlusion pixels. Exact display parity takes
+        # precedence here, so the configured full-quality parameters are sent
+        # through unchanged.
+        low_latency = False
+        width = output_width * 2 if normalized_format == "full_sbs" else output_width
+        height = output_height * 2 if normalized_format == "full_tab" else output_height
         size = (width, height)
         if min(size) < 1:
             raise RuntimeError(f"native CoreML output size is invalid: {size}")
@@ -1027,7 +1413,13 @@ class MetalLocalViewer:
                 if texture is None:
                     raise RuntimeError("could not create a texture view of the Metal output buffer")
                 self._native_pack_slots.append(
-                    {"buffer": buffer, "texture": texture, "busy": False}
+                    {
+                        "buffer": buffer,
+                        "texture": texture,
+                        "busy": False,
+                        "wait_event": None,
+                        "wait_value": 0,
+                    }
                 )
 
         slot = None
@@ -1036,11 +1428,16 @@ class MetalLocalViewer:
             candidate = self._native_pack_slots[index]
             if not candidate["busy"]:
                 candidate["busy"] = True
+                candidate["wait_event"] = None
+                candidate["wait_value"] = 0
                 self._native_pack_cursor = (index + 1) % len(self._native_pack_slots)
                 slot = candidate
                 break
         if slot is None:
-            native_frame.release()
+            try:
+                native_frame.release()
+            except Exception:
+                pass
             object.__setattr__(frame, "viewer_native", None)
             return None
 
@@ -1054,12 +1451,38 @@ class MetalLocalViewer:
                 size,
                 output_format,
             )
-        except Exception:
+        except Exception as exc:
             slot["busy"] = False
-            native_frame.release()
+            try:
+                native_frame.release()
+            except Exception:
+                pass
             object.__setattr__(frame, "viewer_native", None)
+            if native_pack_error_is_recoverable(exc):
+                debug = getattr(frame, "debug_info", None)
+                if isinstance(debug, dict):
+                    debug["macos_metal_native_pack_drop"] = 1
+                    debug["macos_metal_native_pack_error"] = str(exc)
+                on_breakdown_inc = getattr(
+                    getattr(self, "config", None), "on_breakdown_inc", None
+                )
+                if on_breakdown_inc is not None:
+                    on_breakdown_inc("viewer_drop", 1)
+                return None
             raise
-        native_frame.release()
+        pack_async = bool(pack_metrics.get("asynchronous", False))
+        if pack_async:
+            event_pointer = int(pack_metrics.get("completion_event", 0) or 0)
+            if event_pointer:
+                slot["wait_event"] = objc.objc_object(c_void_p=event_pointer)
+                slot["wait_value"] = int(pack_metrics.get("completion_value", 0) or 0)
+            else:
+                pack_async = False
+        if not pack_async:
+            try:
+                native_frame.release()
+            except Exception:
+                pass
         object.__setattr__(frame, "viewer_native", None)
         debug = getattr(frame, "debug_info", None)
         if isinstance(debug, dict):
@@ -1082,6 +1505,7 @@ class MetalLocalViewer:
                 debug["macos_metal_pack_warp_threads"] = int(
                     pack_metrics.get("warp_threads", 0) or 0
                 )
+                debug["macos_metal_pack_async"] = int(pack_async)
         return slot, slot["texture"], width, height
 
     # ── frame flow ──
@@ -1128,25 +1552,20 @@ class MetalLocalViewer:
                 rgb, depth, bgra=getattr(frame, "viewer_bgra", None)
             )
 
-        if gpu_required and native_frame is None:
+        if gpu_required and not _has_gpu_present_source(frame, self.config):
             raise RuntimeError(
-                "GPU-only Metal presentation requires a native CoreML/Metal frame"
+                "GPU-only Metal presentation requires a native frame or packed media frame"
             )
-        if native_frame is not None and os.environ.get(
-            "D2S_METAL_DEFERRED_NATIVE_WARP", "1"
-        ).strip().lower() not in {"0", "false", "off", "no"}:
-            # Keep Core ML's IOSurface texture and raw depth buffer alive until
-            # the CAMetalLayer command completes. This avoids the old full-frame
-            # native SBS pack and its synchronous GPU wait on the local viewer.
-            native_present = self._present_native_coreml_warp(frame)
-            if native_present is not None:
-                return native_present
+        # The fragment deferred-warp path is intentionally not used for normal
+        # presentation. It is an approximation and does not produce the same
+        # pixels as the original layered DIBR display path. The native Metal
+        # pack below is the single source of truth for local output.
         pack_started = time.perf_counter()
         native_pack = self._pack_native_coreml_frame(frame)
         native_slot = None
         if native_pack is not None:
             native_slot, texture, width, height = native_pack
-        elif gpu_required:
+        elif gpu_required and getattr(frame, "viewer_frame_np", None) is None:
             if self.config.on_breakdown_inc is not None:
                 self.config.on_breakdown_inc("viewer_drop", 1)
             return False
@@ -1179,7 +1598,13 @@ class MetalLocalViewer:
                 region, 0, pixels, width * 4
             )
 
-        return self._present_packed_texture(texture, width, height, native_slot=native_slot)
+        return self._present_packed_texture(
+            texture,
+            width,
+            height,
+            native_slot=native_slot,
+            native_frame=native_frame,
+        )
 
     def _present_packed_texture(
         self,
@@ -1188,12 +1613,46 @@ class MetalLocalViewer:
         height: int,
         *,
         native_slot: dict[str, Any] | None = None,
+        native_frame: Any | None = None,
     ) -> bool:
         """Submit a packed GPU texture with the live cursor overlays."""
         drawable = self.layer.nextDrawable()
         if drawable is None:
+            if native_frame is not None:
+                wait_event = (
+                    native_slot.get("wait_event")
+                    if native_slot is not None
+                    else None
+                )
+                wait_value = (
+                    int(native_slot.get("wait_value", 0) or 0)
+                    if native_slot is not None
+                    else 0
+                )
+                if wait_event is not None and wait_value:
+                    cleanup = self.queue.commandBuffer()
+                    cleanup.encodeWaitForEvent_value_(wait_event, wait_value)
+
+                    def _release_unscheduled_native(
+                        _completed,
+                        frame=native_frame,
+                    ):
+                        try:
+                            frame.release()
+                        except Exception:
+                            pass
+
+                    cleanup.addCompletedHandler_(_release_unscheduled_native)
+                    cleanup.commit()
+                else:
+                    try:
+                        native_frame.release()
+                    except Exception:
+                        pass
             if native_slot is not None:
                 native_slot["busy"] = False
+                native_slot["wait_event"] = None
+                native_slot["wait_value"] = 0
             return False
 
         fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
@@ -1236,9 +1695,26 @@ class MetalLocalViewer:
         submit_started = time.perf_counter()
         command_buffer = self.queue.commandBuffer()
         if native_slot is not None:
-            command_buffer.addCompletedHandler_(
-                lambda _completed, slot=native_slot: slot.__setitem__("busy", False)
-            )
+            wait_event = native_slot.get("wait_event")
+            wait_value = int(native_slot.get("wait_value", 0) or 0)
+            if wait_event is not None and wait_value:
+                command_buffer.encodeWaitForEvent_value_(wait_event, wait_value)
+
+            def _complete_native_slot(
+                _completed,
+                slot=native_slot,
+                frame=native_frame,
+            ):
+                slot["busy"] = False
+                slot["wait_event"] = None
+                slot["wait_value"] = 0
+                if frame is not None:
+                    try:
+                        frame.release()
+                    except Exception:
+                        pass
+
+            command_buffer.addCompletedHandler_(_complete_native_slot)
         pass_desc = Metal.MTLRenderPassDescriptor.renderPassDescriptor()
         color = pass_desc.colorAttachments().objectAtIndexedSubscript_(0)
         color.setTexture_(drawable.texture())
@@ -1257,7 +1733,7 @@ class MetalLocalViewer:
         )
         cursor_rects = self._cursor_overlay_rects(eye_rects)
         fps_rects = self._fps_overlay_rects(eye_rects)
-        encoder.setFragmentTexture_atIndex_(self._cursor_texture, 1)
+        encoder.setFragmentTexture_atIndex_(self._cursor_texture_for_present(), 1)
         fps_texture = self._fps_overlay_texture
         if fps_texture is None:
             fps_texture = self._cursor_texture
@@ -1325,10 +1801,10 @@ class MetalLocalViewer:
 
     def present_cached(self) -> bool:
         """Redraw the last GPU frame so cursor motion is independent of inference."""
-        if self._media_browser_visible() and getattr(self, "_cursor_texture", None) is not None:
+        if self._media_browser_visible() and getattr(self, "_blank_texture", None) is not None:
             self.poll_events()
             self._sync_fps_overlay_visibility()
-            return self._present_packed_texture(self._cursor_texture, 2, 1)
+            return self._present_packed_texture(self._blank_texture, 2, 1)
         if (
             self.window is not None
             and self._initialized_flag()
@@ -1344,22 +1820,36 @@ class MetalLocalViewer:
         if (
             self.window is None
             or not self._initialized_flag()
-            or texture is None
-            or width <= 0
-            or height <= 0
         ):
             return False
+        if texture is None or width <= 0 or height <= 0:
+            texture = getattr(self, "_blank_texture", None)
+            if texture is None:
+                return False
+            width, height = 2, 1
         self.poll_events()
         self._sync_fps_overlay_visibility()
         return self._present_packed_texture(texture, width, height)
 
-    def present_media_browser(self) -> bool:
-        """Present the file browser before a media frame is available."""
-        if not self._media_browser_visible() or getattr(self, "_cursor_texture", None) is None:
+    def present_blank(self) -> bool:
+        """Present a black SBS player surface while no media frame is available."""
+        if (
+            self.window is None
+            or not self._initialized_flag()
+            or getattr(self, "_blank_texture", None) is None
+        ):
             return False
         self.poll_events()
         self._sync_fps_overlay_visibility()
-        return self._present_packed_texture(self._cursor_texture, 2, 1)
+        return self._present_packed_texture(self._blank_texture, 2, 1)
+
+    def present_media_browser(self) -> bool:
+        """Present the file browser before a media frame is available."""
+        if not self._media_browser_visible() or getattr(self, "_blank_texture", None) is None:
+            return False
+        self.poll_events()
+        self._sync_fps_overlay_visibility()
+        return self._present_packed_texture(self._blank_texture, 2, 1)
 
     def _present_cached(self) -> bool:
         """Compatibility alias matching the Vulkan viewer interface."""
@@ -1764,7 +2254,7 @@ class MetalLocalViewer:
         media_rects = self._media_overlay_rects(eye_rects)
         cursor_rects = self._cursor_overlay_rects(eye_rects)
         fps_rects = self._fps_overlay_rects(eye_rects)
-        encoder.setFragmentTexture_atIndex_(self._cursor_texture, 2)
+        encoder.setFragmentTexture_atIndex_(self._cursor_texture_for_present(), 2)
         fps_texture = self._fps_overlay_texture
         if fps_texture is None:
             fps_texture = self._cursor_texture
@@ -1965,6 +2455,7 @@ class MetalLocalViewer:
             "macos_metal_output_pack_ms",
             "macos_metal_pack_gpu_ms",
             "macos_metal_pack_host_handoff_ms",
+            "macos_metal_pack_async",
             "metal_present_submit_cpu_ms",
             "metal_present_gpu_ms",
             "viewer_queue_ms",
@@ -2052,6 +2543,7 @@ class MetalLocalViewer:
                 "macos_metal_output_pack_ms",
                 "macos_metal_pack_gpu_ms",
                 "macos_metal_pack_host_handoff_ms",
+                "macos_metal_pack_async",
                 "macos_metal_pack_warp_threads",
                 "metal_present_submit_cpu_ms",
                 "metal_present_gpu_ms",
@@ -2163,7 +2655,13 @@ class MetalLocalViewer:
             glfw.set_window_attrib(self.window, glfw.DECORATED, glfw.TRUE)
             glfw.set_window_pos(self.window, x, y)
             glfw.set_window_size(self.window, width, height)
-        pin_macos_viewer_window(self.window, fullscreen=enabled)
+        pin_macos_viewer_window(
+            self.window,
+            fullscreen=enabled,
+            show_in_app_switcher=bool(
+                getattr(self.config, "show_in_app_switcher", False)
+            ),
+        )
         print(
             f"[MetalLocalViewer] Display fullscreen: {'on' if enabled else 'off'} "
             "(Alt+Enter)",
@@ -2171,13 +2669,24 @@ class MetalLocalViewer:
         )
 
     def poll_events(self) -> None:
+        self._read_media_state()
+        self._refresh_media_overlay()
         self.glfw.poll_events()
+        self._poll_virtual_pointer()
+        self._refresh_media_overlay()
         if self.glfw.window_should_close(self.window):
             raise StopIteration
         if self._exclusive_fullscreen:
-            pin_macos_viewer_window(self.window, fullscreen=True)
+            pin_macos_viewer_window(
+                self.window,
+                fullscreen=True,
+                show_in_app_switcher=bool(
+                    getattr(self.config, "show_in_app_switcher", False)
+                ),
+            )
         if self.config.hide_cursor_overlay:
             update_native_cursor_suppression()
+        self._sync_media_passthrough()
 
     def close(self) -> None:
         try:
@@ -2202,6 +2711,7 @@ class MetalLocalViewer:
                     )
                 self._capture_window_registered = False
             self._staging_texture = None
+            self._blank_texture = None
             self._last_present_texture = None
             self._last_present_size = (0, 0)
             if self._last_native_entry is not None:
@@ -2213,6 +2723,8 @@ class MetalLocalViewer:
             self._fps_overlay_texture = None
             self._fps_overlay_size = (0, 0)
             self._fps_overlay_visible = False
+            self._virtual_pointer_texture = None
+            self._virtual_pointer_uv = None
             self.pipeline = None
             self.queue = None
             self.device = None
@@ -2267,13 +2779,14 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
         return 1.0 / 60.0
 
     try:
+        viewer = MetalLocalViewer(config)
+        viewer.initialize()
+        _configure_metrics(viewer)
+        viewer.present_blank()
+        print("[MetalLocalViewer] Metal local window initialized", flush=True)
+        # Same-monitor ScreenCaptureKit must start after the Cocoa window
+        # exists, otherwise its initial exclusion list is empty.
         if getattr(config, "on_capture_windows_initialized", None) is not None:
-            # Same-monitor ScreenCaptureKit must start after the Cocoa window
-            # exists, otherwise its initial exclusion list is empty.
-            viewer = MetalLocalViewer(config)
-            viewer.initialize()
-            _configure_metrics(viewer)
-            print("[MetalLocalViewer] Metal local window initialized", flush=True)
             config.on_capture_windows_initialized()
         while not shutdown_event.is_set():
             queue_timeout = 0.05
@@ -2288,13 +2801,7 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
                 if viewer is not None:
                     now = time.perf_counter()
                     cached_present = getattr(viewer, "present_cached", None)
-                    browser_visible = getattr(viewer, "_media_browser_visible", None)
-                    browser_visible = bool(browser_visible()) if callable(browser_visible) else False
-                    if (
-                        callable(cached_present)
-                        and (_has_cached_frame(viewer) or browser_visible)
-                        and now >= next_cached_present_at
-                    ):
+                    if callable(cached_present) and now >= next_cached_present_at:
                         present_started = now
                         presented = cached_present()
                         if presented is not False:
@@ -2312,14 +2819,18 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
                 continue
             if config.on_breakdown_inc is not None:
                 config.on_breakdown_inc("viewer_get", 1)
-            while True:
-                try:
-                    result, _started = runtime_q.get_nowait()
-                except queue.Empty:
-                    break
-                if config.on_breakdown_inc is not None:
-                    config.on_breakdown_inc("viewer_get", 1)
-                    config.on_breakdown_inc("viewer_drop", 1)
+            # Media frames carry an ordered source timeline. Only desktop
+            # latest-wins queues may discard queued results here; draining an
+            # ordered media queue makes playback appear frozen or jump ahead.
+            if not bool(getattr(runtime_q, "_d2s_ordered", False)):
+                while True:
+                    try:
+                        result, _started = runtime_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if config.on_breakdown_inc is not None:
+                        config.on_breakdown_inc("viewer_get", 1)
+                        config.on_breakdown_inc("viewer_drop", 1)
             # Deferred warp: pass the whole result so present() sees
             # viewer_rgb/viewer_depth; host-packed frames likewise; otherwise
             # the packed SBS tensor.
@@ -2372,6 +2883,7 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
                         "macos_metal_output_pack_ms",
                         "macos_metal_pack_gpu_ms",
                         "macos_metal_pack_host_handoff_ms",
+                        "macos_metal_pack_async",
                         "macos_metal_pack_warp_threads",
                         "native_coreml_metal_vulkan_alias",
                         "native_coreml_ring_fallback",
@@ -2411,6 +2923,18 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
                     ),
                 )
                 viewer.record_present(False)
+                if str(getattr(config, "capture_mode", "")).casefold() in {
+                    "file", "video",
+                }:
+                    observe_media = getattr(viewer, "observe_media_presentation", None)
+                    if callable(observe_media):
+                        observe_media(result)
+                    on_media_presented = getattr(config, "on_media_presented", None)
+                    if callable(on_media_presented):
+                        on_media_presented(
+                            getattr(result, "debug_info", None) or {},
+                            presented_at,
+                        )
             if config.on_breakdown_add_time is not None:
                 config.on_breakdown_add_time(
                     "local_present", time.perf_counter() - present_started
@@ -2423,6 +2947,13 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
     except StopIteration:
         shutdown_event.set()
     finally:
+        packer = getattr(runtime_q, "_d2s_packer", None)
+        if packer is not None:
+            # Stop native writes before the viewer unmaps its staging ring.
+            packer.stop()
+            from utils.queue_utils import clear_nonblocking
+
+            clear_nonblocking(runtime_q)
         if viewer is not None:
             viewer.close()
 

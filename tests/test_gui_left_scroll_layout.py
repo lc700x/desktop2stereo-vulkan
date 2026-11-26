@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import flet as ft
 from gui import controls
-from gui.builders import GUIBuilderMixin
+from gui.builders import ACTION_GAP, COMPONENT_GAP, GUIBuilderMixin
 from gui.config import DEFAULTS
 from gui.controls import CompactDisplayField, CompactDropdown, S
 from gui.theme import color
@@ -184,23 +184,23 @@ def test_action_footer_stays_outside_the_scroll_area() -> None:
     # Buttons float below the scrollable content instead of scrolling with it.
     assert "scroll_area.controls.append(footer)" not in source
     btn_start = source.index("self._btn_container = ft.Container(")
-    btn_end = source.index("self._log_status_gap", btn_start)
+    btn_end = source.index("self._status_bar_contain", btn_start)
     assert "content=self._btn_bar" in source[btn_start:btn_end]
     column_start = source.index("self._content_with_buttons = ft.Column(")
     column_end = source.index("page.add(self._content_with_buttons)", column_start)
     assert "self._btn_container" in source[column_start:column_end]
 
 
-def test_stop_and_run_buttons_are_inset_from_the_right_edge() -> None:
+def test_action_buttons_use_the_shared_gap_and_right_alignment() -> None:
     source = BUILDERS_SOURCE.read_text(encoding="utf-8")
     row_start = source.index("btn_row = ft.Row(")
     row_end = source.index("self._btn_bar =", row_start)
 
     row_source = source[row_start:row_end]
-    assert "spacing=S(20)" in row_source
+    assert "spacing=ACTION_GAP" in row_source
 
     container_start = source.index("self._btn_container = ft.Container(")
-    container_end = source.index("self._log_status_gap", container_start)
+    container_end = source.index("self._content_with_buttons", container_start)
     container_source = source[container_start:container_end]
     assert "padding=ft.Padding(S(4), S(1), S(4), S(1))" in container_source
     assert "alignment=ft.alignment.Alignment(1, 0)" in container_source
@@ -659,6 +659,7 @@ def test_capture_source_refresh_gap_preserves_label_alignment_and_mode_visibilit
     )
     gui = SimpleNamespace(
         capture_mode_dd=CompactDropdown(options=["输入屏幕"], value="输入屏幕", width=S(130)),
+        media_input_row=ft.Row([]),
         _capture_mode_spacer=ft.Container(width=S(110)),
         monitor_dd=CompactDropdown(options=["1: D270H 3840x2160"], value="1: D270H 3840x2160"),
         window_dd=CompactDropdown(),
@@ -666,14 +667,20 @@ def test_capture_source_refresh_gap_preserves_label_alignment_and_mode_visibilit
         refresh_btn=ft.Button(content="刷新", width=S(130)),
     )
     gui.window_dd.visible = False
-    scope = {"self": gui, "ft": ft, "S": S}
+    scope = {
+        "self": gui,
+        "ft": ft,
+        "S": S,
+        "ACTION_GAP": ACTION_GAP,
+        "COMPONENT_GAP": COMPONENT_GAP,
+    }
     exec(compile(ast.Module(body=[assignment], type_ignores=[]), str(BUILDERS_SOURCE), "exec"), scope)
     row = scope["row8"]
     source_group = row.controls[-1]
-    assert row.controls[:-1] == [gui.capture_mode_dd, gui._capture_mode_spacer]
+    assert row.controls[:-1] == [gui.capture_mode_dd, gui.media_input_row, gui._capture_mode_spacer]
     assert row.spacing == 1
     assert source_group.controls == [gui.monitor_dd, gui.window_dd, gui.media_path_text, gui.refresh_btn]
-    assert source_group.spacing == S(12)
+    assert source_group.spacing == ACTION_GAP
     assert source_group.vertical_alignment == ft.CrossAxisAlignment.CENTER
     assert gui.refresh_btn.width == S(130)
     for monitor_visible, window_visible in ((True, False), (False, True)):
@@ -694,11 +701,12 @@ def test_capture_mode_dropdown_is_compact_and_keeps_source_group_aligned():
         if isinstance(node, ast.Assign)
         and any(isinstance(target, ast.Attribute) and target.attr == "capture_mode_dd" for target in node.targets)
     )
-    width_keyword = next(keyword.value for keyword in constructor.keywords if keyword.arg == "width")
-    assert isinstance(width_keyword, ast.Call)
-    assert next(arg.value for arg in width_keyword.args) == 130
-    assert not any(keyword.arg == "dyna_width" for keyword in constructor.keywords)
+    assert not any(keyword.arg == "width" for keyword in constructor.keywords)
+    dynamic_width = next(keyword.value for keyword in constructor.keywords if keyword.arg == "dyna_width")
+    assert isinstance(dynamic_width, ast.Constant)
+    assert dynamic_width.value is True
+    assert any(keyword.arg == "dyna_width_gap" for keyword in constructor.keywords)
 
     align_source = inspect.getsource(GUIBuilderMixin._auto_align_labels)
-    assert "self._capture_mode_spacer.width = max(0, final_w - S(130) - 1)" in align_source
+    assert "self._capture_mode_spacer.width = max(0, target_offset - source_width - 1)" in align_source
     assert "self._safe_update(self._capture_mode_spacer)" in align_source

@@ -34,6 +34,7 @@ class GUIConfigMixin:
         self.capture_mode_key = capture_mode
         self.media_path = str(cfg.get("Media Path") or "")
         self._media_path = self.media_path
+        self._media_display_path = self.media_path
         media_position = self._parse_float(
             cfg.get("Media Playback Position", cfg.get("Media Resume Position", 0.0)),
             0.0,

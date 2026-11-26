@@ -79,6 +79,31 @@ def test_browser_orders_media_and_creates_playlist(tmp_path):
     browser.close_and_join()
 
 
+def test_browser_file_sort_reorders_current_directory(tmp_path):
+    for name in ("charlie.mp4", "alpha.mp4", "bravo.mp4"):
+        (tmp_path / name).write_bytes(name.encode())
+    browser = MediaBrowser(initial_directory=str(tmp_path))
+    try:
+        assert browser.open() is True
+        state = _wait_for_scan(browser)
+        assert [entry["name"] for entry in state["browser_entries"]] == [
+            "alpha.mp4",
+            "bravo.mp4",
+            "charlie.mp4",
+        ]
+
+        browser.browser_sort(descending=True)
+        state = browser.snapshot()
+        assert state["browser_sort_descending"] is True
+        assert [entry["name"] for entry in state["browser_entries"]] == [
+            "charlie.mp4",
+            "bravo.mp4",
+            "alpha.mp4",
+        ]
+    finally:
+        browser.close_and_join()
+
+
 def test_media_playlist_can_be_primed_for_autoplay(tmp_path):
     first = tmp_path / "first.mp4"
     second = tmp_path / "second.mp4"

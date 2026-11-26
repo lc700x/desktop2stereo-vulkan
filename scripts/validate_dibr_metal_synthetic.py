@@ -57,7 +57,7 @@ def render(device, pipeline, rgb, depth, tag, half_sbs=False):
     texture_descriptor = (
         Metal.MTLTextureDescriptor
         .texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
-            Metal.MTLPixelFormatRGBA8Unorm, WIDTH, HEIGHT, False
+        Metal.MTLPixelFormatRGBA8Unorm_sRGB, WIDTH, HEIGHT, False
         )
     )
     texture_descriptor.setUsage_(Metal.MTLTextureUsageShaderRead)
@@ -84,9 +84,9 @@ def render(device, pipeline, rgb, depth, tag, half_sbs=False):
         0, 1, 1, 2,
         0.08, 1.15, 1.05, 1.05,
         1, 0, 2, 1,
-        0.0, 0.0, 0,
+        0.0, 0.0, 0, 0, 0, 0, 0.0, 1.0,
     )
-    packed_params = struct.pack("<8I5f4i4f4i2fi", *values)
+    packed_params = struct.pack("<8I5f4i4f4i2f4i2f", *values)
     params_buffer = device.newBufferWithBytes_length_options_(
         packed_params, len(packed_params), Metal.MTLResourceStorageModeShared
     )
@@ -130,6 +130,24 @@ def rgba_pattern(red, green, blue):
     return image
 
 
+def srgb_to_linear(image):
+    image = np.clip(image, 0.0, 1.0)
+    return np.where(
+        image <= 0.04045,
+        image / 12.92,
+        ((image + 0.055) / 1.055) ** 2.4,
+    )
+
+
+def linear_to_srgb(image):
+    image = np.clip(image, 0.0, 1.0)
+    return np.where(
+        image <= 0.0031308,
+        image * 12.92,
+        1.055 * image ** (1.0 / 2.4) - 0.055,
+    )
+
+
 def phase_shift(output, reference, start=32, stop=224):
     xs = np.arange(start, stop, dtype=np.float64)
     omega = 2.0 * np.pi / 32.0
@@ -170,14 +188,17 @@ def main():
     flat_half = render(
         device, pipeline, flat_source, flat_depth, "flat_depth", half_sbs=True
     )
-    left_half = np.rint(
-        (flat[:, :WIDTH:2, :3].astype(np.float32)
-         + flat[:, 1:WIDTH:2, :3].astype(np.float32)) * 0.5
-    ).astype(np.uint8)
-    right_half = np.rint(
-        (flat[:, WIDTH::2, :3].astype(np.float32)
-         + flat[:, WIDTH + 1::2, :3].astype(np.float32)) * 0.5
-    ).astype(np.uint8)
+    full_rgb = flat[..., :3].astype(np.float32) / 255.0
+    left_linear = 0.5 * (
+        srgb_to_linear(full_rgb[:, :WIDTH:2])
+        + srgb_to_linear(full_rgb[:, 1:WIDTH:2])
+    )
+    right_linear = 0.5 * (
+        srgb_to_linear(full_rgb[:, WIDTH::2])
+        + srgb_to_linear(full_rgb[:, WIDTH + 1::2])
+    )
+    left_half = np.rint(linear_to_srgb(left_linear) * 255.0).astype(np.uint8)
+    right_half = np.rint(linear_to_srgb(right_linear) * 255.0).astype(np.uint8)
     expected_half = np.concatenate((left_half, right_half), axis=1)
     half_average_delta = int(
         np.abs(flat_half[:, :, :3].astype(np.int16)

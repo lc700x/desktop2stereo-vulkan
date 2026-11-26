@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,7 @@ class AppRuntimeContext:
     output_transport: str
     # True when the GUI requested the process-local NVIDIA NvFRUC stage.
     nvfruc_frame_generation: bool
+    render_size_limit: tuple[int, int] | None
 
 
 def initial_stereo_preset_state(config):
@@ -97,7 +99,7 @@ def _configure_rocm_attention(device, device_info) -> None:
 
 
 def _media_capture_options_from_environment(
-    run_mode: str, settings: dict | None = None
+    run_mode: str, settings: dict | None = None, *, os_name: str | None = None
 ) -> dict[str, object]:
     settings = settings or {}
     control_path = os.environ.get("D2S_MEDIA_CONTROL_PATH") or None
@@ -129,6 +131,15 @@ def _media_capture_options_from_environment(
         muted = env_flag("D2S_MEDIA_MUTED")
     else:
         muted = bool(settings.get("Media Muted", False))
+    presentation_sync = str(run_mode or "").strip().casefold() in {
+        "viewer", "local viewer", "openxr", "openxr link",
+    }
+    # The macOS media path uses AVPlayer for native audio output. Keep it on by
+    # default, with an opt-out for silent local playback.
+    mac_audio_enabled = env_flag("D2S_MAC_MEDIA_AUDIO", "1")
+    running_on_macos = str(os_name or sys.platform).strip().casefold() in {
+        "darwin", "macos", "mac os", "mac os x",
+    }
 
     return {
         "media_path": (
@@ -150,10 +161,11 @@ def _media_capture_options_from_environment(
             or str(settings.get("Media Browser Directory") or "").strip()
             or None
         ),
-        "media_audio_enabled": str(run_mode or "").strip().casefold() != "mjpeg streamer",
-        "media_presentation_sync": str(run_mode or "").strip().casefold() in {
-            "viewer", "local viewer", "openxr", "openxr link",
-        },
+        "media_audio_enabled": (
+            str(run_mode or "").strip().casefold() != "mjpeg streamer"
+            and (not running_on_macos or not presentation_sync or mac_audio_enabled)
+        ),
+        "media_presentation_sync": presentation_sync,
         "window_handle": _env_int("D2S_WINDOW_HANDLE"),
     }
 
@@ -202,6 +214,7 @@ def create_runtime_context(
     depth_strength,
     convergence,
     capture_fps_provider=None,
+    render_size_limit=None,
 ):
     render_size_config = render_size_config or RenderSizeConfig()
     base_dir = os.path.dirname(os.path.abspath(file_path))
@@ -219,12 +232,18 @@ def create_runtime_context(
 
     raw_q = queue.Queue(maxsize=1)
     runtime_q = queue.Queue(maxsize=1)
-    if str(settings.get("Capture Mode", "")).casefold() in {"file", "video"}:
+    media_capture = str(settings.get("Capture Mode", "")).strip().casefold() in {
+        "file", "video",
+    }
+    media_realtime = media_capture and env_flag("D2S_MEDIA_REALTIME", "1")
+    if media_capture and not media_realtime:
         raw_q._d2s_ordered = True
         runtime_q._d2s_ordered = True
     presentation_q = queue.Queue(maxsize=6)
-    # Consumers must preserve generated frame ordering instead of coalescing.
-    presentation_q._d2s_ordered = True
+    # Realtime media follows wall-clock PTS and may drop stale frames when
+    # inference cannot keep up. Other playback modes retain FIFO ordering.
+    if not media_realtime:
+        presentation_q._d2s_ordered = True
     settings_update_q = queue.Queue(maxsize=1)
     runtime_config = runtime_config_from_d2s_settings(
         settings,
@@ -320,9 +339,10 @@ def create_runtime_context(
                 )
             ),
             render_size_config=render_size_config,
-            **_media_capture_options_from_environment(run_mode, settings),
+            **_media_capture_options_from_environment(run_mode, settings, os_name=os_name),
         ),
         render_size_config=render_size_config or RenderSizeConfig(),
+        render_size_limit=render_size_limit,
         application_runtime_target=application_runtime_target,
         output_transport=output_transport,
         nvfruc_frame_generation=nvfruc_frame_generation,
@@ -420,6 +440,7 @@ def build_runtime_pipeline_context(
         output_transport=getattr(app_context, "output_transport", None),
         settings_update_q=app_context.settings_update_q,
         render_size_config=app_context.render_size_config,
+        render_size_limit=getattr(app_context, "render_size_limit", None),
         capture_size_hint=(
             tuple(int(value) for value in app_context.capture_config.output_resolution)
             if isinstance(app_context.capture_config.output_resolution, (tuple, list))
@@ -427,8 +448,10 @@ def build_runtime_pipeline_context(
             else None
         ),
         gpu_required=bool(app_context.capture_config.gpu_required),
-        media_depth_reuse_disabled=str(
-            app_context.capture_config.capture_mode or ""
-        ).strip().casefold() in {"file", "video"},
+        media_depth_reuse_disabled=(
+            str(app_context.capture_config.capture_mode or "").strip().casefold()
+            in {"file", "video"}
+            and not env_flag("D2S_MEDIA_REALTIME", "1")
+        ),
         capture_mode=str(app_context.capture_config.capture_mode or ""),
     )

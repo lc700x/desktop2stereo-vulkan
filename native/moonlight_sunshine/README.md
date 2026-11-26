@@ -16,7 +16,7 @@ In D2S bridge mode, the child skips Sunshine's redundant desktop/encoder probes 
 
 Do not run another Sunshine server (including `SunshineService`) while Desktop2Stereo Moonlight is active. The second host can capture the desktop and open another NVENC session, which starves the D2S encoder and drops the stream to roughly 10 FPS even though Local Viewer remains fast. If the standard Sunshine port is occupied, Desktop2Stereo selects a compatible free port family and continues; this avoids a bind collision but does not prevent GPU or capture-resource contention. Stop the other service for best streaming performance.
 
-Full-SBS and TAB absolute input uses the optional `input_regions` handshake metadata. Each eye maps its visible viewport to the original capture crop independently, including contain bars, cover cropping, and stretch. Missing metadata and Half-SBS retain the legacy input path; relative mouse input is unchanged.
+All 16:9 streams use Sunshine's native absolute-input mapping with a 2x input-width value so the full ray range reaches the full desktop width. Half-SBS and Half-TAB also use this mapping at other aspect ratios. Non-16:9 Full-SBS and Full-TAB use `input_regions` metadata to map each eye's visible viewport through its capture crop, including contain bars, cover cropping, and stretch. Relative mouse input is unchanged.
 
 ## Bundled files
 
@@ -44,7 +44,7 @@ Check out the exact upstream tag with its pinned submodules, then apply the incl
 ```powershell
 git clone --branch v2026.914.233613 --recurse-submodules https://github.com/LizardByte/Sunshine.git sunshine
 Set-Location sunshine
-git apply /path/to/sunshine-d2s-2026.914.233613.patch
+git apply --recount /path/to/sunshine-d2s-2026.914.233613.patch
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_DOCS=OFF -DBUILD_TESTS=OFF -DSUNSHINE_ENABLE_TRAY=OFF -DSUNSHINE_BUILD_WIX_INSTALLER=OFF -DSUNSHINE_USE_STATIC_QT=OFF -DCUDA_FAIL_ON_MISSING=OFF
 cmake --build build --config Release
 cmake --install build --prefix dist

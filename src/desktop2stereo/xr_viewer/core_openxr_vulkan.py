@@ -45,15 +45,21 @@ from viewer.vulkan_projection_screen import VulkanProjectionScreenPass
 from viewer.vulkan_multiview_diagnostic import VulkanMultiviewEyeDiagnosticPass
 from app_runtime.output_contract import VulkanStereoOutputFrame
 from media_ui import (
+    MEDIA_BAR_TEXTURE_SIZE,
     MEDIA_BROWSER_TEXTURE_ASPECT,
+    MEDIA_BROWSER_LAYOUT_SIZE,
     MEDIA_BROWSER_TEXTURE_SIZE,
+    MEDIA_BROWSER_XR_MAX_HEIGHT_FRACTION,
+    MEDIA_BROWSER_XR_MAX_WIDTH_FRACTION,
     MediaHoverAnimation,
     MediaBrowserThumbnailCache,
     build_media_bar_rgba,
     build_media_browser_rgba,
     media_bar_hit,
     media_browser_hit,
+    media_browser_font_scale_for_eye,
     media_browser_scroll_metrics,
+    media_browser_scrollbar_offset,
     media_control_enabled,
 )
 
@@ -180,7 +186,7 @@ def _coalesce_desktop_settings_actions(
 
 _DEFAULT_XR_HEADSET_PRESET = resolve_xr_headset_preset(None)
 
-_MSDF_OSD_SCALE = 0.58
+_MSDF_OSD_SCALE = 0.84
 _MSDF_OSD_RUN_GAP = 8.0
 _MSDF_OSD_PADDING_X = 20.0
 _MSDF_OSD_PADDING_Y = 14.0
@@ -390,7 +396,7 @@ def _build_msdf_fps_panel(
     environment_visible: bool,
 ) -> VulkanMsdfQuadRequest:
     """Build the FPS panel as MSDF runs instead of a rasterized text bitmap."""
-    scale = 24.0 / max(float(atlas.line_height), 1.0)
+    scale = 28.0 / max(float(atlas.line_height), 1.0)
     label_color = (150, 158, 185, 255)
     value_colors = (
         (0, 230, 90, 255),
@@ -1302,12 +1308,11 @@ class OpenXrVulkanPresenter(
         self._media_overlay_hover_animation = MediaHoverAnimation()
         self._media_overlay_scroll = 0
         self._media_overlay_scroll_next_at = 0.0
+        self._media_overlay_scroll_drag_hand: int | None = None
         self._media_overlay_view_mode = "grid"
         self._media_browser_thumbnail_cache = MediaBrowserThumbnailCache()
         self._media_overlay_trigger_down = [False, False]
         self._media_overlay_pending_selection: tuple[int, str, Any] | None = None
-        self._media_overlay_last_click_at = 0.0
-        self._media_overlay_last_click_hit: str | None = None
         self._media_overlay_pose: tuple[tuple[float, ...], tuple[float, ...]] | None = None
         self._media_overlay_size = (0.92, 0.14)
         self._media_overlay_texture_key: tuple[Any, ...] | None = None
@@ -2989,6 +2994,7 @@ class OpenXrVulkanPresenter(
 
         self._media_overlay_trigger_down = [False, False]
         self._media_overlay_pending_selection = None
+        self._media_overlay_scroll_drag_hand = None
         self._settings_menu_trigger_down = [False, False]
         if hasattr(self._settings_menu, "_trigger_down"):
             self._settings_menu._trigger_down = [False, False]
@@ -6113,8 +6119,8 @@ class OpenXrVulkanPresenter(
         height = float(height)
         screen_pose = self._filament_screen_pose_mat4()
         if browser:
-            max_w = max(0.01, width * 0.94)
-            max_h = max(0.01, height * 0.90)
+            max_w = max(0.01, width * MEDIA_BROWSER_XR_MAX_WIDTH_FRACTION)
+            max_h = max(0.01, height * MEDIA_BROWSER_XR_MAX_HEIGHT_FRACTION)
             # Fit the browser texture inside the virtual screen instead of
             # independently stretching width and height. The same panel size
             # drives painting and ray hit-testing, so keeping one aspect ratio
@@ -6137,6 +6143,13 @@ class OpenXrVulkanPresenter(
             (0.0, local_y, local_z), dtype=np.float64
         )
         return matrix, (panel_w, panel_h)
+
+    def _media_browser_font_scale(self) -> float:
+        try:
+            eye_width, eye_height = self._projection_eye_extents()[0]
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return 1.0
+        return media_browser_font_scale_for_eye(eye_width, eye_height)
 
     def _media_overlay_ray_hit(
         self, hand: int, *, browser: bool = False
@@ -6178,6 +6191,9 @@ class OpenXrVulkanPresenter(
     ) -> None:
         if not hit:
             return
+        if hit == "viewer_stop":
+            self._request_runtime_stop()
+            return
         if hit in {"browser_view_grid", "browser_view_list"}:
             self._media_overlay_view_mode = (
                 "grid" if hit == "browser_view_grid" else "list"
@@ -6201,6 +6217,20 @@ class OpenXrVulkanPresenter(
             return
         state = self._media_overlay_state
         if hit == "wake":
+            self._media_overlay_last_activity = time.monotonic()
+            return
+        if hit == "browser_scroll":
+            try:
+                offset = int(value)
+            except (TypeError, ValueError):
+                return
+            browser_state = {
+                **state,
+                "browser_view_mode": getattr(self, "_media_overlay_view_mode", "grid"),
+            }
+            _step, _visible, maximum = media_browser_scroll_metrics(browser_state)
+            self._media_overlay_scroll = max(0, min(maximum, offset))
+            self._media_overlay_browser_key = None
             self._media_overlay_last_activity = time.monotonic()
             return
         if hit.startswith("seek:"):
@@ -6234,6 +6264,7 @@ class OpenXrVulkanPresenter(
                     value=-10.0 if hit.endswith("-10") else 10.0,
                 )
         elif hit == "browse":
+            self._media_overlay_scroll = 0
             self._dispatch_controller_shortcut("media_control", media_action="browse")
         elif hit == "browse_disc":
             self._dispatch_controller_shortcut(
@@ -6256,6 +6287,12 @@ class OpenXrVulkanPresenter(
         elif hit == "browser_close":
             self._dispatch_controller_shortcut(
                 "media_control", media_action="browse_close"
+            )
+        elif hit == "media_exit":
+            self._media_overlay_scroll = 0
+            self._media_overlay_scroll_drag_hand = None
+            self._dispatch_controller_shortcut(
+                "media_control", media_action="media_exit"
             )
         elif hit == "browse_open" and value:
             self._dispatch_controller_shortcut(
@@ -6286,6 +6323,12 @@ class OpenXrVulkanPresenter(
         elif hit in {"playlist_move_up", "playlist_move_down"} and value:
             self._dispatch_controller_shortcut("media_control", media_action="playlist_move",
                 value={"path": str(value), "offset": -1 if hit == "playlist_move_up" else 1})
+        elif hit == "browser_sort":
+            self._dispatch_controller_shortcut(
+                "media_control",
+                media_action="browser_sort",
+                value={"descending": state.get("browser_sort_descending") is not True},
+            )
         elif hit == "playlist_sort":
             self._dispatch_controller_shortcut("media_control", media_action="playlist_sort",
                 value={"descending": state.get("playlist_sort_descending") is False})
@@ -6306,17 +6349,9 @@ class OpenXrVulkanPresenter(
             )
         elif hit == "entry" and value:
             path = str(value)
-            click_key = f"entry:{path}"
-            now = time.monotonic()
-            double_click = (
-                click_key == self._media_overlay_last_click_hit
-                and now - self._media_overlay_last_click_at <= 0.45
-            )
-            self._media_overlay_last_click_hit = click_key
-            self._media_overlay_last_click_at = now
             self._dispatch_controller_shortcut(
                 "media_control",
-                media_action="browse_open" if double_click else "browse_select",
+                media_action="browse_open",
                 value={"path": path},
             )
         elif hit == "play" and media_control_enabled("play", state):
@@ -6332,16 +6367,9 @@ class OpenXrVulkanPresenter(
             )
         elif hit.startswith("entry:"):
             path = hit.split(":", 1)[1]
-            now = time.monotonic()
-            double_click = (
-                hit == self._media_overlay_last_click_hit
-                and now - self._media_overlay_last_click_at <= 0.45
-            )
-            self._media_overlay_last_click_hit = hit
-            self._media_overlay_last_click_at = now
             self._dispatch_controller_shortcut(
                 "media_control",
-                media_action="browse_open" if double_click else "browse_select",
+                media_action="browse_open",
                 value={"path": str(path)},
             )
         elif hit == "playlist_select" and value:
@@ -6400,10 +6428,14 @@ class OpenXrVulkanPresenter(
                     self._media_overlay_pending_selection = (hand, action, value)
                     consumed = True
                 elif action is not None:
+                    if action == "browser_scroll":
+                        self._media_overlay_scroll_drag_hand = hand
                     self._dispatch_media_overlay_hit(action, value)
                     consumed = True
             elif self._media_overlay_trigger_down[hand] and trigger <= 0.3:
                 self._media_overlay_trigger_down[hand] = False
+                if self._media_overlay_scroll_drag_hand == hand:
+                    self._media_overlay_scroll_drag_hand = None
                 pending = self._media_overlay_pending_selection
                 if pending is not None and pending[0] == hand:
                     _pending_hand, pending_action, pending_value = pending
@@ -6425,6 +6457,18 @@ class OpenXrVulkanPresenter(
                         pending_action, pending_value
                     )
                     consumed = True
+            elif (
+                self._media_overlay_trigger_down[hand]
+                and self._media_overlay_scroll_drag_hand == hand
+                and browser
+                and hit is not None
+            ):
+                scroll_offset = media_browser_scrollbar_offset(
+                    browser_state,
+                    hit[1] * MEDIA_BROWSER_LAYOUT_SIZE[1],
+                )
+                self._dispatch_media_overlay_hit("browser_scroll", scroll_offset)
+                consumed = True
             vertical = float(
                 self._controller_input(hand).get("joystick_y", 0.0) or 0.0
             )
@@ -6487,17 +6531,20 @@ class OpenXrVulkanPresenter(
             ))
         return specs
 
+    def _request_runtime_stop(self) -> None:
+        if self._runtime_stop_requested:
+            return
+        self._reset_settings_menu_grab()
+        self._runtime_stop_requested = True
+        self._settings_menu.set_stopping(True)
+        self._accept_output = False
+        if self._shutdown_event is not None:
+            self._shutdown_event.set()
+
     def _apply_settings_menu_control(self, control, uv, *, persist: bool = False) -> None:
         key = control.key
         if key == "runtime:stop":
-            if self._runtime_stop_requested:
-                return
-            self._reset_settings_menu_grab()
-            self._runtime_stop_requested = True
-            self._settings_menu.set_stopping(True)
-            self._accept_output = False
-            if self._shutdown_event is not None:
-                self._shutdown_event.set()
+            self._request_runtime_stop()
             return
         if key.startswith("tab:"):
             self._settings_menu.set_tab(key[4:])
@@ -8005,7 +8052,7 @@ class OpenXrVulkanPresenter(
             # for the complete Chinese and English operation rows.
             "screen_help": (1280, 1536),
             "hand_help": (2048, 768),
-            "media_bar": (1024, 160),
+            "media_bar": MEDIA_BAR_TEXTURE_SIZE,
             "media_browser": MEDIA_BROWSER_TEXTURE_SIZE,
         }
         minimum = minimum_sizes.get(key, pool_size)
@@ -14865,6 +14912,9 @@ class OpenXrVulkanPresenter(
                         view_mode=browser_view_mode,
                     )
                 )
+            browser_font_scale = (
+                self._media_browser_font_scale() if browser_visible else 1.0
+            )
             browser_key = (
                 media_state.get("browser_revision"),
                 browser_visible,
@@ -14895,6 +14945,7 @@ class OpenXrVulkanPresenter(
                 media_state.get("playlist_index"),
                 media_state.get("browser_error"),
                 language,
+                round(browser_font_scale, 3),
             )
             bar_key = (
                 expanded,
@@ -14925,6 +14976,7 @@ class OpenXrVulkanPresenter(
                             scroll_offset=self._media_overlay_scroll,
                             thumbnails=thumbnails,
                             lang=language,
+                            font_scale=browser_font_scale,
                         )
                     )
                     self._media_overlay_browser_key = browser_key
@@ -14937,8 +14989,8 @@ class OpenXrVulkanPresenter(
                 ):
                     self._tool_quad_texture_cache["media_bar"] = build_media_bar_rgba(
                         media_state,
-                        width=1024,
-                        height=160,
+                        width=MEDIA_BAR_TEXTURE_SIZE[0],
+                        height=MEDIA_BAR_TEXTURE_SIZE[1],
                         hover=hover_visual,
                         hover_progress=hover_progress,
                         lang=language,

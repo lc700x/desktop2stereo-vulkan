@@ -97,25 +97,50 @@ def _windows_drives() -> list[MediaBrowserEntry]:
 
 
 def _mount_entries() -> list[MediaBrowserEntry]:
-    drives = _windows_drives()
-    if drives:
-        return drives
-    if os.name != "nt":
-        candidates = ("/", "/mnt", "/media", str(Path.home()))
-        return [
-            MediaBrowserEntry(str(Path(path)), str(Path(path)), "drive")
-            for path in candidates
-            if Path(path).is_dir()
-        ]
-    return []
+    entries: list[MediaBrowserEntry] = []
+    try:
+        home = Path.home()
+        if home.is_dir():
+            entries.append(MediaBrowserEntry("User folder", str(home), "home"))
+    except (OSError, RuntimeError):
+        pass
+
+    if os.name == "nt":
+        entries.extend(_windows_drives())
+    else:
+        for path in ("/", "/mnt", "/media"):
+            candidate = Path(path)
+            try:
+                if candidate.is_dir() and not any(
+                    os.path.normcase(os.path.abspath(entry.path))
+                    == os.path.normcase(os.path.abspath(str(candidate)))
+                    for entry in entries
+                ):
+                    entries.append(
+                        MediaBrowserEntry(str(candidate), str(candidate), "drive")
+                    )
+            except OSError:
+                continue
+    return entries
 
 
-def _sort_entries(entries: Iterable[MediaBrowserEntry]) -> list[MediaBrowserEntry]:
+def _sort_entries(
+    entries: Iterable[MediaBrowserEntry], *, descending: bool = False
+) -> list[MediaBrowserEntry]:
     order = {"directory": 0, "disc": 1, "video": 2, "image": 3, "other": 4}
-    return sorted(
-        entries,
-        key=lambda item: (order.get(item.kind, 9), item.name.casefold()),
-    )
+    grouped: dict[int, list[MediaBrowserEntry]] = {}
+    for entry in entries:
+        grouped.setdefault(order.get(entry.kind, 9), []).append(entry)
+    result: list[MediaBrowserEntry] = []
+    for group in sorted(grouped):
+        result.extend(
+            sorted(
+                grouped[group],
+                key=lambda item: (item.name.casefold(), item.path.casefold()),
+                reverse=descending,
+            )
+        )
+    return result
 
 
 class MediaBrowser:
@@ -135,6 +160,7 @@ class MediaBrowser:
         self._playlist_managed = False
         self._playlist_offset = 0
         self._playlist_sort_descending: bool | None = None
+        self._browser_sort_descending = False
         self._recent: list[MediaBrowserEntry] = []
         self._history_path = str(history_path or "").strip()
         self._recent = self._load_recent()
@@ -289,6 +315,16 @@ class MediaBrowser:
             path = self._path
             selected = self._selected
         return self._begin_navigate(path, selected=selected)
+
+    def browser_sort(self, *, descending: bool = False) -> None:
+        """Sort the current directory's file list by name."""
+        with self._lock:
+            self._entries = _sort_entries(
+                self._entries,
+                descending=bool(descending),
+            )
+            self._browser_sort_descending = bool(descending)
+            self._revision += 1
 
     def navigate(self, path: str) -> bool:
         return self._begin_navigate(path, selected="")
@@ -512,6 +548,7 @@ class MediaBrowser:
                 "browser_selection": self._selected,
                 "browser_error": self._error,
                 "browser_revision": self._revision,
+                "browser_sort_descending": self._browser_sort_descending,
                 "browser_entries": [
                     {
                         "name": entry.name,
@@ -601,14 +638,16 @@ class MediaBrowser:
                     continue
                 if len(entries) >= _MAX_ENTRIES:
                     break
-            entries = _sort_entries(entries)
             mounts = _mount_entries()
             with self._lock:
                 if generation != self._generation or self._closed:
                     return
                 self._path = str(root)
                 self._parent = str(root.parent) if root.parent != root else ""
-                self._entries = entries
+                self._entries = _sort_entries(
+                    entries,
+                    descending=self._browser_sort_descending,
+                )
                 self._mounts = mounts
                 self._selected = selected
                 self._error = ""

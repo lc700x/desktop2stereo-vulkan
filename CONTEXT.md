@@ -12,6 +12,12 @@ Compared with commit `a5eaa747`, the product changes through `322a05208` include
 
 The user-facing log is in `changelog.md`.
 
+## Local Runtime Environment
+
+Use `./src/python3` as this workspace's project Python environment. On macOS,
+run project commands with `./src/python3/bin/python`; do not use the system
+Python for project checks or application commands.
+
 ## Windows Portable Builds
 
 Builds use the Python 3.12.10 x64 archive at

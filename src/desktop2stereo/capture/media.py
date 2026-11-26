@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -56,6 +57,18 @@ def get_media_playback_cadence_target() -> float | None:
 
 def reset_media_playback_cadence_target() -> None:
     set_media_playback_cadence_target(None)
+
+
+def _media_cadence_adaptive_enabled() -> bool:
+    """Return whether media may change its output cadence at runtime.
+
+    Media presentation is driven by a wall-clock PTS.  Changing the decoder's
+    cadence to match a temporary processing bottleneck makes the movie appear
+    to play slowly, so this remains an explicit opt-in for legacy tuning.
+    """
+    return str(os.environ.get("D2S_MEDIA_CADENCE_ADAPTIVE", "0")).strip().lower() not in {
+        "0", "false", "no", "off"
+    }
 
 
 def _is_hardware_decode_unavailable(exc: Exception) -> bool:
@@ -751,6 +764,7 @@ class MediaCaptureSource:
         self._native_frame_importer = None
         self._native_frame_pts = None
         self._native_frame_duration = 0.0
+        self._macos_media_player = None
         self._audio_process = None
         self._audio_stream = None
         self._audio_thread = None
@@ -985,6 +999,21 @@ class MediaCaptureSource:
         self._position_anchor_time = None
         self._source_frame_index = 0
         self._current_source_frame_identity = None
+        if sys.platform == "darwin":
+            from .native.macos_media_player import MacOSMediaPlayer
+
+            self._macos_media_player = MacOSMediaPlayer(
+                self.path,
+                hdr=self.hdr,
+                audio_enabled=self._audio_enabled,
+            )
+            self._frame_format = (
+                "p010_cv_pixel_buffer" if self.hdr else "bgra_cv_pixel_buffer"
+            )
+            self.grab_native_zero_copy = self._grab_macos_native_frame
+            self._start_video(self.position, realtime=True)
+            self._ready = True
+            return
         self._start_video(self.position, realtime=True)
         if self._has_audio:
             self._start_audio(self.position)
@@ -998,6 +1027,23 @@ class MediaCaptureSource:
         self._close_nvdec()
         self._close_opencv()
         self._close_native_decoder()
+        native_player = getattr(self, "_macos_media_player", None)
+        if native_player is not None:
+            native_player.seek(position)
+            native_player.set_audio(
+                self.volume,
+                self.muted or not bool(getattr(self, "_audio_enabled", True)),
+            )
+            native_player.set_playing(realtime)
+            self._decode_backend = (
+                "avfoundation-p010-iosurface"
+                if self.hdr
+                else "avfoundation-bgra-iosurface"
+            )
+            self._frame_format = (
+                "p010_cv_pixel_buffer" if self.hdr else "bgra_cv_pixel_buffer"
+            )
+            return
         vendor = getattr(self, "_gpu_vendor", None) or _media_gpu_vendor()
         is_10_bit = getattr(self, "_frame_pixel_format", "") == "p010le"
         if (
@@ -1041,11 +1087,22 @@ class MediaCaptureSource:
                 position, realtime=realtime, decoder=self._amf_decoder
             )
             return
+        if sys.platform == "darwin":
+            self._decode_backend = "avfoundation-metal-unavailable"
+            self.decode_fallback_reason = (
+                "macOS media playback requires the native AVFoundation/Metal path; "
+                "CPU frame readback is disabled"
+            )
+            raise _HardwareDecodeUnavailable(self.decode_fallback_reason)
         self._decode_backend = "ffmpeg-software"
         self._start_ffmpeg_video(position, realtime=realtime)
 
     def _start_ffmpeg_video(
-        self, position: float, *, realtime: bool, decoder: str | None = None
+        self,
+        position: float,
+        *,
+        realtime: bool,
+        decoder: str | None = None,
     ) -> None:
         video_filter = self._video_filter
         amf_output_size = getattr(self, "_amf_output_size", None)
@@ -1314,6 +1371,7 @@ class MediaCaptureSource:
             import sounddevice as sd
 
             sync_enabled = bool(getattr(self.config, "media_presentation_sync", False))
+            callback_stream = sync_enabled and sys.platform != "darwin"
             command = [self._ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
             if not sync_enabled:
                 command.append("-re")
@@ -1340,17 +1398,26 @@ class MediaCaptureSource:
 
                 sync = MediaAudioSync(generation=self.media_generation, start_pts=float(position))
                 self._audio_sync = sync
-                stream_type = sd.OutputStream
-                def audio_callback(outdata, frames, time_info, status):
-                    if status.output_underflow:
-                        sync.note_device_underflow()
-                    callback_at = time.perf_counter()
-                    # Pa_GetStreamTime is calibrated once to perf_counter.
-                    # Mapping from callback entry/currentTime on every block
-                    # would add Python/GIL scheduling delay to the DAC PTS.
-                    dac_at = float(time_info.outputBufferDacTime) + audio_clock_offset
-                    sync.render(outdata, dac_at=dac_at, callback_at=callback_at, volume=self.volume, muted=self.muted)
-                stream_kwargs.update(blocksize=480, latency="low", callback=audio_callback)
+                stream_kwargs.update(blocksize=480, latency="low")
+                if callback_stream:
+                    stream_type = sd.OutputStream
+
+                    def audio_callback(outdata, frames, time_info, status):
+                        if status.output_underflow:
+                            sync.note_device_underflow()
+                        callback_at = time.perf_counter()
+                        # Pa_GetStreamTime is calibrated once to perf_counter.
+                        # Mapping from callback entry/currentTime on every block
+                        # would add Python/GIL scheduling delay to the DAC PTS.
+                        dac_at = float(time_info.outputBufferDacTime) + audio_clock_offset
+                        sync.render(
+                            outdata,
+                            dac_at=dac_at,
+                            callback_at=callback_at,
+                            volume=self.volume,
+                            muted=self.muted,
+                        )
+                    stream_kwargs["callback"] = audio_callback
             else:
                 self._audio_sync = None
             preferred_device = _preferred_audio_output_device(sd)
@@ -1366,6 +1433,7 @@ class MediaCaptureSource:
             audio_clock_offset = (
                 time.perf_counter() - float(self._audio_stream.time) if sync_enabled else 0.0
             )
+            self._audio_clock_offset = audio_clock_offset
             self._audio_stream.start()
             self._audio_stop.clear()
             self._audio_position_anchor = max(0.0, float(position))
@@ -1412,6 +1480,21 @@ class MediaCaptureSource:
                 if sync is not None:
                     if not sync.enqueue(samples.reshape(-1, 2), stop):
                         break
+                    render = getattr(sync, "render", None)
+                    write = getattr(stream, "write", None)
+                    if callable(render) and callable(write):
+                        output = np.empty((len(samples) // 2, 2), dtype=np.float32)
+                        try:
+                            stream_time = float(getattr(stream, "time", 0.0))
+                        except (TypeError, ValueError, RuntimeError):
+                            stream_time = 0.0
+                        render(
+                            output,
+                            dac_at=stream_time + float(getattr(self, "_audio_clock_offset", 0.0)),
+                            volume=self.volume,
+                            muted=self.muted,
+                        )
+                        write(output)
                     continue
                 gain = 0.0 if self.muted else max(0.0, min(1.0, self.volume))
                 if gain != 1.0:
@@ -1424,15 +1507,17 @@ class MediaCaptureSource:
             self.audio_error = f"{type(exc).__name__}: {exc}"
             self._audio_stop.set()
             process, self._audio_process = self._audio_process, None
-            self._terminate(process)
-            stream, self._audio_stream = self._audio_stream, None
-            if stream is not None:
+            if process is not None:
                 try:
-                    stream.stop()
-                    stream.close()
+                    if process.poll() is None:
+                        process.terminate()
                 except Exception:
                     pass
             print(f"[media] audio output stopped: {self.audio_error}", flush=True)
+        finally:
+            if getattr(self, "_audio_stream", None) is stream:
+                self._audio_stream = None
+            self._close_audio_stream(stream)
 
     @staticmethod
     def _terminate(process) -> None:
@@ -1449,25 +1534,67 @@ class MediaCaptureSource:
             if stream is not None and not stream.closed:
                 stream.close()
 
+    @staticmethod
+    def _close_audio_stream(stream) -> None:
+        if stream is None:
+            return
+        try:
+            # PortAudio's CoreAudio stop path can call PyEval_SaveThread after
+            # a Vulkan/MPS worker has run on the process. Closing the blocking
+            # stream directly is sufficient here because the audio worker has
+            # already stopped writing; keep stop/abort for non-macOS backends.
+            if sys.platform != "darwin":
+                stop = getattr(stream, "stop", None)
+                if not callable(stop):
+                    stop = getattr(stream, "abort", None)
+                if callable(stop):
+                    stop()
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+
     def _close_audio(self) -> None:
         self._audio_stop.set()
         sync, self._audio_sync = getattr(self, "_audio_sync", None), None
         if sync is not None:
-            sync.close()
+            # Wake a decoder blocked by the bounded PCM queue before joining
+            # its worker. The stop Event alone cannot interrupt Condition.wait.
+            close_sync = getattr(sync, "close", None)
+            if callable(close_sync):
+                close_sync()
         self._audio_started_at = None
+        thread, self._audio_thread = self._audio_thread, None
         process, self._audio_process = self._audio_process, None
-        self._terminate(process)
-        stream, self._audio_stream = self._audio_stream, None
-        if stream is not None:
+        # The audio worker may be inside a blocking pipe read or PortAudio
+        # write. Break the FFmpeg read first, then wait for that worker before
+        # touching the stream; closing PortAudio concurrently with write() can
+        # crash the macOS PortAudio bridge in native code.
+        if process is not None:
             try:
-                abort = getattr(stream, "abort", stream.stop)
-                abort()
-                stream.close()
+                if process.poll() is None:
+                    process.terminate()
             except Exception:
                 pass
-        thread, self._audio_thread = self._audio_thread, None
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=0.5)
+            thread.join()
+        # A live audio worker owns PortAudio teardown. If setup failed before
+        # the worker started, close the stream here because no owner exists.
+        stream, self._audio_stream = self._audio_stream, None
+        if thread is None:
+            self._close_audio_stream(stream)
+        if process is not None:
+            # The worker may have been blocked in stdout.read. The terminate
+            # signal above is enough to end that child; avoid waitpid here,
+            # which can enter the macOS GIL failure while native rendering is
+            # unwinding on another thread. Normal EOF still reaps via wait().
+            stdout = getattr(process, "stdout", None)
+            if stdout is not None and not getattr(stdout, "closed", True):
+                try:
+                    stdout.close()
+                except Exception:
+                    pass
 
     def observe_video_presentation(self, generation: int, index: int, pts: float, at: float) -> None:
         """Called after presentation; do not run decoder/audio setup on the XR thread."""
@@ -1501,31 +1628,38 @@ class MediaCaptureSource:
                 self._position_anchor = self.position
 
     def calibrate_media_cadence(self, service_ms: float) -> None:
-        """Select an initial measured divisor before any source clock advances."""
+        """Measure preroll cost without changing the wall-clock playback rate."""
         if (not getattr(self, "_presentation_clock_pending", False) or self._media_cadence_calibrated
                 or not getattr(self, "_ready", True) or self._source_fps <= 0.0):
             return
         if not math.isfinite(service_ms) or service_ms <= 0.0:
             return
-        fps, step = _resolve_media_playback_cadence(
-            self._source_fps, self.width, self.height, float(self.config.fps),
-            target_fps=1000.0 / service_ms,
-        )
+        if _media_cadence_adaptive_enabled():
+            fps, step = _resolve_media_playback_cadence(
+                self._source_fps, self.width, self.height, float(self.config.fps),
+                target_fps=1000.0 / service_ms,
+            )
+        else:
+            # Keep the requested cadence and let the wall-clock selector drop
+            # stale frames if inference cannot consume every source frame.
+            fps = float(self._playback_fps)
+            step = max(1, int(getattr(self, "_frame_pump_decimation_step", 1) or 1))
         with self._frame_buffer_condition:
             self._playback_fps = fps
             self._frame_pump_decimation_step = step
             self._last_source_frame_duration = 1.0 / fps
             self._media_prepare_lead_s = service_ms * 0.001 + 1.0 / max(1.0, float(self.config.fps))
             self._media_cadence_calibrated = True
-        print(f"[media] cadence preroll: service={service_ms:.2f}ms target={fps:.2f}fps step={step}", flush=True)
+        mode = "adaptive" if _media_cadence_adaptive_enabled() else "wall-clock"
+        print(
+            f"[media] cadence preroll: service={service_ms:.2f}ms "
+            f"mode={mode} target={fps:.2f}fps step={step}",
+            flush=True,
+        )
 
     def observe_media_timing(self, metadata: dict, at: float) -> None:
         if (not self.playing or getattr(self, "_browser_mode", False)
                 or getattr(self, "_presentation_clock_pending", False)):
-            return
-        if str(os.environ.get("D2S_MEDIA_CADENCE_ADAPTIVE", "1")).strip().lower() in {
-            "0", "false", "no", "off"
-        }:
             return
         generation = metadata.get("media_generation")
         identity = (generation, metadata.get("source_frame_index"))
@@ -1541,6 +1675,11 @@ class MediaCaptureSource:
                         samples = self._media_prepare_latency_samples = deque(maxlen=17)
                     samples.append(latency)
                     self._media_prepare_lead_s = sorted(samples)[len(samples) // 2]
+        # Latency measurements still feed the preparation lead in wall-clock
+        # mode. Only the cadence controller itself is disabled by the opt-in
+        # guard below.
+        if not _media_cadence_adaptive_enabled():
+            return
         if (float(at) < float(getattr(self, "_cadence_observe_after", 0.0))
                 or abs(float(metadata.get("media_playback_fps") or self._playback_fps) - self._playback_fps) > 0.01):
             return
@@ -1591,6 +1730,9 @@ class MediaCaptureSource:
         return sync.snapshot(time.perf_counter()) if sync is not None else {}
 
     def _current_position(self) -> float:
+        native_player = getattr(self, "_macos_media_player", None)
+        if native_player is not None:
+            return native_player.position
         if self.playing and self._position_anchor_time is not None:
             value = (
                 self._position_anchor
@@ -1774,6 +1916,8 @@ class MediaCaptureSource:
         self._frame_pump_thread = None
 
     def _apply_media_playback_cadence_target(self) -> None:
+        if not _media_cadence_adaptive_enabled():
+            return
         target = getattr(self, "_adaptive_cadence_target", None) or get_media_playback_cadence_target()
         if target is None or self._source_fps <= 0.0:
             return
@@ -1849,10 +1993,59 @@ class MediaCaptureSource:
             while not self._frame_pump_stop.is_set():
                 with self._frame_buffer_condition:
                     while (
-                        (len(self._frame_buffer) >= self._frame_buffer_capacity
-                         or (getattr(self, "_presentation_clock_pending", False) and self._source_frame_index > 0))
+                        (
+                            len(self._frame_buffer) >= self._frame_buffer_capacity
+                            or (
+                                getattr(self, "_presentation_clock_pending", False)
+                                and self._source_frame_index > 0
+                            )
+                        )
                         and not self._frame_pump_stop.is_set()
                     ):
+                        # A wall-clock presentation must keep a current source
+                        # time available. If inference is slower than decode,
+                        # discard only a stale FIFO head; if the queue is
+                        # ahead, wait so the next selected frame is never
+                        # future-dated. The presentation-preroll gate still
+                        # waits for its first frame below.
+                        if (
+                            len(self._frame_buffer) >= self._frame_buffer_capacity
+                            and bool(
+                                getattr(
+                                    getattr(self, "config", None),
+                                    "media_presentation_sync",
+                                    False,
+                                )
+                            )
+                            and not _media_cadence_adaptive_enabled()
+                            and not getattr(self, "_presentation_clock_pending", False)
+                        ):
+                            # Drop only frames that are already behind the
+                            # wall-clock position. If the queue is ahead,
+                            # wait for the consumer so a real-time source does
+                            # not turn into a permanently future-dated queue.
+                            current_position = float(self._current_position())
+                            source_period = self._source_frame_duration()
+                            oldest_pts = float(self._frame_buffer[0][0])
+                            if current_position - oldest_pts > max(
+                                source_period, 0.5 * self._frame_duration()
+                            ):
+                                self._frame_buffer.popleft()
+                                self._frame_buffer_stale_drops += 1
+                                now = time.perf_counter()
+                                if now - self._frame_buffer_drop_log_at >= 2.0:
+                                    self._frame_buffer_drop_log_at = now
+                                    print(
+                                        "[media] realtime buffer full; dropped oldest frame",
+                                        flush=True,
+                                    )
+                                break
+                        if (
+                            getattr(self, "_presentation_clock_pending", False)
+                            and self._source_frame_index > 0
+                        ):
+                            self._frame_buffer_condition.wait(timeout=0.05)
+                            continue
                         self._frame_buffer_condition.wait(timeout=0.05)
                 if self._frame_pump_stop.is_set():
                     break
@@ -1956,9 +2149,26 @@ class MediaCaptureSource:
                     return item
 
                 if bool(getattr(getattr(self, "config", None), "media_presentation_sync", False)):
-                    # Absolute source time already owns selection. A second
-                    # minimum-emit phase retains any temporary GPU stall as
-                    # permanent slow playback, even after the rate downshifts.
+                    # Select the newest decoded frame that is due on the
+                    # wall-clock timeline. Keeping older due frames here turns
+                    # a slow inference pass into permanent playback lag.
+                    dropped_stale = 0
+                    while (
+                        len(self._frame_buffer) > 1
+                        and float(self._frame_buffer[1][0]) <= target_position
+                    ):
+                        self._frame_buffer.popleft()
+                        dropped_stale += 1
+                    if dropped_stale:
+                        self._frame_buffer_stale_drops += dropped_stale
+                        now = time.perf_counter()
+                        if now - self._frame_buffer_drop_log_at >= 2.0:
+                            self._frame_buffer_drop_log_at = now
+                            print(
+                                "[media] realtime catch-up dropped "
+                                f"{dropped_stale} stale frame(s)",
+                                flush=True,
+                            )
                     if self._frame_buffer and float(self._frame_buffer[0][0]) <= target_position + tolerance:
                         item = self._frame_buffer.popleft()
                         self._frame_buffer_condition.notify_all()
@@ -2072,6 +2282,8 @@ class MediaCaptureSource:
                 self._frame_buffer_condition.wait(timeout=min(0.005, remaining))
 
     def _has_open_video_decoder(self) -> bool:
+        if getattr(self, "_macos_media_player", None) is not None:
+            return True
         if getattr(self, "_native_decoder", None) is not None:
             return True
         if str(getattr(self, "_decode_backend", "")).startswith("nvdec"):
@@ -2082,6 +2294,15 @@ class MediaCaptureSource:
         return process is not None and process.poll() is None
 
     def _pause_playback(self) -> None:
+        native_player = getattr(self, "_macos_media_player", None)
+        if native_player is not None:
+            self.position = native_player.position
+            native_player.set_playing(False)
+            self._position_anchor = self.position
+            self._position_anchor_time = None
+            self.playing = False
+            self._publish_state(force=True)
+            return
         # Freeze source time within the displayed frame interval. The visible
         # image keeps its exact PTS; resuming must not skip the remaining part
         # of that interval by rebasing to the next selected image's PTS.
@@ -2111,6 +2332,22 @@ class MediaCaptureSource:
 
     def _resume_playback(self, position: float) -> None:
         self._browser_mode = False
+        native_player = getattr(self, "_macos_media_player", None)
+        if native_player is not None:
+            position = max(0.0, float(position))
+            if abs(native_player.position - position) > 0.05:
+                native_player.seek(position)
+            native_player.set_audio(
+                self.volume,
+                self.muted or not bool(getattr(self, "_audio_enabled", True)),
+            )
+            native_player.set_playing(True)
+            self.position = position
+            self._position_anchor = position
+            self._position_anchor_time = None
+            self.playing = True
+            self._publish_state(force=True)
+            return
         self.playing = True
         synced = bool(getattr(self.config, "media_presentation_sync", False))
         paused_pts = getattr(self, "_paused_clock_pts", None)
@@ -2136,6 +2373,26 @@ class MediaCaptureSource:
         self._start_frame_pump()
 
     def _restart(self, position: float, *, playing: bool) -> None:
+        native_player = getattr(self, "_macos_media_player", None)
+        if native_player is not None:
+            self._media_generation = self.media_generation + 1
+            self._source_frame_index = 0
+            self._current_source_frame_identity = None
+            self._eof = False
+            self.position = max(0.0, min(float(position), self.duration or float(position)))
+            self._position_anchor = self.position
+            self._position_anchor_time = None
+            self._frame = None
+            self._displayed_frame = None
+            native_player.seek(self.position)
+            native_player.set_audio(
+                self.volume,
+                self.muted or not bool(getattr(self, "_audio_enabled", True)),
+            )
+            native_player.set_playing(playing)
+            self.playing = bool(playing)
+            self._publish_state(force=True)
+            return
         self._media_generation = self.media_generation + 1
         has_frame_buffer = hasattr(self, "_frame_buffer_condition")
         if has_frame_buffer:
@@ -2170,6 +2427,12 @@ class MediaCaptureSource:
                 self._close_opencv()
 
     def _reset_media_for_open(self, path: str, mode: str, position: float) -> None:
+        if hasattr(self, "grab_native_zero_copy"):
+            del self.grab_native_zero_copy
+        native_player = getattr(self, "_macos_media_player", None)
+        self._macos_media_player = None
+        if native_player is not None:
+            native_player.close()
         self._media_generation = self.media_generation + 1
         self._source_frame_index = 0
         self._current_source_frame_identity = None
@@ -2365,18 +2628,50 @@ class MediaCaptureSource:
                     self.volume = max(0.0, min(1.0, float(value)))
                 except (TypeError, ValueError):
                     continue
+                native_player = getattr(self, "_macos_media_player", None)
+                if native_player is not None:
+                    native_player.set_audio(
+                        self.volume,
+                        self.muted or not bool(getattr(self, "_audio_enabled", True)),
+                    )
             elif action == "mute":
                 self.muted = bool(value)
+                native_player = getattr(self, "_macos_media_player", None)
+                if native_player is not None:
+                    native_player.set_audio(
+                        self.volume,
+                        self.muted or not bool(getattr(self, "_audio_enabled", True)),
+                    )
             elif action == "browse":
                 self._browser_mode = True
+                native_player = getattr(self, "_macos_media_player", None)
+                if native_player is not None:
+                    native_player.set_playing(False)
+                    self.playing = False
                 self._browser.open(value)
             elif action == "browse_up":
                 self._browser.up()
             elif action == "browse_refresh":
                 self._browser.refresh()
+            elif action == "browser_sort":
+                descending = (
+                    bool(value.get("descending", False))
+                    if isinstance(value, dict)
+                    else False
+                )
+                self._browser.browser_sort(descending=descending)
             elif action == "browse_close":
                 self._browser.close()
                 self._browser_mode = False
+            elif action == "media_exit":
+                browser_directory = str(Path(self.path).expanduser().parent) if self.path else ""
+                self.stop()
+                self._browser.open(browser_directory or None)
+                self._browser_mode = True
+                self._frame = None
+                self._displayed_frame = None
+                self.playing = False
+                self._ready = True
             elif action == "browse_select":
                 path = value.get("path") if isinstance(value, dict) else value
                 self._browser.select(str(path or ""))
@@ -2830,7 +3125,7 @@ class MediaCaptureSource:
             "frame_buffer_capacity": frame_buffer_capacity,
             "playback_fps": getattr(self, "_playback_fps", 0.0),
             "source_fps": getattr(self, "_source_fps", 0.0),
-            "cadence_mode": "adaptive",
+            "cadence_mode": "adaptive" if _media_cadence_adaptive_enabled() else "wall_clock",
             "cadence_reason": getattr(getattr(self, "_media_cadence_controller", None), "reason", "warming_up"),
             "decode_backend": self._decode_backend,
             "decode_fallback_reason": self.decode_fallback_reason,
@@ -2894,6 +3189,53 @@ class MediaCaptureSource:
         self._publish_state(force=True)
         return frame
 
+    def _grab_macos_native_frame(self, timeout: float = 0.0):
+        with self._get_media_control_lock():
+            self._read_control()
+            player = getattr(self, "_macos_media_player", None)
+            size = (self.width, self.height)
+            if (
+                player is None
+                or not self._ready
+                or self._browser_mode
+                or not self.playing
+            ):
+                return None, size
+            deadline = time.perf_counter() + max(0.0, float(timeout))
+            while True:
+                frame = player.copy_frame()
+                if frame is not None:
+                    index = int(self._source_frame_index)
+                    self._source_frame_index = index + 1
+                    pts = float(frame.presentation_time)
+                    self.position = pts
+                    self._current_source_frame_identity = (
+                        self.media_generation,
+                        index,
+                        pts,
+                    )
+                    self._current_source_metadata = {
+                        "media_zero_copy": True,
+                        "media_pts": pts,
+                        "media_pixel_format": frame.resource_format,
+                        "media_decode_backend": self._decode_backend,
+                    }
+                    metrics_lock, _read_times, frame_times = self._ensure_frame_pump_metrics()
+                    with metrics_lock:
+                        frame_times.append(time.perf_counter())
+                    self._publish_state()
+                    return frame, size
+                if time.perf_counter() >= deadline:
+                    break
+                time.sleep(min(0.002, max(0.0, deadline - time.perf_counter())))
+            if self.duration > 0.0 and player.position >= self.duration - 0.01:
+                self.playing = False
+                self.position = self.duration
+                self._eof = True
+                player.set_playing(False)
+            self._publish_state()
+            return None, size
+
     def grab(self):
         with self._get_media_control_lock():
             return self._grab_media_frame()
@@ -2906,19 +3248,14 @@ class MediaCaptureSource:
             return None, (self.width, self.height)
         if getattr(self, "_browser_mode", False):
             self._current_source_frame_identity = None
-            now = time.monotonic()
-            if self._frame is None or now - self._last_browser_frame_at >= 0.2:
-                width, height = _browser_output_size(
-                    self.config, self.width, self.height
-                )
-                self.width, self.height = width, height
-                self._frame = np.full((height, width, 3), 8, dtype=np.uint8)
-                self._frame_format = "bgr24"
-                self._last_browser_frame_at = now
-            else:
-                time.sleep(0.01)
+            # The browser is a GPU overlay owned by each output presenter. A
+            # synthetic CPU frame here would enter depth inference and can
+            # initialize a stereo backend even though no media is available.
+            # Keep the polling loop quiet while the presenter redraws from the
+            # shared media state file.
+            time.sleep(0.02)
             self._publish_state()
-            return self._frame, (self.width, self.height)
+            return None, (self.width, self.height)
         frame = None
         if self._image:
             now = time.monotonic()
@@ -3009,36 +3346,44 @@ class MediaCaptureSource:
         return frame, (self.width, self.height)
 
     def stop(self) -> None:
-        self.position = self._current_position()
-        if hasattr(self, "_frame_buffer_condition"):
-            self._stop_frame_pump()
-        self._close_native_decoder()
-        self._terminate(self._video_process)
-        self._video_process = None
-        self._close_nvdec()
-        self._close_opencv()
-        self._close_audio()
-        if hasattr(self, "_frame_buffer_condition"):
-            self._reset_frame_buffer(self.position)
-        self._displayed_frame = None
-        if hasattr(self, "_browser"):
-            self._browser.close()
-        self.playing = False
-        self._ready = False
-        self._position_anchor = self.position
-        self._position_anchor_time = None
-        self._publish_state(force=True)
-        if self._manifest_path:
-            try:
-                os.unlink(self._manifest_path)
-            except FileNotFoundError:
-                pass
-            self._manifest_path = None
-        if self._owns_iso_mount and self._mounted_iso_path:
-            try:
-                _dismount_iso(self._mounted_iso_path)
-            except Exception as exc:
-                self.error = f"Could not dismount ISO: {exc}"
-                print(f"[media] {self.error}", flush=True)
-            self._owns_iso_mount = False
+        # Capture shutdown can call stop from both the runner's finally block
+        # and the runtime coordinator. Serialize native audio/decoder teardown
+        # so sounddevice and FFmpeg handles are never closed concurrently.
+        with self._get_media_control_lock():
+            self.position = self._current_position()
+            if hasattr(self, "_frame_buffer_condition"):
+                self._stop_frame_pump()
+            self._close_native_decoder()
+            self._terminate(self._video_process)
+            self._video_process = None
+            self._close_nvdec()
+            self._close_opencv()
+            self._close_audio()
+            native_player = getattr(self, "_macos_media_player", None)
+            self._macos_media_player = None
+            if native_player is not None:
+                native_player.close()
+            if hasattr(self, "_frame_buffer_condition"):
+                self._reset_frame_buffer(self.position)
+            self._displayed_frame = None
+            if hasattr(self, "_browser"):
+                self._browser.close()
+            self.playing = False
+            self._ready = False
+            self._position_anchor = self.position
+            self._position_anchor_time = None
             self._publish_state(force=True)
+            if self._manifest_path:
+                try:
+                    os.unlink(self._manifest_path)
+                except FileNotFoundError:
+                    pass
+                self._manifest_path = None
+            if self._owns_iso_mount and self._mounted_iso_path:
+                try:
+                    _dismount_iso(self._mounted_iso_path)
+                except Exception as exc:
+                    self.error = f"Could not dismount ISO: {exc}"
+                    print(f"[media] {self.error}", flush=True)
+                self._owns_iso_mount = False
+                self._publish_state(force=True)

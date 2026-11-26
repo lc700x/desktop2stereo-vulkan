@@ -5,10 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-
 from path_config import APP_ROOT, PROJECT_ROOT
-
 
 ROOT = PROJECT_ROOT
 RUNTIME_ENTRY = APP_ROOT / "app_runtime/runtime_entry.py"
@@ -37,6 +34,25 @@ def test_local_viewer_uses_configured_vsync_for_media_and_desktop() -> None:
     assert _local_viewer_vsync_enabled(False, "Image") is False
     assert _local_viewer_vsync_enabled(False, "Monitor") is False
     assert _local_viewer_vsync_enabled(True, "Window") is True
+
+
+def test_local_viewer_render_size_limit_uses_selected_output_display() -> None:
+    from app_runtime.runtime_entry import _resolve_local_viewer_render_size_limit
+
+    displays = [
+        SimpleNamespace(capture_index=1, width=3840, height=2160),
+        SimpleNamespace(capture_index=2, width=1920, height=1080),
+    ]
+
+    assert _resolve_local_viewer_render_size_limit(
+        "Local Viewer", 2, "Half-SBS", displays=displays
+    ) == (1920, 1080)
+    assert _resolve_local_viewer_render_size_limit(
+        "Local Viewer", 2, "Full-SBS", displays=displays
+    ) == (960, 1080)
+    assert _resolve_local_viewer_render_size_limit(
+        "Moonlight Streamer", 2, "Half-SBS", displays=displays
+    ) is None
 
 
 def test_openxr_capture_floor_is_opt_in(monkeypatch) -> None:
@@ -87,6 +103,39 @@ def test_media_capture_options_restore_saved_settings_without_gui_env(monkeypatc
     assert options["media_volume"] == pytest.approx(0.65)
     assert options["media_muted"] is True
     assert options["media_browser_directory"] == "F:/Videos"
+
+
+def test_macos_local_media_audio_defaults_on_and_can_be_opted_out(monkeypatch) -> None:
+    from app_runtime import runtime_context
+
+    monkeypatch.delenv("D2S_MAC_MEDIA_AUDIO", raising=False)
+    monkeypatch.setattr(runtime_context.sys, "platform", "darwin")
+    options = runtime_context._media_capture_options_from_environment("Local Viewer")
+    assert options["media_audio_enabled"] is True
+
+    monkeypatch.setenv("D2S_MAC_MEDIA_AUDIO", "0")
+    options = runtime_context._media_capture_options_from_environment("Local Viewer")
+    assert options["media_audio_enabled"] is False
+
+
+def test_viewer_media_exit_command_is_written(tmp_path: Path) -> None:
+    from app_runtime.runtime_callbacks import RuntimeCallbacks
+
+    control_path = tmp_path / "media-control.viewer"
+    callbacks = RuntimeCallbacks.__new__(RuntimeCallbacks)
+    callbacks.context = SimpleNamespace(
+        capture_config=SimpleNamespace(
+            media_viewer_control_path=str(control_path),
+            media_session_id="session-1",
+        )
+    )
+
+    assert callbacks.write_viewer_media_command("media_exit") is True
+    assert json.loads(control_path.read_text(encoding="utf-8")) == {
+        "session": "session-1",
+        "revision": 0,
+        "action": "media_exit",
+    }
 
 
 def test_stop_request_is_consumed_only_by_target_runtime(tmp_path: Path) -> None:
@@ -195,8 +244,8 @@ def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode(monkey
     from streaming.stream_session import (
         NetworkStreamSessionConfig,
         is_network_stream_mode,
-        resolve_stream_audio_device,
         resolve_network_video_backend,
+        resolve_stream_audio_device,
         supports_network_calibration,
     )
 
@@ -421,7 +470,7 @@ def test_direct_stream_output_uses_uint8_nvenc_and_fps_provider() -> None:
     assert "observe_sbs_fps if adaptive_capture_rate.enabled else None" in stream_branch
 
 
-def test_macos_local_viewer_defaults_coreml_to_ane_without_overriding_user_choice() -> None:
+def test_macos_local_viewer_selects_coreml_compute_units_by_source_type() -> None:
     source = RUNTIME_ENTRY.read_text(encoding="utf-8")
     local_viewer_branch = source[
         source.index('if configured_run_mode in {"Local Viewer", "Viewer"} and platform.system() == "Darwin":'):
@@ -430,13 +479,58 @@ def test_macos_local_viewer_defaults_coreml_to_ane_without_overriding_user_choic
 
     assert 'coreml_requested = str(settings.get("CoreML", False))' in local_viewer_branch
     assert "if coreml_requested:" in local_viewer_branch
-    assert 'os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")' in local_viewer_branch
+    assert 'os.environ["D2S_COREML_COMPUTE_UNITS"] = "all"' in local_viewer_branch
     assert 'os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")' in local_viewer_branch
+
+
+def test_macos_media_playback_enables_native_coreml_io_by_default() -> None:
+    source = RUNTIME_ENTRY.read_text(encoding="utf-8")
+    local_viewer_branch = source[
+        source.index('if configured_run_mode in {"Local Viewer", "Viewer"} and platform.system() == "Darwin":'):
+        source.index("configured_target_fps = target_fps_for_run_mode(settings)")
+    ]
+
+    assert 'media_capture = str(settings.get("Capture Mode", "")).strip().casefold()' in source
+    assert '"file", "video"' in source
+    assert 'os.environ["D2S_COREML_NATIVE_IO"] = "1"' in local_viewer_branch
+    assert 'settings["CoreML"] = True' in local_viewer_branch
+    assert 'os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")' in local_viewer_branch
+    assert 'os.environ["D2S_MEDIA_P010_CPU"] = "0"' in local_viewer_branch
+    assert 'os.environ.setdefault("D2S_MEDIA_CADENCE_ADAPTIVE", "0")' in local_viewer_branch
+    assert 'os.environ["D2S_VIEWER_HOST_FRAME"] = "0" if media_capture' in local_viewer_branch
+    assert 'if not media_capture:' in source
+
+
+def test_macos_local_media_does_not_apply_hidden_render_downscale(monkeypatch) -> None:
+    import app_runtime.runtime_entry as runtime_entry
+    from stereo_runtime.render_size import RenderSizeConfig
+
+    configured = RenderSizeConfig(scale_factor="100%")
+    monkeypatch.setattr(runtime_entry.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(runtime_entry, "RENDER_SIZE_CONFIG", configured)
+    monkeypatch.setenv("D2S_MEDIA_RENDER_SCALE", "50%")
+
+    resolved = runtime_entry._resolve_local_viewer_render_size_config(
+        {"Capture Mode": "File"}, "Local Viewer", SimpleNamespace(type="mps")
+    )
+
+    assert resolved is configured
 
 
 def test_macos_local_viewer_defaults_to_metal_deferred_present() -> None:
     source = RUNTIME_ENTRY.read_text(encoding="utf-8")
     assert 'os.environ.get("D2S_MAC_VIEWER", "metal")' in source
+
+
+def test_macos_lsfg_window_setting_targets_the_app_switcher() -> None:
+    source = RUNTIME_ENTRY.read_text(encoding="utf-8")
+    start = source.index("local_viewer_config = VulkanLocalViewerConfig(")
+    end = source.index("cursor_passthrough=cursor_passthrough", start)
+    viewer_config = source[start:end]
+
+    assert 'show_in_app_switcher=(' in viewer_config
+    assert 'OS_NAME == "Darwin"' in viewer_config
+    assert 'bool(settings.get("LSFG Support", False))' in viewer_config
 
 
 def test_stream_compute_units_are_not_changed_by_local_viewer_default() -> None:
@@ -478,9 +572,8 @@ def test_local_viewer_legacy_source_size_requires_explicit_override(monkeypatch)
 
 
 def test_local_viewer_tensorrt_respects_native_processing_by_default(monkeypatch) -> None:
-    import torch
     import app_runtime.runtime_entry as runtime_entry
-
+    import torch
     from stereo_runtime.render_size import RenderSizeConfig
 
     monkeypatch.setattr(runtime_entry, "RENDER_SIZE_CONFIG", RenderSizeConfig(scale_factor="100%"))
@@ -525,6 +618,23 @@ def test_openxr_starts_after_inference_load_and_first_ready_output() -> None:
     presenter_create = source.index("presenter = OpenXrVulkanPresenter(")
 
     assert prepare < capture_start < wait_ready < presenter_create
+
+
+def test_runtime_waits_for_core_workers_before_closing_stereo_runtime() -> None:
+    source = RUNTIME_ENTRY.read_text(encoding="utf-8")
+    cleanup = source[source.rindex("    finally:"):]
+
+    assert "pipeline_thread.join()" in cleanup
+    assert "capture_thread.join()" in cleanup
+    assert "pipeline_thread.join(timeout=2.0)" not in cleanup
+    assert cleanup.index("pipeline_thread.join()") < cleanup.index(
+        'close = getattr(context.stereo_runtime, "close"'
+    )
+    first_capture_join = cleanup.index("capture_thread.join(timeout=2.0)")
+    stop_capture = cleanup.index("callbacks.stop_active_capture_session()")
+    assert stop_capture < first_capture_join < cleanup.index("pipeline_thread.join()")
+    final_capture_join = cleanup.index("capture_thread.join()", first_capture_join + 1)
+    assert first_capture_join < final_capture_join
 
 
 def test_openxr_filament_screen_geometry_follows_gui_headset_model() -> None:
@@ -756,8 +866,8 @@ def test_openxr_environment_resolves_hdr_panorama_image(tmp_path: Path) -> None:
 @pytest.mark.parametrize("is_rocm", [False, True])
 @pytest.mark.parametrize("percent", ["100%", "85%", "75%", "50%"])
 def test_local_quality_scale_is_not_implicitly_replaced(monkeypatch, is_rocm, percent):
-    import torch
     import app_runtime.runtime_entry as runtime_entry
+    import torch
     from stereo_runtime.render_size import RenderSizeConfig
 
     monkeypatch.setattr(runtime_entry.platform, "system", lambda: "Windows")

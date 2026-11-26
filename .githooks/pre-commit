@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+if [ "${D2S_FORCE_VIEWER_UI_HOOK:-0}" != "1" ] && \
+    ! git diff --cached --name-only -- \
+        src/desktop2stereo/media_ui.py \
+        src/desktop2stereo/viewer/macos_metal_viewer.py \
+        src/desktop2stereo/viewer/vulkan_local_viewer.py \
+        tests/test_media_player_ui.py \
+        tests/test_macos_metal_viewer.py \
+        tests/test_vulkan_local_viewer.py | grep -q .; then
+    exit 0
+fi
+
+python="$repo_root/src/python3/bin/python"
+if [ ! -x "$python" ]; then
+    echo "viewer UI hook requires $python" >&2
+    exit 1
+fi
+
+exec "$python" -m pytest -q \
+    tests/test_media_player_ui.py \
+    tests/test_macos_metal_viewer.py \
+    tests/test_vulkan_local_viewer.py

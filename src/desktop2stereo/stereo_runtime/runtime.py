@@ -1632,6 +1632,10 @@ class StereoRuntime:
                 "native_coreml_deferred_warp": 1,
                 "native_coreml_nonfinite_count": int(native_depth.nonfinite_count),
                 "depth_finite": int(bool(native_depth.finite_depth)),
+                "depth_preprocess_ms": float(profile.preprocess_ms),
+                "depth_model_ms": float(profile.model_ms),
+                "depth_postprocess_ms": float(profile.postprocess_ms),
+                "depth_total_ms": float(profile.total_ms),
                 "native_coreml_normalize_lo": float(native_depth.normalize_lo),
                 "native_coreml_normalize_hi": float(native_depth.normalize_hi),
                 "depth_render_size": f"{native_depth.depth_width}x{native_depth.depth_height}",
@@ -1712,11 +1716,10 @@ class StereoRuntime:
         synth_start = time.perf_counter()
         deferred_vulkan_request = None
         deferred_vulkan_reason = "disabled"
-        # Deferred Metal shader warp (macOS Local Viewer): skip torch-side
-        # synthesis entirely; the viewer's fragment shader samples rgb+depth
-        # at draw time (v2.5 approach). runtime_entry sets the env default to
-        # "1" only for Darwin Local Viewer, so stream/OpenXR paths never see
-        # it unless a user opts in explicitly.
+        # Keep the canonical synthesis path unless an explicit diagnostic
+        # shader-warp opt-in is requested. The production Metal viewer uses
+        # native CoreML/Metal DIBR packing, which matches the original display
+        # path; the fragment warp is only an approximation.
         deferred_warp = _deferred_metal_shader_warp_enabled(
             stereo_config.output_format,
             skip_sbs_output=skip_sbs_output,

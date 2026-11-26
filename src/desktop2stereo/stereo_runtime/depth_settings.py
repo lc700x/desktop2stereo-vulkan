@@ -26,31 +26,15 @@ class DepthSettings:
     use_openvino: bool
     recompile_openvino: bool
 
-
-def _is_macos_mps_device(settings: dict, os_name: str | None) -> bool:
-    if os_name != "Darwin":
-        return False
-    device = settings.get("Computing Device")
-    if isinstance(device, str):
-        return "mps" in device.lower()
-    if str(settings.get("Device", "")).lower().startswith("mps"):
-        return True
-    try:
-        import torch
-
-        if device is not None:
-            return str(torch.device(device)).lower().startswith("mps")
-    except Exception:
-        pass
-    return bool(settings.get("CoreML"))
-
-
 def resolve_depth_settings(settings: dict, *, cache_path: str = "./models", os_name: str | None = None) -> DepthSettings:
     mapping = model_name_mapping()
     model = settings["Depth Model"]
+    # Core ML conversion uses FLOAT16 compute precision on Apple Silicon and
+    # the native bridge accepts both Float16 and Float32 model outputs. Keep
+    # the user's FP16 selection intact on macOS so the cached Core ML artifact
+    # and the native ANE path use the requested precision. MPS-only fallback
+    # providers may still choose their own safe dtype at runtime.
     fp16 = bool(settings["FP16"])
-    if _is_macos_mps_device(settings, os_name):
-        fp16 = False
     return DepthSettings(
         model=model,
         model_id=mapping[model],

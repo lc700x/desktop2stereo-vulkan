@@ -117,7 +117,26 @@ def _load_overlay_font_cached(size, font_type, prefer_cjk, bold, prefer_inter=Fa
             r"C:\Windows\Fonts\msyhbd.ttc" if bold
             else r"C:\Windows\Fonts\msyh.ttc"
         )
+        # Use the W3/W6 faces from the macOS CJK collection so regular and
+        # emphasized text keep distinct weights at every raster size.
+        candidates.extend(
+            (
+                ("/System/Library/Fonts/Hiragino Sans GB.ttc", 2 if bold else 0),
+                "/System/Library/Fonts/PingFang.ttc",
+                ("/System/Library/Fonts/STHeiti Medium.ttc", 1),
+            )
+        )
     elif prefer_inter and _INTER_FONT_PATH.is_file():
+        candidates.append(str(_INTER_FONT_PATH))
+    elif not prefer_cjk:
+        candidates.extend(
+            (
+                "/System/Library/Fonts/SFNS.ttf",
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/STHeiti Medium.ttc",
+            )
+        )
+    if (prefer_cjk or prefer_inter) and _INTER_FONT_PATH.is_file():
         candidates.append(str(_INTER_FONT_PATH))
     if bold:
         candidates.extend((
@@ -132,9 +151,15 @@ def _load_overlay_font_cached(size, font_type, prefer_cjk, bold, prefer_inter=Fa
     for candidate in candidates:
         if not candidate:
             continue
+        if isinstance(candidate, tuple):
+            candidate_path, collection_index = candidate
+        else:
+            candidate_path, collection_index = candidate, 0
         try:
-            font = ImageFont.truetype(candidate, size)
-            if Path(candidate) == _INTER_FONT_PATH:
+            font = ImageFont.truetype(
+                candidate_path, size, index=int(collection_index)
+            )
+            if Path(candidate_path) == _INTER_FONT_PATH:
                 font.set_variation_by_name("SemiBold" if bold else "Regular")
             return font
         except Exception:
@@ -142,19 +167,59 @@ def _load_overlay_font_cached(size, font_type, prefer_cjk, bold, prefer_inter=Fa
     return ImageFont.load_default()
 
 
-def load_overlay_font(size, font_type=None, *, prefer_cjk=False, bold=False):
+def load_overlay_font(
+    size, font_type=None, *, prefer_cjk=False, prefer_inter=False, bold=False
+):
     font_key = None if font_type is None else str(font_type)
     return _load_overlay_font_cached(
-        int(size), font_key, bool(prefer_cjk), bool(bold)
+        int(size), font_key, bool(prefer_cjk), bool(bold), bool(prefer_inter)
     )
 
 
-def _fit_overlay_font(draw, text, size, max_width, *, prefer_cjk=True, bold=False, minimum=14):
+def _contains_cjk(text) -> bool:
+    return any(
+        "\u2e80" <= character <= "\u9fff"
+        or "\uac00" <= character <= "\ud7af"
+        or "\uf900" <= character <= "\ufaff"
+        or "\U00020000" <= character <= "\U000323af"
+        for character in str(text or "")
+    )
+
+
+def load_overlay_font_for_text(size, text, font_type=None, *, bold=False):
+    prefer_cjk = _contains_cjk(text)
+    return load_overlay_font(
+        size,
+        font_type,
+        prefer_cjk=prefer_cjk,
+        prefer_inter=not prefer_cjk,
+        bold=bold,
+    )
+
+
+def _fit_overlay_font(
+    draw,
+    text,
+    size,
+    max_width,
+    *,
+    prefer_cjk=None,
+    bold=False,
+    minimum=14,
+):
+    if prefer_cjk is None:
+        prefer_cjk = _contains_cjk(text)
+    prefer_cjk = bool(prefer_cjk)
+    prefer_inter = not prefer_cjk
     for font_size in range(int(size), int(minimum) - 1, -1):
-        font = _load_overlay_font_cached(font_size, None, bool(prefer_cjk), bool(bold), True)
+        font = _load_overlay_font_cached(
+            font_size, None, prefer_cjk, bool(bold), prefer_inter
+        )
         if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
             return font
-    return _load_overlay_font_cached(int(minimum), None, bool(prefer_cjk), bool(bold), True)
+    return _load_overlay_font_cached(
+        int(minimum), None, prefer_cjk, bool(bold), prefer_inter
+    )
 
 
 def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, lang="EN"):
@@ -911,10 +976,11 @@ def build_short_osd_rgba(lines, font_type=None, *, width=768, height=96):
     img = Image.new("RGBA", (int(width), int(height)), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle([0, 0, int(width) - 1, int(height) - 1], radius=14, fill=(32, 32, 36, 210))
+    text = "  ".join(str(line) for line in lines[:2])
     draw.text(
         (18, 16),
-        "  ".join(str(line) for line in lines[:2]),
-        font=load_overlay_font(24, font_type, prefer_cjk=True),
+        text,
+        font=load_overlay_font_for_text(28, text, font_type),
         fill=(220, 235, 255, 255),
     )
     return np.ascontiguousarray(np.asarray(img, dtype=np.uint8))
@@ -939,12 +1005,14 @@ def build_screen_adjust_osd_rgba(
     )
     if not draw_text:
         return np.ascontiguousarray(np.asarray(img, dtype=np.uint8))
-    font = load_overlay_font(24, font_type, prefer_cjk=True)
-    bold_font = font
-    label_color = (150, 158, 185, 255)
-    value_color = (0, 210, 230, 255)
     size_value = f"{float(screen_width):.2f} x {float(screen_width) * 9.0 / 16.0:.2f} m"
     distance_value = f"{float(screen_distance):.2f} m"
+    font = load_overlay_font_for_text(
+        26, f"{size_value} {distance_value}", font_type
+    )
+    bold_font = load_overlay_font_for_text(26, "Size Dist", font_type, bold=True)
+    label_color = (150, 158, 185, 255)
+    value_color = (0, 210, 230, 255)
     parts = (
         ("Size", label_color, bold_font),
         (size_value, value_color, font),
@@ -980,11 +1048,11 @@ def build_screen_preset_osd_rgba(
     )
     if not draw_text:
         return np.ascontiguousarray(np.asarray(img, dtype=np.uint8))
-    label_font = load_overlay_font(24, font_type, prefer_cjk=True)
-    value_font = label_font
+    label = "Preset"
+    label_font = load_overlay_font_for_text(26, label, font_type, bold=True)
+    value_font = load_overlay_font_for_text(26, str(preset_label), font_type)
     label_color = (150, 158, 185, 255)
     value_color = (0, 210, 230, 255)
-    label = "Preset"
     gap = 8
     label_width = _text_width(draw, label, label_font)
     value_width = _text_width(draw, str(preset_label), value_font)
@@ -1037,14 +1105,20 @@ def build_fps_overlay_rgba(
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle([0, 0, ow - 1, oh - 1], radius=14, fill=(32, 32, 36, 210))
 
-    font = load_overlay_font(24, font_type, prefer_cjk=True)
-    label_font = load_overlay_font(24, font_type, prefer_cjk=True)
+    labels = ["[Performance]", "[3D Display]", "[Resolution]", "[Controller]", "[Environment]"]
+    font = load_overlay_font_for_text(
+        26,
+        f"XR FPS Capture Latency Depth Strength Model {controller_brand or ''}",
+        font_type,
+    )
+    label_font = load_overlay_font_for_text(
+        26, " ".join(labels), font_type, bold=True
+    )
     c_label = (150, 158, 185, 255)
     c_green = (0, 230, 90, 255)
     c_cyan = (0, 210, 230, 255)
     c_amber = (255, 190, 40, 255)
     pad = 14
-    labels = ["[Performance]", "[3D Display]", "[Resolution]", "[Controller]", "[Environment]"]
     val_x = pad + max(_text_width(draw, label, label_font) for label in labels) + 10
 
     lat_str = f"{float(latency_ms):.0f}ms" if float(latency_ms or 0.0) > 0 else "N/A"
@@ -1145,14 +1219,20 @@ def build_team_status_rgba(
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle([0, 0, ow - 1, oh - 1], radius=14, fill=(32, 32, 36, 210))
 
-    font = load_overlay_font(24, font_type, prefer_cjk=True)
-    label_font = load_overlay_font(24, font_type, prefer_cjk=True)
+    labels = ["[Performance]", "[3D Display]", "[Resolution]", "[Show Shortcuts]", "[Models]"]
+    font = load_overlay_font_for_text(
+        26,
+        f"XR FPS Latency Depth Strength Environment {environment_name or ''} {controller_brand or ''}",
+        font_type,
+    )
+    label_font = load_overlay_font_for_text(
+        26, " ".join(labels), font_type, bold=True
+    )
     c_label = (150, 158, 185, 255)
     c_green = (0, 230, 90, 255)
     c_cyan = (0, 210, 230, 255)
     c_amber = (255, 190, 40, 255)
     pad = 14
-    labels = ["[Performance]", "[3D Display]", "[Resolution]", "[Show Shortcuts]", "[Models]"]
     val_x = pad + max(_text_width(draw, label, label_font) for label in labels) + 10
 
     lat_str = f"{float(latency_ms):.0f}ms" if float(latency_ms or 0.0) > 0 else "--"

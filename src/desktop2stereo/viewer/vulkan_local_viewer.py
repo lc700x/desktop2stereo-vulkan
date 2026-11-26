@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from media_ui import (
-    MEDIA_BROWSER_TEXTURE_ASPECT,
+    MEDIA_BAR_TEXTURE_SIZE,
+    MEDIA_BROWSER_LAYOUT_SIZE,
     MEDIA_BROWSER_TEXTURE_SIZE,
-    MEDIA_BROWSER_VISIBLE_ROWS,
+    MEDIA_POINTER_IDLE_SECONDS,
     MediaHoverAnimation,
     build_media_bar_rgba,
     build_media_browser_rgba,
@@ -29,14 +30,23 @@ from media_ui import (
     media_bar_hit,
     media_bar_value_fraction,
     media_browser_hit,
+    media_browser_font_scale,
+    media_browser_rect_for_eye,
+    media_browser_scroll_metrics,
+    media_browser_scrollbar_offset,
     media_control_enabled,
+    media_bar_rect_for_eye,
 )
 from utils.display_info import resolve_glfw_monitor_index
 from utils.queue_utils import _release_item
 from utils.sys_load import format_load_fields
 
 from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
-from viewer.direct_sink import DIRECT_SINK, direct_staging_enabled
+from viewer.direct_sink import (
+    DIRECT_SINK,
+    direct_staging_enabled,
+    native_pack_error_is_recoverable,
+)
 from viewer.source_pointer import (
     send_screen_pointer_click,
     send_screen_pointer_move,
@@ -45,7 +55,10 @@ from viewer.source_pointer import (
     source_pointer_point,
 )
 from viewer.vulkan_context import _query_adapter_luid
-from viewer.vulkan_fps_overlay import VulkanFpsOverlay, build_fps_panel_rgba
+from viewer.vulkan_fps_overlay import (
+    VulkanFpsOverlay,
+    build_fps_panel_rgba,
+)
 from viewer.vulkan_resources import (
     VulkanExportableBuffer,
     VulkanExportableImage,
@@ -276,7 +289,12 @@ def configure_glfw_window_hints(
     glfw.window_hint(glfw.VISIBLE, glfw.TRUE)
     glfw.window_hint(glfw.DECORATED, glfw.TRUE)
     glfw.window_hint(glfw.FLOATING, glfw.FALSE)
-    glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.TRUE)
+    if sys.platform == "darwin":
+        # Same-monitor SBS is a non-activating accessory overlay. Let the
+        # source application keep its fullscreen Space and focus.
+        glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.FALSE)
+    else:
+        glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.TRUE)
     if (fullscreen or initially_hidden) and sys.platform == "win32":
         # Create the output hidden so the final taskbar style is applied before
         # Windows shows the fullscreen window.
@@ -285,7 +303,14 @@ def configure_glfw_window_hints(
         glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.FALSE)
 
 
-def present_fps_if_due(frames: int, elapsed: float, interval: float = 5.0) -> float | None:
+FPS_REPORT_INTERVAL_SECONDS = 5.0
+
+
+def present_fps_if_due(
+    frames: int,
+    elapsed: float,
+    interval: float = FPS_REPORT_INTERVAL_SECONDS,
+) -> float | None:
     if frames <= 0 or elapsed < interval:
         return None
     return frames / max(elapsed, 1e-6)
@@ -721,6 +746,26 @@ def pack_frame_to_rgba8(frame: Any) -> tuple[Any, int, int] | None:
         return None
 
 
+def _has_gpu_present_source(frame: Any, config: Any) -> bool:
+    """Return whether a frame satisfies the local viewer's present contract."""
+    if (
+        getattr(frame, "viewer_frame_direct", None) is not None
+        or getattr(frame, "viewer_native", None) is not None
+        or bool(getattr(frame, "is_cuda", False))
+    ):
+        return True
+    capture_mode = str(getattr(config, "capture_mode", "") or "").strip().casefold()
+    return (
+        capture_mode in {"file", "video"}
+        and getattr(frame, "viewer_frame_np", None) is not None
+    )
+
+
+def is_media_capture_mode(capture_mode: Any) -> bool:
+    """Return whether the Local Viewer is presenting interactive media."""
+    return str(capture_mode or "").strip().casefold() in {"file", "video"}
+
+
 def frame_to_cuda_rgba(frame: Any) -> Any | None:
     """Return an HxWx4 CUDA uint8 tensor, without a host round trip."""
     image = frame.detach() if hasattr(frame, "detach") else frame
@@ -851,6 +896,7 @@ class VulkanLocalViewerConfig:
     exclude_from_capture: bool = False
     on_capture_window_exclusion: Callable[[int, bool], bool] | None = None
     show_taskbar_button: bool = False
+    show_in_app_switcher: bool = False
     cursor_passthrough: bool = False
     # Original capture size (tex_w,tex_h in legacy viewer) for dynamic eye ratio.
     # When set, HalfSBS uses W/2×H etc. based on this, not packed sw/sh.
@@ -862,6 +908,7 @@ class VulkanLocalViewerConfig:
     media_state_path: str | None = None
     media_session_id: str | None = None
     media_action_callback: Callable[[str, object], bool] | None = None
+    on_stop_requested: Callable[[], None] | None = None
     pointer_mapping_enabled: bool = False
     locale: str = "EN"
     vsync: bool = True
@@ -1018,7 +1065,12 @@ class VulkanLocalViewer:
         self._media_bar_texture_key: tuple[Any, ...] | None = None
         self._media_browser_texture_key: tuple[Any, ...] | None = None
         self._media_browser_scroll = 0
-        self._media_pointer_uv: tuple[float, float] | None = None
+        self._media_browser_scroll_drag = False
+        self._media_pointer_uv: tuple[float, float] | None = (
+            (0.5, 0.5)
+            if bool(getattr(config, "pointer_mapping_enabled", False))
+            else None
+        )
         self._media_hit_uv: tuple[float, float] | None = None
         self._media_pointer_overlay: VulkanFpsOverlay | None = None
         self._media_pointer_texture_key: tuple[Any, ...] | None = None
@@ -1026,8 +1078,6 @@ class VulkanLocalViewer:
         self._media_panel_hovered = False
         self._media_drag_action: str | None = None
         self._media_drag_last_sent_at = 0.0
-        self._media_last_click_at = 0.0
-        self._media_last_click_hit: str | None = None
         self._cursor_snapshot = None
         self._cursor_snapshot_key = None
         # Frame-available -> successful present, on the capture perf_counter
@@ -1144,7 +1194,9 @@ class VulkanLocalViewer:
         glfw.set_window_pos(self.window, x, y)
         if sys.platform == "darwin":
             pin_macos_viewer_window(
-                self.window, fullscreen=self._exclusive_fullscreen
+                self.window,
+                fullscreen=self._exclusive_fullscreen,
+                show_in_app_switcher=self.config.show_in_app_switcher,
             )
             if self._exclusive_fullscreen:
                 glfw.show_window(self.window)
@@ -1217,7 +1269,9 @@ class VulkanLocalViewer:
             # Space membership. Reapply the auxiliary/all-Spaces policy after
             # the first show, before the source capture session starts.
             pin_macos_viewer_window(
-                self.window, fullscreen=self._exclusive_fullscreen
+                self.window,
+                fullscreen=self._exclusive_fullscreen,
+                show_in_app_switcher=self.config.show_in_app_switcher,
             )
         if self.config.cursor_passthrough:
             set_window_mouse_passthrough(
@@ -1238,10 +1292,15 @@ class VulkanLocalViewer:
             )
 
     def _init_cursor_texture_overlay(self) -> None:
+        capture_mode = str(self.config.capture_mode or "").strip().casefold()
         if (
             sys.platform not in {"win32", "darwin"}
             or not self.config.cursor_passthrough
             or not self.config.hide_cursor_overlay
+            or (
+                sys.platform == "darwin"
+                and capture_mode in {"monitor", "window", "file", "video"}
+            )
         ):
             return
         try:
@@ -1265,7 +1324,11 @@ class VulkanLocalViewer:
 
     def _update_cursor_texture_overlay(self, eye_rects):
         overlay = self._cursor_texture_overlay
-        if overlay is None:
+        capture_mode = str(self.config.capture_mode or "").strip().casefold()
+        if overlay is None or (
+            sys.platform == "darwin"
+            and capture_mode in {"monitor", "window", "file", "video"}
+        ):
             return ()
         key = cursor_snapshot_key(self.config.display_mode)
         if key is None:
@@ -1313,7 +1376,13 @@ class VulkanLocalViewer:
                 )
                 continue
             setattr(self, attr, overlay)
-        if self.config.pointer_mapping_enabled:
+        if (
+            self.config.pointer_mapping_enabled
+            and (
+                sys.platform != "darwin"
+                or is_media_capture_mode(self.config.capture_mode)
+            )
+        ):
             try:
                 pointer = VulkanFpsOverlay(self)
                 if pointer.available:
@@ -1375,32 +1444,28 @@ class VulkanLocalViewer:
             or time.monotonic() - last_activity <= 3.0
         )
 
+    def _media_pointer_visible(self) -> bool:
+        last_activity = float(getattr(self, "_media_last_activity", 0.0) or 0.0)
+        return (
+            last_activity <= 0.0
+            or time.monotonic() - last_activity <= MEDIA_POINTER_IDLE_SECONDS
+        )
+
     def _media_rect_for_eye(
         self,
         eye_rect: tuple[int, int, int, int],
         *,
         browser: bool = False,
     ) -> tuple[int, int, int, int]:
-        left, top, right, bottom = (int(value) for value in eye_rect)
-        eye_w = max(1, right - left)
-        eye_h = max(1, bottom - top)
-        if browser:
-            max_w = max(1, int(eye_w * 0.98))
-            max_h = max(1, int(eye_h * 0.88))
-            if max_w / max_h > MEDIA_BROWSER_TEXTURE_ASPECT:
-                panel_h = max_h
-                panel_w = max(1, int(panel_h * MEDIA_BROWSER_TEXTURE_ASPECT))
-            else:
-                panel_w = max_w
-                panel_h = max(1, int(panel_w / MEDIA_BROWSER_TEXTURE_ASPECT))
-        else:
-            panel_w = min(int(eye_w * 0.92), 1024)
-            panel_h = max(70, int(panel_w * 160 / 1024))
-        if panel_w <= 0 or panel_h <= 0:
-            return (left, top, left + 1, top + 1)
-        x = left + (eye_w - panel_w) // 2
-        y = top + eye_h - panel_h - max(10, int(eye_h * 0.035)) if not browser else top + (eye_h - panel_h) // 2
-        return (x, y, x + panel_w, y + panel_h)
+        if not browser:
+            return media_bar_rect_for_eye(
+                eye_rect,
+                str(getattr(getattr(self, "config", None), "display_mode", "")),
+            )
+        return media_browser_rect_for_eye(
+            eye_rect,
+            str(getattr(getattr(self, "config", None), "display_mode", "")),
+        )
 
     def _media_bar_texture_key_value(self) -> tuple[Any, ...]:
         state = self._media_state
@@ -1449,7 +1514,19 @@ class VulkanLocalViewer:
             state.get("playlist_index"),
             state.get("browser_error"),
             getattr(self.config, "locale", "EN"),
+            round(self._media_browser_font_scale(), 3),
         )
+
+    def _media_browser_font_scale(self) -> float:
+        eye_rects = getattr(self, "_media_eye_rects", ())
+        if not eye_rects:
+            try:
+                width, height = self.extent
+            except (AttributeError, TypeError, ValueError):
+                return 1.0
+            eye_rects = ((0, 0, int(width) // 2, int(height)),)
+        panel = self._media_rect_for_eye(eye_rects[0], browser=True)
+        return media_browser_font_scale(panel[3] - panel[1])
 
     def _refresh_media_textures(self) -> None:
         language = "CN" if getattr(self.config, "locale", "EN") == "CN" else "EN"
@@ -1467,14 +1544,14 @@ class VulkanLocalViewer:
             if key != self._media_bar_texture_key:
                 rgba = build_media_bar_rgba(
                     self._media_state,
-                    width=1024,
-                    height=160,
+                    width=MEDIA_BAR_TEXTURE_SIZE[0],
+                    height=MEDIA_BAR_TEXTURE_SIZE[1],
                     hover=self._media_hover_hit,
                     hover_progress=self._media_hover_progress,
                     lang=language,
                     collapsed=not self._media_bar_expanded(),
                 )
-                media_bar_overlay.set_rgba(rgba.tobytes(), (1024, 160))
+                media_bar_overlay.set_rgba(rgba.tobytes(), MEDIA_BAR_TEXTURE_SIZE)
                 self._media_bar_texture_key = key
         media_browser_overlay = getattr(self, "_media_browser_overlay", None)
         if media_browser_overlay is not None and self._media_browser_visible():
@@ -1488,6 +1565,7 @@ class VulkanLocalViewer:
                     hover_progress=self._media_hover_progress,
                     scroll_offset=self._media_browser_scroll,
                     lang=language,
+                    font_scale=self._media_browser_font_scale(),
                 )
                 media_browser_overlay.set_rgba(
                     rgba.tobytes(), MEDIA_BROWSER_TEXTURE_SIZE
@@ -1517,32 +1595,41 @@ class VulkanLocalViewer:
             return False
         return bool(callback(action, value))
 
-    def _dispatch_media_hit(self, hit: str | None, *, double_click: bool = False) -> None:
+    def _dispatch_media_hit(self, hit: str | None) -> None:
         if not hit:
+            return
+        if hit == "viewer_stop":
+            callback = getattr(self.config, "on_stop_requested", None)
+            if callable(callback):
+                callback()
             return
         if hit.startswith("entry:"):
             path = hit.split(":", 1)[1]
-            if not double_click:
-                self._media_state = {
-                    **self._media_state,
-                    "browser_selection": path,
-                    "browser_revision": int(
-                        self._media_state.get("browser_revision", 0) or 0
-                    ) + 1,
-                }
-                self._media_browser_texture_key = None
-                refresh = getattr(self, "_refresh_media_textures", None)
-                if callable(refresh):
-                    refresh()
-            self._media_action(
-                "browse_open" if double_click else "browse_select",
-                {"path": path},
-            )
+            self._media_state = {
+                **self._media_state,
+                "browser_selection": path,
+                "browser_revision": int(
+                    self._media_state.get("browser_revision", 0) or 0
+                ) + 1,
+            }
+            self._media_browser_texture_key = None
+            refresh = getattr(self, "_refresh_media_textures", None)
+            if callable(refresh):
+                refresh()
+            self._media_action("browse_open", {"path": path})
             return
         if hit.startswith("mount:"):
             self._media_action("browse", hit.split(":", 1)[1])
             return
         action, _, path = hit.partition(":")
+        if action == "browser_scroll":
+            try:
+                self._media_browser_scroll = int(path or 0)
+            except (TypeError, ValueError):
+                return
+            self._media_browser_texture_key = None
+            self._refresh_media_textures()
+            return
         if action in {"playlist_add", "playlist_remove"} and path:
             self._media_action(action, {"path": path})
             return
@@ -1552,6 +1639,12 @@ class VulkanLocalViewer:
         if hit == "playlist_sort":
             self._media_action(
                 "playlist_sort", {"descending": self._media_state.get("playlist_sort_descending") is False}
+            )
+            return
+        if hit == "browser_sort":
+            self._media_action(
+                "browser_sort",
+                {"descending": self._media_state.get("browser_sort_descending") is not True},
             )
             return
         if hit in {"playlist_page_previous", "playlist_page_next"}:
@@ -1599,6 +1692,10 @@ class VulkanLocalViewer:
             self._media_action("browse_up")
         elif hit == "browser_refresh":
             self._media_action("browse_refresh")
+        elif hit == "media_exit":
+            self._media_browser_scroll = 0
+            self._media_browser_scroll_drag = False
+            self._media_action("media_exit")
         elif hit == "playlist_previous":
             self._media_action("playlist_previous")
         elif hit == "playlist_next":
@@ -1691,12 +1788,39 @@ class VulkanLocalViewer:
             if self._media_browser_visible()
             else self._media_bar_rects
         )
+        display_mode = str(getattr(self.config, "display_mode", ""))
+        packed_mode = display_mode.strip().casefold().replace("_", "-")
+        frame_left = min(rect[0] for rect in eye_rects)
+        frame_top = min(rect[1] for rect in eye_rects)
+        frame_right = max(rect[2] for rect in eye_rects)
+        frame_bottom = max(rect[3] for rect in eye_rects)
+        shared_u = shared_v = None
+        if frame_left <= x < frame_right and frame_top <= y < frame_bottom:
+            if packed_mode.endswith("sbs"):
+                common_top = max(rect[1] for rect in eye_rects)
+                common_bottom = min(rect[3] for rect in eye_rects)
+                if common_bottom <= common_top:
+                    common_top, common_bottom = frame_top, frame_bottom
+                shared_u = (x - frame_left) / max(1, frame_right - frame_left)
+                shared_v = (y - common_top) / max(1, common_bottom - common_top)
+            elif packed_mode.endswith("tab"):
+                common_left = max(rect[0] for rect in eye_rects)
+                common_right = min(rect[2] for rect in eye_rects)
+                if common_right <= common_left:
+                    common_left, common_right = frame_left, frame_right
+                shared_u = (x - common_left) / max(1, common_right - common_left)
+                shared_v = (y - frame_top) / max(1, frame_bottom - frame_top)
         for index, rect in enumerate(eye_rects):
             left, top, right, bottom = rect
             if not (left <= x < right and top <= y < bottom):
                 continue
-            u = (x - left) / max(1, right - left)
-            v = (y - top) / max(1, bottom - top)
+            # The ray is measured in the complete packed frame. For SBS the
+            # horizontal axis spans both eyes; for TAB the vertical axis does.
+            if shared_u is None or shared_v is None:
+                u = (x - left) / max(1, right - left)
+                v = (y - top) / max(1, bottom - top)
+            else:
+                u, v = shared_u, shared_v
             self._media_pointer_uv = (u, v)
             panel = panels[min(index, len(panels) - 1)] if panels else None
             if panel is None:
@@ -1706,10 +1830,25 @@ class VulkanLocalViewer:
                     self._map_pointer_move(u, v)
                 return
             p_left, p_top, p_right, p_bottom = panel
-            hit_u = (x - p_left) / max(1, p_right - p_left)
-            hit_v = (y - p_top) / max(1, p_bottom - p_top)
+            hit_x, hit_y = x, y
+            if shared_u is not None and shared_v is not None and self.config.pointer_mapping_enabled:
+                hit_x = left + u * (right - left)
+                hit_y = top + v * (bottom - top)
+            hit_u = (hit_x - p_left) / max(1, p_right - p_left)
+            hit_v = (hit_y - p_top) / max(1, p_bottom - p_top)
             self._media_hit_uv = (hit_u, hit_v)
             hit = self._media_hit(hit_u, hit_v)
+            if (
+                self._media_browser_scroll_drag
+                and self._media_browser_visible()
+                and hit
+                and hit.startswith("browser_scroll:")
+            ):
+                self._media_browser_scroll = media_browser_scrollbar_offset(
+                    self._media_state,
+                    hit_v * MEDIA_BROWSER_LAYOUT_SIZE[1],
+                )
+                self._media_browser_texture_key = None
             self._media_panel_hovered = expanded and 0.0 <= hit_u <= 1.0 and 0.0 <= hit_v <= 1.0
             if not expanded and hit == "wake":
                 self._media_last_activity = time.monotonic()
@@ -1730,6 +1869,7 @@ class VulkanLocalViewer:
         right_button = int(getattr(self.glfw, "MOUSE_BUTTON_RIGHT", 1))
         release = int(getattr(self.glfw, "RELEASE", 0))
         if action == release:
+            self._media_browser_scroll_drag = False
             if self._media_drag_action is not None and self._media_hit_uv is not None:
                 self._media_drag_last_sent_at = 0.0
                 self._update_media_drag(self._media_hit_uv[0])
@@ -1751,18 +1891,13 @@ class VulkanLocalViewer:
             self._media_last_activity = time.monotonic()
             return
         if hit and self._media_hit_uv is not None:
+            if hit.startswith("browser_scroll:"):
+                self._media_browser_scroll_drag = True
             now = time.monotonic()
-            double_click = (
-                hit.startswith("entry:")
-                and hit == self._media_last_click_hit
-                and now - self._media_last_click_at <= 0.45
-            )
-            self._dispatch_media_hit(hit, double_click=double_click)
+            self._dispatch_media_hit(hit)
             if hit.startswith(("seek:", "volume:")):
                 self._media_drag_action = hit.split(":", 1)[0]
                 self._media_drag_last_sent_at = now
-            self._media_last_click_hit = hit
-            self._media_last_click_at = now
             self._media_last_activity = now
             return
         if not self._media_panel_hovered and self.config.pointer_mapping_enabled and self._media_pointer_uv is not None:
@@ -1771,12 +1906,12 @@ class VulkanLocalViewer:
     def _on_scroll(self, _window: Any, _xoffset: float, yoffset: float) -> None:
         if not self._media_browser_visible() or not self._media_panel_hovered:
             return
-        entries = self._media_state.get("browser_entries") or []
+        step, _visible, maximum = media_browser_scroll_metrics(self._media_state)
         self._media_browser_scroll = max(
             0,
             min(
-                max(0, len(entries) - MEDIA_BROWSER_VISIBLE_ROWS),
-                self._media_browser_scroll + (-3 if yoffset > 0 else 3),
+                maximum,
+                self._media_browser_scroll + (-step * 3 if yoffset > 0 else step * 3),
             ),
         )
         self._media_last_activity = time.monotonic()
@@ -1911,16 +2046,25 @@ class VulkanLocalViewer:
                 layout = self.vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
         if (
             self._media_pointer_overlay is not None
+            and (
+                sys.platform != "darwin"
+                or is_media_capture_mode(self.config.capture_mode)
+            )
             and self.config.pointer_mapping_enabled
+            and self._media_pointer_visible()
             and self._media_pointer_uv is not None
             and self._media_eye_rects
         ):
             u, v = self._media_pointer_uv
+            packed_mode = str(
+                getattr(self.config, "display_mode", "")
+            ).strip().casefold().replace("_", "-")
+            pointer_width = 24 if packed_mode == "half-sbs" else 48
             pointer_rects = []
             for left, top, right, bottom in self._media_eye_rects:
-                x = int(left + u * (right - left)) - 24
+                x = int(left + u * (right - left)) - pointer_width // 2
                 y = int(top + v * (bottom - top)) - 24
-                pointer_rects.append((x, y, 48, 48))
+                pointer_rects.append((x, y, pointer_width, 48))
             if self._media_pointer_overlay.record_rects(
                 cmd,
                 swapchain_image,
@@ -2016,7 +2160,11 @@ class VulkanLocalViewer:
             raise StopIteration
         self._keep_fullscreen_visible()
         if sys.platform == "darwin" and self._exclusive_fullscreen:
-            pin_macos_viewer_window(self.window, fullscreen=True)
+            pin_macos_viewer_window(
+                self.window,
+                fullscreen=True,
+                show_in_app_switcher=self.config.show_in_app_switcher,
+            )
         self._sync_media_passthrough()
         if self.config.cursor_passthrough and self.config.hide_cursor_overlay:
             update_native_cursor_suppression()
@@ -2195,7 +2343,11 @@ class VulkanLocalViewer:
             glfw.set_window_pos(self.window, x, y)
             glfw.set_window_size(self.window, width, height)
         if sys.platform == "darwin":
-            pin_macos_viewer_window(self.window, fullscreen=enabled)
+            pin_macos_viewer_window(
+                self.window,
+                fullscreen=enabled,
+                show_in_app_switcher=self.config.show_in_app_switcher,
+            )
         if self.device is not None:
             self.recreate_swapchain()
         print(
@@ -3274,16 +3426,10 @@ class VulkanLocalViewer:
         )
         direct_source = getattr(frame, "viewer_frame_direct", None)
         native_frame = getattr(frame, "viewer_native", None)
-        cuda_frame = bool(getattr(frame, "is_cuda", False))
-        if (
-            gpu_required
-            and direct_source is None
-            and native_frame is None
-            and not cuda_frame
-        ):
+        if gpu_required and not _has_gpu_present_source(frame, self.config):
             raise RuntimeError(
                 "GPU-only Vulkan presentation requires a CUDA tensor, native frame, "
-                "or direct GPU frame source"
+                "direct GPU frame source, or a packed media frame"
             )
         if native_frame is not None and direct_source is None:
             try:
@@ -3292,13 +3438,13 @@ class VulkanLocalViewer:
                 output_format = str(
                     getattr(frame, "output_format", "half_sbs") or "half_sbs"
                 )
-                source_size = getattr(frame, "output_eye_size", None)
-                if source_size is None:
-                    source_size = getattr(native_frame, "source_size", None)
-                if not isinstance(source_size, (tuple, list)) or len(source_size) != 2:
-                    raise RuntimeError("native CoreML result has no source dimensions")
+                output_size = getattr(frame, "output_eye_size", None)
+                if not isinstance(output_size, (tuple, list)) or len(output_size) != 2:
+                    output_size = getattr(native_frame, "source_size", None)
+                if not isinstance(output_size, (tuple, list)) or len(output_size) != 2:
+                    raise RuntimeError("native CoreML result has no output dimensions")
                 target_size = pack_target(
-                    int(source_size[0]), int(source_size[1]), output_format
+                    int(output_size[0]), int(output_size[1]), output_format
                 )
                 # Native frames arrive before the first viewer frame has
                 # initialized the transfer ring. Create/register the direct
@@ -3398,6 +3544,11 @@ class VulkanLocalViewer:
                 )
                 if self.config.on_breakdown_inc is not None:
                     self.config.on_breakdown_inc("native_present_unavailable", 1)
+                if native_pack_error_is_recoverable(exc):
+                    object.__setattr__(frame, "viewer_native", None)
+                    if self.config.on_breakdown_inc is not None:
+                        self.config.on_breakdown_inc("viewer_drop", 1)
+                    return False
                 if gpu_required:
                     raise RuntimeError(
                         f"GPU-only Vulkan presentation failed: {type(exc).__name__}: {exc}"

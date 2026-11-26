@@ -342,7 +342,7 @@
 		</data>
 		<key>Resources/assets/web/sunshine-esm-stats.json</key>
 		<data>
-		gB8dw9nhR6FNGM5zXvAGbz8jZvs=
+		Kf+ntX3tMFxs6C7ILgHfb9oFEsI=
 		</data>
 		<key>Resources/assets/web/troubleshooting.html</key>
 		<data>
@@ -363,10 +363,10 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			6fYX6VJC6dzdQpxJVOdZRA/FTqI=
+			XZOUlflhydbPJy10I8/kNLvfyy0=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"e9f617e95242e9dcdd429c4954e759440fc54ea2"</string>
+			<string>cdhash H"5d939495f961c9d6cf272d7423cfe434bbdfcb2d"</string>
 		</dict>
 		<key>Frameworks/libicudata.78.3.dylib</key>
 		<dict>
@@ -386,10 +386,10 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			lTTJXXF1BiPZUbwofU7MNUhkOTg=
+			JbKLpSjWtLpo1gHWouqejZvPYxA=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"9534c95d71750623d951bc287d4ecc3548643938"</string>
+			<string>cdhash H"25b28ba528d6b4ba68d601d6a2ea9e8d9bcf6310"</string>
 		</dict>
 		<key>Frameworks/libicui18n.78.dylib</key>
 		<dict>
@@ -428,10 +428,10 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			v8xTY/0gS1ZKZ/QI8UMFXRlHWL8=
+			RIYhYQ4xSW7ZakZGIxRszJms68k=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"bfcc5363fd204b564a67f408f143055d194758bf"</string>
+			<string>cdhash H"448621610e31496ed96a464623146ccc99acebc9"</string>
 		</dict>
 		<key>Resources/assets/apps.json</key>
 		<dict>
@@ -1025,7 +1025,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			HSHtjMejp1EMMjzR7J1A5uEAXmnb039eTt52oKyvKlo=
+			cEohOKwhA/iDmAWEjTI9cWpNVRffmsPKzxUzHwbQNL8=
 			</data>
 		</dict>
 		<key>Resources/assets/web/troubleshooting.html</key>

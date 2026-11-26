@@ -281,6 +281,117 @@ class VulkanStereoImageComputeBackend:
             "vulkan_sbs_gpu_copy_count": 0 if packed_output else 2,
         }
 
+    def submit_prebound_to_images(
+        self,
+        *,
+        width: int,
+        height: int,
+        rgb_buffer: Any,
+        depth_buffer: Any,
+        left_eye: Any,
+        right_eye: Any,
+        params: VulkanLayeredStereoParams,
+        ready_timeline: int | None = None,
+        wait_semaphore: Any | None = None,
+        signal_semaphore: Any | None = None,
+        packed_output: bool = False,
+    ) -> tuple[int, dict[str, Any]]:
+        """Dispatch using producer-owned input buffers without host staging.
+
+        The buffers must already contain the tightly packed float32 RGB and
+        depth planes expected by ``VulkanStereoImagePass``.  Ownership and
+        reuse of those buffers stay with the producer; callers should pass a
+        producer-ready semaphore (or timeline) when the contents are written
+        by another GPU API.  The method only records the Vulkan dispatch and
+        never maps, copies, or reads the input/output resources.
+        """
+        if self._closed:
+            raise VulkanStereoBackendUnavailable("Vulkan stereo image backend is closed")
+        width = int(width)
+        height = int(height)
+        if width < 1 or height < 1:
+            raise ValueError("Vulkan stereo image dimensions must be positive")
+        self._ensure_shape(height, width, packed_output=packed_output)
+        if self._pass is None:
+            raise VulkanStereoBackendUnavailable("Vulkan stereo image pass is unavailable")
+
+        expected = self._pass.input_buffer_sizes
+        for name, buffer in (("rgb", rgb_buffer), ("depth", depth_buffer)):
+            if getattr(buffer, "context", None) is not self.context:
+                raise ValueError(f"{name} buffer belongs to a different Vulkan context")
+            if int(getattr(buffer, "size", 0)) < int(expected[name]):
+                raise ValueError(f"{name} buffer is too small")
+
+        expected_width = width * 2 if packed_output else width
+        for image in (left_eye, right_eye):
+            if getattr(image, "context", None) is not self.context:
+                raise ValueError("stereo output image belongs to a different Vulkan context")
+            resource = getattr(image, "resource", image)
+            if int(getattr(resource, "width", 0)) != expected_width or int(
+                getattr(resource, "height", 0)
+            ) != height:
+                raise ValueError("stereo output image dimensions do not match")
+
+        timeline = self._pass.submit(
+            rgb_buffer,
+            depth_buffer,
+            left_eye,
+            right_eye,
+            params=params,
+            frame_id=self._frame_id,
+            config_version=0,
+            ready_timeline=ready_timeline,
+            wait_semaphore=wait_semaphore,
+            signal_semaphore=signal_semaphore,
+        )
+        self._frame_id += 1
+        self._last_submit_timeline = max(self._last_submit_timeline, int(timeline))
+        vk = self.context.vk
+        output_state = ImageState(
+            layout=vk.VK_IMAGE_LAYOUT_GENERAL,
+            access_mask=vk.VK_ACCESS_SHADER_WRITE_BIT,
+            stage_mask=vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            queue_family_index=self.context.queue_family_index,
+        )
+        for image in (left_eye, right_eye):
+            resource = getattr(image, "resource", image)
+            self.context.register_image_state(resource.image, output_state)
+        depth_gaussian_enabled = bool(
+            getattr(self._pass, "depth_gaussian_enabled", False)
+        )
+        return int(timeline), {
+            "stereo_compute_backend": "vulkan",
+            "vulkan_fused_backend": (
+                "vulkan_sbs_fused_output_image"
+                if packed_output
+                else "vulkan_stereo_layered_output_image"
+            ),
+            "vulkan_submit_timeline": int(timeline),
+            "vulkan_readback": "none",
+            "vulkan_compute_output": "presenter_owned_storage_image",
+            "vulkan_output_image_direct": True,
+            "vulkan_gpu_to_cpu": False,
+            "vulkan_zero_cpu_readback": True,
+            # The dispatch avoids its own upload, but this adapter cannot
+            # verify how the caller populated or allocated these buffers.
+            "vulkan_zero_copy": False,
+            "vulkan_zero_copy_reason": "prebound_input_buffer_provenance_unverified",
+            "vulkan_input_path": "prebound_vulkan_buffer",
+            "vulkan_input_reuse_sync": (
+                "external_semaphore" if wait_semaphore is not None else "caller_owned"
+            ),
+            "vulkan_input_upload_ms": 0.0,
+            "vulkan_input_upload_elided": True,
+            "vulkan_depth_gaussian_enabled": depth_gaussian_enabled,
+            "vulkan_depth_gaussian": (
+                "5x5_sigma2_scaled" if depth_gaussian_enabled else "disabled"
+            ),
+            "vulkan_output_sync": "vulkan_compute_external_semaphore",
+            "vulkan_hole_fill_mode": int(params.hole_fill_mode),
+            "vulkan_hole_fill_backend": vulkan_hole_fill_backend_name(params.hole_fill_mode),
+            "vulkan_sbs_gpu_copy_count": 0 if packed_output else 2,
+        }
+
     def _ensure_cuda_inputs(self, height: int, width: int) -> None:
         if (
             self._cuda_importer is not None

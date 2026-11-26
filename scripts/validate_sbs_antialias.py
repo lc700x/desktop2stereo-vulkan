@@ -332,7 +332,7 @@ class SyntheticMetalRenderer:
         full_before_half = bool(aa and half)
         raw_width = 2 * w if (aa or not half) else ow
         descriptor = m.MTLTextureDescriptor.texture2DDescriptorWithPixelFormat_width_height_mipmapped_(
-            m.MTLPixelFormatRGBA8Unorm, w, h, False)
+            m.MTLPixelFormatRGBA8Unorm_sRGB, w, h, False)
         descriptor.setUsage_(m.MTLTextureUsageShaderRead)
         descriptor.setStorageMode_(m.MTLStorageModeShared)
         texture = self.device.newTextureWithDescriptor_(descriptor)
@@ -343,13 +343,13 @@ class SyntheticMetalRenderer:
                                                            m.MTLResourceStorageModeShared)
         raw = self.device.newBufferWithLength_options_(raw_width * h * 4, m.MTLResourceStorageModeShared)
         output = self.device.newBufferWithLength_options_(ow * h * 4, m.MTLResourceStorageModeShared)
-        # Exact 116-byte WarpParams layout including the final edge AA field.
+        # Exact 132-byte WarpParams layout including raw-depth normalization.
         warp_format = 9 if full_before_half else (0 if half else 1)
         values = (w, h, w, h, raw_width, h, warp_format, 4,
                   depth_strength, max_disparity, 0.0, 0.04, 0.0,
                   0, 1, 1, 2, 0.08, 1.15, 1.05, 1.05, 1, 0, 2, 1,
-                  0.0, 0.0, 0, 0)
-        packed = struct.pack("<8I5f4i4f4i2f2i", *values)
+                  0.0, 0.0, 0, 0, 0, 0.0, 1.0)
+        packed = struct.pack("<8I5f4i4f4i2f4i2f", *values)
         params = self.device.newBufferWithBytes_length_options_(packed, len(packed),
                                                                m.MTLResourceStorageModeShared)
         cmd = self.queue.commandBuffer()

@@ -202,11 +202,12 @@ class CompactDropdown(ft.Container):
 
     def __init__(self, options=None, value="", on_select=None, expand=False,
                  dyna_width=None, width=None, min_width=None, max_width=None,
-                 tooltip=None, _instances_list=None):
+                 tooltip=None, _instances_list=None, dyna_width_gap=0):
         super().__init__()
         self._options = options or []
         self._on_select_cb = on_select
         self._dyna = dyna_width
+        self._dyna_gap = dyna_width_gap or 0
         self._fixed = width
         self._min = min_width or 0
         self._max = max_width or 0
@@ -255,7 +256,8 @@ class CompactDropdown(ft.Container):
 
     def _apply_width(self):
         if self._dyna:
-            self.width = LABEL_ALIGN_WIDTH or self._calc_auto_width()
+            width = LABEL_ALIGN_WIDTH or self._calc_auto_width()
+            self.width = max(S(1), width - self._dyna_gap)
         elif self._fixed is not None:
             self.width = self._fixed
         else:

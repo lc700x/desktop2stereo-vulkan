@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import flet as ft
 import pytest
 from gui.builders import GUIBuilderMixin, _main_menu_action_style
+from gui.controls import S
 from gui.handlers import GUIHandlerMixin
 from gui.localization import _STATUS_MESSAGES, MESSAGE_CATALOGS, translate_status
 from gui.process import GUIProcessMixin
@@ -68,16 +69,23 @@ def test_main_menu_actions_use_theme_colors_for_all_interaction_states():
     for style in (primary, danger, secondary):
         assert set(style.bgcolor) == expected_states
         assert set(style.color) == expected_states
-        assert set(style.side) == expected_states
+        assert style.side is None
         assert style.elevation == 0
+        assert style.shape.radius == S(7)
+        assert style.text_style.weight == ft.FontWeight.W_600
 
     assert primary.bgcolor[states.DEFAULT] == color("primary")
     assert primary.bgcolor[states.HOVERED] == color("primary_hover")
     assert primary.color[states.DEFAULT] == color("primary_state_text")
-    assert danger.bgcolor[states.DEFAULT] == color("destructive")
-    assert danger.bgcolor[states.HOVERED] == color("destructive_hover")
-    assert secondary.bgcolor[states.HOVERED] == color("surface_container_high")
-    assert secondary.side[states.FOCUSED].width == 2
+    assert danger.bgcolor[states.DEFAULT] == color("action_destructive")
+    assert danger.bgcolor[states.HOVERED] == color("action_destructive_hover")
+    assert danger.bgcolor[states.PRESSED] == color("action_destructive_pressed")
+    assert danger.color[states.DEFAULT] == color("action_destructive_text")
+    assert danger.color[states.HOVERED] == color("action_destructive_text")
+    assert danger.color[states.PRESSED] == color("action_destructive_text")
+    assert secondary.bgcolor[states.DEFAULT] == color("primary_container")
+    assert secondary.bgcolor[states.HOVERED] == color("primary_hover")
+    assert secondary.color[states.DEFAULT] == color("primary_state_text")
 
     builder_source = inspect.getsource(GUIBuilderMixin.build_ui)
     for button_name, variant in (

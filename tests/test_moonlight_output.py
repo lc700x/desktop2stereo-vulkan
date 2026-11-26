@@ -577,7 +577,7 @@ def test_macos_moonlight_accepts_video_toolbox_for_a_client():
     ):
         response = output._configure_encoder(config)
 
-    assert response == {"accepted_width": 1920, "accepted_height": 1080}
+    assert response == {"accepted_width": 1920, "accepted_height": 1080, "input_width": 3840}
     assert isinstance(output._encoder, _Encoder)
 
 
@@ -1102,7 +1102,7 @@ def test_amd_encoder_wrapper_resizes_oversized_access_unit():
     assert encoder._dll.calls == 2
 
 
-@pytest.mark.parametrize("display_mode", ["Full-SBS", "Half-TAB", "Full-TAB"])
+@pytest.mark.parametrize("display_mode", ["Full-SBS", "Full-TAB"])
 @pytest.mark.parametrize("fit_mode", ["contain", "cover", "stretch"])
 @pytest.mark.parametrize("source_size", [(3840, 2160), (2560, 1080), (720, 1280), (1366, 768)])
 def test_moonlight_input_regions_follow_each_actual_eye(display_mode, fit_mode, source_size):
@@ -1113,17 +1113,17 @@ def test_moonlight_input_regions_follow_each_actual_eye(display_mode, fit_mode, 
         base_dir=".", fps=60, display_mode=display_mode, fit_mode=fit_mode,
         input_size=source_size, input_bounds=None, device="cuda:0",
     )
-    config = MoonlightClientConfig(3840, 2160, 60.0, 20_000, "hevc", width, height, 0, 0, width, height, 0)
+    config = MoonlightClientConfig(3840, 2200, 60.0, 20_000, "hevc", width, height, 0, 0, width, height, 0)
     response = output._client_ready_response(config)
     mappings = response["input_regions"]
-    assert response["accepted_width"] == 3840 and response["accepted_height"] == 2160
+    assert response["accepted_width"] == 3840 and response["accepted_height"] == 2200
     assert len(mappings) == 2
     packed = (width * 2, height) if display_mode == "Full-SBS" else (
         (width, height * 2) if display_mode == "Full-TAB" else (width, height)
     )
-    expected_regions = presentation_blit_regions(packed, (3840, 2160), fit_mode, display_mode, source_size)
+    expected_regions = presentation_blit_regions(packed, (3840, 2200), fit_mode, display_mode, source_size)
     centers = []
-    for mapping, (_crop, viewport) in zip(mappings, expected_regions):
+    for mapping, (crop, viewport) in zip(mappings, expected_regions):
         assert mapping[:4] == list(viewport)
         x0, y0, x1, y1 = mapping[4:]
         assert 0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height
@@ -1133,25 +1133,44 @@ def test_moonlight_input_regions_follow_each_actual_eye(display_mode, fit_mode, 
     assert centers[0] == centers[1]
 
 
-def test_moonlight_full_sbs_pointer_uses_visible_rect_not_letterbox():
+def test_moonlight_full_sbs_non_16_9_uses_visible_rect_not_letterbox():
     output = MoonlightSbsOutput(
         base_dir=".", fps=60, display_mode="Full-SBS", fit_mode="contain",
         input_size=(1920, 1080), input_bounds=None, device="cuda:0",
     )
-    config = MoonlightClientConfig(1920, 1080, 60.0, 20_000, "hevc", 1920, 1080, 0, 0, 1920, 1080, 0)
-    assert output._client_ready_response(config)["input_regions"] == [
-        [0, 270, 960, 810, 0, 0, 1920, 1080],
-        [960, 270, 1920, 810, 0, 0, 1920, 1080],
+    config = MoonlightClientConfig(1920, 1200, 60.0, 20_000, "hevc", 1920, 1080, 0, 0, 1920, 1080, 0)
+    response = output._client_ready_response(config)
+    assert "input_mapping" not in response
+    assert response["input_regions"] == [
+        [0, 330, 960, 870, 0, 0, 1920, 1080],
+        [960, 330, 1920, 870, 0, 0, 1920, 1080],
     ]
 
 
-def test_moonlight_half_sbs_retains_legacy_input_contract():
+def test_moonlight_half_sbs_uses_double_input_width():
     output = MoonlightSbsOutput(
         base_dir=".", fps=60, display_mode="Half-SBS", fit_mode="contain",
         input_size=(1920, 1080), input_bounds=None, device="cuda:0",
     )
     config = MoonlightClientConfig(1920, 1080, 60.0, 20_000, "hevc", 1920, 1080, 0, 0, 1920, 1080, 0)
-    assert output._client_ready_response(config) == {"accepted_width": 1920, "accepted_height": 1080}
+    assert output._client_ready_response(config) == {
+        "accepted_width": 1920,
+        "accepted_height": 1080,
+        "input_width": 3840,
+    }
+
+
+def test_moonlight_half_tab_uses_double_input_width():
+    output = MoonlightSbsOutput(
+        base_dir=".", fps=60, display_mode="Half-TAB", fit_mode="contain",
+        input_size=(1920, 1080), input_bounds=None, device="cuda:0",
+    )
+    config = MoonlightClientConfig(1920, 1080, 60.0, 20_000, "hevc", 1920, 1080, 0, 0, 1920, 1080, 0)
+    assert output._client_ready_response(config) == {
+        "accepted_width": 1920,
+        "accepted_height": 1080,
+        "input_width": 3840,
+    }
 
 
 @pytest.mark.parametrize("display_mode", ["Half-SBS", "Full-SBS", "Half-TAB", "Full-TAB"])
@@ -1286,7 +1305,11 @@ def test_cuda_moonlight_prefers_zero_delay_nv12_and_preserves_explicit_or_missin
     output.encoder_backend = backend
     config = MoonlightClientConfig(3840, 2160, 60.0, 20000, "hevc", 1920, 1080, 0, 0, 1920, 1080, 0)
     try:
-        assert output._configure_encoder(config) == {"accepted_width": 3840, "accepted_height": 2160}
+        assert output._configure_encoder(config) == {
+            "accepted_width": 3840,
+            "accepted_height": 2160,
+            "input_width": 7680,
+        }
         assert output._encoder is encoder and output._encoder_config is config
         assert output.current_network_bitrate_mbps == 20.0
         expected = "native" if backend == "auto" and native_available else "pynv"

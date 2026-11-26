@@ -3,24 +3,22 @@ from __future__ import annotations
 import ctypes
 import queue
 import threading
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-
 from capture.types import CapturedFrame
+from stereo_runtime._fused_warp_mps import pack_target
 from stereo_runtime.providers.apple.native.coreml_io import (
     NativeCoreMLBusy,
     NativeCoreMLFrame,
     NativeCoreMLIOBridge,
-    native_anaglyph_method_id,
-    native_output_format_id,
     _NativeResult,
     _NativeWarpConfig,
+    native_anaglyph_method_id,
+    native_output_format_id,
 )
 from utils.queue_utils import put_latest
-from stereo_runtime._fused_warp_mps import pack_target
-
 
 _NATIVE_SOURCE = Path(__file__).resolve().parents[1] / (
     "src/desktop2stereo/stereo_runtime/providers/apple/native/macos_coreml_io.mm"
@@ -109,6 +107,24 @@ def test_native_local_half_sbs_has_raw_depth_fast_kernels() -> None:
     assert "BOOL fast_half_sbs_raw" in pack
     assert "slot->raw_depth_buffer" in pack
     assert "D2S_COREML_DEPTH_RANGE_INTERVAL" in source
+    fast_start = source.index("kernel void d2s_warp_pack_half_sbs_fast(")
+    fast_end = source.index("static inline float projected_target_x", fast_start)
+    assert "p.source_width != p.output_width" not in source[fast_start:fast_end]
+    assert "float(p.source_height) / float(p.output_height)" in source
+
+
+def test_native_warp_supports_target_resolution_different_from_source() -> None:
+    source = _NATIVE_SOURCE.read_text()
+    pack_start = source.index("static int32_t d2s_coreml_io_pack_internal")
+    pack_end = source.index("int32_t d2s_coreml_io_pack(", pack_start)
+    pack = source[pack_start:pack_end]
+
+    assert "required_destination_size" in pack
+    assert "!expected_size" not in pack
+    assert "packed_width_even" in pack
+    assert "packed_height_even" in pack
+    assert "float(p.source_width) / float(p.output_width)" in source
+    assert "float(p.source_height) / float(p.output_height)" in source
 
 
 def test_native_output_resolution_depth_gaussian_runs_before_warp_without_color_aa() -> None:
@@ -193,6 +209,15 @@ def test_native_metal_bridge_preserves_metal_logical_rgb_channel_order() -> None
     assert "(p.stream_bgra != 0 ? pixel.r : pixel.b) * 255.0f" in pack
 
 
+def test_native_p010_creates_a_gpu_color_texture_for_warp() -> None:
+    source = _NATIVE_SOURCE.read_text()
+
+    assert "kernel void d2s_convert_p010" in source
+    assert "p010_color_pipeline" in source
+    assert "MTLPixelFormatRGBA16Float" in source
+    assert "setTexture:slot->warp_color_texture atIndex:2" in source
+
+
 def test_screen_edge_disparity_fade_matches_android_eight_pixel_band() -> None:
     source_root = Path(__file__).resolve().parents[1] / "src/desktop2stereo"
     python_shift = (source_root / "stereo_runtime/baseline_shift.py").read_text()
@@ -253,7 +278,7 @@ def test_native_eye_signs_match_vulkan_layered_path() -> None:
     pack_end = source.index(")D2S\";", pack_start)
     pack = source[pack_start:pack_end]
 
-    assert "float3 left_pixel = eye_pixel(color, depth, float(x), float(y), 1.0f" in pack
+    assert "float3 left_pixel = eye_pixel(color, depth, source_x, source_y, 1.0f" in pack
     assert "p.symmetric != 0 ? -1.0f : -0.9f" in pack
     assert "left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f)" in pack
 

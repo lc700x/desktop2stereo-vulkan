@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import numpy as np
+import os
 
+import numpy as np
 
 _LINEAR_GAMUT_TO_BT709 = {
     "bt2020": (
@@ -100,6 +101,9 @@ def prepare_rgb_for_stereo_runtime(frame_rgb, *, device=None):
         "triton_media_p010_hdr_resize",
         "triton_media_p010_resize",
         "torch_media_nv12",
+        "torch_media_p010",
+        "torch_media_p010_mps_fast",
+        "torch_media_p010_mps_fused",
     }
     if frame_rgb.ndim == 3 and frame_rgb.shape[0] == 3:
         tensor = frame_rgb.unsqueeze(0)
@@ -109,6 +113,7 @@ def prepare_rgb_for_stereo_runtime(frame_rgb, *, device=None):
         raise ValueError(f"frame_rgb must be RGB CHW/BCHW for stereo_runtime, got shape {tuple(frame_rgb.shape)}")
 
     scale_from_uint8 = scale_from_uint8 or not tensor.is_floating_point()
+    tensor = _prepare_mps_transfer_tensor(tensor, device, torch)
     tensor = tensor.to(device=device, dtype=torch.float32)
     if scale_from_uint8:
         tensor = tensor.mul_(1.0 / 255.0)
@@ -147,6 +152,124 @@ def _same_torch_device(source_device, requested_device, torch_module) -> bool:
         return current_index(device.type)
 
     return device_index(source_device) == device_index(requested_device)
+
+
+def _prepare_mps_transfer_tensor(frame, requested_device, torch_module):
+    """Convert host uint16 samples before handing them to Apple's MPS backend."""
+    requested_device = torch_module.device(requested_device)
+    if requested_device.type != "mps" or frame.dtype != torch_module.uint16:
+        return frame
+    if frame.device.type != "cpu":
+        frame = frame.to(device="cpu")
+    # MPS has no UInt16 storage/cast path. Keep integer samples intact until
+    # the format-specific conversion runs on the destination device.
+    return frame.to(dtype=torch_module.int32)
+
+
+def _mps_p010_color_conversion_size(target_height: int, target_width: int) -> tuple[int, int]:
+    """Keep HDR color conversion at the requested output resolution."""
+    return _even_size(target_height), _even_size(target_width)
+
+
+def _capture_p010_mps_fast(
+    frame_raw,
+    target_height: int,
+    target_width: int,
+    *,
+    transfer: str,
+    primaries: str,
+    yuv_matrix: str,
+    full_range: bool,
+    torch_module,
+):
+    """Convert host P010 to RGB without an MPS UInt16/Int32 staging copy.
+
+    Apple MPS has no UInt16 storage path.  Converting the complete P010 frame
+    to Int32 on the CPU before uploading it made a 4K HDR frame take seconds.
+    Uploading the packed bytes as UInt8 and unpacking them in MPS keeps all
+    sample arithmetic on the GPU. HDR color conversion retains the requested
+    spatial resolution on MPS.
+    """
+    import torch.nn.functional as F
+
+    if not frame_raw.is_contiguous():
+        frame_raw = frame_raw.contiguous()
+    source_height = int(frame_raw.shape[0]) * 2 // 3
+    source_width = int(frame_raw.shape[1])
+    conversion_height, conversion_width = _mps_p010_color_conversion_size(
+        target_height, target_width
+    )
+    raw_bytes = frame_raw.view(torch_module.uint8).reshape(
+        int(frame_raw.shape[0]), source_width, 2
+    ).to(device="mps", non_blocking=False)
+    y_bytes = raw_bytes[:source_height]
+    y = (
+        y_bytes[..., 0].to(torch_module.float32)
+        + y_bytes[..., 1].to(torch_module.float32) * 256.0
+    ) * (1.0 / 64.0)
+    uv_bytes = raw_bytes[source_height:].reshape(
+        source_height // 2, source_width // 2, 2, 2
+    )
+    uv = (
+        uv_bytes[..., 0, 0].to(torch_module.float32)
+        + uv_bytes[..., 0, 1].to(torch_module.float32) * 256.0
+    )
+    uv = torch_module.stack(
+        (
+            uv,
+            (
+                uv_bytes[..., 1, 0].to(torch_module.float32)
+                + uv_bytes[..., 1, 1].to(torch_module.float32) * 256.0
+            ),
+        ),
+        dim=-1,
+    ) * (1.0 / 64.0)
+    if not full_range:
+        y = (y - 64.0) * (1.0 / 876.0)
+        chroma_scale = 1.0 / 896.0
+    else:
+        y = y * (1.0 / 1023.0)
+        chroma_scale = 1.0 / 1023.0
+    if (conversion_height, conversion_width) != (source_height, source_width):
+        y = F.interpolate(
+            y.unsqueeze(0).unsqueeze(0),
+            size=(conversion_height, conversion_width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )[0, 0]
+    uv = F.interpolate(
+        uv.permute(2, 0, 1).unsqueeze(0),
+        size=(conversion_height, conversion_width),
+        mode="bilinear",
+        align_corners=False,
+    )[0]
+    cb = (uv[0] - 512.0) * chroma_scale
+    cr = (uv[1] - 512.0) * chroma_scale
+    if yuv_matrix == "bt2020nc":
+        red = y + 1.4746 * cr
+        green = y - 0.164553 * cb - 0.571353 * cr
+        blue = y + 1.8814 * cb
+    elif yuv_matrix in {"smpte170m", "bt470bg"}:
+        red = y + 1.402 * cr
+        green = y - 0.344136 * cb - 0.714136 * cr
+        blue = y + 1.772 * cb
+    else:
+        red = y + 1.5748 * cr
+        green = y - 0.187324 * cb - 0.468124 * cr
+        blue = y + 1.8556 * cb
+    frame_rgb = torch_module.stack((red, green, blue), dim=0).clamp_(0.0, 1.0)
+    if transfer in {"pq", "hlg", "sdr"}:
+        frame_rgb = _convert_rgbp_to_bt709(frame_rgb, transfer, primaries, torch_module)
+    out = frame_rgb.unsqueeze(0)
+    if (conversion_height, conversion_width) != (target_height, target_width):
+        out = F.interpolate(
+            out,
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+    return out.clamp_(0.0, 1.0)
 
 
 def _capture_frame_to_rgb_torch(
@@ -197,8 +320,14 @@ def _capture_frame_to_rgb_torch(
         )
         media_input = frame_raw if isinstance(frame_raw, torch.Tensor) else torch.from_numpy(frame_raw)
         requested_device = torch.device(device)
+        media_input = _prepare_mps_transfer_tensor(media_input, requested_device, torch)
         if not _same_torch_device(media_input.device, requested_device, torch):
-            media_input = media_input.to(device=requested_device, non_blocking=True)
+            # Video frames are views over a decoder-owned byte buffer. MPS can
+            # otherwise read that buffer after the next decode reuses it.
+            media_input = media_input.to(
+                device=requested_device,
+                non_blocking=requested_device.type != "mps",
+            )
         try:
             from capture.preprocess_triton import (
                 can_use_triton_media_preprocess,
@@ -308,8 +437,13 @@ def _capture_frame_to_rgb_torch(
         pass
 
     source_device = torch.device(frame_raw.device)
+    frame_raw = _prepare_mps_transfer_tensor(frame_raw, requested_device, torch)
     if not _same_torch_device(source_device, requested_device, torch):
-        frame_raw = frame_raw.to(device=requested_device, non_blocking=True)
+        # Keep host video memory alive until MPS has completed the upload.
+        frame_raw = frame_raw.to(
+            device=requested_device,
+            non_blocking=requested_device.type != "mps",
+        )
 
     if media_format == "bgr24" and frame_raw.shape[-1] == 3:
         try:
@@ -404,11 +538,6 @@ def _capture_nv12_to_rgb_torch(
     if width % 2 or height % 2 or int(frame_raw.shape[0]) != height * 3 // 2:
         raise ValueError(f"Invalid NV12 frame shape: {tuple(frame_raw.shape)}")
     requested_device = torch.device(requested_device)
-    if not _same_torch_device(frame_raw.device, requested_device, torch):
-        frame_raw = frame_raw.to(device=requested_device, non_blocking=True)
-    if not frame_raw.is_contiguous():
-        frame_raw = frame_raw.contiguous()
-
     parts = original_format.split("_")
     transfer = parts[1] if len(parts) > 1 else "sdr"
     primaries = parts[2] if len(parts) > 2 else "bt709"
@@ -416,6 +545,82 @@ def _capture_nv12_to_rgb_torch(
     full_range = len(parts) > 4 and parts[4] == "pc"
     chroma_location = parts[5] if len(parts) > 5 else "left"
     out_height, out_width = _resolve_target_size(target_resolution, height, width)
+    # CoreML and MPS use separate Metal command queues. On macOS, repeatedly
+    # running HDR/P010 integer conversion on MPS while CoreML owns its queue
+    # can corrupt the next frame's command buffer. Keep this opt-in fallback
+    # scoped to media playback; CUDA/ROCm and normal MPS preprocessing retain
+    # the GPU path.
+    force_cpu_p010 = (
+        p010
+        and requested_device.type == "mps"
+        and str(os.environ.get("D2S_MEDIA_P010_CPU", "0") or "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if (
+        p010
+        and requested_device.type == "mps"
+        and frame_raw.device.type == "cpu"
+        and not force_cpu_p010
+    ):
+        backend = "torch_media_p010_mps_fast"
+        if (
+            transfer == "pq"
+            and primaries == "bt2020"
+            and yuv_matrix == "bt2020nc"
+            and not full_range
+        ):
+            try:
+                from capture.preprocess_mps import p010_pq_bt2020_to_rgb
+
+                out = p010_pq_bt2020_to_rgb(
+                    frame_raw,
+                    torch_module=torch,
+                    target_size=(out_height, out_width),
+                )
+                backend = "torch_media_p010_mps_fused"
+            except (ImportError, NotImplementedError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                print(
+                    f"[MediaPreprocess] fused P010 Metal path unavailable ({exc}); "
+                    "using the full-resolution MPS path",
+                    flush=True,
+                )
+                out = None
+        else:
+            out = None
+        if out is None:
+            out = _capture_p010_mps_fast(
+                frame_raw,
+                out_height,
+                out_width,
+                transfer=transfer,
+                primaries=primaries,
+                yuv_matrix=yuv_matrix,
+                full_range=full_range,
+                torch_module=torch,
+            )
+        _mark_preprocess_metadata(
+            out,
+            backend=backend,
+            input_kind=input_kind,
+            origin_device=origin_device,
+            output_device=_frame_device_text(out),
+            capture_copy_mode=capture_copy_mode,
+            capture_zero_copy=capture_zero_copy,
+        )
+        return out
+    preprocess_device = torch.device("cpu") if force_cpu_p010 else requested_device
+    frame_raw = _prepare_mps_transfer_tensor(frame_raw, preprocess_device, torch)
+    if not _same_torch_device(frame_raw.device, preprocess_device, torch):
+        # Keep the host-to-MPS P010 copy synchronous. The MPS backend can
+        # otherwise read the temporary int32 staging buffer before the copy
+        # has completed, corrupting the packed UV plane.
+        frame_raw = frame_raw.to(
+            device=preprocess_device,
+            non_blocking=preprocess_device.type != "mps",
+        )
+    if not frame_raw.is_contiguous():
+        frame_raw = frame_raw.contiguous()
+
     out = None
     try:
         from capture.preprocess_triton import can_use_triton_media_preprocess, media_to_rgb_norm
@@ -432,13 +637,11 @@ def _capture_nv12_to_rgb_torch(
                 p010=p010,
             )
             if (height, width) != (out_height, out_width):
-                out = F.interpolate(
+                out = _resize_media_rgb(
                     out,
-                    size=(out_height, out_width),
-                    mode="bilinear",
-                    align_corners=False,
-                    antialias=out_height < height or out_width < width,
-                ).clamp_(0.0, 1.0)
+                    (out_height, out_width),
+                    area_downsample=p010,
+                )
     except Exception:
         out = None
 
@@ -484,12 +687,10 @@ def _capture_nv12_to_rgb_torch(
         if transfer in {"pq", "hlg", "sdr"}:
             frame_rgb = _convert_rgbp_to_bt709(frame_rgb, transfer, primaries, torch)
         if (height, width) != (out_height, out_width):
-            frame_rgb = F.interpolate(
+            frame_rgb = _resize_media_rgb(
                 frame_rgb.unsqueeze(0),
-                size=(out_height, out_width),
-                mode="bilinear",
-                align_corners=False,
-                antialias=out_height < height or out_width < width,
+                (out_height, out_width),
+                area_downsample=p010,
             )
         else:
             frame_rgb = frame_rgb.unsqueeze(0)
@@ -546,8 +747,12 @@ def _capture_rgbp_to_rgb_torch(
         raise ValueError(f"RGBP frame must be CHW/BCHW, got shape {tuple(frame_raw.shape)}")
 
     requested_device = torch.device(requested_device)
+    frame_rgb = _prepare_mps_transfer_tensor(frame_rgb, requested_device, torch)
     if not _same_torch_device(frame_rgb.device, requested_device, torch):
-        frame_rgb = frame_rgb.to(device=requested_device, non_blocking=True)
+        frame_rgb = frame_rgb.to(
+            device=requested_device,
+            non_blocking=requested_device.type != "mps",
+        )
     height, width = int(frame_rgb.shape[1]), int(frame_rgb.shape[2])
     new_height, new_width = _resolve_target_size(target_resolution, height, width)
     with torch.no_grad():
@@ -585,6 +790,28 @@ def _capture_rgbp_to_rgb_torch(
     return out
 
 
+def _mps_bt2020_to_bt709_gamut(linear, torch_module):
+    red, green, blue = linear.unbind(0)
+    red_709 = 1.660491 * red - 0.587641 * green - 0.072850 * blue
+    green_709 = -0.124550 * red + 1.132900 * green - 0.008349 * blue
+    blue_709 = -0.018151 * red - 0.100579 * green + 1.118730 * blue
+    luminance = 0.2126 * red_709 + 0.7152 * green_709 + 0.0722 * blue_709
+    minimum = torch_module.minimum(torch_module.minimum(red_709, green_709), blue_709)
+    compression = torch_module.where(
+        minimum < 0.0,
+        (-minimum / (luminance - minimum).clamp_min(1e-6)).clamp(0.0, 1.0),
+        torch_module.zeros_like(minimum),
+    )
+    return torch_module.stack(
+        (
+            (red_709 + compression * (luminance - red_709)).clamp_min(0.0),
+            (green_709 + compression * (luminance - green_709)).clamp_min(0.0),
+            (blue_709 + compression * (luminance - blue_709)).clamp_min(0.0),
+        ),
+        dim=0,
+    )
+
+
 def _convert_rgbp_to_bt709(frame_rgb, transfer, primaries, torch_module):
     def hable(value):
         a, b, c, d, e, f = 0.15, 0.50, 0.10, 0.20, 0.02, 0.30
@@ -620,24 +847,27 @@ def _convert_rgbp_to_bt709(frame_rgb, transfer, primaries, torch_module):
 
     gamut_matrix = _LINEAR_GAMUT_TO_BT709.get(primaries)
     if gamut_matrix is not None:
-        matrix = torch_module.tensor(gamut_matrix, dtype=linear.dtype, device=linear.device)
-        linear = torch_module.matmul(matrix, linear.reshape(3, -1)).reshape_as(linear)
-        luminance = (
-            linear
-            * torch_module.tensor(
-                (0.2126, 0.7152, 0.0722), dtype=linear.dtype, device=linear.device
-            ).view(3, *([1] * (linear.ndim - 1)))
-        ).sum(dim=0, keepdim=True)
-        minimum = linear.min(dim=0, keepdim=True).values
-        compression = torch_module.where(
-            minimum < 0.0,
-            (-minimum / (luminance - minimum).clamp_min(1e-6)).clamp(0.0, 1.0),
-            torch_module.zeros_like(minimum),
-        )
-        # Desaturate out-of-gamut colours toward their luminance instead of
-        # clipping each channel independently. Per-channel clipping shifts
-        # hue in saturated BT.2020 highlights.
-        linear = (linear + compression * (luminance - linear)).clamp_min_(0.0)
+        if linear.device.type == "mps" and primaries == "bt2020":
+            linear = _mps_bt2020_to_bt709_gamut(linear, torch_module)
+        else:
+            matrix = torch_module.tensor(gamut_matrix, dtype=linear.dtype, device=linear.device)
+            linear = torch_module.matmul(matrix, linear.reshape(3, -1)).reshape_as(linear)
+            luminance = (
+                linear
+                * torch_module.tensor(
+                    (0.2126, 0.7152, 0.0722), dtype=linear.dtype, device=linear.device
+                ).view(3, *([1] * (linear.ndim - 1)))
+            ).sum(dim=0, keepdim=True)
+            minimum = linear.min(dim=0, keepdim=True).values
+            compression = torch_module.where(
+                minimum < 0.0,
+                (-minimum / (luminance - minimum).clamp_min(1e-6)).clamp(0.0, 1.0),
+                torch_module.zeros_like(minimum),
+            )
+            # Desaturate out-of-gamut colours toward their luminance instead of
+            # clipping each channel independently. Per-channel clipping shifts
+            # hue in saturated BT.2020 highlights.
+            linear = (linear + compression * (luminance - linear)).clamp_min_(0.0)
 
     if transfer in {"pq", "hlg"}:
         peak_value = torch_module.tensor(
@@ -755,6 +985,30 @@ def _resolve_target_size(target_resolution, source_height, source_width):
     target_width = int(source_width * target_height / source_height)
     target_width = _even_size(target_width)
     return target_height, target_width
+
+
+def _resize_media_rgb(frame_rgb, target_size, *, area_downsample=False):
+    import torch.nn.functional as F
+
+    target_height, target_width = (int(value) for value in target_size)
+    source_height, source_width = (int(value) for value in frame_rgb.shape[-2:])
+    if (
+        area_downsample
+        and target_height <= source_height
+        and target_width <= source_width
+    ):
+        return F.interpolate(
+            frame_rgb,
+            size=(target_height, target_width),
+            mode="area",
+        ).clamp_(0.0, 1.0)
+    return F.interpolate(
+        frame_rgb,
+        size=(target_height, target_width),
+        mode="bilinear",
+        align_corners=False,
+        antialias=target_height < source_height or target_width < source_width,
+    ).clamp_(0.0, 1.0)
 
 
 def _even_size(value):

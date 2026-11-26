@@ -44,7 +44,7 @@ class Desktop2StereoGUI(
     GUIConfigMixin,
     GUIProcessMixin,
 ):
-    """Flet GUI for Desktop2Stereo — full equivalent of tk ConfigGUI."""
+    """Flet GUI for Desktop2Stereo."""
     def __init__(self, page: ft.Page):
         self.page = page
         self._loop = None
