@@ -86,10 +86,10 @@ def test_rocm_installer_uses_and_validates_project_local_python() -> None:
 def test_posix_installers_use_the_virtualenv_python_and_current_layout() -> None:
     for name in ("install-cuda.bash", "install-mps", "install-mps0", "install-rocm7.bash"):
         script = (ENV_INSTALL_ROOT / name).read_text(encoding="utf-8")
-        assert 'PYTHON_EXE="$VIRTUAL_ENV/bin/python"' in script
+        assert "$VIRTUAL_ENV/bin/python" in script
         assert "export PIP_RETRIES=10" in script
         assert "export PIP_TIMEOUT=180" in script
-        assert 'PIP_CACHE_DIR="$VIRTUAL_ENV/.pip-cache"' in script
+        assert "PIP_CACHE_DIR=" in script
         assert '--cache-dir "$PIP_CACHE_DIR" --prefer-binary' in script
         assert "--no-cache-dir" not in script
 
@@ -102,8 +102,11 @@ def test_posix_installers_use_the_virtualenv_python_and_current_layout() -> None
 
     for name in ("install-mps", "install-mps0"):
         script = (ENV_INSTALL_ROOT / name).read_text(encoding="utf-8")
-        assert 'chmod a+x "$PROJECT_ROOT/run_mac" "$0"' in script
+        assert 'chmod a+x "$PROJECT_ROOT/run_mac"' in script
         assert '"$PROJECT_ROOT/../run_mac"' not in script
+
+    mps_script = (ENV_INSTALL_ROOT / "install-mps").read_text(encoding="utf-8")
+    assert 'PIP_CACHE_DIR="${TMPDIR:-/tmp}/desktop2stereo-mps-pip-cache"' in mps_script
 
 
 def test_windows_scripts_are_preserved_as_crlf_bytes() -> None:
@@ -127,3 +130,14 @@ def test_windows_scripts_are_preserved_as_crlf_bytes() -> None:
     for path in windows_files:
         data = path.read_bytes()
         assert b"\n" not in data.replace(b"\r\n", b""), path
+
+
+def test_windows_launchers_activate_the_existing_gui() -> None:
+    for name in ("run_windows.bat", "run_windows_cuda.bat"):
+        script = (REPO_ROOT / "src" / name).read_text(encoding="utf-8")
+
+        assert 'set "GUI_ACTIVATION_FILE=%LOG_DIR%\\gui.activate.request"' in script
+        assert "request_gui_activation(GUI_ACTIVATION_FILE)" in script
+        assert 'if "%ERRORLEVEL%"=="75"' in script
+        assert "ExitCode -eq 75" in script
+        assert "taskkill /f /t /im python" not in script

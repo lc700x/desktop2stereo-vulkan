@@ -1397,6 +1397,43 @@ kernel void d2s_warp_pack_half_sbs_2d(
     if (p.output_channels == 4u) output[offset + 3u] = 255u;
 }
 
+kernel void d2s_warp_pack_full_sbs_2d(
+    texture2d<float, access::sample> color [[texture(0)]],
+    device float *depth [[buffer(0)]],
+    device uchar *output [[buffer(1)]],
+    constant WarpParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint x = gid.x;
+    uint y = gid.y;
+    if (x >= p.output_width || y >= p.output_height ||
+        p.output_format != 1u) return;
+
+    uint eye_width = p.output_width / 2u;
+    bool left = x < eye_width;
+    uint eye_x = left ? x : x - eye_width;
+    float source_x = (float(eye_x) + 0.5f) *
+                     (float(p.source_width) / float(eye_width)) - 0.5f;
+    float source_y = (float(y) + 0.5f) *
+                     (float(p.source_height) / float(p.output_height)) - 0.5f;
+    uint edge = min(uint(max(p.screen_edge_suppression, 0)),
+                    min(eye_width, p.output_height));
+    bool screen_edge = edge > 0u &&
+        (eye_x < edge || y < edge ||
+         eye_x >= eye_width - edge || y >= p.output_height - edge);
+    float3 pixel = output_eye_pixel(
+        color, depth, source_x, source_y,
+        left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f), screen_edge, p);
+    pixel = finite_color(pixel);
+    pixel = linear_to_srgb(pixel);
+    uint offset = (y * p.output_width + x) * p.output_channels;
+    output[offset + 0u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.b : pixel.r) * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 1u] = uchar(clamp(pixel.g * 255.0f + 0.5f, 0.0f, 255.0f));
+    output[offset + 2u] = uchar(clamp(
+        (p.stream_bgra != 0 ? pixel.r : pixel.b) * 255.0f + 0.5f, 0.0f, 255.0f));
+    if (p.output_channels == 4u) output[offset + 3u] = 255u;
+}
+
 )D2S";
 
 // Optional model-grid separable smoothing. Keeping this in a separate
@@ -1736,6 +1773,7 @@ typedef struct {
     __strong id<MTLComputePipelineState> depth_global_gaussian_pipeline;
     __strong id<MTLComputePipelineState> warp_pipeline;
     __strong id<MTLComputePipelineState> half_sbs_2d_pipeline;
+    __strong id<MTLComputePipelineState> full_sbs_2d_pipeline;
     __strong id<MTLComputePipelineState> fast_half_sbs_pipeline;
     __strong id<MTLComputePipelineState> fast_half_sbs_float_pipeline;
     __strong id<MTLComputePipelineState> fast_half_sbs_half_pipeline;
@@ -1894,6 +1932,7 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     ctx->global_gaussian_depth_buffer = nil;
     ctx->warp_pipeline = nil;
     ctx->half_sbs_2d_pipeline = nil;
+    ctx->full_sbs_2d_pipeline = nil;
     ctx->fast_half_sbs_pipeline = nil;
     ctx->fast_half_sbs_float_pipeline = nil;
     ctx->fast_half_sbs_half_pipeline = nil;
@@ -1932,6 +1971,8 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     id<MTLFunction> warp = [library newFunctionWithName:@"d2s_warp_pack"];
     id<MTLFunction> half_sbs_2d =
         [library newFunctionWithName:@"d2s_warp_pack_half_sbs_2d"];
+    id<MTLFunction> full_sbs_2d =
+        [library newFunctionWithName:@"d2s_warp_pack_full_sbs_2d"];
     id<MTLFunction> fast_half_sbs = [library newFunctionWithName:@"d2s_warp_pack_half_sbs_fast"];
     id<MTLFunction> fast_half_sbs_float =
         [library newFunctionWithName:@"d2s_warp_pack_half_sbs_fast_float"];
@@ -1939,8 +1980,8 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
         [library newFunctionWithName:@"d2s_warp_pack_half_sbs_fast_half"];
     if (!preprocess || !p010_color || !preprocess_p010 || !norm_half || !norm_float || !range_reset ||
         !range_minmax_half || !range_minmax_float || !range_histogram_half ||
-        !range_histogram_float || !range_reduce || !warp || !half_sbs_2d || !fast_half_sbs ||
-        !fast_half_sbs_float || !fast_half_sbs_half) return NO;
+        !range_histogram_float || !range_reduce || !warp || !half_sbs_2d ||
+        !fast_half_sbs || !fast_half_sbs_float || !fast_half_sbs_half) return NO;
     ctx->preprocess_pipeline = [ctx->device newComputePipelineStateWithFunction:preprocess error:error];
     ctx->p010_color_pipeline = [ctx->device
         newComputePipelineStateWithFunction:p010_color error:error];
@@ -1957,6 +1998,8 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     ctx->warp_pipeline = [ctx->device newComputePipelineStateWithFunction:warp error:error];
     ctx->half_sbs_2d_pipeline = [ctx->device
         newComputePipelineStateWithFunction:half_sbs_2d error:error];
+    ctx->full_sbs_2d_pipeline = full_sbs_2d != nil ? [ctx->device
+        newComputePipelineStateWithFunction:full_sbs_2d error:error] : nil;
     ctx->fast_half_sbs_pipeline = [ctx->device
         newComputePipelineStateWithFunction:fast_half_sbs error:error];
     ctx->fast_half_sbs_float_pipeline = [ctx->device
@@ -2879,6 +2922,17 @@ static int32_t d2s_coreml_io_pack_internal(
             !fast_half_sbs_raw && !fast_half_sbs &&
             ctx->half_sbs_2d_pipeline != nil &&
             output_format == D2S_OUTPUT_HALF_SBS;
+        const char *full_sbs_2d_setting = getenv("D2S_METAL_FULL_SBS_2D");
+        BOOL full_sbs_2d_enabled = full_sbs_2d_setting == NULL ||
+            !(strcmp(full_sbs_2d_setting, "0") == 0 ||
+              strcasecmp(full_sbs_2d_setting, "false") == 0 ||
+              strcasecmp(full_sbs_2d_setting, "off") == 0 ||
+              strcasecmp(full_sbs_2d_setting, "no") == 0);
+        BOOL full_sbs_2d =
+            full_sbs_2d_enabled &&
+            ctx->full_sbs_2d_pipeline != nil &&
+            output_format == D2S_OUTPUT_FULL_SBS;
+        BOOL sbs_2d = half_sbs_2d || full_sbs_2d;
         id<MTLComputePipelineState> warp_pipeline =
             fast_half_sbs_raw
                 ? (slot->output_is_float16
@@ -2887,7 +2941,9 @@ static int32_t d2s_coreml_io_pack_internal(
                 : (fast_half_sbs ? ctx->fast_half_sbs_pipeline
                                  : (half_sbs_2d
                                         ? ctx->half_sbs_2d_pipeline
-                                        : ctx->warp_pipeline));
+                                        : (full_sbs_2d
+                                            ? ctx->full_sbs_2d_pipeline
+                                            : ctx->warp_pipeline)));
         [encoder setComputePipelineState:warp_pipeline];
         [encoder setTexture:warp_color_texture atIndex:0];
         [encoder setBuffer:warp_depth_buffer offset:0 atIndex:0];
@@ -2909,11 +2965,11 @@ static int32_t d2s_coreml_io_pack_internal(
             }
         }
         if (result != NULL) result->warp_threads = (int32_t)threads;
-        MTLSize grid = half_sbs_2d
+        MTLSize grid = sbs_2d
             ? MTLSizeMake((NSUInteger)output_width, (NSUInteger)output_height, 1)
             : MTLSizeMake((NSUInteger)output_width * output_height, 1, 1);
         // The full-quality 2D kernel is faster with a 64-lane tile.
-        MTLSize threadgroup = half_sbs_2d && threads == 64
+        MTLSize threadgroup = sbs_2d && threads == 64
             ? MTLSizeMake(8, 8, 1)
             : MTLSizeMake(threads, 1, 1);
         [encoder dispatchThreads:grid

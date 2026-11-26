@@ -8,6 +8,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+pytest.importorskip("triton", reason="Triton is optional on macOS")
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
 

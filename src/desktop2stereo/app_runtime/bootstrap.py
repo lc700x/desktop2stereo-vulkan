@@ -93,7 +93,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(build_capability_report(), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.runtime:
+        from gui.paths import RUNTIME_LOCK_FILE, RUNTIME_PID_FILE
+        from utils.instance_lock import ProcessInstanceLock
+
         _install_crash_logging()
+        runtime_lock = ProcessInstanceLock.acquire(
+            RUNTIME_LOCK_FILE,
+            RUNTIME_PID_FILE,
+            mutex_scope="Runtime",
+        )
+        if runtime_lock is None:
+            sys.stderr.write(
+                "Desktop2Stereo runtime is already active; "
+                "the duplicate GPU consumer was not started.\n"
+            )
+            sys.stderr.flush()
+            return 0
         from .runtime_entry import run_processing_runtime
 
         try:
@@ -116,6 +131,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             except Exception:
                 pass
             return 1
+        finally:
+            runtime_lock.close()
     if args.gui or not args.probe:
         from gui.gui import main as gui_main
 

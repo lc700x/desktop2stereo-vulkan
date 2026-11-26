@@ -5,6 +5,12 @@ from pathlib import Path
 from path_config import APP_ROOT
 
 import numpy as np
+import pytest
+
+try:
+    import xr  # noqa: F401
+except Exception as exc:
+    pytest.skip(f"OpenXR loader unavailable: {exc}", allow_module_level=True)
 
 from xr_viewer.core_openxr_vulkan import OpenXrVulkanPresenter
 

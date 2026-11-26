@@ -4,6 +4,8 @@ import ctypes
 
 import pytest
 
+pytest.importorskip("win32gui", reason="Windows native capture is not installed on this host")
+
 import desktop2stereo.capture.backends.windows_desktop_duplication as desktop_duplication
 from desktop2stereo.capture.backends.desktop_duplication_native import (
     NativeDesktopDuplication,

@@ -7,6 +7,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+pytest.importorskip("triton", reason="Triton is optional on macOS")
+
 import stereo_runtime.synthesis as synthesis_module
 from stereo_runtime import fast_plus_fused_triton
 

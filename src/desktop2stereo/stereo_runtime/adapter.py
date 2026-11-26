@@ -450,10 +450,16 @@ def _normalize_depth_backend(value: Any) -> DepthBackend:
         "migraphx_rocm": "migraphx_rocm",
         "directml": "directml",
         "dml": "directml",
-        # Older macOS settings may still select the removed MLX provider.
+        # Older macOS settings may still select removed provider names. Apple
+        # providers are chosen by the automatic path, with CoreML controlled
+        # by the separate CoreML setting.
         "mlx": "auto",
         "apple_mlx": "auto",
         "mlx_metal": "auto",
+        "pytorch_mps": "auto",
+        "mps": "auto",
+        "apple_mps": "auto",
+        "coreml": "auto",
         "rocm_migraphx": "migraphx_rocm",
     }
     try:

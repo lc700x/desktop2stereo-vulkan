@@ -36,7 +36,8 @@ def test_mps_rcas_preserves_shape_and_clamps() -> None:
     assert bool((sharpened >= 0.0).all() and (sharpened <= 1.0).all())
 
 
-def test_upscale_easu_falls_back_to_mps_bicubic_on_mps() -> None:
+def test_upscale_easu_falls_back_to_mps_bicubic_on_mps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("D2S_CAP_OUTPUT_UPSCALE", "0")
     left = torch.rand(1, 3, 540, 960, device=MPS)
     right = torch.rand(1, 3, 540, 960, device=MPS)
     cfg = SimpleNamespace(

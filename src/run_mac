@@ -20,6 +20,8 @@ GUI_READY_FILE="${LOG_DIR}/gui_ready.flag"
 LAUNCH_STDOUT="${LOG_DIR}/launcher_stdout.log"
 LAUNCH_STDERR="${LOG_DIR}/launcher_stderr.log"
 APP_LOG="${LOG_DIR}/desktop2stereo.log"
+GUI_PID_FILE="${LOG_DIR}/gui.pid"
+GUI_ACTIVATION_FILE="${LOG_DIR}/gui.activate.request"
 
 # ----------------------------------------------------------------------
 # Pre-flight checks
@@ -38,11 +40,26 @@ fi
 
 mkdir -p "${LOG_DIR}"
 
-echo "[Preflight] [EN] Force-killing existing Python processes before Desktop2Stereo starts."
-echo "             [CN] 启动 Desktop2Stereo 前强制结束所有现有 Python 进程."
-
-# Kill any running Python processes (be careful: this kills ALL python processes)
-pkill -f python 2>/dev/null || true
+# Refuse a second GUI from the same package. Killing the primary GUI here can
+# orphan its native Flet window, which then looks like duplicated GUI windows.
+if [ -f "${GUI_PID_FILE}" ]; then
+    OLD_GUI_PID="$(cat "${GUI_PID_FILE}" 2>/dev/null || true)"
+    if [[ "${OLD_GUI_PID}" =~ ^[0-9]+$ ]]; then
+        OLD_GUI_COMMAND="$(ps -p "${OLD_GUI_PID}" -o command= 2>/dev/null || true)"
+        # macOS reports the resolved Mach-O path rather than the launcher's
+        # symlinked python path, so match the package's `-m gui` invocation.
+        if [[ "${OLD_GUI_COMMAND}" == *"${PYTHON_EXE}"* || "${OLD_GUI_COMMAND}" == *" -m gui"* ]]; then
+            PYTHONPATH="${APP_DIR}" \
+            D2S_GUI_ACTIVATION_FILE="${GUI_ACTIVATION_FILE}" \
+            "${PYTHON_EXE}" -c \
+                'import os; from gui.single_instance import request_gui_activation; request_gui_activation(os.environ["D2S_GUI_ACTIVATION_FILE"])' \
+                >/dev/null 2>&1 || true
+            echo "[Desktop2Stereo] GUI is already running (pid ${OLD_GUI_PID}); requested it to come to the front."
+            exit 0
+        fi
+    fi
+    rm -f "${GUI_PID_FILE}"
+fi
 
 # Remove old flag and log files
 rm -f "${GUI_READY_FILE}" "${LAUNCH_STDOUT}" "${LAUNCH_STDERR}" 2>/dev/null
@@ -65,6 +82,9 @@ export PYTHONPATH="${APP_DIR}"
 # Start the GUI process, redirect stdout/stderr to log files, run in background
 "${PYTHON_EXE}" -m gui > "${LAUNCH_STDOUT}" 2> "${LAUNCH_STDERR}" &
 GUI_PID=$!
+# gui.main writes gui.pid after acquiring the OS single-instance lock.
+# Letting the child publish it avoids a launch race where two scripts overwrite
+# the PID file before either GUI has finished starting.
 
 # ----------------------------------------------------------------------
 # Wait for the ready flag (timeout after 60 seconds)
@@ -77,7 +97,16 @@ while [ $elapsed -lt $timeout_seconds ]; do
         exit 0
     fi
     # Check if the GUI process is still running
-    if ! kill -0 $GUI_PID 2>/dev/null; then
+    if ! kill -0 "${GUI_PID}" 2>/dev/null; then
+        if wait "${GUI_PID}"; then
+            GUI_EXIT_CODE=0
+        else
+            GUI_EXIT_CODE=$?
+        fi
+        if [ "${GUI_EXIT_CODE}" -eq 75 ]; then
+            echo "[Desktop2Stereo] Existing GUI was requested to come to the front."
+            exit 0
+        fi
         # Process has exited prematurely
         echo ""
         echo "[Error] [EN] Desktop2Stereo GUI failed before reporting ready. This terminal will stay open."
@@ -90,6 +119,7 @@ while [ $elapsed -lt $timeout_seconds ]; do
             echo "===== launcher_stderr.log ====="
             cat "${LAUNCH_STDERR}"
         fi
+        rm -f "${GUI_PID_FILE}"
         exit 1
     fi
     sleep 0.25
@@ -108,4 +138,5 @@ if [ -f "${LAUNCH_STDERR}" ]; then
     echo "===== launcher_stderr.log ====="
     cat "${LAUNCH_STDERR}"
 fi
+rm -f "${GUI_PID_FILE}"
 exit 1

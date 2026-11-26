@@ -717,7 +717,7 @@ def test_flet_launcher_starts_visible_and_restores_after_panel_and_hide(monkeypa
     )
     settings_menu._run_flet_desktop_settings_app(snapshots, queue.Queue(), commands, (0, 0, 3840, 2160))
 
-    launcher = (192, 57, True, 0.4, False, True)
+    launcher = (12, 57, True, 0.4, False, True)
     panel = (760, 650, True, 1.0, False, False)
     assert run_options["view"] == ft.AppView.FLET_APP_HIDDEN
     assert states == [launcher, panel, launcher]
@@ -725,7 +725,7 @@ def test_flet_launcher_starts_visible_and_restores_after_panel_and_hide(monkeypa
     # resized to the target mode, so the dimensions lag the new minimums.
     assert constraints == [
         (1, 1, 192, 57),
-        (580, 420, 192, 57),
+        (580, 420, 12, 57),
         (1, 1, 760, 650),
     ]
     assert window.destroyed is True

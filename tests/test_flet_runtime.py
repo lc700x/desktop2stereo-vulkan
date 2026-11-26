@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from gui import flet_runtime
 
@@ -19,13 +20,18 @@ def test_flet_process_tree_targets_only_client_descendants() -> None:
     assert flet_runtime._flet_process_ids(processes, 10) == (12,)
 
 
-def test_main_gui_reaps_its_flet_client_when_flet_run_raises(monkeypatch) -> None:
+def test_main_gui_reaps_flet_clients_before_startup_and_at_shutdown(monkeypatch) -> None:
     import os
 
     import pytest
     from gui import gui
 
     stopped = []
+    monkeypatch.setattr(
+        gui.GUIInstanceLock,
+        "acquire",
+        lambda *_args, **_kwargs: SimpleNamespace(close=lambda: None),
+    )
     monkeypatch.setattr(gui, "_setup_console_logging", lambda: None)
     monkeypatch.setattr(
         gui,
@@ -40,7 +46,7 @@ def test_main_gui_reaps_its_flet_client_when_flet_run_raises(monkeypatch) -> Non
     with pytest.raises(RuntimeError, match="simulated Flet close"):
         gui.main()
 
-    assert stopped == [os.getpid()]
+    assert stopped == [os.getpid(), os.getpid()]
 
 
 def test_stop_flet_descendants_terminates_only_owned_client(tmp_path) -> None:

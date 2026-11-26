@@ -288,6 +288,7 @@ def test_fused_srgb_area_preserves_cpu_and_noninteger_fallback():
 
 
 def test_fused_srgb_area_compiler_failure_retains_torch_reference(monkeypatch):
+    pytest.importorskip("triton", reason="Triton is optional on macOS")
     from triton.errors import TritonError
     import stereo_runtime.output_quality_triton as kernels
     from stereo_runtime.output import downsample_horizontal_area_srgb

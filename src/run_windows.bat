@@ -10,6 +10,9 @@ set "GUI_READY_FILE=%LOG_DIR%\gui_ready.flag"
 set "LAUNCH_STDOUT=%LOG_DIR%\launcher_stdout.log"
 set "LAUNCH_STDERR=%LOG_DIR%\launcher_stderr.log"
 set "APP_LOG=%LOG_DIR%\desktop2stereo.log"
+set "GUI_PID_FILE=%LOG_DIR%\gui.pid"
+set "GUI_LOCK_FILE=%LOG_DIR%\gui.instance.lock"
+set "GUI_ACTIVATION_FILE=%LOG_DIR%\gui.activate.request"
 
 rem Formal launcher must not inherit diagnostic overrides from a reused shell.
 set "D2S_FILAMENT_CONTROLLER_EYE_DIAGNOSTIC="
@@ -46,10 +49,12 @@ if not exist "%APP_DIR%\gui\gui.py" (
 
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 
-echo [Preflight] [EN] Force-killing existing Python processes before Desktop2Stereo starts.
-echo             [CN] 启动 Desktop2Stereo 前强制结束所有现有 Python 进程。
-taskkill /f /t /im python.exe >nul 2>nul
-taskkill /f /t /im pythonw.exe >nul 2>nul
+set "PYTHONPATH=%APP_DIR%"
+"%PYTHON_EXE%" -c "import sys; from gui.paths import GUI_LOCK_FILE, GUI_PID_FILE, GUI_ACTIVATION_FILE; from gui.single_instance import GUIInstanceLock, request_gui_activation; lock=GUIInstanceLock.acquire(GUI_LOCK_FILE, GUI_PID_FILE, mutex_scope='GUI'); (lock.close(), sys.exit(0)) if lock else (request_gui_activation(GUI_ACTIVATION_FILE), sys.exit(75))"
+if "%ERRORLEVEL%"=="75" (
+    echo [Desktop2Stereo] GUI is already running; requested it to come to the front.
+    exit /b 0
+)
 
 if exist "%GUI_READY_FILE%" del /f /q "%GUI_READY_FILE%" >nul 2>nul
 if exist "%LAUNCH_STDOUT%" del /f /q "%LAUNCH_STDOUT%" >nul 2>nul
@@ -63,10 +68,9 @@ echo       [CN] 正在等待 GUI 就绪标志。首次运行的编译和加载�
 echo       [EN] This CMD window will close automatically after the GUI reports ready.
 echo       [CN] 收到 GUI 就绪标志后，此 CMD 窗口会自动关闭。
 
-set "PYTHONPATH=%APP_DIR%"
 set "PYTHON_EXE=%PYTHON_EXE%"
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:PYTHONPATH='%APP_DIR%'; $env:PYTHON_EXE='%PYTHON_EXE%'; $p = Start-Process -FilePath '%PYTHON_EXE%' -ArgumentList '-m','gui' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden -RedirectStandardOutput '%LAUNCH_STDOUT%' -RedirectStandardError '%LAUNCH_STDERR%' -PassThru; $deadline = (Get-Date).AddSeconds(60); while ((Get-Date) -lt $deadline) { if (Test-Path -LiteralPath '%GUI_READY_FILE%') { exit 0 }; if ($p.HasExited) { exit 1 }; Start-Sleep -Milliseconds 250 }; exit 2"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:PYTHONPATH='%APP_DIR%'; $env:PYTHON_EXE='%PYTHON_EXE%'; $p = Start-Process -FilePath '%PYTHON_EXE%' -ArgumentList '-m','gui' -WorkingDirectory '%APP_DIR%' -WindowStyle Hidden -RedirectStandardOutput '%LAUNCH_STDOUT%' -RedirectStandardError '%LAUNCH_STDERR%' -PassThru; $deadline = (Get-Date).AddSeconds(60); while ((Get-Date) -lt $deadline) { if (Test-Path -LiteralPath '%GUI_READY_FILE%') { exit 0 }; if ($p.HasExited) { $p.Refresh(); if ($p.ExitCode -eq 75) { exit 0 }; exit 1 }; Start-Sleep -Milliseconds 250 }; exit 2"
 if errorlevel 2 goto launch_timeout
 if errorlevel 1 goto launch_failed
 exit /b 0

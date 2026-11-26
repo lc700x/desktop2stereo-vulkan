@@ -390,7 +390,7 @@ def test_metal_native_present_sizes_gpu_pack_from_output_eye_size(monkeypatch, o
     calls = []
     native = SimpleNamespace(
         source_size=source_size,
-        pack_metal=lambda *args: calls.append(args),
+        pack_metal=lambda *args: calls.append(args) or {},
         release=lambda: calls.append("release"),
     )
     result = SimpleNamespace(viewer_native=native, output_eye_size=processing, output_format=output_format)
@@ -413,7 +413,7 @@ def test_metal_local_half_sbs_preserves_exact_warp_configuration(monkeypatch):
     native = SimpleNamespace(
         source_size=(4, 2),
         warp_config={"edge_aa_enabled": 1},
-        pack_metal=lambda *_args: None,
+        pack_metal=lambda *_args: {},
         release=lambda: None,
     )
     result = SimpleNamespace(viewer_native=native, output_eye_size=(4, 2), output_format="half_sbs")

@@ -1,6 +1,8 @@
 import sys
 import types
 
+import pytest
+
 from capture import CaptureConfig, create_capture_runner
 from capture.factory import get_desktop_grabber_class, normalize_config
 from capture.factory import DesktopDuplicationFallbackRunner
@@ -106,6 +108,7 @@ def test_polling_tools_create_polling_runner(monkeypatch):
         assert isinstance(runner, PollingCaptureRunner)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Desktop Duplication is Windows-only")
 def test_desktop_duplication_selects_explicit_backend():
     cls = get_desktop_grabber_class(
         CaptureConfig(os_name="Windows", capture_tool="DesktopDuplication")
@@ -114,6 +117,7 @@ def test_desktop_duplication_selects_explicit_backend():
     assert cls.__module__.endswith("windows_desktop_duplication")
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Desktop Duplication is Windows-only")
 def test_desktop_duplication_is_polling_runner():
     runner = create_capture_runner(
         CaptureConfig(os_name="Windows", capture_tool="DesktopDuplication")

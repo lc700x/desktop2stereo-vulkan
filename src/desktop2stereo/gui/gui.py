@@ -22,8 +22,20 @@ from .process import GUIProcessMixin, _setup_console_logging
 from .config import DEFAULTS
 from .controls import S
 from .theme import build_app_theme
-from .paths import BASE_DIR, GUI_READY_FILE, LOG_DIR
+from .paths import (
+    BASE_DIR,
+    GUI_ACTIVATION_FILE,
+    GUI_LOCK_FILE,
+    GUI_PID_FILE,
+    GUI_READY_FILE,
+    LOG_DIR,
+)
 from .localization import UI_MESSAGES
+from .single_instance import (
+    GUIInstanceLock,
+    clear_gui_activation_request,
+    request_gui_activation,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -90,6 +102,7 @@ class Desktop2StereoGUI(
         self._device_startup_task = None
         self._model_download_running = False
         self._model_download_task = None
+        self._instance_activation_task = None
 
     async def setup(self):
         self.gui_log_handler = _setup_console_logging()
@@ -167,6 +180,9 @@ class Desktop2StereoGUI(
         self.auto_enable_optimizers_based_on_device()
         self.page.on_keyboard_event = self._on_key
         self._esc_task = asyncio.ensure_future(self._esc_poll_task())
+        self._instance_activation_task = asyncio.create_task(
+            self._watch_instance_activation()
+        )
         self._set_log_panel_visible(self._config.get("Show Log Panel", DEFAULTS["Show Log Panel"]), update=False)
         # Size the window to the fitted content BEFORE showing it. Applying the
         # size after visible=True lets the Flet client fall back to its own
@@ -191,6 +207,31 @@ class Desktop2StereoGUI(
 
     def _signal_gui_ready(self):
         _write_gui_ready_flag()
+
+    async def _watch_instance_activation(self):
+        """Raise and focus this window when another launch targets it."""
+        last_token = None
+        while not self._closed:
+            try:
+                with open(
+                    GUI_ACTIVATION_FILE,
+                    "r",
+                    encoding="ascii",
+                ) as request_file:
+                    token = request_file.read().strip()
+            except OSError:
+                token = ""
+            if token and token != last_token:
+                last_token = token
+                try:
+                    self.page.window.minimized = False
+                    self.page.window.visible = True
+                    self.page.update()
+                    await self.page.window.to_front()
+                    self.page.update()
+                except Exception:
+                    logger.exception("Failed to activate the running GUI window")
+            await asyncio.sleep(0.15)
 
     async def _prepare_startup_after_window_visible(self):
         self.set_status(
@@ -223,7 +264,31 @@ class Desktop2StereoGUI(
 
 def main():
     """Entry point for the GUI application."""
+    instance_lock = GUIInstanceLock.acquire(
+        GUI_LOCK_FILE,
+        GUI_PID_FILE,
+        mutex_scope="GUI",
+    )
+    if instance_lock is None:
+        request_gui_activation(GUI_ACTIVATION_FILE)
+        print(
+            "Desktop2Stereo GUI is already running; requested the existing "
+            "window to come to the front.",
+            flush=True,
+        )
+        return 75
+    clear_gui_activation_request(GUI_ACTIVATION_FILE)
     _setup_console_logging()
+    try:
+        stale_clients = stop_flet_descendants(os.getpid())
+    except Exception:
+        logger.exception("Failed to clean stale Flet clients before startup")
+    else:
+        if stale_clients:
+            logger.warning(
+                "Stopped stale Flet clients before startup: %s",
+                ", ".join(str(pid) for pid in stale_clients),
+            )
     try:
         ft.run(_async_main)
     finally:
@@ -237,6 +302,8 @@ def main():
                     "Flet client processes remained after GUI shutdown: %s",
                     ", ".join(str(pid) for pid in remaining),
                 )
+        instance_lock.close()
+    return 0
 
 
 async def _async_main(page: ft.Page):
@@ -271,4 +338,4 @@ async def _async_main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

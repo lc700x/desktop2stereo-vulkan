@@ -6,6 +6,7 @@ import hashlib
 import logging
 import subprocess
 import shutil
+import signal
 import tarfile
 import time
 import zipfile
@@ -144,7 +145,7 @@ def _terminate_windows_processes(process_ids: tuple[int, ...]) -> None:
 def stop_flet_descendants(parent_pid: int, *, timeout_s: float = 3.0) -> tuple[int, ...]:
     """Reap only this GUI's bundled Flet clients after its window closes."""
     if os.name != "nt":
-        return ()
+        return _stop_posix_package_flet(timeout_s=timeout_s)
 
     deadline = time.monotonic() + max(0.0, float(timeout_s))
     attempted: set[int] = set()
@@ -176,6 +177,54 @@ def stop_flet_descendants(parent_pid: int, *, timeout_s: float = 3.0) -> tuple[i
                 remaining = _flet_process_ids(_windows_process_snapshot(), parent_pid)
             return remaining
         time.sleep(0.05)
+
+
+def _stop_posix_package_flet(*, timeout_s: float) -> tuple[int, ...]:
+    """Stop stale Flet clients from this package, including orphaned windows."""
+    marker = str(CLIENTS_DIR)
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.exception("Failed to enumerate Flet client processes")
+        return ()
+    process_ids: set[int] = set()
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid = int(parts[0])
+        command = parts[1]
+        if pid > 1 and marker in command and "flet" in command.casefold():
+            process_ids.add(pid)
+    if not process_ids:
+        return ()
+
+    for pid in process_ids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            process_ids.discard(pid)
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while process_ids and time.monotonic() < deadline:
+        for pid in tuple(process_ids):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                process_ids.discard(pid)
+        if process_ids:
+            time.sleep(0.05)
+    for pid in process_ids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return tuple(sorted(process_ids))
 
 
 def ensure_vendored_flet_view() -> str | None:

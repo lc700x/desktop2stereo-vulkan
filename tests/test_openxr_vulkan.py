@@ -16,7 +16,11 @@ import pytest
 import vulkan as vk
 
 from path_config import APP_ROOT
-import xr
+
+try:
+    import xr
+except Exception as exc:
+    pytest.skip(f"OpenXR loader unavailable: {exc}", allow_module_level=True)
 
 from app_runtime.output_contract import VulkanStereoOutputFrame
 from xr_viewer import core_input_helpers

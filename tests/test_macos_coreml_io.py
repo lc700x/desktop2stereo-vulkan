@@ -5,6 +5,7 @@ import queue
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from capture.types import CapturedFrame
@@ -78,7 +79,7 @@ def test_native_output_modes_match_runtime_frame_shapes() -> None:
     assert native_anaglyph_method_id("gray") == 3
 
 
-def test_native_scalar_kernels_use_one_dimensional_threadgroups() -> None:
+def test_native_scalar_kernels_use_metal_dispatch_threads() -> None:
     source = _NATIVE_SOURCE.read_text()
     normalize_start = source.index("static void d2s_encode_normalize")
     normalize_end = source.index("static BOOL d2s_gpu_depth_range", normalize_start)
@@ -89,11 +90,73 @@ def test_native_scalar_kernels_use_one_dimensional_threadgroups() -> None:
     assert "dispatchThreads:grid" in normalize
     assert "dispatchThreads:grid" in pack
     assert "threadsPerThreadgroup:MTLSizeMake(w, 1, 1)" in normalize
-    assert "threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)" in pack
+    assert "threadsPerThreadgroup:threadgroup" in pack
+    assert "MTLSizeMake(8, 8, 1)" in pack
     assert "dispatchThreadgroups:groups" not in normalize
     assert "dispatchThreadgroups:groups" not in pack
     assert "threadsPerThreadgroup:MTLSizeMake(w, h, 1)" not in normalize
     assert "threadsPerThreadgroup:MTLSizeMake(w, h, 1)" not in pack
+
+
+def test_bridge_close_waits_for_predict_and_outstanding_frames() -> None:
+    predict_started = threading.Event()
+    finish_predict = threading.Event()
+    destroyed = threading.Event()
+
+    class BlockingLibrary:
+        def d2s_coreml_io_predict(
+            self, _handle: Any, _pointer: Any, _frame_id: int, result: Any
+        ) -> int:
+            predict_started.set()
+            assert finish_predict.wait(timeout=2)
+            native_result = result._obj
+            native_result.slot = 2
+            native_result.source_width = 4
+            native_result.source_height = 2
+            native_result.depth_width = 2
+            native_result.depth_height = 1
+            return 0
+
+        def d2s_coreml_io_frame_depth_is_float16(self, _handle: Any, _slot: int) -> int:
+            return 0
+
+        def d2s_coreml_io_release(self, _handle: Any, _slot: int) -> int:
+            return 0
+
+        def d2s_coreml_io_destroy(self, _handle: Any) -> None:
+            destroyed.set()
+
+    bridge = object.__new__(NativeCoreMLIOBridge)
+    bridge._library = BlockingLibrary()
+    bridge._handle = ctypes.c_void_p(1)
+    bridge.last_error = ""
+    bridge._state_condition = threading.Condition()
+    bridge._active_calls = 0
+    bridge._outstanding_frames = 0
+    bridge._closing = False
+
+    frame_holder = {}
+
+    def predict() -> None:
+        frame_holder["frame"] = bridge.predict(SimpleNamespace(pixel_buffer_pointer=1), 42)
+
+    predict_thread = threading.Thread(target=predict)
+    predict_thread.start()
+    assert predict_started.wait(timeout=1)
+
+    close_thread = threading.Thread(target=bridge.close)
+    close_thread.start()
+    finish_predict.set()
+    predict_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert not predict_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert not destroyed.is_set()
+
+    frame_holder["frame"].release()
+
+    assert destroyed.is_set()
 
 
 def test_native_local_half_sbs_has_raw_depth_fast_kernels() -> None:

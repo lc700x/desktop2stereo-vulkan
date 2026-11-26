@@ -59,6 +59,22 @@ def test_legacy_mlx_backend_selection_falls_back_to_auto(backend: str) -> None:
     assert config.depth_backend == "auto"
 
 
+@pytest.mark.parametrize("backend", ["pytorch_mps", "mps", "apple_mps", "coreml"])
+def test_legacy_apple_backend_selection_falls_back_to_auto(backend: str) -> None:
+    config = runtime_config_from_d2s_settings(
+        {
+            "Depth Model": "xingyang1/Distill-Any-Depth-Small-hf",
+            "Depth Backend": backend,
+            "CoreML": True,
+        },
+        cache_dir="/tmp/d2s-models",
+        device="mps",
+    )
+
+    assert config.depth_backend == "auto"
+    assert config.use_coreml is True
+
+
 def test_depth_aa_defaults_to_two_and_preserves_explicit_zero() -> None:
     default_config = runtime_config_from_d2s_settings(
         {"Depth Model": "xingyang1/Distill-Any-Depth-Small-hf"},

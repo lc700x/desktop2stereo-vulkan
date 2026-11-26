@@ -28,9 +28,14 @@ from .config import (
 from .paths import (
     BASE_DIR,
     DIAG_LOG,
+    GUI_ACTIVATION_FILE,
+    GUI_LOCK_FILE,
+    GUI_PID_FILE,
     LOG_DIR,
     LOG_FILE,
     STOP_REQUEST_FILE,
+    RUNTIME_LOCK_FILE,
+    RUNTIME_PID_FILE,
     STREAM_CALIBRATION_PROFILE_FILE,
     STREAM_CALIBRATION_STATE_FILE,
 )
@@ -461,6 +466,11 @@ def _setup_console_logging():
     try:
         persistent_paths = {
             os.path.abspath(LOG_FILE),
+            os.path.abspath(GUI_ACTIVATION_FILE),
+            os.path.abspath(GUI_LOCK_FILE),
+            os.path.abspath(GUI_PID_FILE),
+            os.path.abspath(RUNTIME_LOCK_FILE),
+            os.path.abspath(RUNTIME_PID_FILE),
             os.path.abspath(STREAM_CALIBRATION_PROFILE_FILE),
         }
         for name in os.listdir(LOG_DIR):
@@ -2308,6 +2318,12 @@ class GUIProcessMixin:
             self._esc_task.cancel()
         if hasattr(self, '_log_poll_task') and self._log_poll_task and not self._log_poll_task.done():
             self._log_poll_task.cancel()
+        if (
+            hasattr(self, "_instance_activation_task")
+            and self._instance_activation_task
+            and not self._instance_activation_task.done()
+        ):
+            self._instance_activation_task.cancel()
         # The browser can reach the completed state just before the user
         # closes the GUI.  The polling task may not have applied the profile
         # to settings.yaml yet, so finish that persistence step synchronously

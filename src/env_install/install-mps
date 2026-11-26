@@ -7,18 +7,37 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "--- Desktop2Stereo Installer for Mac (Apple Silicon) ---"
-echo "- Preparing a Python 3.12 environment"
+echo "- Preparing a Python 3.11/3.12 environment"
 
-PYTHON_CMD="python3.12"
-if ! command -v "$PYTHON_CMD" >/dev/null 2>&1; then
-    echo "Python 3.12 is required by this project but was not found."
-    echo "Install it with: brew install python@3.12"
+find_supported_python() {
+    local candidate
+    for candidate in python3.12 python3.11; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+PYTHON_CMD="$(find_supported_python || true)"
+if [[ -z "$PYTHON_CMD" ]]; then
+    if ! command -v brew >/dev/null 2>&1; then
+        echo "Python 3.11 or 3.12 was not found and Homebrew is unavailable." >&2
+        echo "Install Homebrew from https://brew.sh, then rerun this installer." >&2
+        exit 1
+    fi
+    echo "- Installing Python 3.12 with Homebrew"
+    brew install python@3.12
+    PYTHON_CMD="$(find_supported_python || true)"
+fi
+if [[ -z "$PYTHON_CMD" ]]; then
+    echo "Python is still unavailable after installation." >&2
     exit 1
 fi
-PYTHON_VERSION="$($PYTHON_CMD -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-if [[ "$PYTHON_VERSION" != "3.12" ]]; then
-    echo "$PYTHON_CMD resolved to Python $PYTHON_VERSION; Python 3.12 is required."
-    echo "Install it with: brew install python@3.12"
+PYTHON_VERSION="$("$PYTHON_CMD" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+if [[ "$PYTHON_VERSION" != "3.11" && "$PYTHON_VERSION" != "3.12" ]]; then
+    echo "$PYTHON_CMD resolved to Python $PYTHON_VERSION; Python 3.11 or 3.12 is required." >&2
     exit 1
 fi
 PYTHON_EXE="$(command -v "$PYTHON_CMD")"

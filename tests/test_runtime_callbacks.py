@@ -91,6 +91,8 @@ def test_capture_window_registers_before_initial_wgc_session() -> None:
 def test_late_capture_window_stays_globally_hidden_until_next_initial_session(
     monkeypatch,
 ) -> None:
+    if sys.platform != "win32":
+        pytest.skip("Windows HWND capture exclusion is not available on this host")
     from viewer.window_control import WDA_EXCLUDEFROMCAPTURE, WDA_NONE
 
     callbacks = _callbacks()

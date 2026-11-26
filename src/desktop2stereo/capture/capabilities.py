@@ -205,15 +205,53 @@ def probe_windows_capture_capabilities() -> dict[str, Any]:
     return report
 
 
+def probe_macos_capture_capabilities() -> dict[str, Any]:
+    """Describe the ScreenCaptureKit/CoreGraphics path without claiming hardware proof."""
+    sck_available = _module_available("ScreenCaptureKit")
+    core_graphics_available = _module_available("Quartz")
+    implemented = sck_available or core_graphics_available
+    return {
+        "platform": "Darwin",
+        "status": "implemented" if implemented else "Apple capture modules unavailable",
+        "implemented": {
+            "monitor_capture": implemented,
+            "window_capture": sck_available,
+            "backend": "ScreenCaptureKit + CoreGraphics" if implemented else None,
+            "resource_type": "CVPixelBuffer/Metal texture; CPU compatibility frames where needed",
+            "gpu_to_cpu": "not_probed",
+            "gpu_copy_count": "not_probed",
+            "zero_copy": False,
+        },
+        "screen_capture_kit": {
+            "available": sck_available,
+            "status": "implemented; screen-recording permission required" if sck_available else "module unavailable",
+            "hardware_verified": False,
+        },
+        "core_graphics": {
+            "available": core_graphics_available,
+            "status": "implemented fallback" if core_graphics_available else "module unavailable",
+            "hardware_verified": False,
+        },
+        "fallback_order": [
+            "ScreenCaptureKit (Metal/IOSurface frames when available)",
+            "CoreGraphics CPU compatibility frames",
+            "CPU inference and composition",
+        ],
+        "hardware_verified": False,
+    }
+
+
 def probe_capture_capabilities() -> dict[str, Any]:
     system = platform.system()
     if system == "Windows":
         return probe_windows_capture_capabilities()
     if system == "Linux":
         return probe_linux_capture_capabilities()
+    if system == "Darwin":
+        return probe_macos_capture_capabilities()
     return {
         "platform": system,
-        "status": "本次目标不实现该平台原生捕获",
+        "status": "unsupported platform",
         "hardware_verified": False,
     }
 
@@ -221,5 +259,6 @@ def probe_capture_capabilities() -> dict[str, Any]:
 __all__ = [
     "probe_capture_capabilities",
     "probe_linux_capture_capabilities",
+    "probe_macos_capture_capabilities",
     "probe_windows_capture_capabilities",
 ]
