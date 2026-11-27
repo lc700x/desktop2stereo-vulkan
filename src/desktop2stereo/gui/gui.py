@@ -88,6 +88,8 @@ class Desktop2StereoGUI(
         self._audio_startup_task = None
         self._startup_defer_devices = True
         self._device_startup_task = None
+        self._model_download_running = False
+        self._model_download_task = None
 
     async def setup(self):
         self.gui_log_handler = _setup_console_logging()

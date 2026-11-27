@@ -1,0 +1,2 @@
+model,backend,status,setup_ms,mean_ms,median_ms,p90_ms,preprocess_ms,model_ms,postprocess_ms,model_profile,zero_copy_output,host_readback_bytes,error
+FlashDepth-S,tensorrt_native,ok,212.3113999987254,5.473059999349061,5.416199997853255,5.689800000254763,0.10137999925063923,1.0122199993929826,0.3994999991846271,spatial-temporal-off,True,0,

@@ -85,6 +85,21 @@ def test_projection_plan_preserves_1920x1200_aspect_ratio():
     assert plan.quality_width / plan.quality_height == pytest.approx(16 / 10)
 
 
+def test_projection_oversample_increases_minified_screen_quality_without_inventing_detail():
+    minified = build_projection_screen_sampling_plan(
+        3840, 2160, 667, 386, oversample=1.5
+    )
+    already_upscaled = build_projection_screen_sampling_plan(
+        1920, 1200, 2400, 1500, oversample=1.5
+    )
+
+    assert minified.mode == "downsample_lanczos_rcas"
+    assert minified.quality_size == (1024, 576)
+    assert minified.filter_scale == pytest.approx(3840 / 1024)
+    assert already_upscaled.mode == "upscale_easu"
+    assert already_upscaled.quality_size == (2432, 1520)
+
+
 def test_projection_plan_keeps_native_mode_across_small_pose_footprint_jitter():
     for footprint_width in (1893, 1918, 1975):
         plan = build_projection_screen_sampling_plan(

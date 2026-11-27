@@ -447,6 +447,22 @@ class GUIBuilderMixin:
             value=default_size,
             on_select=self.on_model_size_change,
             width=S(110))
+        self.download_model_btn = ft.Button(
+            content=ft.Text(
+                UI_MESSAGES[self.locale].get("Download Model", "Download Model"),
+                size=FONT_SIZE,
+                max_lines=1,
+                no_wrap=True,
+            ),
+            width=S(150),
+            height=S(32),
+            on_click=self.on_download_model,
+            tooltip=UI_MESSAGES[self.locale].get(
+                "tooltip_download_model",
+                "Download the selected model into the runtime cache",
+            ),
+            style=_main_menu_action_style("secondary"),
+        )
         self.fp16_cb = ft.Checkbox(scale=SCALE, visual_density=ft.VisualDensity.COMPACT, label="FP16")
         parallel_inference_tooltip = (
             "Pipelines depth inference with SBS synthesis. Two workers are recommended; "
@@ -466,6 +482,7 @@ class GUIBuilderMixin:
         row0 = ft.Row([
             self.depth_model_label, self.depth_model_dd,
             ft.Container(width=S(8)), self.model_size_dd,
+            ft.Container(width=S(18)), self.download_model_btn,
         ], spacing=1)
 
         # Row 2: Depth resolution + Depth Quick
@@ -662,6 +679,25 @@ class GUIBuilderMixin:
             self.projection_mip_lod_bias_label, self.projection_mip_lod_bias_dd,
             ft.Container(width=S(40)), self.projection_rcas_sharpness_label, self.projection_rcas_sharpness_dd,
         ], spacing=1)
+        projection_screen_oversample_tooltip = (
+            "Supersamples the visible screen before final Projection. "
+            "1.50 is recommended for text and fine-detail clarity."
+        )
+        self.projection_screen_oversample_label = ft.Text(
+            "Screen SS:", size=FONT_SIZE, width=S(130),
+            tooltip=projection_screen_oversample_tooltip,
+        )
+        self.projection_screen_oversample_dd = CompactDropdown(
+            options=[f"{1.0 + index * 0.05:.2f}" for index in range(21)],
+            value="1.50",
+            width=S(130),
+            on_select=self.on_stereo_hot_param_change,
+            tooltip=projection_screen_oversample_tooltip,
+        )
+        projection_screen_oversample_row = ft.Row([
+            self.projection_screen_oversample_label,
+            self.projection_screen_oversample_dd,
+        ], spacing=1)
 
         self._advanced_stereo_rows = [convergence_depth_row, depth_strength_row, row2b, stereo_row1, stereo_row3, stereo_row3b, stereo_row3c, stereo_row4]
 
@@ -796,7 +832,14 @@ class GUIBuilderMixin:
         self.upscaler_sharpness_dd = CompactDropdown(options=["0.00"], value="0.00", width=S(1))
         self.upscaler_sharpness_dd.visible = False
         self.row6c = ft.Row([], spacing=1, visible=False)
-        self._advanced_device_rows = [color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row]
+        self._advanced_device_rows = [
+            color_row1,
+            color_row2,
+            color_row3,
+            projection_lod_row,
+            projection_sharpen_row,
+            projection_screen_oversample_row,
+        ]
         for row in self._advanced_device_rows:
             row.visible = self.advanced_device_cb.value
         if OS_NAME == "Linux":
@@ -823,6 +866,7 @@ class GUIBuilderMixin:
             on_click=self.open_openxr_controls,
             disabled=True,
             visible=False,
+            style=_main_menu_action_style("secondary"),
         )
         self.display_mode_label = ft.Text("Display Mode:", size=FONT_SIZE, width=S(130))
         self.display_mode_dd = CompactDropdown(
@@ -928,6 +972,7 @@ class GUIBuilderMixin:
             width=S(170),
             disabled=True,
             on_click=self.on_media_open_file,
+            style=_main_menu_action_style("secondary"),
         )
         self.media_open_disc_label = ft.Text(
             media_messages.get("Open Disc", "Open Disc"),
@@ -948,6 +993,7 @@ class GUIBuilderMixin:
             tooltip=media_messages.get("Open Disc Folder", "Open Disc Folder"),
             disabled=True,
             on_click=self.on_media_open_folder,
+            style=_main_menu_action_style("secondary"),
         )
         self.media_path_text = ft.Text(
             "",
@@ -975,6 +1021,7 @@ class GUIBuilderMixin:
             tooltip=media_messages.get("Select Video", "Select Video"),
             disabled=True,
             on_click=self.on_media_open_file,
+            style=_main_menu_action_style("secondary"),
         )
         self.media_input_folder_label = ft.Text(
             media_messages.get("Select Directory", "Select Directory"),
@@ -995,6 +1042,7 @@ class GUIBuilderMixin:
             tooltip=media_messages.get("Select Directory", "Select Directory"),
             disabled=True,
             on_click=self.on_media_open_folder,
+            style=_main_menu_action_style("secondary"),
         )
         self.media_input_row = ft.Row(
             [self.media_input_file_btn, self.media_input_folder_btn],
@@ -1231,7 +1279,7 @@ class GUIBuilderMixin:
             weight=ft.FontWeight.BOLD,
             color=ft.Colors.ON_SURFACE,
         )
-        device_content = ft.Column([self._devices_output_group_heading, row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, self.row6b, self.row6d, self.row6g, self.row6e, self.row6f,
+        device_content = ft.Column([self._devices_output_group_heading, row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, projection_screen_oversample_row, self.row6b, self.row6d, self.row6g, self.row6e, self.row6f,
                        self.row7a, self.xr_headset_row, self.row7b, row8, self.media_controls_row,
                        self.row6c, self.row9,
                        self.moonlight_controls_row,
@@ -1434,8 +1482,12 @@ class GUIBuilderMixin:
             max_width=S(230),
             on_click=self.copy_url_to_clipboard,
         )
-        self.preview_btn = ft.Button(content=ft.Text("Preview", size=FONT_SIZE),
-            width=S(130), on_click=self.preview_in_browser)
+        self.preview_btn = ft.Button(
+            content=ft.Text("Preview", size=FONT_SIZE),
+            width=S(130),
+            on_click=self.preview_in_browser,
+            style=_main_menu_action_style("secondary"),
+        )
         self.stream_url_row = ft.Row(
             [self.stream_url_label, self.stream_url_tf, ft.Container(width=S(10)), self.preview_btn], spacing=1)
         self.stream_port_label = ft.Text("Streamer Port:", size=FONT_SIZE, width=S(150))
@@ -1497,6 +1549,7 @@ class GUIBuilderMixin:
             content=ft.Text("Calibrate", size=FONT_SIZE),
             width=S(130),
             on_click=self.start_stream_calibration,
+            style=_main_menu_action_style("secondary"),
         )
         self.stream_calibration_status = ft.Text(
             "", size=FONT_SIZE, color=ft.Colors.GREY, visible=False
@@ -1587,9 +1640,7 @@ class GUIBuilderMixin:
                 no_wrap=True,
             ),
             width=S(145 if self.locale == "CN" else 170),
-            style=ft.ButtonStyle(
-                padding=ft.Padding(S(10), S(4), S(10), S(4))
-            ),
+            style=_main_menu_action_style("secondary"),
             on_click=self.open_moonlight_pairing,
             disabled=True,
         )
@@ -1610,9 +1661,7 @@ class GUIBuilderMixin:
                 max_lines=1,
                 no_wrap=True,
             ),
-            style=ft.ButtonStyle(
-                padding=ft.Padding(S(10), S(4), S(10), S(4))
-            ),
+            style=_main_menu_action_style("secondary"),
             on_click=self.open_moonlight_pairing_pin_dialog,
             disabled=True,
         )

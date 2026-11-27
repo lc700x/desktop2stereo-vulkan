@@ -60,6 +60,11 @@ LATEST_KEYS = {
     "rt_capture_to_start_ms",
     "rt_capture_ready_ms",
     "openxr_async_effects_enabled",
+    "openxr_projection_layout",
+    "openxr_projection_swapchain_count",
+    "openxr_projection_array_size",
+    "openxr_projection_single_sbs_requested",
+    "openxr_projection_single_sbs_fallback_reason",
     "parallel_inference_enabled",
     "parallel_inference_pending_limit",
     "parallel_inference_workers",
@@ -559,6 +564,11 @@ class FPSBreakdown:
             f"screen_quad_new={rate('openxr_screen_quad_new'):.1f} "
             f"screen_quad_reuse={rate('openxr_screen_quad_reuse'):.1f} "
             f"screen_quad_fallback={rate('openxr_screen_quad_fallback'):.1f} "
+            f"projection_layout={stats.get('openxr_projection_layout', 'unknown')} "
+            f"projection_swapchains={int(stats.get('openxr_projection_swapchain_count', 0))} "
+            f"projection_array_size={int(stats.get('openxr_projection_array_size', 1))} "
+            f"sbs_single_requested={int(bool(stats.get('openxr_projection_single_sbs_requested', False)))} "
+            f"sbs_single_fallback={stats.get('openxr_projection_single_sbs_fallback_reason') or 'none'} "
             f"vk_composer_requested={int(bool(stats.get('openxr_vulkan_projection_composer_requested', False)))} "
             f"vk_composer_active={int(bool(stats.get('openxr_vulkan_projection_composer_active', False)))} "
             "vk_quality_chain="

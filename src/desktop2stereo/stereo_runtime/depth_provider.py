@@ -51,6 +51,15 @@ def _model_output_semantics(model_id: str) -> DepthOutputSemantics:
     return resolve_output_semantics(str(model_id))
 
 
+def _model_profile_for(model_name_or_id: str) -> str:
+    try:
+        from .model_registry import ModelRegistry
+
+        return ModelRegistry.default().get(model_name_or_id).compat_profile or "full-fidelity"
+    except KeyError:
+        return "full-fidelity"
+
+
 @dataclass(frozen=True)
 class DepthProviderInfo:
     provider: str
@@ -73,6 +82,9 @@ class DepthProviderInfo:
     trt_lib_dirs: list[str] | None = None
     raw_output_semantics: DepthOutputSemantics | None = None
     dibr_output_semantics: DepthOutputSemantics = DEFAULT_DEPTH_OUTPUT_SEMANTICS
+    model_profile: str | None = None
+    zero_copy_output: bool = False
+    host_readback_bytes: int = 0
 
     def __post_init__(self) -> None:
         if self.raw_output_semantics is None:
@@ -108,6 +120,9 @@ class DepthProfileResult:
     model_depth_antialias_applied: bool = False
     raw_output_semantics: DepthOutputSemantics = DEFAULT_DEPTH_OUTPUT_SEMANTICS
     dibr_output_semantics: DepthOutputSemantics = DEFAULT_DEPTH_OUTPUT_SEMANTICS
+    model_profile: str | None = None
+    zero_copy_output: bool = False
+    host_readback_bytes: int = 0
 
     @property
     def total_ms(self) -> float:
@@ -124,6 +139,9 @@ class DepthProfileResult:
             "nonfinite_count": int(self.nonfinite_count),
             "native_io_binding": bool(self.native_depth is not None),
             "native_zero_copy": bool(self.native_zero_copy),
+            "model_profile": self.model_profile,
+            "zero_copy_output": bool(self.zero_copy_output),
+            "host_readback_bytes": int(self.host_readback_bytes),
             "raw_output_semantics": self.raw_output_semantics,
             "dibr_output_semantics": self.dibr_output_semantics,
         }
@@ -296,6 +314,19 @@ def _postprocess_model_depth(depth: torch.Tensor, model_id: str) -> torch.Tensor
 
 def _is_infinidepth_model(model_id: str) -> bool:
     return "infinidepth" in str(model_id).lower()
+
+
+def _is_native_family_model(model_name_or_id: str) -> bool:
+    try:
+        from .model_registry import ModelRegistry
+
+        return ModelRegistry.default().get(model_name_or_id).family in {
+            "depth-pro-2",
+            "moge-3",
+            "flashdepth",
+        }
+    except KeyError:
+        return False
 
 
 def _infinidepth_encoder_for_model(model_id: str) -> str:
@@ -1178,9 +1209,12 @@ InfiniDepthTorchProvider = InfiniDepthProvider
 
 def _normalization_tensors_for_model(model_id: str, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
     model_lower = model_id.lower()
-    if _is_zipdepth_model(model_id):
+    if _is_zipdepth_model(model_id) or "moge" in model_lower:
         mean_values = [0.0, 0.0, 0.0]
         std_values = [1.0, 1.0, 1.0]
+    elif "depthpro2" in model_lower or "flashdepth" in model_lower:
+        mean_values = [0.485, 0.456, 0.406]
+        std_values = [0.229, 0.224, 0.225]
     elif any(key in model_lower for key in ("depthpro", "zoedepth", "dpt")):
         mean_values = [0.5, 0.5, 0.5]
         std_values = [0.5, 0.5, 0.5]
@@ -1229,7 +1263,10 @@ def _prepare_accelerated_artifacts(
         kwargs["export_height"], kwargs["export_width"] = int(input_size[0]), int(input_size[1])
     result = prepare_model_artifacts(
         cfg.model_name
-        if _is_zipdepth_model(cfg.model_id) and cfg.model_name.casefold() in {"zipdepth-base", "zipdepth-small"}
+        if (
+            (_is_zipdepth_model(cfg.model_id) and cfg.model_name.casefold() in {"zipdepth-base", "zipdepth-small"})
+            or _is_native_family_model(cfg.model_name or cfg.model_id)
+        )
         else cfg.model_id,
         cache_dir=cache_dir,
         model_dir=model_dir,
@@ -1287,6 +1324,26 @@ class AutoDepthProvider:
             "depth_upsample": cfg.depth_upsample,
             "depth_upsample_edge_strength": cfg.depth_upsample_edge_strength,
         }
+        from .model_registry import ModelRegistry
+
+        try:
+            spec = ModelRegistry.default().get(cfg.model_name or cfg.model_id)
+        except KeyError:
+            spec = None
+        if spec is not None and spec.family in {"depth-pro-2", "moge-3", "flashdepth"}:
+            from .new_model_providers import create_family_provider
+
+            return create_family_provider(
+                family=spec.family,
+                model_id=spec.model_id,
+                model_name=spec.name,
+                device=device,
+                depth_resolution=cfg.depth_resolution,
+                local_files_only=cfg.local_files_only,
+                force_download=cfg.force_download,
+                compat_profile=True,
+                **{key: value for key, value in common.items() if key not in {"local_files_only", "force_download"}},
+            )
         if _is_zipdepth_model(cfg.model_id):
             return _zipdepth_provider_for_config(cfg, device)
         if cfg.model_id != DISTILL_ANY_DEPTH_BASE_MODEL_ID:
@@ -1341,11 +1398,35 @@ class AutoDepthProvider:
             ))
             factories.append(("PyTorch CUDA", lambda: self._torch_provider(cfg.device)))
         elif device_type == "cuda" and getattr(torch.version, "hip", None):
-            from .providers.amd import create_pytorch_rocm_provider
+            from .providers.amd import create_migraphx_rocm_provider, is_migraphx_available
 
+            if is_migraphx_available():
+                factories.append((
+                    "MIGraphX ROCm",
+                    lambda: create_migraphx_rocm_provider(
+                        model_id=cfg.model_id,
+                        model_name=cfg.model_name,
+                        device=cfg.device,
+                        cache_dir=cfg.cache_dir,
+                        onnx_path=cfg.onnx_path,
+                        graph_path=cfg.engine_path,
+                        build_graph=cfg.build_engine,
+                        force_rebuild=cfg.force_rebuild,
+                        local_files_only=cfg.local_files_only,
+                        force_download=cfg.force_download,
+                        allow_pytorch_fallback=False,
+                        depth_resolution=cfg.depth_resolution,
+                        patch_size=cfg.patch_size,
+                        depth_upsample=cfg.depth_upsample,
+                        depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
+                        use_torch_compile=cfg.use_torch_compile,
+                    ),
+                ))
             factories.append((
                 "PyTorch ROCm",
-                lambda: self._torch_provider(cfg.device) if _is_zipdepth_model(cfg.model_id) else create_pytorch_rocm_provider(
+                lambda: self._torch_provider(cfg.device)
+                if _is_zipdepth_model(cfg.model_id) or _is_native_family_model(cfg.model_name or cfg.model_id)
+                else create_pytorch_rocm_provider(
                     model_id=cfg.model_id,
                     model_name=cfg.model_name,
                     device=cfg.device,
@@ -1381,7 +1462,9 @@ class AutoDepthProvider:
 
             factories.append((
                 "PyTorch XPU",
-                lambda: self._torch_provider(cfg.device) if _is_zipdepth_model(cfg.model_id) else create_pytorch_xpu_provider(
+                lambda: self._torch_provider(cfg.device)
+                if _is_zipdepth_model(cfg.model_id) or _is_native_family_model(cfg.model_name or cfg.model_id)
+                else create_pytorch_xpu_provider(
                     model_id=cfg.model_id,
                     model_name=cfg.model_name,
                     device=cfg.device,
@@ -1399,7 +1482,9 @@ class AutoDepthProvider:
 
             factories.append((
                 "PyTorch MPS",
-                lambda: create_pytorch_mps_provider(
+                lambda: self._torch_provider(cfg.device)
+                if _is_native_family_model(cfg.model_name or cfg.model_id)
+                else create_pytorch_mps_provider(
                     model_id=cfg.model_id,
                     model_name=cfg.model_name,
                     device=cfg.device,
@@ -1421,7 +1506,9 @@ class AutoDepthProvider:
             if is_directml_available() and not any(name == "DirectML" for name, _ in factories):
                 factories.append((
                     "DirectML",
-                    lambda: self._torch_provider(cfg.device) if _is_zipdepth_model(cfg.model_id) else create_directml_provider(
+                    lambda: self._torch_provider(cfg.device)
+                    if _is_zipdepth_model(cfg.model_id) or _is_native_family_model(cfg.model_name or cfg.model_id)
+                    else create_directml_provider(
                         model_id=cfg.model_id,
                         model_name=cfg.model_name,
                         cache_dir=cfg.cache_dir,
@@ -1433,7 +1520,9 @@ class AutoDepthProvider:
                         depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
                     ),
                 ))
-        factories.append(("CPU", lambda: self._torch_provider("cpu")))
+        if device_type == "cpu" or not _is_native_family_model(cfg.model_name or cfg.model_id):
+            if device_type == "cpu" or cfg.allow_pytorch_fallback:
+                factories.append(("CPU", lambda: self._torch_provider("cpu")))
         self._factories = factories
         return factories
 
@@ -1588,6 +1677,8 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
     if backend in {"pytorch_rocm", "rocm", "amd_rocm"}:
         if _is_zipdepth_model(cfg.model_id):
             return _zipdepth_provider_for_config(cfg, device)
+        if _is_native_family_model(cfg.model_name or cfg.model_id):
+            return AutoDepthProvider(cfg)._torch_provider(device)
         from .providers.amd import create_pytorch_rocm_provider
 
         return create_pytorch_rocm_provider(
@@ -1640,6 +1731,8 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
         )
 
     if backend in {"pytorch_mps", "mps", "apple_mps"}:
+        if _is_native_family_model(cfg.model_name or cfg.model_id):
+            return AutoDepthProvider(cfg)._torch_provider(device)
         from .providers.apple import create_pytorch_mps_provider
 
         return create_pytorch_mps_provider(
@@ -1749,6 +1842,8 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
             )
         if _is_zipdepth_model(cfg.model_id):
             return _zipdepth_provider_for_config(cfg, device)
+        if _is_native_family_model(cfg.model_name or cfg.model_id):
+            return AutoDepthProvider(cfg)._torch_provider(device)
         if cfg.model_id != DISTILL_ANY_DEPTH_BASE_MODEL_ID:
             if _is_infinidepth_model(cfg.model_id):
                 return InfiniDepthProvider(

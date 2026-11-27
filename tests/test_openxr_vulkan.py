@@ -434,6 +434,89 @@ def test_projection_swapchains_use_runtime_recommendation_times_render_scale() -
     assert created == [(1500, 1200), (1350, 1050)]
 
 
+def test_single_sbs_projection_uses_proxy_controller_layer() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._single_sbs_projection_requested = True
+    presenter._view_configuration_views = (
+        SimpleNamespace(
+            recommended_image_rect_width=1000,
+            recommended_image_rect_height=800,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+        SimpleNamespace(
+            recommended_image_rect_width=1000,
+            recommended_image_rect_height=800,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+    )
+    presenter.vulkan = object()
+    presenter.swapchain_format = 43
+    presenter._vulkan_projection_screen_pass = SimpleNamespace()
+    created = []
+
+    def create_swapchain(width, height, **kwargs):
+        created.append((width, height, kwargs.get("array_size", 1)))
+        return SimpleNamespace(
+            handle="sbs", images=[], width=width, height=height,
+            resources=[], array_size=kwargs.get("array_size", 1), sbs_split=False,
+        )
+
+    presenter._create_projection_swapchain = create_swapchain
+    presenter._create_projection_swapchains_for_scale(1.0)
+
+    assert created == [(2000, 800, 1), (1000, 800, 1), (1000, 800, 1)]
+    assert len(presenter.swapchains) == 1
+    assert presenter.swapchains[0].sbs_split is True
+    assert presenter._single_sbs_projection_active is True
+    assert presenter._vulkan_controller_proxy_enabled is True
+    assert len(presenter._vulkan_controller_proxy_swapchains) == 2
+
+
+def test_single_sbs_projection_falls_back_to_per_eye_before_frames() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._single_sbs_projection_requested = True
+    presenter._view_configuration_views = (
+        SimpleNamespace(
+            recommended_image_rect_width=1000,
+            recommended_image_rect_height=800,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+        SimpleNamespace(
+            recommended_image_rect_width=1000,
+            recommended_image_rect_height=800,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+    )
+    presenter.vulkan = SimpleNamespace(wait_idle=lambda: None)
+    presenter.swapchain_format = 43
+    presenter._vulkan_projection_screen_pass = SimpleNamespace()
+    calls = []
+
+    def create_swapchain(width, height, **kwargs):
+        calls.append((width, height, kwargs.get("array_size", 1)))
+        if width == 2000:
+            raise RuntimeError("unsupported width")
+        return SimpleNamespace(
+            handle=object(), images=[], width=width, height=height,
+            resources=[], array_size=1, sbs_split=False,
+        )
+
+    presenter._create_projection_swapchain = create_swapchain
+    presenter._destroy_projection_swapchain = lambda _eye: None
+    presenter._create_projection_swapchains_for_scale(1.0)
+
+    assert calls == [(2000, 800, 1), (1000, 800, 1), (1000, 800, 1)]
+    assert len(presenter.swapchains) == 2
+    assert presenter._single_sbs_projection_active is False
+    assert presenter._single_sbs_projection_fallback_reason == (
+        "swapchain creation failed: RuntimeError"
+    )
+
+
 def test_projection_pass_is_precreated_with_panorama_support(monkeypatch) -> None:
     presenter = OpenXrVulkanPresenter()
     presenter.config = replace(presenter.config, filament_panorama_path="test-panorama.hdr")
@@ -1692,7 +1775,7 @@ def test_projection_quality_chain_uses_native_mips_for_cuda_screen_minification(
 
     assert plan is not None
     assert plan.mode == "native_mip"
-    assert plan.filter_scale == pytest.approx(3.31, abs=0.05)
+    assert plan.filter_scale == pytest.approx(2.22, abs=0.05)
     assert plan.quality_width is None
     assert plan.quality_height is None
 
@@ -1892,6 +1975,36 @@ def test_projection_sampling_uses_openxr_screen_footprint_for_quality_size() -> 
     assert plan.quality_width > 2048
 
 
+def test_projection_screen_oversample_uses_configured_supersampling(monkeypatch) -> None:
+    presenter = OpenXrVulkanPresenter(
+        OpenXrVulkanConfig(screen_oversample=1.5)
+    )
+    presenter._filament_screen = (
+        (0.0, 0.0, -2.0), 2.0, 1.0, (0.0, 0.0, 0.0)
+    )
+    presenter._projection_eye_extents = lambda: ((1280, 1400), (1280, 1400))
+    presenter._screen_footprint_pixels = lambda _view, _target: (667.0, 386.0)
+    frame = VulkanStereoOutputFrame(
+        frame_id=1,
+        timestamp=0.0,
+        left_eye=SimpleNamespace(width=3840, height=2160),
+        right_eye=SimpleNamespace(width=3840, height=2160),
+        metadata={},
+    )
+
+    plan = presenter._apply_screen_sampling_policy(frame, [object(), object()])
+    assert plan is not None
+    assert plan.quality_size == (1024, 576)
+
+    monkeypatch.setenv("D2S_OPENXR_SCREEN_OVERSAMPLE", "2.0")
+    presenter._screen_sampling_stabilizer.reset()
+    presenter._active_screen_sampling_plan = None
+    presenter._last_screen_sampling_status = None
+    plan = presenter._apply_screen_sampling_policy(frame, [object(), object()])
+    assert plan is not None
+    assert plan.quality_size == (1344, 756)
+
+
 def test_projection_does_not_repeat_the_shared_output_quality_pass() -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._filament_screen = ((0.0, 0.0, -2.0), 2.0, 1.0, (0.0, 0.0, 0.0))
@@ -2042,6 +2155,87 @@ def test_vulkan_panorama_upload_is_bounded_and_releases_staging() -> None:
     assert "Image.Resampling.BILINEAR" in source
     assert "self._vulkan_panorama_staging.close()" in source
     assert "source={source_w}x{source_h} uploaded={w}x{h}" in source
+
+
+def test_controller_proxy_skips_filament_controller_overlay() -> None:
+    calls = []
+
+    class Bridge:
+        controller_overlay_abi_available = True
+
+        def set_active_eye(self, eye_index):
+            calls.append(("eye", eye_index))
+
+        def set_acquired_image(self, image_index):
+            calls.append(("image", image_index))
+
+        def render_controller_overlay(self):
+            calls.append(("overlay", None))
+
+    presenter = OpenXrVulkanPresenter()
+    presenter.filament_bridge = Bridge()
+    presenter._filament_controller_overlay_after_composer = True
+    presenter._vulkan_controller_proxy_enabled = True
+    presenter._single_sbs_projection_active = True
+
+    presenter._render_filament_controller_overlay(
+        [(object(), 3)], lambda *_args: None
+    )
+    presenter._single_sbs_projection_active = False
+    presenter._render_filament_controller_overlay(
+        [(object(), 3), (object(), 5)], lambda *_args: None
+    )
+
+    assert calls == []
+
+
+def test_single_sbs_proxy_failure_falls_back_before_frames() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._single_sbs_projection_requested = True
+    presenter._view_configuration_views = (
+        SimpleNamespace(
+            recommended_image_rect_width=1000,
+            recommended_image_rect_height=800,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+        SimpleNamespace(
+            recommended_image_rect_width=1000,
+            recommended_image_rect_height=800,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+    )
+    presenter.vulkan = SimpleNamespace(wait_idle=lambda: None)
+    presenter.swapchain_format = 43
+    presenter._vulkan_projection_screen_pass = SimpleNamespace()
+    calls = []
+
+    def create_swapchain(width, height, **kwargs):
+        calls.append((width, height))
+        if len(calls) == 3:
+            raise RuntimeError("proxy unsupported")
+        return SimpleNamespace(
+            handle=object(), images=[], width=width, height=height,
+            resources=[], array_size=1, sbs_split=False,
+        )
+
+    presenter._create_projection_swapchain = create_swapchain
+    presenter._destroy_projection_swapchain = lambda _eye: None
+    presenter._create_projection_swapchains_for_scale(1.0)
+
+    assert calls == [
+        (2000, 800),
+        (1000, 800),
+        (1000, 800),
+        (1000, 800),
+        (1000, 800),
+    ]
+    assert presenter._single_sbs_projection_active is False
+    assert presenter._vulkan_controller_proxy_enabled is False
+    assert presenter._single_sbs_projection_fallback_reason == (
+        "Vulkan controller proxy swapchains unavailable: RuntimeError"
+    )
 
 
 def test_filament_controller_overlay_runs_after_vulkan_composer() -> None:
@@ -3456,7 +3650,7 @@ def test_screen_osd_selects_gpu_msdf_request_for_quad_upload() -> None:
 
     assert isinstance(osd[1], VulkanMsdfQuadRequest)
     assert osd[1].height < 78
-    assert osd[1].width < 512
+    assert osd[1].width < 640
     assert osd[1].width > osd[1].height
     assert osd[3][0] / osd[3][1] == pytest.approx(
         osd[1].width / osd[1].height
@@ -5710,6 +5904,29 @@ def test_presenter_keeps_latest_output_during_non_renderable_xr_tick(
             "layers": None,
         }
     ]
+
+
+def test_projection_render_template_uses_sbs_half_rect() -> None:
+    screen_pass = object.__new__(VulkanProjectionScreenPass)
+    screen_pass.vk = vk
+    screen_pass._render_pass_recording_templates = {}
+    screen_pass._render_pass_template_hits = 0
+    screen_pass._render_pass_template_misses = 0
+
+    template = screen_pass._render_pass_recording_template(
+        vk.ffi.NULL,
+        vk.ffi.NULL,
+        40,
+        20,
+        (0.0, 0.0, 0.0, 1.0),
+        (20, 0, 20, 20),
+    )
+
+    assert template["begin_info"].renderArea.offset.x == 20
+    assert template["begin_info"].renderArea.extent.width == 20
+    assert template["viewport"][0].x == 20.0
+    assert template["viewport"][0].width == 20.0
+    assert template["scissor"][0].offset.x == 20
 
 
 @pytest.mark.parametrize("underlay", [False, True])
@@ -9237,6 +9454,62 @@ def test_projection_layer_builder_owns_only_layer_assembly() -> None:
         "width": 30,
         "height": 40,
     }
+
+
+def test_projection_layer_builder_maps_single_sbs_to_two_rectangles() -> None:
+    class FakeXr:
+        CompositionLayerProjectionView = staticmethod(lambda **kwargs: kwargs)
+        SwapchainSubImage = staticmethod(lambda **kwargs: kwargs)
+        Rect2Di = staticmethod(lambda **kwargs: kwargs)
+        Offset2Di = staticmethod(lambda **kwargs: kwargs)
+        Extent2Di = staticmethod(lambda **kwargs: kwargs)
+        CompositionLayerProjection = staticmethod(lambda **kwargs: kwargs)
+
+    views = [
+        SimpleNamespace(pose="left-pose", fov="left-fov"),
+        SimpleNamespace(pose="right-pose", fov="right-fov"),
+    ]
+    swapchain = _EyeSwapchain(
+        "sbs-chain", [], 40, 20, array_size=1, sbs_split=True
+    )
+
+    layer = OpenXrCompositionBuilder(FakeXr, "local-space").projection_layer(
+        views, [swapchain]
+    )
+
+    assert [
+        view["sub_image"]["swapchain"] for view in layer["views"]
+    ] == ["sbs-chain", "sbs-chain"]
+    assert [
+        view["sub_image"]["image_array_index"] for view in layer["views"]
+    ] == [0, 0]
+    assert [
+        (
+            view["sub_image"]["image_rect"]["offset"]["x"],
+            view["sub_image"]["image_rect"]["extent"]["width"],
+        )
+        for view in layer["views"]
+    ] == [(0, 20), (20, 20)]
+
+
+def test_projection_target_for_single_sbs_uses_left_and_right_rects() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._single_sbs_projection_active = True
+    swapchain = _EyeSwapchain(
+        "sbs-chain", [], 40, 20, resources=[object()], sbs_split=True
+    )
+
+    left = presenter._projection_target_for_eye(
+        [(swapchain, 3)], 0, layered=False, single_sbs=True
+    )
+    right = presenter._projection_target_for_eye(
+        [(swapchain, 3)], 1, layered=False, single_sbs=True
+    )
+
+    assert left[0] is swapchain and right[0] is swapchain
+    assert left[2] == right[2] == 0
+    assert left[3] == (0, 0, 20, 20)
+    assert right[3] == (20, 0, 20, 20)
 
 
 def test_projection_layer_builder_maps_multiview_to_array_layers() -> None:

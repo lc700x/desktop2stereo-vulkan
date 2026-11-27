@@ -2,7 +2,7 @@
 
 DISABLE_TRT_KEYWORDS = [
     "dpt-hybrid-midas",
-    "depthpro",
+    "depthpro-large",
     "da3-giant",
     "da3nested-giant",
     "video-depth-anything",
@@ -32,7 +32,7 @@ TRT_FIX_KEYWORDS = [
 FORCE_FP32_KEYWORDS = [
     "Intel/zoedepth-nyu",
     "Intel/zoedepth-kitti",
-    "depthpro",
+    "depthpro-large",
     "zoedepth",
     "infinidepth-large",
 ]
@@ -52,7 +52,7 @@ DISABLE_COREML_KEYWORDS = [
     "da3nested",
     "dpt-beit",
     "zoedepth",
-    "depthpro",
+    "depthpro-large",
     "infinidepth",
     "zipdepth-base",
 ]

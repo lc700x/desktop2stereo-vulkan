@@ -733,3 +733,386 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   not considered safe.
 - Focused ROCm and CUDA media/OpenXR/output tests after this change:
   `520 passed, 2 skipped` in each environment.
+
+## 2026-11-15 media repair follow-up
+
+Canonical current lessons and measured limitations are in AGENTS.md under
+"Media timeline, XR input and playlist repairs". The previous statement that
+Lossless Scaling is not installed is obsolete: the user provided its location
+as D:\Lossless Scaling. No LSFG integration was added in this repair.
+The remaining native ROCm presenter command-coalescing bug was covered by a
+new regression test. The post-repair Quest run had no input focus and zero
+presented frames, so it is not acceptance evidence. Do not claim complete
+CUDA/ROCm headset smoothness from that run or from tests alone.
+
+## Media remote-input isolation
+
+See AGENTS.md "Media-player controller desktop isolation" for the guards and
+verification. Desktop/window forwarding is preserved; file/video/image mode
+retains player/XR controls but cannot inject Windows input. Both bundled
+backend regression runs passed 566 tests with 1 skip. The newest live ROCm
+VDXR repro had no HMD form factor and zero presented frames, so it is not a
+successful black-screen fix or hardware interaction acceptance.
+
+## 2026-11-16 media AV/pause verification
+
+Current source-PTS audio/display synchronization, GPU pause-frame ownership,
+clock conversion, measured ROCm Quest 2 results and CUDA hardware limitation
+are recorded in AGENTS.md under "Media audio/display clock and pause ownership".
+The measured AV error is PortAudio DAC vs OpenXR predicted display time, not
+headset acoustic/video recording. RTX 2070 was disabled (Windows code 22), so
+CPU fallback is not CUDA hardware acceptance. See the ignored run summary
+runtime-diagnostics/media-acceptance/rocm-av-final-summary.json for this run.
+
+## Media tick scheduler rollback (2026-11-17)
+
+- The OpenXR integer-tick scheduler and the OpenXR-only 24 fps startup override
+  were rejected after the user reported severe Quest 2/VDXR judder. Roll back to
+  the prior float `_media_next_present_at` deadline and the deterministic 40 fps
+  startup path. Do not reintroduce a frame-counter/tick scheduler merely because
+  source-index deltas look regular; the headset view is the acceptance signal.
+- Keep the already-verified audio clock, pause-frame ownership, ordered media
+  queues, controller isolation, and playlist behavior. The Local Viewer cadence
+  target API remains available; OpenXR no longer retargets the active media
+  source to 24 fps.
+- ROCm Quest 2 rollback check: 1750 presents, steady-state source-index deltas
+  all 3, source-PTS speed 1.00017x, audio DAC-vs-display median -9.51 ms and
+  p95 4.65 ms, zero PCM/device underruns. Predicted display intervals still show
+  the runtime's 1/2-tick pulldown, so this is source-cadence evidence, not a
+  claim of visually perfect compositor pacing.
+- A follow-up experiment that advanced the float deadline with
+  `media_playback_period_s` was rejected: the live ROCm Quest 2 run fell to
+  0.9932x source-PTS speed (0.9973x in steady state), despite retaining source
+  deltas of 3. Reverted to the rollback scheduler; do not use playback period as
+  a replacement for the source frame pump/display-tick phase without a new
+  end-to-end design.
+- A source-PTS -> actual-XR-tick attempt (40 fps rational phase, no 24 fps
+  target) was also rejected: the live ROCm Quest 2 run produced only 680
+  presents and 0.4538x source-PTS speed with a long stall. It was fully
+  reverted. Do not reintroduce any source-PTS tick mapping without proving that
+  queue starvation and source-time speed remain within acceptance bounds.
+- Raising `D2S_MEDIA_DECIMATION_TARGET_FPS` from 40 to 60 was also rejected:
+  the ROCm Quest 2 run reached only 0.7905x source-PTS speed with source deltas
+  of 2, so the GPU/presenter path cannot sustain 60 fps without a separate
+  optimization. Keep the default 40 fps target until measured end-to-end
+  headroom exists.
+- The OpenXR refresh-rate extension returns wrapped `c_float` scalars.
+  `_request_media_display_refresh_rate()` must unwrap every enumerate/get result;
+  otherwise the request raises `ValueError` and never changes refresh. After the
+  fix VDXR confirmed `supported=(72.0,)`, `requested=72.0`, `actual=72.0`. The
+  40 fps steady run then measured 1.00006x source-PTS speed; the refresh fix is
+  retained independently of the rejected scheduler experiments.
+- Use the confirmed runtime display period (`_display_period_s`) for the media
+  half-tick deadline check instead of the jittery CPU loop duration. The
+  retained ROCm Quest 2 run measured 1.00003x source-PTS speed with source
+  deltas of 3. Do not use `media_playback_period_s` to advance the float
+  deadline; that variant measured 0.99731x and was reverted.
+- VDXR rejects an unenumerated 80 Hz refresh request with
+  `DisplayRefreshRateUnsupportedFBError`; only 72 Hz is currently available.
+  Do not assume 40 fps can be made integral by switching this runtime to 80 Hz.
+- Two parallel inference workers did not rescue the 60 fps target: the ROCm
+  Quest 2 run measured 0.6870x source-PTS speed. Keep single-worker 40 fps as
+  the present throughput ceiling unless the capture/runtime synchronization
+  path is optimized separately.
+- Full regression environments: ROCm `2905 passed, 70 skipped`; CUDA
+  `2717 passed, 257 skipped`. CUDA hardware remains unavailable
+  (`torch.cuda.is_available() == False`), so no CUDA headset acceptance is
+  claimed.
+
+
+## Hardware-adaptive media cadence work in progress (2026-11-17)
+
+- User now explicitly requires hardware-adaptive rates and original playback
+  duration. A default fixed 40/30 FPS cap is no longer an accepted solution.
+  MediaCadenceController selects source divisors from measured decode/runtime/
+  presentation service cost, reduces on sustained overload, and waits for
+  sustained headroom before recovering one divisor. Source PTS stays in
+  original source-frame units; the environment FPS override is an explicit
+  ceiling, not the production default.
+- Adaptive changes drain already-selected buffered frames before changing the
+  source divisor. Never clear that queue to force a faster recovery; that
+  produced large 49/57/65-source-frame jumps during the first experiment.
+- The Local Viewer reports its actual output refresh to the source controller;
+  it no longer forces a process-global fixed media target. OpenXR reports its
+  actual predicted display period and keeps the existing float scheduler.
+- Preserve linear-light pixel-coverage filtering. Fusing the existing integer
+  horizontal box filter and sRGB transfers, including the transposed vertical
+  pass, removes repeated full-frame Torch intermediates. GPU comparisons cover
+  float16/float32, 2/3/4 ratios and non-contiguous transposed tensors. CPU, RGBA,
+  uint8, non-integral ratios and compiler failures retain the reference filter.
+- The initial roughly 40 ms "SBS" measurement included output-quality work,
+  not just packing. Standalone packing was about 1 ms. Do not label a grouped
+  stage as one kernel. The fused-filter A/B sustained 30 FPS / 1.000001x source
+  speed on the ROCm Local Viewer 4K120 source, versus about 15 FPS / 0.51x
+  before optimization, with identical quality settings.
+- D3D11 decode-ahead external fence waits otherwise interleave with inference
+  on the default HIP stream. Complete the required owned ring-image clone on
+  the importer stream before publishing, and record its consumer stream. This
+  remains GPU-resident. Do not launch an unused FFmpeg raw pipe when the active
+  decoder is the native ffmpeg-d3d11va-gpu backend.
+- Clean adaptive ROCm tail test: selected 24 FPS in this hardware/load/profile,
+  steady source speed 1.000336x, steady source deltas all 5, no new PCM/device
+  underruns, DAC-vs-submission absolute error p95 about 24.55 ms. However the
+  46.333 s presented source span took 46.820 s from first to last presentation.
+  Startup overload still adds about 0.49 s; original-duration acceptance is NOT
+  complete and must not be claimed from the steady-state speed alone.
+- Do not run GPU regression tests concurrently with playback benchmarks.
+  Those compete for GPU/context startup and contaminate adaptive rate evidence.
+- Post-change OpenXR hardware acceptance is pending: after a runtime close,
+  Virtual Desktop returned to its desktop environment. Subsequent sessions
+  were SYNCHRONIZED with zero layers/presents and are explicitly failures,
+  not passing runs. Preserve Guardian/proximity state and have the user return
+  Virtual Desktop to VR before measuring several videos in one XR session.
+
+
+## Media cadence/source-clock continuation (2026-11-17 evening)
+
+- The earlier adaptive decoder cost was not a valid per-output service metric:
+  NVDEC batches can wait for many original frames. When the look-ahead queue
+  is nonstarving, those waits must not lower the proven playback rate. Lock
+  a sustained 1.0x rate, require 15 seconds and 25% next-rung service headroom
+  to recover, and also treat missing selected-frame delivery as over-budget
+  even if wall-clock source speed remains 1.0x through catch-up drops.
+- NVDEC explicitly uses an owned non-default CUDA decode stream. Its copy
+  stream waits for that decode stream only; discarded intermediate batches
+  release their decoder surfaces BEFORE fetching the next ring batch. Actual
+  short final batch length, not requested length, advances source identity.
+- Presentation-synchronized media holds the first real source frame while
+  warmup/calibration runs. Four GPU-complete executions of that actual frame
+  measure initial service cost; discard the engine-init sample and select an
+  initial divisor with downstream headroom. No user playback clock or PCM
+  playback starts until the first successful presentation. Resume re-anchors
+  to its first newly presented frame but does not rerun calibration.
+- Prepare future media frames by the measured capture-return-to-presentation
+  latency. This is an internal scheduling lead, NOT an audio delay, source-PTS
+  alteration or playback-rate adjustment. Reused XR frames cannot increase
+  that latency estimate. FIFO chosen media frames must remain ordered at WSI:
+  Local Viewer media uses plain FIFO, never FIFO_LATEST_READY; desktop capture
+  retains latest-ready behavior.
+- The previous ~170 ms EOF "duration error" included decoder/audio cleanup.
+  Acceptance records EOF at entry BEFORE cleanup and uses an explicit single
+  requested-file playlist, not an implicit folder scan. A decoded item at or
+  beyond declared duration must not block ordered EOF; decode-ahead reaching
+  EOF cannot stop the last source-time interval or audio early.
+- Natural AAC EOF can precede the final video frame slightly. Record audio
+  decoder EOF and trailing PCM silence separately, rather than labeling its
+  natural partial final callback an underrun. Underruns before decoder EOF and
+  PortAudio device underflows remain reported; decoder failure is not success.
+- Current CUDA FIFO/EOF retests: 23.976 fps anime had source deltas all 1 and
+  ~6.56 ms EOF duration difference; 60 fps recording selected 30 fps, deltas
+  all 2 and ~43.18 ms duration difference. No new steady video skips in either
+  measured segment. The one recording audio "underrun" was 36 ms before video
+  EOF and is now separately classified as natural audio EOF; post-change live
+  audio retest remains necessary. These are timestamp ledgers, not acoustic
+  measurements or measured physical scanout times.
+- A sequential six-case CUDA/ROCm FIFO/EOF batch is running via exec session
+  81140; inspect its authoritative live status before waiting/restarting. Logs
+  and JSONs are under ignored runtime-diagnostics/media-acceptance/20261117-matrix
+  with *-fifo-eof names. Some early cases precede the latest delivery-rate/audio
+  EOF fixes and must not be claimed as final current-code acceptance.
+- Latest hardware state: Quest 2 reachable, proximity enabled/normal and
+  HEADSET_UNMOUNTED; Guardian still disabled from its inherited state. No
+  proximity/boundary changes were made. ADB attachment or wake does not prove
+  XR input focus; user must wear/connect Virtual Desktop in VR for OpenXR
+  hardware presentation acceptance. Goal remains incomplete.
+
+
+## Native H.264 padding, current test results and remaining work (2026-11-17)
+
+- Repeated ROCm 1080p H.264 tests initially fell back to FFmpeg because the
+  native decoder compared D3D11 texture dimensions against visible output.
+  Macroblock padding (1088 texture rows for 1080 visible rows) is legitimate.
+  Native process_frame now validates AVFrame width/height minus cropping and
+  supplies explicit VP source/destination/output rectangles. Rebuilt/deployed
+  native DLL SHA256: 569ff8333b53eab871ade07ee8f1b71016a78f414575edc66b16546d45361f63.
+  Subsequent 1080p tests remained ffmpeg-d3d11va-gpu with no fallback.
+- Resume now anchors only to an output at or after the first newly captured
+  resume index, never a pre-pause queued frame. The controller ignores its
+  first two seconds after that epoch to avoid downshifting on wakeup/preroll.
+- Each selected queue item owns its selected playback rate and terminal-partial
+  status. Reading the current global rate after a pop can retag an older frame
+  during a cadence change. Pipeline metadata now preserves the terminal flag.
+  Partial NVDEC EOF batches advance by the actual returned original count.
+- Source-index regularity alone is insufficient. The analyzer also reports PTS
+  gap candidates. One 60 fps MKV tail gap (468.417 -> 468.450) is in the ORIGINAL
+  video, confirmed with offline FFmpeg showinfo; it is not a runtime drop.
+  Reference output is retained under the ignored matrix folder as
+  recording60-original-eof-reference.log. Do not invent an absent 468.433 frame.
+- CUDA anime current-verify was interrupted by a .viewer seek request and has
+  extra generations; it cannot prove uninterrupted duration. The separate
+  cuda-local-anime24-uninterrupted run has 719 presents, deltas all 1,
+  EOF duration difference -6.01 ms, and no new PCM/device underruns.
+- Current-code six-case local matrix files use *-current-verify names. ROCm
+  120 fps source selected 30 fps (step 4) and showed zero source-index/PTS
+  anomalies, source speed about 1.000235x and EOF error +0.34 ms. ROCm anime
+  selected 23.976 fps with continuous source indices. ROCm recording retained
+  60 fps; its sole PTS candidate is the original MKV gap above. CUDA recording
+  selected 30 fps (step 2), continuous selected indices and EOF error -0.63 ms.
+- CUDA 4K120 still downshifted 20 -> 15 fps after sustained overload. Its EOF
+  source duration was about 30.0375 s for 30.0 s, and its clock-ledger AV absolute
+  p95 was about 38.58 ms. Its terminal short batch was correctly marked at
+  capture but the old presenter log omitted that flag; propagation is now
+  fixed and has focused regression coverage. Do not call the whole goal done.
+- Latest nearest-subsystem ROCm regression: 961 passed, 1 skipped. Separate
+  CUDA gate: 710 passed, 1 skipped. Two desktop-input tests previously depended
+  on user-local/stale media UI state after pipeline tests; their desktop-only
+  fixtures now explicitly isolate the media-mode predicate. Production media
+  controller isolation remains unchanged and separately covered.
+- Exec sessions 81140, 47011 and 71708 are terminal. Last single-file retest was
+  exec 35230; inspect its handle/process status before waiting or restarting.
+  No gameplay/cadence benchmark should overlap real GPU regression work.
+- Remaining: validate current OpenXR on a worn, VR-connected Quest/VDXR session;
+  do not accept SYNCHRONIZED/zero-presents as proof. Tighten local presentation
+  deadline behavior and prepare-lead selection if the CUDA transition/late
+  terminal image persists. Source preparation already has a measured lead,
+  but Local Viewer fresh frames are still submitted ASAP rather than held to
+  an explicit source-PTS presentation deadline. Do not resurrect rejected
+  OpenXR integer-tick/source-tick schedulers to patch this local issue.
+- The objective remains active: all of local + OpenXR source order, real speed,
+  original playback duration and AV synchronization must be proved. Clock-ledger
+  evidence excludes physical scanout, Virtual Desktop transport and headset
+  acoustics; it is not end-to-end acoustic/visual acceptance.
+
+
+### End-of-turn verification handoff
+
+- Terminal-partial status now propagates through _attach_capture_debug; the
+  latest nearest-subsystem ROCm gate is clean: 961 passed, 1 skipped, only the
+  existing mss deprecation warnings. The scroll-sign test also isolates live
+  physical input; the decode-pacing test mocks capture.media.time only, not
+  the global time module used by background keyboard-watch threads.
+- CUDA anime uninterrupted retest is terminal: 719 presents, all source deltas
+  1, EOF difference -6.01 ms, no new PCM/device underruns. Its AV timestamp
+  absolute p95 is ~33.41 ms; this remains a DAC/submission ledger, not scanout.
+- Exec 35230 is terminal. Active last check is exec 90531, CUDA Local Viewer
+  4K120 HDR tail, with pause/resume, current metadata propagation and control
+  auditing. Files are cuda-local-hdr120-terminal-check.* in the ignored matrix
+  directory. Revalidate this exact handle/process before waiting or restarting.
+- Next local step: inspect that check, especially its selected-rate transition,
+  terminal partial count, PTS candidates and timing. If needed, add a source-PTS
+  presentation deadline to Local Viewer media rather than merely increasing
+  preparation lead. Keep desktop latest-wins and the accepted OpenXR float
+  scheduler unchanged. OpenXR current-code real-headset coverage still missing.
+
+- Exec 90531 has now been independently observed terminal (exit 0); no media acceptance or pytest process remains. Inspect its saved terminal-check JSON/summary next, not a live wait.
+
+- Latest CUDA terminal-check is NOT acceptance: whole source speed 0.988391x;
+  a 30.0 s source segment took 30.291299 s (291.30 ms late). First steady segment
+  23.446 fresh fps / 0.976925x, later 17.592 fresh fps / 1.005913x after adaptive
+  change. Selected-index and native/counted-PTS anomalies are zero; the one EOF
+  partial is now correctly reported. PCM/device underrun deltas zero; timestamp
+  AV absolute p95 40.57 ms. This confirms that regular source indices and good
+  audio counters do not prove original playback duration.
+- Highest-priority next fix is the shared source-PTS/prepare/display deadline
+  contract: decode-ahead cannot retain a separate minimum emit phase that keeps
+  an overload-induced delay forever. Keep selected FIFO frames and plan future
+  divisors, then hold prepared media to absolute presentation deadlines on the
+  Local Viewer. Validate before changing the accepted OpenXR float scheduling;
+  no integer tick workaround or image-quality reduction is authorized.
+
+
+## Verified Quest source-clock work after connection (2026-11-17)
+
+- User confirmed Quest connection. Real VDXR presentation was independently
+  observed FOCUSED with two retained layers and readable headset screenshots.
+  Sensor/Guardian states were only read, never changed.
+- OpenXR now selects media by the live source epoch against QPC-converted
+  predicted display time, with a half-display-period nearest-tick tolerance.
+  This is an absolute FLOAT source deadline, not an integer frame/tick mapping.
+  The existing float scheduler remains the fallback when no source provider
+  exists. A single preroll frame can start the epoch; pause retains the pending
+  output and displays cached GPU eyes; resume uses the new epoch. Old seek/open
+  generations are rejected BEFORE GPU ring conversion.
+- The acceptance ledger now records only successful on_media_presented feedback,
+  not pre-xrEndFrame commits. The same converted predicted display clock is
+  reused for scheduling and AV feedback. It also reports applied controls,
+  missing requested paths and scenario-thread errors; partial scenarios cannot
+  return a false passing exit code. PermissionError on atomic control-file
+  replace is retried boundedly, because Windows readers can briefly hold it.
+- Real 220-second ROCm/Quest2/VDXR source-clock test covered three requested
+  videos in one XR session. Steady before/after-pause results:
+  * anime23.976: 23.974/23.979 fresh FPS, 0.999926/1.000104x source speed,
+    all selected source steps 1, no index/PTS anomalies.
+  * recording60: 30.011/30.086 fresh FPS, 1.000373/1.002873x speed,
+    selected steps 2, no index/PTS anomalies.
+  * 4K120 HDR: 39.992/40.003 fresh FPS, 0.999794/1.000082x speed,
+    selected steps 3, no index/PTS anomalies.
+  All sampled sessions FOCUSED. Pause observations retained one identical
+  source image with two layers. New steady PCM/device underrun deltas zero.
+  AV absolute p95 ~16.31/15.48/16.73 ms by PortAudio DAC vs predicted-display
+  timestamp ledger; this is NOT a headset acoustic/scanout recording.
+- Headset VrApi samples separately confirmed 72/72, Stale=0, Tear=0.
+  Raw logs are ignored matrix files rocm-openxr-source-clock-headset-vrapi*.log.
+- A subsequent multi-file EOF test measured anime and recording tails but its
+  scenario failed before HDR: Windows PermissionError during command replacement,
+  and its old explicit playlist auto-opened an unrequested file. Both are now
+  made explicit/repaired in the test harness. Do not treat that partial test as
+  full duration acceptance. Preserve original folder/managed playlist behavior
+  in product code; the harness now keeps one active requested file per switch.
+- Current EOF rerun handle exec 89605 (rocm-openxr-quest-eof-complete.*) was
+  confirmed alive but only SYNCHRONIZED/state3, zero layers/presents. Headset
+  screenshot was black and UI dump exposed vrshell only. User has been asked
+  to return Virtual Desktop to VR; the same process is waiting, not restarted.
+  Revalidate its exact process/handle before any wait or further GPU benchmark.
+- Remaining full objective: current-code real XR three-file EOF duration proof,
+  repeat final Local Viewer matrix with absolute deadlines/independent controls,
+  run regression after live tests stop, and user-visible smoothness/audio check.
+  Stable source speed alone does not establish whole-file duration or sound
+  arriving at headset speakers in sync with physical panel scanout.
+
+
+## Quest EOF restoration and clock-epoch proof (2026-11-17)
+
+- User restored the nonblack Quest session. rocm-openxr-quest-eof-restored ran
+  FOCUSED and reached EOF for all three requested files without scenario errors
+  or missing files. Its apparent 13..70 ms duration differences exposed a
+  measurement mismatch: callback arrival is not the predicted display epoch,
+  and command-file processing completion is not the source pause instant.
+- The harness now stores presentation_at_relative_s and exact source-clock
+  pause/resume epochs. The analyzer uses those epochs, not a processing delay,
+  for duration and playback speed. MediaCaptureSource publishes paused_at and
+  resumed_at as part of its live presentation clock.
+- A first XR image can finish initialization AFTER its predicted tick. The
+  presenter must not anchor source time in that unsubmitted past. It explicitly
+  reports late_first_submission_fallback for that first epoch. Normal supported
+  frames retain xr_predicted_display_qpc; unsupported runtime conversion uses
+  submitted_frame_fallback at successful submission, not the beginning of the
+  CPU loop. This is not a claim of measured physical scanout time.
+- Current clock-ledger EOF test independently reached all three EOFs with rc=0,
+  scenario_errors=[], missing_media_paths=[] in one real Quest/VDXR session:
+  * anime: remaining source 30.030030 s, playing 30.036124 s, +6.09 ms;
+    steady 23.978/23.977 FPS, 1.000083/1.000036x, selected steps 1.
+  * 60 FPS recording: remaining 30.0 s, playing 30.003042 s, +3.04 ms;
+    steady 29.950/30.012 FPS, 0.998333/1.000359x, selected steps 2.
+  * 4K120 HDR: remaining 29.999 s, playing 30.002954 s, +3.95 ms;
+    steady 39.982/39.991 FPS, 0.999548/0.999776x, selected steps 3.
+  Both index and PTS anomaly counts zero in the measured segments. New steady
+  PCM/device underrun deltas zero, AV absolute p95 13.69/12.90/17.36 ms by
+  PortAudio DAC vs XR time ledger. All sampled session states FOCUSED.
+- Current harness also records eye-image dimensions, projection-swapchain
+  dimensions, runtime-to-presentation latency and model/output dimensions. Do
+  not call a 4K120 source file a measured 4K60 output result; actual eye images
+  and stage times must accompany any such performance claim.
+- Exec 14532 and 91515 are terminal. Latest nearest-subsystem ROCm regression
+  after epoch tests: 990 passed, 1 skipped; selected lint and diff checks pass.
+- In progress: exec 84094 is a sequential owned batch: full 120 FPS video in
+  ROCm OpenXR first (max 385s), then six Local Viewer tail cases (ROCm/CUDA x
+  anime/recording/HDR). The OpenXR child PID 72664 was confirmed live under
+  launcher PID 79440 but SYNCHRONIZED/zero-presents after the prior runtime
+  close; user has been asked to switch Virtual Desktop back to VR. Never run
+  GPU regression tests while this batch is active or restart it from a stale
+  observation. If it times out, retain the rc=3 no-presentation failure; local
+  batch continues sequentially. Whole-film/current-local acceptance is still
+  required and is not replaced by the passing thirty-second XR tail proof.
+
+
+## Windows bundled Python environments
+
+- Use `src/python3_cuda/python.exe` for CUDA benchmarks and tests. The
+  ROCm 7 environment is `src/python3/python.exe`; never infer CUDA from
+  a generic `python` command or run CUDA acceptance through the ROCm interpreter.
+
+
+## Verification gate
+
+- Do not consider source edits complete until relevant tests have been run and passed. Add or update focused regression tests for behavior changes, then run the focused module and broader related checks when practical. If a required test cannot run, state exactly what remains unverified instead of implying completion.

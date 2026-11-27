@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-import warnings
 
 import torch
-
 from utils.cpu_warnings import describe_tensor, warn_cpu_operation
 
 OnnxDtypeMode = Literal["auto", "fp16", "fp32"]
@@ -44,6 +43,8 @@ def choose_export_dtype(model_id: str, device, requested: OnnxDtypeMode) -> tupl
         return torch.float32, "fp32", "auto: non-CUDA device"
     if "infinidepth" in model_lower:
         return torch.float32, "fp32", "auto: InfiniDepth requires fp32"
+    if "depthpro2" in model_lower:
+        return torch.float16, "fp16", "auto: DepthPro2 inverse-depth graph"
     if any(keyword in model_lower for keyword in FORCE_FP32_KEYWORDS):
         return torch.float32, "fp32", "auto: model requires fp32"
     return torch.float16, "fp16", "auto: CUDA default"
@@ -68,7 +69,7 @@ def _extract_depth_output(output):
 def probe_model_dtype(model, *, device, dtype, height: int, width: int) -> tuple[bool, str]:
     import torch
 
-    dummy_factory = torch.rand if getattr(model, "zipdepth_rgb_input", False) else torch.randn
+    dummy_factory = torch.rand if getattr(model, "rgb_input", False) or getattr(model, "zipdepth_rgb_input", False) else torch.randn
     dummy = dummy_factory(1, 3, height, width, device=device, dtype=dtype)
     try:
         model.eval()
@@ -141,6 +142,52 @@ class ZipDepthEncoderOnnxExportWrapper(torch.nn.Module):
             return_s_quarter=True,
         )
         return (s_half, s_quarter, *features)
+
+
+class NativeDepthPro2OnnxExportWrapper(torch.nn.Module):
+    rgb_input = True
+
+    def __init__(self, model) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, pixel_values):
+        return self.model.predict_inverse_depth(pixel_values)
+
+
+class NativeMoGeOnnxExportWrapper(torch.nn.Module):
+    rgb_input = True
+
+    def __init__(self, model, *, target_resolution: int) -> None:
+        super().__init__()
+        self.model = model
+        self.target_resolution = int(target_resolution)
+
+    def forward(self, pixel_values):
+        from .model_impl.custom_models import predict_moge_3_depth
+
+        return predict_moge_3_depth(
+            self.model,
+            pixel_values,
+            target_resolution=self.target_resolution,
+            # The ONNX export graph does not preserve the training-time mask
+            # head reliably across all TensorRT/MIGraphX targets.  The point
+            # map is still finite, and the shared postprocessor sanitizes it.
+            apply_mask=False,
+        )
+
+
+class NativeFlashDepthOnnxExportWrapper(torch.nn.Module):
+    rgb_input = True
+
+    def __init__(self, model) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, pixel_values):
+        from .model_impl.custom_models import predict_flashdepth
+
+        return predict_flashdepth(self.model, pixel_values)
 
 
 class VideoDepthAnythingOnnxExportWrapper(torch.nn.Module):
@@ -294,11 +341,63 @@ def load_model_for_dtype(
     cache_dir: Path,
     local_files_only: bool,
     force_download: bool,
+    height: int = 294,
+    width: int = 518,
 ):
     import torch
 
+    from .model_registry import ModelRegistry
+
+    try:
+        spec = ModelRegistry.default().get(model_name or model_id)
+    except KeyError:
+        spec = None
+
+    if spec is not None and spec.family == "depth-pro-2":
+        from .model_impl.custom_models import load_depth_pro_2
+
+        model, _ = load_depth_pro_2(
+            model_name_or_id=spec.name,
+            cache_dir=cache_dir,
+            device=device,
+            dtype=dtype,
+            local_files_only=local_files_only,
+            force_download=force_download,
+        )
+        return NativeDepthPro2OnnxExportWrapper(model).eval()
+
+    if spec is not None and spec.family == "moge-3":
+        from .model_impl.custom_models import load_moge_3
+
+        model, _ = load_moge_3(
+            model_name_or_id=spec.name,
+            cache_dir=cache_dir,
+            device=device,
+            compat_profile=True,
+            local_files_only=local_files_only,
+            force_download=force_download,
+        )
+        if hasattr(model, "onnx_compatible_mode"):
+            model.onnx_compatible_mode = True
+        return NativeMoGeOnnxExportWrapper(
+            model,
+            target_resolution=max(int(height), int(width)),
+        ).eval()
+
+    if spec is not None and spec.family == "flashdepth":
+        from .model_impl.custom_models import load_flashdepth
+
+        model, _ = load_flashdepth(
+            model_name_or_id=spec.name,
+            cache_dir=cache_dir,
+            device=device,
+            local_files_only=local_files_only,
+            force_download=force_download,
+        )
+        return NativeFlashDepthOnnxExportWrapper(model).eval()
+
     if "zipdepth" in str(model_id).lower():
-        from .depth_provider import ZipDepthProvider, ZIPDEPTH_PATCH_SIZE
+        from .depth_provider import ZIPDEPTH_PATCH_SIZE, ZipDepthProvider
 
         provider = ZipDepthProvider(
             model_id=model_id,
@@ -329,9 +428,10 @@ def load_model_for_dtype(
         return InfiniDepthOnnxExportWrapper(model, fp32=dtype != torch.float16).eval()
 
     if _is_da3_model(model_id):
+        from stereo_runtime.model_impl.depth_anything_3.api_n import DepthAnything3
+
         from .model_artifacts import find_local_model_weight
         from .model_registry import resolve_model_dir
-        from stereo_runtime.model_impl.depth_anything_3.api_n import DepthAnything3
 
         model_dir = resolve_model_dir(model_id, cache_dir)
         model_path = find_local_model_weight(model_dir)
@@ -343,9 +443,10 @@ def load_model_for_dtype(
         return DepthOnnxExportWrapper(model).eval()
 
     if _is_video_depth_anything_model(model_id):
+        from stereo_runtime.model_impl.video_depth_anything.vda2_s import VideoDepthAnything
+
         from .model_artifacts import find_local_model_weight
         from .model_registry import resolve_model_dir
-        from stereo_runtime.model_impl.video_depth_anything.vda2_s import VideoDepthAnything
 
         model_path = find_local_model_weight(resolve_model_dir(model_id, cache_dir))
         if model_path is None:
@@ -438,6 +539,8 @@ def export_depth_model_onnx(
             cache_dir=cache_dir,
             local_files_only=local_files_only,
             force_download=force_download,
+            height=height,
+            width=width,
         )
 
     with activity_progress(f"Probing ONNX export dtype: {dtype_name}"):
@@ -460,6 +563,8 @@ def export_depth_model_onnx(
                 cache_dir=cache_dir,
                 local_files_only=local_files_only,
                 force_download=False,
+                height=height,
+                width=width,
             )
         with activity_progress(f"Probing ONNX export dtype: {dtype_name}"):
             ok, probe_reason = probe_model_dtype(model, device=device_obj, dtype=dtype_obj, height=height, width=width)
@@ -470,20 +575,19 @@ def export_depth_model_onnx(
     dummy_input = dummy_factory(1, 3, height, width, device=device_obj, dtype=dtype_obj)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     status_write(f"正在导出 ONNX：{output_path.name}。这个步骤可能需要一段时间，进度请看上方进度条。")
-    with activity_progress(f"Exporting ONNX: {output_path.name}"):
-        with torch.no_grad(), _quiet_onnx_export_warnings():
-            torch.onnx.export(
-                model,
-                dummy_input,
-                str(output_path),
-                input_names=["pixel_values"],
-                output_names=["predicted_depth"],
-                do_constant_folding=True,
-                export_params=True,
-                verbose=False,
-                training=torch.onnx.TrainingMode.EVAL,
-                dynamo=False,
-            )
+    with activity_progress(f"Exporting ONNX: {output_path.name}"), torch.no_grad(), _quiet_onnx_export_warnings():
+        torch.onnx.export(
+            model,
+            dummy_input,
+            str(output_path),
+            input_names=["pixel_values"],
+            output_names=["predicted_depth"],
+            do_constant_folding=True,
+            export_params=True,
+            verbose=False,
+            training=torch.onnx.TrainingMode.EVAL,
+            dynamo=False,
+        )
     status_write(f"ONNX 导出完成：{output_path.name}。")
 
     return OnnxExportResult(

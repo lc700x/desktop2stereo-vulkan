@@ -1,0 +1,746 @@
+{
+  "rgb": "outputs\\depth-model-eval-20261128\\person_75s.png",
+  "environment": {
+    "python": "F:\\desktop2stereo-vulkan\\src\\python3_cuda\\python.exe",
+    "torch": "2.11.0+cu128",
+    "torch_cuda": "12.8",
+    "torch_hip": null,
+    "cuda_available": true,
+    "device": "cuda",
+    "gpu": "NVIDIA GeForce RTX 2070"
+  },
+  "models": {
+    "Distill-Any-Depth-Small": {
+      "pytorch_cuda": {
+        "status": "ok",
+        "error": null,
+        "provider": {
+          "provider": "transformers.AutoModelForDepthEstimation",
+          "model_name": "Distill-Any-Depth-Small",
+          "model_id": "xingyang1/Distill-Any-Depth-Small-hf",
+          "depth_resolution": 518,
+          "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+          "load_mode": "online",
+          "depth_backend": "pytorch_cuda",
+          "runtime": "transformers-generic",
+          "onnx_path": null,
+          "execution_provider": null,
+          "fallback_reason": null,
+          "io_binding": false,
+          "dlpack": false,
+          "native_io_binding": false,
+          "native_output_backing": false,
+          "native_io_reason": null,
+          "output_device": null,
+          "trt_lib_dirs": null,
+          "raw_output_semantics": "relative_inverse_depth",
+          "dibr_output_semantics": "relative_inverse_depth",
+          "model_profile": null,
+          "zero_copy_output": false,
+          "host_readback_bytes": 0
+        },
+        "output_shape": [
+          1,
+          1,
+          518,
+          518
+        ],
+        "setup_ms": 13363.014700000349,
+        "timings": {
+          "count": 3,
+          "mean_ms": 68.34526666716556,
+          "median_ms": 49.586100001761224,
+          "p90_ms": 109.28050000075018,
+          "min_ms": 46.16919999898528,
+          "max_ms": 109.28050000075018
+        },
+        "profile": {
+          "preprocess": {
+            "count": 3,
+            "mean_ms": 1.1848000006769628,
+            "median_ms": 1.3091000000713393,
+            "p90_ms": 1.442600001610117,
+            "min_ms": 0.8027000003494322,
+            "max_ms": 1.442600001610117
+          },
+          "model": {
+            "count": 3,
+            "mean_ms": 6.373633332259487,
+            "median_ms": 6.087299996579532,
+            "p90_ms": 7.219099999929313,
+            "min_ms": 5.814500000269618,
+            "max_ms": 7.219099999929313
+          },
+          "postprocess": {
+            "count": 3,
+            "mean_ms": 0.28296666641836055,
+            "median_ms": 0.2510999984224327,
+            "p90_ms": 0.3598000002966728,
+            "min_ms": 0.23800000053597614,
+            "max_ms": 0.3598000002966728
+          }
+        },
+        "profile_raw": [
+          {
+            "preprocess_ms": 1.442600001610117,
+            "model_ms": 7.219099999929313,
+            "postprocess_ms": 0.3598000002966728,
+            "slot_wait_ms": 0.0,
+            "total_ms": 9.021500001836102,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": null,
+            "zero_copy_output": false,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 1.3091000000713393,
+            "model_ms": 5.814500000269618,
+            "postprocess_ms": 0.2510999984224327,
+            "slot_wait_ms": 0.0,
+            "total_ms": 7.37469999876339,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": null,
+            "zero_copy_output": false,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.8027000003494322,
+            "model_ms": 6.087299996579532,
+            "postprocess_ms": 0.23800000053597614,
+            "slot_wait_ms": 0.0,
+            "total_ms": 7.12799999746494,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": null,
+            "zero_copy_output": false,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          }
+        ]
+      }
+    },
+    "Distill-Any-Depth-Base": {
+      "pytorch_cuda": {
+        "status": "ok",
+        "error": null,
+        "provider": {
+          "provider": "transformers.AutoModelForDepthEstimation",
+          "model_name": "Distill-Any-Depth-Base",
+          "model_id": "lc700x/Distill-Any-Depth-Base-hf",
+          "depth_resolution": 518,
+          "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+          "load_mode": "online",
+          "depth_backend": "pytorch_cuda",
+          "runtime": "transformers",
+          "onnx_path": null,
+          "execution_provider": null,
+          "fallback_reason": null,
+          "io_binding": false,
+          "dlpack": false,
+          "native_io_binding": false,
+          "native_output_backing": false,
+          "native_io_reason": null,
+          "output_device": null,
+          "trt_lib_dirs": null,
+          "raw_output_semantics": "relative_inverse_depth",
+          "dibr_output_semantics": "relative_inverse_depth",
+          "model_profile": null,
+          "zero_copy_output": false,
+          "host_readback_bytes": 0
+        },
+        "output_shape": [
+          1,
+          1,
+          518,
+          518
+        ],
+        "setup_ms": 303.3199000019522,
+        "timings": {
+          "count": 3,
+          "mean_ms": 31.198233332058106,
+          "median_ms": 31.307400000514463,
+          "p90_ms": 31.4723999981652,
+          "min_ms": 30.81489999749465,
+          "max_ms": 31.4723999981652
+        },
+        "profile": {
+          "preprocess": {
+            "count": 3,
+            "mean_ms": 0.3103666664780273,
+            "median_ms": 0.3120000001217704,
+            "p90_ms": 0.31239999952958897,
+            "min_ms": 0.30669999978272244,
+            "max_ms": 0.31239999952958897
+          },
+          "model": {
+            "count": 3,
+            "mean_ms": 30.373566666336654,
+            "median_ms": 30.358900003193412,
+            "p90_ms": 30.720899998414097,
+            "min_ms": 30.040899997402448,
+            "max_ms": 30.720899998414097
+          },
+          "postprocess": {
+            "count": 3,
+            "mean_ms": 0.4567666680183417,
+            "median_ms": 0.411000000895001,
+            "p90_ms": 0.5658000009134412,
+            "min_ms": 0.3935000022465829,
+            "max_ms": 0.5658000009134412
+          }
+        },
+        "profile_raw": [
+          {
+            "preprocess_ms": 0.30669999978272244,
+            "model_ms": 30.720899998414097,
+            "postprocess_ms": 0.3935000022465829,
+            "slot_wait_ms": 0.0,
+            "total_ms": 31.421100000443403,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": null,
+            "zero_copy_output": false,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.31239999952958897,
+            "model_ms": 30.358900003193412,
+            "postprocess_ms": 0.5658000009134412,
+            "slot_wait_ms": 0.0,
+            "total_ms": 31.237100003636442,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": null,
+            "zero_copy_output": false,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.3120000001217704,
+            "model_ms": 30.040899997402448,
+            "postprocess_ms": 0.411000000895001,
+            "slot_wait_ms": 0.0,
+            "total_ms": 30.76389999841922,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": null,
+            "zero_copy_output": false,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          }
+        ]
+      }
+    },
+    "DepthPro2-S": {
+      "pytorch_cuda": {
+        "status": "ok",
+        "error": null,
+        "provider": {
+          "provider": "stereo_runtime.model_impl.depth-pro-2",
+          "model_name": "DepthPro2-S",
+          "model_id": "lc700x/DepthPro2",
+          "depth_resolution": 518,
+          "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+          "load_mode": "online",
+          "depth_backend": "pytorch_cuda",
+          "runtime": "depth-pro-2",
+          "onnx_path": null,
+          "execution_provider": null,
+          "fallback_reason": null,
+          "io_binding": false,
+          "dlpack": false,
+          "native_io_binding": false,
+          "native_output_backing": false,
+          "native_io_reason": null,
+          "output_device": "cuda",
+          "trt_lib_dirs": null,
+          "raw_output_semantics": "relative_inverse_depth",
+          "dibr_output_semantics": "relative_inverse_depth",
+          "model_profile": "onnx-inverse-depth",
+          "zero_copy_output": true,
+          "host_readback_bytes": 0
+        },
+        "output_shape": [
+          1,
+          1,
+          518,
+          518
+        ],
+        "setup_ms": 670.7526999998663,
+        "timings": {
+          "count": 3,
+          "mean_ms": 116.67359999895173,
+          "median_ms": 90.54610000021057,
+          "p90_ms": 184.03609999950277,
+          "min_ms": 75.43859999714186,
+          "max_ms": 184.03609999950277
+        },
+        "profile": {
+          "preprocess": {
+            "count": 3,
+            "mean_ms": 1.7992333341680933,
+            "median_ms": 1.499300000432413,
+            "p90_ms": 2.9654999998456333,
+            "min_ms": 0.9329000022262335,
+            "max_ms": 2.9654999998456333
+          },
+          "model": {
+            "count": 3,
+            "mean_ms": 113.99933333329197,
+            "median_ms": 87.94850000049337,
+            "p90_ms": 180.18410000149743,
+            "min_ms": 73.8653999978851,
+            "max_ms": 180.18410000149743
+          },
+          "postprocess": {
+            "count": 3,
+            "mean_ms": 0.8261333326421058,
+            "median_ms": 0.8091999989119358,
+            "p90_ms": 1.0612000005494338,
+            "min_ms": 0.6079999984649476,
+            "max_ms": 1.0612000005494338
+          }
+        },
+        "profile_raw": [
+          {
+            "preprocess_ms": 2.9654999998456333,
+            "model_ms": 180.18410000149743,
+            "postprocess_ms": 0.8091999989119358,
+            "slot_wait_ms": 0.0,
+            "total_ms": 183.958800000255,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "onnx-inverse-depth",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 1.499300000432413,
+            "model_ms": 87.94850000049337,
+            "postprocess_ms": 1.0612000005494338,
+            "slot_wait_ms": 0.0,
+            "total_ms": 90.50900000147521,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "onnx-inverse-depth",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.9329000022262335,
+            "model_ms": 73.8653999978851,
+            "postprocess_ms": 0.6079999984649476,
+            "slot_wait_ms": 0.0,
+            "total_ms": 75.40629999857629,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "onnx-inverse-depth",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          }
+        ]
+      }
+    },
+    "MoGe3-L": {
+      "pytorch_cuda": {
+        "status": "ok",
+        "error": null,
+        "provider": {
+          "provider": "stereo_runtime.model_impl.moge-3",
+          "model_name": "MoGe3-L",
+          "model_id": "Ruicheng/moge-3-vitl",
+          "depth_resolution": 518,
+          "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+          "load_mode": "online",
+          "depth_backend": "pytorch_cuda",
+          "runtime": "moge-3",
+          "onnx_path": null,
+          "execution_provider": null,
+          "fallback_reason": null,
+          "io_binding": false,
+          "dlpack": false,
+          "native_io_binding": false,
+          "native_output_backing": false,
+          "native_io_reason": null,
+          "output_device": "cuda",
+          "trt_lib_dirs": null,
+          "raw_output_semantics": "metric_z_depth",
+          "dibr_output_semantics": "relative_inverse_depth",
+          "model_profile": "spatial-refine-off",
+          "zero_copy_output": true,
+          "host_readback_bytes": 0
+        },
+        "output_shape": [
+          1,
+          1,
+          518,
+          518
+        ],
+        "setup_ms": 3219.189900002675,
+        "timings": {
+          "count": 3,
+          "mean_ms": 294.63273333385587,
+          "median_ms": 294.5652999987942,
+          "p90_ms": 295.9130000017467,
+          "min_ms": 293.4199000010267,
+          "max_ms": 295.9130000017467
+        },
+        "profile": {
+          "preprocess": {
+            "count": 3,
+            "mean_ms": 0.09423333419060025,
+            "median_ms": 0.09090000094147399,
+            "p90_ms": 0.10250000195810571,
+            "min_ms": 0.08929999967222102,
+            "max_ms": 0.10250000195810571
+          },
+          "model": {
+            "count": 3,
+            "mean_ms": 294.03306666669476,
+            "median_ms": 294.0120000021125,
+            "p90_ms": 295.229899998958,
+            "min_ms": 292.8572999990138,
+            "max_ms": 295.229899998958
+          },
+          "postprocess": {
+            "count": 3,
+            "mean_ms": 0.46026666556523804,
+            "median_ms": 0.420000000303844,
+            "p90_ms": 0.5550999994738959,
+            "min_ms": 0.4056999969179742,
+            "max_ms": 0.5550999994738959
+          }
+        },
+        "profile_raw": [
+          {
+            "preprocess_ms": 0.08929999967222102,
+            "model_ms": 292.8572999990138,
+            "postprocess_ms": 0.420000000303844,
+            "slot_wait_ms": 0.0,
+            "total_ms": 293.36659999898984,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-refine-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "metric_z_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.10250000195810571,
+            "model_ms": 294.0120000021125,
+            "postprocess_ms": 0.4056999969179742,
+            "slot_wait_ms": 0.0,
+            "total_ms": 294.52020000098855,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-refine-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "metric_z_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.09090000094147399,
+            "model_ms": 295.229899998958,
+            "postprocess_ms": 0.5550999994738959,
+            "slot_wait_ms": 0.0,
+            "total_ms": 295.87589999937336,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-refine-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "metric_z_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          }
+        ]
+      }
+    },
+    "FlashDepth-S": {
+      "pytorch_cuda": {
+        "status": "ok",
+        "error": null,
+        "provider": {
+          "provider": "stereo_runtime.model_impl.flashdepth",
+          "model_name": "FlashDepth-S",
+          "model_id": "Eyeline-Labs/FlashDepth",
+          "depth_resolution": 518,
+          "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+          "load_mode": "online",
+          "depth_backend": "pytorch_cuda",
+          "runtime": "flashdepth",
+          "onnx_path": null,
+          "execution_provider": null,
+          "fallback_reason": null,
+          "io_binding": false,
+          "dlpack": false,
+          "native_io_binding": false,
+          "native_output_backing": false,
+          "native_io_reason": null,
+          "output_device": "cuda",
+          "trt_lib_dirs": null,
+          "raw_output_semantics": "relative_inverse_depth",
+          "dibr_output_semantics": "relative_inverse_depth",
+          "model_profile": "spatial-temporal-off",
+          "zero_copy_output": true,
+          "host_readback_bytes": 0
+        },
+        "output_shape": [
+          1,
+          1,
+          518,
+          518
+        ],
+        "setup_ms": 385.69169999755104,
+        "timings": {
+          "count": 3,
+          "mean_ms": 23.78163333438958,
+          "median_ms": 23.804500000551343,
+          "p90_ms": 23.89240000047721,
+          "min_ms": 23.64800000214018,
+          "max_ms": 23.89240000047721
+        },
+        "profile": {
+          "preprocess": {
+            "count": 3,
+            "mean_ms": 0.16429999959655106,
+            "median_ms": 0.16139999934239313,
+            "p90_ms": 0.17070000103558414,
+            "min_ms": 0.16079999841167592,
+            "max_ms": 0.17070000103558414
+          },
+          "model": {
+            "count": 3,
+            "mean_ms": 23.21283333367319,
+            "median_ms": 23.237699999299366,
+            "p90_ms": 23.30219999930705,
+            "min_ms": 23.09860000241315,
+            "max_ms": 23.30219999930705
+          },
+          "postprocess": {
+            "count": 3,
+            "mean_ms": 0.3725333335751202,
+            "median_ms": 0.37290000182110816,
+            "p90_ms": 0.3856999974232167,
+            "min_ms": 0.3590000014810357,
+            "max_ms": 0.3856999974232167
+          }
+        },
+        "profile_raw": [
+          {
+            "preprocess_ms": 0.17070000103558414,
+            "model_ms": 23.30219999930705,
+            "postprocess_ms": 0.3856999974232167,
+            "slot_wait_ms": 0.0,
+            "total_ms": 23.85859999776585,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-temporal-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.16139999934239313,
+            "model_ms": 23.237699999299366,
+            "postprocess_ms": 0.37290000182110816,
+            "slot_wait_ms": 0.0,
+            "total_ms": 23.772000000462867,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-temporal-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.16079999841167592,
+            "model_ms": 23.09860000241315,
+            "postprocess_ms": 0.3590000014810357,
+            "slot_wait_ms": 0.0,
+            "total_ms": 23.61840000230586,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-temporal-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          }
+        ]
+      }
+    },
+    "FlashDepth-Full": {
+      "pytorch_cuda": {
+        "status": "ok",
+        "error": null,
+        "provider": {
+          "provider": "stereo_runtime.model_impl.flashdepth",
+          "model_name": "FlashDepth-Full",
+          "model_id": "Eyeline-Labs/FlashDepth",
+          "depth_resolution": 448,
+          "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+          "load_mode": "online",
+          "depth_backend": "pytorch_cuda",
+          "runtime": "flashdepth",
+          "onnx_path": null,
+          "execution_provider": null,
+          "fallback_reason": null,
+          "io_binding": false,
+          "dlpack": false,
+          "native_io_binding": false,
+          "native_output_backing": false,
+          "native_io_reason": null,
+          "output_device": "cuda",
+          "trt_lib_dirs": null,
+          "raw_output_semantics": "relative_inverse_depth",
+          "dibr_output_semantics": "relative_inverse_depth",
+          "model_profile": "spatial-temporal-off@448",
+          "zero_copy_output": true,
+          "host_readback_bytes": 0
+        },
+        "output_shape": [
+          1,
+          1,
+          518,
+          518
+        ],
+        "setup_ms": 2967.698200001905,
+        "timings": {
+          "count": 3,
+          "mean_ms": 196.66876666694102,
+          "median_ms": 146.8669999994745,
+          "p90_ms": 316.8937000009464,
+          "min_ms": 126.24560000040219,
+          "max_ms": 316.8937000009464
+        },
+        "profile": {
+          "preprocess": {
+            "count": 3,
+            "mean_ms": 0.5648999989110356,
+            "median_ms": 0.3318999988550786,
+            "p90_ms": 1.09619999784627,
+            "min_ms": 0.2666000000317581,
+            "max_ms": 1.09619999784627
+          },
+          "model": {
+            "count": 3,
+            "mean_ms": 195.40050000068732,
+            "median_ms": 145.83050000146613,
+            "p90_ms": 315.0370000003022,
+            "min_ms": 125.3340000002936,
+            "max_ms": 315.0370000003022
+          },
+          "postprocess": {
+            "count": 3,
+            "mean_ms": 0.6614999995993761,
+            "median_ms": 0.6713000002491754,
+            "p90_ms": 0.7016000017756596,
+            "min_ms": 0.6115999967732932,
+            "max_ms": 0.7016000017756596
+          }
+        },
+        "profile_raw": [
+          {
+            "preprocess_ms": 1.09619999784627,
+            "model_ms": 315.0370000003022,
+            "postprocess_ms": 0.7016000017756596,
+            "slot_wait_ms": 0.0,
+            "total_ms": 316.83479999992414,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-temporal-off@448",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.3318999988550786,
+            "model_ms": 145.83050000146613,
+            "postprocess_ms": 0.6713000002491754,
+            "slot_wait_ms": 0.0,
+            "total_ms": 146.8337000005704,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-temporal-off@448",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.2666000000317581,
+            "model_ms": 125.3340000002936,
+            "postprocess_ms": 0.6115999967732932,
+            "slot_wait_ms": 0.0,
+            "total_ms": 126.21219999709865,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-temporal-off@448",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          }
+        ]
+      }
+    }
+  }
+}

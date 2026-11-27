@@ -22,6 +22,7 @@ python_xlib; sys_platform == "linux"
 imageio==2.37.3
 easydict==1.13
 einops==0.8.2
+timm==1.0.24
 
 # for rtmp and new streaming
 sounddevice==0.5.5

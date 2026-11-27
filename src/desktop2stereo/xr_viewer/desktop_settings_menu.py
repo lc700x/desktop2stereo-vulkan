@@ -262,17 +262,75 @@ def _flet_icon_for_control(ft: Any, control: Any) -> Any | None:
     return getattr(ft.Icons, icon_name) if icon_name else None
 
 
+def _action_button_colors(
+    active: bool, destructive: bool, enabled: bool
+) -> tuple[str, str, str, str]:
+    background = (
+        _menu_color("destructive") if destructive
+        else _menu_color("selection_container") if active
+        else _menu_color("primary_container")
+    )
+    text_color = (
+        _menu_color("text_disabled") if not enabled
+        else _menu_color("destructive_text") if destructive
+        else _menu_color("selection_text")
+    )
+    hover_color = (
+        _menu_color("destructive_hover") if destructive
+        else _menu_color("primary_hover")
+    )
+    pressed_color = (
+        _menu_color("destructive_pressed") if destructive
+        else _menu_color("primary")
+    )
+    return background, text_color, hover_color, pressed_color
+
+
+def _navigation_button_style(ft: Any, active: bool) -> Any:
+    state = ft.ControlState
+    return ft.ButtonStyle(
+        bgcolor={
+            state.DEFAULT: (
+                _menu_color("selection_container")
+                if active else _menu_color("primary_container")
+            ),
+            state.HOVERED: _menu_color("selection_hover_container"),
+            state.FOCUSED: _menu_color("selection_hover_container"),
+            state.PRESSED: _menu_color("primary"),
+            state.DISABLED: _menu_color("surface_container"),
+        },
+        color={
+            state.DEFAULT: _menu_color("selection_text"),
+            state.HOVERED: _menu_color("selection_text"),
+            state.FOCUSED: _menu_color("selection_text"),
+            state.PRESSED: _menu_color("primary_state_text"),
+            state.DISABLED: _menu_color("text_disabled"),
+        },
+        icon_color=_menu_color("primary_state_text"),
+        padding=ft.Padding.symmetric(
+            horizontal=_FLET_BUTTON_PADDING_X,
+            vertical=_FLET_BUTTON_PADDING_Y,
+        ),
+        elevation=0,
+        text_style=ft.TextStyle(size=14, weight=ft.FontWeight.W_600),
+        shape=ft.RoundedRectangleBorder(
+            radius=OPENXR_MENU_RADII["control"],
+        ),
+        alignment=ft.Alignment.CENTER_LEFT,
+    )
+
+
 def _make_step_button_style(ft: Any) -> Any:
     state = ft.ControlState
     return ft.ButtonStyle(
         bgcolor={
-            state.DEFAULT: _menu_color("surface_container_high"),
+            state.DEFAULT: _menu_color("primary_container"),
             state.HOVERED: _menu_color("primary_hover"),
             state.PRESSED: _menu_color("primary"),
             state.DISABLED: _menu_color("surface_container"),
         },
         color={
-            state.DEFAULT: _menu_color("text_primary"),
+            state.DEFAULT: _menu_color("selection_text"),
             state.HOVERED: _menu_color("primary_state_text"),
             state.PRESSED: _menu_color("primary_state_text"),
             state.DISABLED: _menu_color("text_disabled"),
@@ -1074,21 +1132,8 @@ def _run_flet_desktop_settings_app(
                 destructive = key == "runtime:stop"
                 enabled = bool(control.enabled)
                 state = ft.ControlState
-                background = (
-                    _menu_color("destructive") if destructive and enabled
-                    else _menu_color("surface_container_high") if destructive or not active
-                    else _menu_color("selection_container")
-                )
-                text_color = (
-                    _menu_color("text_disabled") if not enabled
-                    else _menu_color("destructive_text") if destructive
-                    else _menu_color("selection_text") if active
-                    else _menu_color("text_primary")
-                )
-                hover_color = (
-                    _menu_color("destructive_hover") if destructive
-                    else _menu_color("selection_hover_container") if active
-                    else _menu_color("primary_container")
+                background, text_color, hover_color, pressed_color = (
+                    _action_button_colors(active, destructive, enabled)
                 )
                 button_height = _button_height_for_key(key)
                 button_width = (
@@ -1112,7 +1157,7 @@ def _run_flet_desktop_settings_app(
                     ),
                     state.DISABLED: _menu_color("text_disabled"),
                 }
-                return ft.ElevatedButton(
+                return ft.FilledButton(
                     content=ft.Text(
                         translate(str(control.label)),
                         size=14,
@@ -1130,10 +1175,7 @@ def _run_flet_desktop_settings_app(
                             state.DEFAULT: background,
                             state.HOVERED: hover_color,
                             state.FOCUSED: hover_color,
-                            state.PRESSED: (
-                                _menu_color("destructive_hover")
-                                if destructive else _menu_color("primary")
-                            ),
+                            state.PRESSED: pressed_color,
                             state.DISABLED: _menu_color("surface_container_high"),
                         },
                         color=state_text_colors,
@@ -1155,7 +1197,7 @@ def _run_flet_desktop_settings_app(
                 )
 
             def make_step_button(control: Any) -> Any:
-                return ft.ElevatedButton(
+                return ft.FilledButton(
                     content=_make_step_button_label(ft, str(control.key)),
                     on_click=queue_button(str(control.key)),
                     disabled=not bool(control.enabled),
@@ -1167,7 +1209,6 @@ def _run_flet_desktop_settings_app(
             def nav_button(control: Any) -> Any:
                 key = str(control.key)
                 active = key == f"tab:{tab}"
-                state = ft.ControlState
                 nav_icons = {
                     "tab:screen": ft.Icons.CROP_LANDSCAPE,
                     "tab:depth": ft.Icons.LAYERS,
@@ -1175,16 +1216,13 @@ def _run_flet_desktop_settings_app(
                     "tab:room": ft.Icons.HOME_WORK,
                     "tab:picture": ft.Icons.IMAGE,
                 }
-                return ft.ElevatedButton(
+                return ft.FilledButton(
                     content=ft.Row(
                         controls=[
                             ft.Icon(
                                 nav_icons.get(key, ft.Icons.SETTINGS),
                                 size=16,
-                                color=(
-                                    _menu_color("selection_text")
-                                    if active else _menu_color("text_secondary")
-                                ),
+                                color=_menu_color("primary_state_text"),
                             ),
                             ft.Text(
                                 translate(str(control.label)),
@@ -1202,38 +1240,7 @@ def _run_flet_desktop_settings_app(
                     on_click=queue_button(key),
                     width=_FLET_SIDEBAR_CONTROL_WIDTH,
                     height=_FLET_BUTTON_HEIGHT,
-                    style=ft.ButtonStyle(
-                        bgcolor={
-                            state.DEFAULT: (
-                                _menu_color("selection_container")
-                                if active else _menu_color("surface_container_high")
-                            ),
-                            state.HOVERED: _menu_color("selection_hover_container"),
-                            state.FOCUSED: _menu_color("selection_hover_container"),
-                            state.PRESSED: _menu_color("primary"),
-                            state.DISABLED: _menu_color("surface_container"),
-                        },
-                        color={
-                            state.DEFAULT: (
-                                _menu_color("selection_text")
-                                if active else _menu_color("text_primary")
-                            ),
-                            state.HOVERED: _menu_color("selection_text"),
-                            state.FOCUSED: _menu_color("selection_text"),
-                            state.PRESSED: _menu_color("primary_state_text"),
-                            state.DISABLED: _menu_color("text_disabled"),
-                        },
-                        padding=ft.Padding.symmetric(
-                            horizontal=_FLET_BUTTON_PADDING_X,
-                            vertical=_FLET_BUTTON_PADDING_Y,
-                        ),
-                        elevation=0,
-                        text_style=ft.TextStyle(size=14, weight=ft.FontWeight.W_600),
-                        shape=ft.RoundedRectangleBorder(
-                            radius=OPENXR_MENU_RADII["control"],
-                        ),
-                        alignment=ft.Alignment.CENTER_LEFT,
-                    ),
+                    style=_navigation_button_style(ft, active),
                 )
 
             def step_controls_for(slider_key: str) -> tuple[Any | None, Any | None]:

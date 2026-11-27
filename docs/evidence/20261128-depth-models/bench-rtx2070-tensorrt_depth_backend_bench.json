@@ -1,0 +1,170 @@
+{
+  "rgb": "outputs\\depth-model-eval-20261128\\person_75s.png",
+  "environment": {
+    "python": "F:\\desktop2stereo-vulkan\\src\\python3_cuda\\python.exe",
+    "torch": "2.11.0+cu128",
+    "torch_cuda": "12.8",
+    "torch_hip": null,
+    "cuda_available": true,
+    "device": "cuda",
+    "gpu": "NVIDIA GeForce RTX 2070"
+  },
+  "models": {
+    "FlashDepth-S": {
+      "tensorrt_native": {
+        "status": "ok",
+        "error": null,
+        "provider": {
+          "provider": "tensorrt.Runtime",
+          "model_name": "FlashDepth-S",
+          "model_id": "Eyeline-Labs/FlashDepth",
+          "depth_resolution": 518,
+          "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+          "load_mode": "local_onnx_native_tensorrt",
+          "depth_backend": "tensorrt_native",
+          "runtime": "tensorrt-native-async",
+          "onnx_path": "F:\\desktop2stereo-vulkan\\models\\models--Eyeline-Labs--FlashDepth\\flashdepth_s_model_fp16_294x518.onnx",
+          "execution_provider": "TensorRT native",
+          "fallback_reason": null,
+          "io_binding": false,
+          "dlpack": false,
+          "native_io_binding": false,
+          "native_output_backing": false,
+          "native_io_reason": null,
+          "output_device": "cuda",
+          "trt_lib_dirs": [
+            "F:\\desktop2stereo-vulkan\\src\\python3_cuda\\Lib\\site-packages\\tensorrt_libs"
+          ],
+          "raw_output_semantics": "relative_inverse_depth",
+          "dibr_output_semantics": "relative_inverse_depth",
+          "model_profile": "spatial-temporal-off",
+          "zero_copy_output": true,
+          "host_readback_bytes": 0
+        },
+        "output_shape": [
+          1,
+          1,
+          518,
+          518
+        ],
+        "setup_ms": 212.3113999987254,
+        "timings": {
+          "count": 5,
+          "mean_ms": 5.473059999349061,
+          "median_ms": 5.416199997853255,
+          "p90_ms": 5.689800000254763,
+          "min_ms": 5.329400002665352,
+          "max_ms": 5.689800000254763
+        },
+        "profile": {
+          "preprocess": {
+            "count": 5,
+            "mean_ms": 0.10137999925063923,
+            "median_ms": 0.09479999789618887,
+            "p90_ms": 0.15659999917261302,
+            "min_ms": 0.07579999873996712,
+            "max_ms": 0.15659999917261302
+          },
+          "model": {
+            "count": 5,
+            "mean_ms": 1.0122199993929826,
+            "median_ms": 0.9453000020585023,
+            "p90_ms": 1.4638999964518007,
+            "min_ms": 0.8153999988280702,
+            "max_ms": 1.4638999964518007
+          },
+          "postprocess": {
+            "count": 5,
+            "mean_ms": 0.3994999991846271,
+            "median_ms": 0.37479999809875153,
+            "p90_ms": 0.48639999658917077,
+            "min_ms": 0.34450000021024607,
+            "max_ms": 0.48639999658917077
+          }
+        },
+        "profile_raw": [
+          {
+            "preprocess_ms": 0.15659999917261302,
+            "model_ms": 1.4638999964518007,
+            "postprocess_ms": 0.48639999658917077,
+            "slot_wait_ms": 0.021800002286909148,
+            "total_ms": 2.1068999922135845,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-temporal-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.09489999865763821,
+            "model_ms": 0.9572999988449737,
+            "postprocess_ms": 0.44020000132150017,
+            "slot_wait_ms": 0.007200000254670158,
+            "total_ms": 1.4923999988241121,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-temporal-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.09479999789618887,
+            "model_ms": 0.9453000020585023,
+            "postprocess_ms": 0.37479999809875153,
+            "slot_wait_ms": 0.006599999323952943,
+            "total_ms": 1.4148999980534427,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-temporal-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.08480000178678893,
+            "model_ms": 0.8153999988280702,
+            "postprocess_ms": 0.3515999997034669,
+            "slot_wait_ms": 0.006200003554113209,
+            "total_ms": 1.251800000318326,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-temporal-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.07579999873996712,
+            "model_ms": 0.8792000007815659,
+            "postprocess_ms": 0.34450000021024607,
+            "slot_wait_ms": 0.00540000110049732,
+            "total_ms": 1.299499999731779,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-temporal-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          }
+        ]
+      }
+    }
+  }
+}

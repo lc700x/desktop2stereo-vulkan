@@ -10,7 +10,7 @@ from .model_catalog import GUI_MODEL_CATALOG
 from .paths import BASE_DIR
 
 
-_MODEL_SIZES = ["Small", "SmallPlus", "Base", "Large", "Giant"]
+_MODEL_SIZES = ["S", "Small", "SmallPlus", "B", "Base", "L", "Large", "H", "Giant", "G", "Full"]
 _SIZE_ORDER = {s: i for i, s in enumerate(_MODEL_SIZES)}
 _ENV_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".hdr")
 _ENV_IMAGE_NAMES = ("background", "panorama", "equirectangular", "360", "sky", "skybox")
@@ -157,6 +157,7 @@ DEFAULTS = {
     "Vulkan Projection Max LOD": 0.35,
     "Vulkan Projection MIP LOD Bias": -0.35,
     "Vulkan Projection RCAS Sharpness": 0.5,
+    "Vulkan Projection Screen Oversample": 1.5,
     "Display Mode": "Half-SBS",
     "FP16": True,
     "torch.compile": False,

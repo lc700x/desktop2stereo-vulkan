@@ -1588,6 +1588,35 @@ class VulkanProjectionScreenPass:
                 flush=True,
             )
 
+    @staticmethod
+    def _target_identity(target: Any) -> int:
+        return id(getattr(target, "image", target))
+
+    @staticmethod
+    def _normalize_target_rect(
+        target: Any, target_rect: tuple[int, int, int, int] | None = None
+    ) -> tuple[int, int, int, int]:
+        width = int(getattr(target, "width", 0))
+        height = int(getattr(target, "height", 0))
+        if width <= 0 or height <= 0:
+            raise ValueError("projection target size is invalid")
+        if target_rect is None:
+            return (0, 0, width, height)
+        try:
+            x, y, rect_width, rect_height = (int(value) for value in target_rect)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("projection target rect is invalid") from exc
+        if (
+            x < 0
+            or y < 0
+            or rect_width <= 0
+            or rect_height <= 0
+            or x + rect_width > width
+            or y + rect_height > height
+        ):
+            raise ValueError("projection target rect is outside target bounds")
+        return (x, y, rect_width, rect_height)
+
     def _target_view_and_framebuffer(
         self, target: Any, array_layer: int, *, overlay: bool = False
     ) -> tuple[Any, Any]:
@@ -1689,6 +1718,7 @@ class VulkanProjectionScreenPass:
                 push_constants=item["push_constants"],
                 clear_color=item["clear_color"],
                 source_crop_uv=item.get("source_crop_uv"),
+                target_rect=item.get("target_rect"),
                 overlay=bool(load_target),
             )
             if load_target:
@@ -1696,6 +1726,14 @@ class VulkanProjectionScreenPass:
             if item.get("screen_underlay", False):
                 draw["pipeline"] = self.underlay_pipeline
             prepared.append(draw)
+        seen_targets: set[int] = set()
+        for draw in prepared:
+            target_key = self._target_identity(draw["target"])
+            if target_key in seen_targets:
+                draw["target_old_layout"] = (
+                    self.vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                )
+            seen_targets.add(target_key)
         wait_semaphores = [item["wait_semaphore"] for item in draws]
         wait_semaphores = [item for item in wait_semaphores if item is not None]
         wait_semaphores.extend(
@@ -1753,6 +1791,7 @@ class VulkanProjectionScreenPass:
                 frame_slot=int(item["frame_slot"]),
                 push_constants=bytes(push_constants),
                 clear_color=item["clear_color"],
+                target_rect=item.get("target_rect"),
                 descriptor_set=self.glow_descriptor_sets[descriptor_index],
                 descriptor_timelines=self.glow_descriptor_timelines,
                 overlay=not clear_target,
@@ -1796,6 +1835,7 @@ class VulkanProjectionScreenPass:
         frame_slot: int,
         push_constants: bytes,
         clear_color: tuple[float, float, float, float],
+        target_rect: tuple[int, int, int, int] | None = None,
         clear_target: bool = False,
     ) -> dict[str, Any]:
         if self.laser_pipeline is None or len(push_constants) != 64:
@@ -1814,6 +1854,7 @@ class VulkanProjectionScreenPass:
         return {
             "target": target,
             "array_layer": int(array_layer),
+            "target_rect": self._normalize_target_rect(target, target_rect),
             "framebuffer": framebuffer,
             "descriptor_set": self.laser_descriptor_sets[descriptor_index],
             "payload": self.vk.ffi.new("char[]", push_constants),
@@ -1854,6 +1895,7 @@ class VulkanProjectionScreenPass:
                 frame_slot=int(item["frame_slot"]),
                 push_constants=bytes(item["laser_push_constants"]),
                 clear_color=item["clear_color"],
+                target_rect=item.get("target_rect"),
             )
             self.laser_param_buffers[laser_draw["descriptor_index"]].write_bytes(params)
             prepared.append(laser_draw)
@@ -1905,6 +1947,7 @@ class VulkanProjectionScreenPass:
                 frame_slot=int(item["frame_slot"]),
                 push_constants=bytes(item["controller_proxy_push_constants"]),
                 clear_color=item["clear_color"],
+                target_rect=item.get("target_rect"),
                 clear_target=bool(clear_target),
             )
             proxy_draw["pipeline"] = self.controller_proxy_pipeline
@@ -2135,6 +2178,7 @@ class VulkanProjectionScreenPass:
                     push_constants=item["push_constants"],
                     clear_color=item["clear_color"],
                     source_crop_uv=item.get("source_crop_uv"),
+                    target_rect=item.get("target_rect"),
                     source_ready_in_submission=True,
                     overlay=bool(load_target),
             )
@@ -2379,6 +2423,7 @@ class VulkanProjectionScreenPass:
                 eye_index=eye_index, frame_slot=int(item["frame_slot"]),
                 push_constants=item["push_constants"], clear_color=item["clear_color"],
                 source_crop_uv=item.get("source_crop_uv"),
+                target_rect=item.get("target_rect"),
                 source_ready_in_submission=True,
                 overlay=bool(load_target),
             )
@@ -2387,6 +2432,14 @@ class VulkanProjectionScreenPass:
                     self.vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
                 )
             screen_draws.append(screen_draw)
+        seen_targets: set[int] = set()
+        for screen_draw in screen_draws:
+            target_key = self._target_identity(screen_draw["target"])
+            if target_key in seen_targets:
+                screen_draw["target_old_layout"] = (
+                    self.vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                )
+            seen_targets.add(target_key)
         wait_semaphores = [item["wait_semaphore"] for item in draws if item["wait_semaphore"] is not None]
         wait_semaphores.extend(
             item for item in extra_wait_semaphores if item is not None
@@ -2501,6 +2554,9 @@ class VulkanProjectionScreenPass:
                 "source_array_layer": int(eye_index),
                 "target": target,
                 "target_array_layer": target_layer,
+                "target_rect": self._normalize_target_rect(
+                    target, item.get("target_rect")
+                ),
                 "framebuffer": framebuffer,
                 "descriptor_set": descriptor_set,
                 "descriptor_index": descriptor_index,
@@ -2515,6 +2571,14 @@ class VulkanProjectionScreenPass:
                     "char[]", struct.pack("<4f", float(exposure_ev), 0.0, 0.0, 0.0)
                 ),
             })
+        seen_targets: set[int] = set()
+        for draw in prepared:
+            target_key = self._target_identity(draw["target"])
+            if target_key in seen_targets:
+                draw["target_old_layout"] = (
+                    self.vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                )
+            seen_targets.add(target_key)
         timeline = self.context.submit_on(
             "graphics",
             lambda command_buffer: [
@@ -2579,6 +2643,9 @@ class VulkanProjectionScreenPass:
             prepared.append({
                 "source": source, "target": target,
                 "array_layer": int(item["array_layer"]),
+                "target_rect": self._normalize_target_rect(
+                    target, item.get("target_rect")
+                ),
                 "framebuffer": framebuffer, "descriptor_set": descriptor,
                 "descriptor_index": descriptor_index,
                 "pipeline": self.panorama_pipeline,
@@ -2589,6 +2656,14 @@ class VulkanProjectionScreenPass:
                 "target_old_layout": self.context.image_state(target.image).layout,
                 "source_ready_in_submission": True,
             })
+        seen_targets: set[int] = set()
+        for draw in prepared:
+            target_key = self._target_identity(draw["target"])
+            if target_key in seen_targets:
+                draw["target_old_layout"] = (
+                    self.vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                )
+            seen_targets.add(target_key)
         timeline = self.context.submit_on(
             "graphics",
             lambda command_buffer: [self._record_draw(command_buffer, draw) for draw in prepared],
@@ -2639,6 +2714,7 @@ class VulkanProjectionScreenPass:
         *,
         source_ready_in_submission: bool = False,
         descriptor_sets: list[Any] | None = None,
+        target_rect: tuple[int, int, int, int] | None = None,
     ) -> dict[str, Any]:
         if self.copy_pipeline is None or self.copy_pipeline_layout is None:
             raise RuntimeError("Vulkan projection mip copy pass is unavailable")
@@ -2679,6 +2755,7 @@ class VulkanProjectionScreenPass:
         return {
             "source": source,
             "target": target,
+            "target_rect": self._normalize_target_rect(target, target_rect),
             "framebuffer": framebuffer,
             "descriptor_set": descriptor_set,
             "descriptor_index": descriptor_index,
@@ -2778,23 +2855,45 @@ class VulkanProjectionScreenPass:
         width: int,
         height: int,
         clear_color: tuple[float, float, float, float],
+        target_rect: tuple[int, int, int, int] | None = None,
     ) -> dict[str, Any]:
         normalized_color = tuple(float(value) for value in clear_color)
+        if target_rect is None:
+            target_rect = (0, 0, int(width), int(height))
+        else:
+            try:
+                x, y, rect_width, rect_height = (int(value) for value in target_rect)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("projection target rect is invalid") from exc
+            if (
+                x < 0
+                or y < 0
+                or rect_width <= 0
+                or rect_height <= 0
+                or x + rect_width > int(width)
+                or y + rect_height > int(height)
+            ):
+                raise ValueError("projection target rect is outside target bounds")
+            target_rect = (x, y, rect_width, rect_height)
         key = (
             int(self.vk.ffi.cast("uintptr_t", render_pass)),
             int(self.vk.ffi.cast("uintptr_t", framebuffer)),
             int(width),
             int(height),
             normalized_color,
+            target_rect,
         )
         cached = self._render_pass_recording_templates.get(key)
         if cached is not None:
             self._render_pass_template_hits += 1
             return cached
         self._render_pass_template_misses += 1
+        render_x, render_y, render_width, render_height = target_rect
         render_area = self.vk.VkRect2D(
-            offset=self.vk.VkOffset2D(x=0, y=0),
-            extent=self.vk.VkExtent2D(width=int(width), height=int(height)),
+            offset=self.vk.VkOffset2D(x=render_x, y=render_y),
+            extent=self.vk.VkExtent2D(
+                width=int(render_width), height=int(render_height)
+            ),
         )
         template = {
             "begin_info": self.vk.VkRenderPassBeginInfo(
@@ -2808,10 +2907,10 @@ class VulkanProjectionScreenPass:
                 )],
             ),
             "viewport": [self.vk.VkViewport(
-                x=0.0,
-                y=0.0,
-                width=float(width),
-                height=float(height),
+                x=float(render_x),
+                y=float(render_y),
+                width=float(render_width),
+                height=float(render_height),
                 minDepth=0.0,
                 maxDepth=1.0,
             )],
@@ -2864,6 +2963,7 @@ class VulkanProjectionScreenPass:
             int(target.width),
             int(target.height),
             (0.0, 0.0, 0.0, 1.0),
+            draw.get("target_rect"),
         )
         self.vk.vkCmdBeginRenderPass(
             command_buffer,
@@ -3078,6 +3178,7 @@ class VulkanProjectionScreenPass:
         push_constants: bytes,
         clear_color: tuple[float, float, float, float],
         source_crop_uv: tuple[float, float, float, float] | None = None,
+        target_rect: tuple[int, int, int, int] | None = None,
         source_ready_in_submission: bool = False,
         descriptor_set: Any | None = None,
         descriptor_timelines: list[int] | None = None,
@@ -3151,6 +3252,7 @@ class VulkanProjectionScreenPass:
         return {
             "target": target,
             "array_layer": int(array_layer),
+            "target_rect": self._normalize_target_rect(target, target_rect),
             "framebuffer": framebuffer,
             "descriptor_set": descriptor_set,
             "payload": self.vk.ffi.new("char[]", push_constants),
@@ -3212,6 +3314,7 @@ class VulkanProjectionScreenPass:
             int(target.width),
             int(target.height),
             tuple(float(value) for value in draw["clear_color"]),
+            draw.get("target_rect"),
         )
         self.vk.vkCmdBeginRenderPass(
             command_buffer,
