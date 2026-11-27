@@ -1,0 +1,241 @@
+{
+  "source": "outputs\\depth-model-report\\person_75s.png",
+  "source_size": [
+    960,
+    540
+  ],
+  "models": {
+    "DepthPro2-S": {
+      "provider": {
+        "provider": "stereo_runtime.model_impl.depth-pro-2",
+        "model_name": "DepthPro2-S",
+        "model_id": "lc700x/DepthPro2",
+        "depth_resolution": 518,
+        "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+        "load_mode": "local_files_only",
+        "depth_backend": "pytorch_rocm",
+        "runtime": "depth-pro-2",
+        "onnx_path": null,
+        "execution_provider": null,
+        "fallback_reason": null,
+        "io_binding": false,
+        "dlpack": false,
+        "native_io_binding": false,
+        "native_output_backing": false,
+        "native_io_reason": null,
+        "output_device": "cuda",
+        "trt_lib_dirs": null,
+        "raw_output_semantics": "relative_inverse_depth",
+        "dibr_output_semantics": "relative_inverse_depth",
+        "model_profile": "onnx-inverse-depth",
+        "zero_copy_output": true,
+        "host_readback_bytes": 0
+      },
+      "depth_report": {
+        "preprocess_ms": 20.266999999876134,
+        "model_ms": 11217.835600000399,
+        "postprocess_ms": 516.560500000196,
+        "slot_wait_ms": 0.0,
+        "total_ms": 11754.66310000047,
+        "finite_depth": true,
+        "nonfinite_count": 0,
+        "native_io_binding": false,
+        "native_zero_copy": false,
+        "model_profile": "onnx-inverse-depth",
+        "zero_copy_output": true,
+        "host_readback_bytes": 0,
+        "raw_output_semantics": "relative_inverse_depth",
+        "dibr_output_semantics": "relative_inverse_depth"
+      },
+      "elapsed_ms": 11754.788300000655,
+      "depth_shape": [
+        1,
+        1,
+        540,
+        960
+      ],
+      "half_sbs_shape": [
+        1,
+        3,
+        540,
+        960
+      ],
+      "finite_depth": true,
+      "nonfinite_count": 0
+    },
+    "MoGe3-L": {
+      "provider": {
+        "provider": "stereo_runtime.model_impl.moge-3",
+        "model_name": "MoGe3-L",
+        "model_id": "Ruicheng/moge-3-vitl",
+        "depth_resolution": 518,
+        "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+        "load_mode": "local_files_only",
+        "depth_backend": "pytorch_rocm",
+        "runtime": "moge-3",
+        "onnx_path": null,
+        "execution_provider": null,
+        "fallback_reason": null,
+        "io_binding": false,
+        "dlpack": false,
+        "native_io_binding": false,
+        "native_output_backing": false,
+        "native_io_reason": null,
+        "output_device": "cuda",
+        "trt_lib_dirs": null,
+        "raw_output_semantics": "metric_z_depth",
+        "dibr_output_semantics": "relative_inverse_depth",
+        "model_profile": "spatial-refine-off",
+        "zero_copy_output": true,
+        "host_readback_bytes": 0
+      },
+      "depth_report": {
+        "preprocess_ms": 1.4606999975512736,
+        "model_ms": 4671.683499997016,
+        "postprocess_ms": 37.50930000387598,
+        "slot_wait_ms": 0.0,
+        "total_ms": 4710.653499998443,
+        "finite_depth": true,
+        "nonfinite_count": 0,
+        "native_io_binding": false,
+        "native_zero_copy": false,
+        "model_profile": "spatial-refine-off",
+        "zero_copy_output": true,
+        "host_readback_bytes": 0,
+        "raw_output_semantics": "metric_z_depth",
+        "dibr_output_semantics": "relative_inverse_depth"
+      },
+      "elapsed_ms": 4710.750099999132,
+      "depth_shape": [
+        1,
+        1,
+        540,
+        960
+      ],
+      "half_sbs_shape": [
+        1,
+        3,
+        540,
+        960
+      ],
+      "finite_depth": true,
+      "nonfinite_count": 0
+    },
+    "FlashDepth-S": {
+      "provider": {
+        "provider": "stereo_runtime.model_impl.flashdepth",
+        "model_name": "FlashDepth-S",
+        "model_id": "Eyeline-Labs/FlashDepth",
+        "depth_resolution": 518,
+        "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+        "load_mode": "local_files_only",
+        "depth_backend": "pytorch_rocm",
+        "runtime": "flashdepth",
+        "onnx_path": null,
+        "execution_provider": null,
+        "fallback_reason": null,
+        "io_binding": false,
+        "dlpack": false,
+        "native_io_binding": false,
+        "native_output_backing": false,
+        "native_io_reason": null,
+        "output_device": "cuda",
+        "trt_lib_dirs": null,
+        "raw_output_semantics": "relative_inverse_depth",
+        "dibr_output_semantics": "relative_inverse_depth",
+        "model_profile": "spatial-temporal-off",
+        "zero_copy_output": true,
+        "host_readback_bytes": 0
+      },
+      "depth_report": {
+        "preprocess_ms": 0.956299998506438,
+        "model_ms": 26.47630000137724,
+        "postprocess_ms": 0.8118000041577034,
+        "slot_wait_ms": 0.0,
+        "total_ms": 28.24440000404138,
+        "finite_depth": true,
+        "nonfinite_count": 0,
+        "native_io_binding": false,
+        "native_zero_copy": false,
+        "model_profile": "spatial-temporal-off",
+        "zero_copy_output": true,
+        "host_readback_bytes": 0,
+        "raw_output_semantics": "relative_inverse_depth",
+        "dibr_output_semantics": "relative_inverse_depth"
+      },
+      "elapsed_ms": 28.33150000515161,
+      "depth_shape": [
+        1,
+        1,
+        540,
+        960
+      ],
+      "half_sbs_shape": [
+        1,
+        3,
+        540,
+        960
+      ],
+      "finite_depth": true,
+      "nonfinite_count": 0
+    },
+    "FlashDepth-Full": {
+      "provider": {
+        "provider": "stereo_runtime.model_impl.flashdepth",
+        "model_name": "FlashDepth-Full",
+        "model_id": "Eyeline-Labs/FlashDepth",
+        "depth_resolution": 518,
+        "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+        "load_mode": "local_files_only",
+        "depth_backend": "pytorch_rocm",
+        "runtime": "flashdepth",
+        "onnx_path": null,
+        "execution_provider": null,
+        "fallback_reason": null,
+        "io_binding": false,
+        "dlpack": false,
+        "native_io_binding": false,
+        "native_output_backing": false,
+        "native_io_reason": null,
+        "output_device": "cuda",
+        "trt_lib_dirs": null,
+        "raw_output_semantics": "relative_inverse_depth",
+        "dibr_output_semantics": "relative_inverse_depth",
+        "model_profile": "spatial-temporal-off",
+        "zero_copy_output": true,
+        "host_readback_bytes": 0
+      },
+      "depth_report": {
+        "preprocess_ms": 0.7359000010183081,
+        "model_ms": 199.29229999979725,
+        "postprocess_ms": 0.9760000029928051,
+        "slot_wait_ms": 0.0,
+        "total_ms": 201.00420000380836,
+        "finite_depth": true,
+        "nonfinite_count": 0,
+        "native_io_binding": false,
+        "native_zero_copy": false,
+        "model_profile": "spatial-temporal-off",
+        "zero_copy_output": true,
+        "host_readback_bytes": 0,
+        "raw_output_semantics": "relative_inverse_depth",
+        "dibr_output_semantics": "relative_inverse_depth"
+      },
+      "elapsed_ms": 201.09199999569682,
+      "depth_shape": [
+        1,
+        1,
+        540,
+        960
+      ],
+      "half_sbs_shape": [
+        1,
+        3,
+        540,
+        960
+      ],
+      "finite_depth": true,
+      "nonfinite_count": 0
+    }
+  }
+}
