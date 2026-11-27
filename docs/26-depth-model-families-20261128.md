@@ -145,17 +145,29 @@ The required quality gate was finite depth 100%, Spearman ≥ 0.98, and normaliz
 All tested compiled graphs pass with substantial margin. The shared postprocessor also guarantees
 finite normalized depth for NaN/Inf inputs, including the sky/Inf cases that DepthPro2 can emit.
 
-## 7. Half-SBS visual review
+## 7. Depth and Half-SBS visual review
 
-The contact sheet shows the same person frame after DIBR synthesis for all six primary benchmark
-models:
+All panels below use the same 960×540 person frame extracted at 75 seconds from the source video.
+The contact sheet pairs each new model family's depth map with its synthesized Half-SBS output:
 
-[Depth model Half-SBS contact sheet](evidence/20261128-depth-models/half_sbs_contact_sheet.jpg)
+![New model depth maps and Half-SBS contact sheet](evidence/20261128-depth-models/depth_and_half_sbs_contact_sheet.jpg)
 
-Each image is a 960×540 Half-SBS result. The left/right views contain different parallax warps, not
-a duplicated left image. Full individual samples and the source frame are in
-`outputs/depth-model-eval-20261128/samples-75s/` on the test host and the contact sheet is committed
-as evidence.
+### 7.1 Source frame
+
+![Source frame at 75 seconds](evidence/20261128-depth-models/visual-75s/source_rgb.png)
+
+### 7.2 Per-model depth and Half-SBS
+
+| Model | Depth map | Half-SBS |
+|---|---|---|
+| DepthPro2-S | ![DepthPro2-S depth](evidence/20261128-depth-models/visual-75s/DepthPro2-S_depth.png) | ![DepthPro2-S Half-SBS](evidence/20261128-depth-models/visual-75s/DepthPro2-S_half_sbs.png) |
+| MoGe3-L | ![MoGe3-L depth](evidence/20261128-depth-models/visual-75s/MoGe3-L_depth.png) | ![MoGe3-L Half-SBS](evidence/20261128-depth-models/visual-75s/MoGe3-L_half_sbs.png) |
+| FlashDepth-S | ![FlashDepth-S depth](evidence/20261128-depth-models/visual-75s/FlashDepth-S_depth.png) | ![FlashDepth-S Half-SBS](evidence/20261128-depth-models/visual-75s/FlashDepth-S_half_sbs.png) |
+| FlashDepth-Full | ![FlashDepth-Full depth](evidence/20261128-depth-models/visual-75s/FlashDepth-Full_depth.png) | ![FlashDepth-Full Half-SBS](evidence/20261128-depth-models/visual-75s/FlashDepth-Full_half_sbs.png) |
+
+Each Half-SBS image contains separate left/right parallax warps, not a duplicated source image.
+The complete per-image timings and finite-depth checks are recorded in
+[`visual-75s/sample_report.json`](evidence/20261128-depth-models/visual-75s/sample_report.json).
 
 ## 8. Regression coverage
 
