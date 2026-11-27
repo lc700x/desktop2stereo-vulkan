@@ -37,6 +37,13 @@ LOCAL_CONFIG_MODEL_FAMILIES = frozenset({
     "da3",
     "video-depth-anything",
     "metric-video-depth-anything",
+    "depth-pro-2",
+    "moge-3",
+    "flashdepth",
+})
+SHARED_REPO_ARTIFACT_FAMILIES = frozenset({
+    "depth-pro-2",
+    "flashdepth",
 })
 
 
@@ -108,7 +115,14 @@ def _nearest_multiple(value: int, patch: int) -> int:
 
 def export_size_for_model(model_id: str, export_height: int = 294, export_width: int = 518) -> tuple[int, int]:
     model_lower = str(model_id).lower()
-    patch = 32 if "zipdepth" in model_lower else 16 if "infinidepth" in model_lower else 14
+    if "depthpro2" in model_lower or "depth-pro-2" in model_lower:
+        patch = 32
+    elif "zipdepth" in model_lower:
+        patch = 32
+    elif "infinidepth" in model_lower:
+        patch = 16
+    else:
+        patch = 14
     return _nearest_multiple(int(export_height), patch), _nearest_multiple(int(export_width), patch)
 
 
@@ -129,8 +143,8 @@ def artifact_paths_for_model(
     export_height, export_width = export_size_for_model(spec.model_id, export_height, export_width)
     root = Path(model_dir) if model_dir is not None else resolve_model_dir(spec.model_id, cache_dir)
     artifact_prefix = (
-        f"{spec.name.lower().replace('-', '_')}_"
-        if spec.family in ZIPDEPTH_CHECKPOINT_FILENAMES
+        f"{spec.name.lower().replace('-', '_').replace('.', '_')}_"
+        if spec.family in ZIPDEPTH_CHECKPOINT_FILENAMES or spec.family in SHARED_REPO_ARTIFACT_FAMILIES
         else ""
     )
     return ModelArtifactPaths(
@@ -208,11 +222,20 @@ def ensure_model_downloaded(
             # snapshot_download reads HF_ENDPOINT when the Hub client is built.
             # Keep the probe and the actual download on the same endpoint.
             with _hf_endpoint(endpoint), _hf_download_progress_patch():
+                snapshot_kwargs = {}
+                if model_spec.model_subdir:
+                    snapshot_kwargs["allow_patterns"] = [
+                        f"{model_spec.model_subdir}/{name}"
+                        for name in model_spec.weight_files
+                    ]
+                elif model_spec.family in SHARED_REPO_ARTIFACT_FAMILIES:
+                    snapshot_kwargs["allow_patterns"] = list(model_spec.weight_files) + ["LICENSE*", "README.md"]
                 snapshot_download(
                     repo_id=model_spec.model_id,
                     cache_dir=str(cache_dir),
                     local_files_only=local_files_only,
                     force_download=force_download,
+                    **snapshot_kwargs,
                 )
             if _model_cache_is_complete(model_spec, model_dir):
                 return model_dir
@@ -222,27 +245,35 @@ def ensure_model_downloaded(
                 raise
     if local_files_only:
         raise FileNotFoundError(f"local model files are incomplete: {model_dir}") from last_error
-    weight_filenames = MODEL_WEIGHT_FILENAMES
-    if model_spec.family in {"video-depth-anything", "metric-video-depth-anything"}:
-        weight_filenames = (*MODEL_WEIGHT_FILENAMES, *VIDEO_WEIGHT_FILENAMES)
+    if model_spec.family in {"depth-pro-2", "moge-3", "flashdepth"}:
+        weight_filenames = model_spec.weight_files
+    else:
+        weight_filenames = MODEL_WEIGHT_FILENAMES
+        if model_spec.family in {"video-depth-anything", "metric-video-depth-anything"}:
+            weight_filenames = (*MODEL_WEIGHT_FILENAMES, *VIDEO_WEIGHT_FILENAMES)
     for endpoint in endpoints:
         for filename in weight_filenames:
+            relative = f"{model_spec.model_subdir}/{filename}" if model_spec.model_subdir else filename
+            existing = model_dir / relative
             try:
-                existing = model_dir / filename
                 if existing.is_file() and existing.stat().st_size > 0:
-                    break
-                _download_hf_file_direct(model_spec.model_id, filename, cache_dir, endpoint)
-                break
-            except Exception as exc:
-                last_error = exc
-        for filename in MODEL_CONFIG_FILENAMES:
-            try:
-                existing = model_dir / filename
-                if existing.is_file() and existing.stat().st_size > 0:
+                    if model_spec.family not in {"depth-pro-2", "moge-3", "flashdepth"}:
+                        break
                     continue
-                _download_hf_file_direct(model_spec.model_id, filename, cache_dir, endpoint)
+                _download_hf_file_direct(model_spec.model_id, relative, cache_dir, endpoint)
+                if model_spec.family not in {"depth-pro-2", "moge-3", "flashdepth"}:
+                    break
             except Exception as exc:
                 last_error = exc
+        if model_spec.family not in LOCAL_CONFIG_MODEL_FAMILIES:
+            for filename in MODEL_CONFIG_FILENAMES:
+                try:
+                    existing = model_dir / filename
+                    if existing.is_file() and existing.stat().st_size > 0:
+                        continue
+                    _download_hf_file_direct(model_spec.model_id, filename, cache_dir, endpoint)
+                except Exception as exc:
+                    last_error = exc
         if _model_cache_is_complete(model_spec, model_dir):
             return model_dir
     if not model_dir.exists():
@@ -256,6 +287,8 @@ def _model_cache_is_complete(model_spec: DepthModelSpec, model_dir: str | Path) 
     if model_spec.family in ZIPDEPTH_CHECKPOINT_FILENAMES:
         weight = root / ZIPDEPTH_CHECKPOINT_FILENAMES[model_spec.family]
         return weight.is_file() and weight.stat().st_size > 0
+    if model_spec.family in {"depth-pro-2", "moge-3", "flashdepth"}:
+        return model_spec.has_complete_weights(root)
     if find_local_model_weight(root) is None:
         return False
     if model_spec.family in LOCAL_CONFIG_MODEL_FAMILIES:

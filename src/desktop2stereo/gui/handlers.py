@@ -33,7 +33,7 @@ from .capture_sources import (
 from .config import (
     DEFAULTS, FAMILY_SIZE_TO_MODEL, FAMILY_TO_SIZES,
     environment_display_label, environment_key_from_label, save_yaml,
-    get_environment_model_options, load_environment_display_names,
+    get_environment_model_options, load_environment_display_names, parse_model_name,
 )
 from .controls import FONT_SIZE, S
 from .localization import UI_MESSAGES, is_supported_locale
@@ -286,7 +286,10 @@ class GUIHandlerMixin:
 
     def _on_model_changed(self):
         model = self.current_model_name
+        if not self._confirm_research_model_if_needed(model):
+            return
         self._config["Depth Model"] = model
+        self._last_applied_model_name = model
         self.update_depth_resolution_options(model)
         self.auto_enable_optimizers_based_on_device()
         if "CUDA" in self.device_dd.value:
@@ -299,6 +302,59 @@ class GUIHandlerMixin:
         elif "XPU" in self.device_dd.value:
             self.update_openvino_visibility_based_on_model(model)
         self._fit_window_to_content()
+
+    def _confirm_research_model_if_needed(self, model):
+        """Gate Apple DepthPro2 downloads behind an explicit research-only acknowledgement."""
+        try:
+            from stereo_runtime.model_registry import ModelRegistry
+
+            spec = ModelRegistry.default().get(model)
+        except KeyError:
+            return True
+        if not spec.research_only or getattr(self, "_research_license_acknowledged", False):
+            return True
+        if model == getattr(self, "_last_applied_model_name", None):
+            return True
+
+        previous = getattr(self, "_last_applied_model_name", None) or self._config.get("Depth Model", "")
+        self._pending_research_model = model
+
+        def accept(_event):
+            self._research_license_acknowledged = True
+            self._config["Depth Model"] = model
+            self._last_applied_model_name = model
+            self.page.pop_dialog()
+            self.update_depth_resolution_options(model)
+            self.auto_enable_optimizers_based_on_device()
+            self._fit_window_to_content()
+
+        def dismiss(_event):
+            family, size = parse_model_name(previous)
+            if family in self.depth_model_dd.options:
+                self.depth_model_dd.value = family
+                self.model_size_dd.options = FAMILY_TO_SIZES.get(family, [])
+                self.model_size_dd.value = size if size in self.model_size_dd.options else (
+                    self.model_size_dd.options[0] if self.model_size_dd.options else ""
+                )
+            self._config["Depth Model"] = previous
+            self.page.pop_dialog()
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Research-only DepthPro2 model"),
+            content=ft.Text(
+                "Apple DepthPro2 weights are provided for non-commercial research use only. "
+                "Confirm that you accept the model license before downloading or running this model. "
+                "The mirrored weights remain gated by Hugging Face authentication."
+            ),
+            actions=[
+                ft.TextButton("Cancel", on_click=dismiss),
+                ft.Button("I understand and accept", on_click=accept),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.show_dialog(dialog)
+        return False
 
     # ── device / accelerator handlers ──
 

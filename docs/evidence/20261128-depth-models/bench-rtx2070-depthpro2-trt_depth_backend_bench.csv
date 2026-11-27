@@ -1,0 +1,2 @@
+model,backend,status,setup_ms,mean_ms,median_ms,p90_ms,preprocess_ms,model_ms,postprocess_ms,model_profile,zero_copy_output,host_readback_bytes,error
+DepthPro2-S,tensorrt_native,ok,13.040899997577071,33.92424999947252,33.92424999947252,34.16360000119312,0.17110000044340268,1.4665500002593035,0.48534999950788915,onnx-inverse-depth,True,0,

@@ -20,9 +20,61 @@ class DepthModelSpec:
     model_id: str
     family: str = "generic"
     output_semantics: DepthOutputSemantics = DEFAULT_DEPTH_OUTPUT_SEMANTICS
+    default_resolution: int = 518
+    weight_files: tuple[str, ...] = ("model.safetensors", "model.pt", "model.ckpt")
+    model_subdir: str | None = None
+    license_id: str = "unknown"
+    research_only: bool = False
+    full_fidelity_backends: tuple[str, ...] = ()
+    compat_profile: str | None = None
 
     def model_dir(self, cache_dir: str | Path = "./models") -> Path:
         return resolve_model_dir(self.model_id, cache_dir)
+
+    def asset_path(self, root: str | Path) -> Path:
+        path = Path(root)
+        return path / self.model_subdir if self.model_subdir else path
+
+    def asset_roots(self, root: str | Path) -> tuple[Path, ...]:
+        """Return direct and Hub-snapshot directories in lookup order."""
+        base = Path(root)
+        candidates = [self.asset_path(base)]
+        snapshots = base / "snapshots"
+        if snapshots.is_dir():
+            for revision in sorted(
+                (path for path in snapshots.iterdir() if path.is_dir()),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            ):
+                candidates.append(self.asset_path(revision))
+        deduplicated: list[Path] = []
+        for candidate in candidates:
+            if candidate not in deduplicated:
+                deduplicated.append(candidate)
+        return tuple(deduplicated)
+
+    def resolve_asset_root(self, root: str | Path) -> Path | None:
+        for asset_root in self.asset_roots(root):
+            if all(
+                (asset_root / filename).is_file()
+                and (asset_root / filename).stat().st_size > 0
+                for filename in self.weight_files
+            ):
+                return asset_root
+        return None
+
+    def weight_paths(self, root: str | Path) -> tuple[Path, ...]:
+        asset_root = self.resolve_asset_root(root) or self.asset_path(root)
+        return tuple(asset_root / filename for filename in self.weight_files)
+
+    def has_complete_weights(self, root: str | Path) -> bool:
+        return self.resolve_asset_root(root) is not None
+
+    def primary_weight_path(self, root: str | Path) -> Path | None:
+        for candidate in self.weight_paths(root):
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate
+        return None
 
 
 def resolve_model_dir(model_id: str, cache_dir: str | Path = "./models") -> Path:
@@ -131,4 +183,101 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
     DepthModelSpec("zoedepth-nyu", "Intel/zoedepth-nyu", "zoedepth", "metric_z_depth"),
     DepthModelSpec("zoedepth-kitti", "Intel/zoedepth-kitti", "zoedepth", "metric_z_depth"),
     DepthModelSpec("DepthPro-Large", "apple/DepthPro-hf", "depthpro", "metric_z_depth"),
+    DepthModelSpec(
+        "DepthPro2-S",
+        "lc700x/DepthPro2",
+        "depth-pro-2",
+        "relative_inverse_depth",
+        weight_files=("depthpro2-s-bgcc6f8bg3.pt", "depthpro2-fov-ew55zg4kq7.pt"),
+        license_id="apple-research-only",
+        research_only=True,
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        compat_profile="onnx-inverse-depth",
+    ),
+    DepthModelSpec(
+        "DepthPro2-B",
+        "lc700x/DepthPro2",
+        "depth-pro-2",
+        "relative_inverse_depth",
+        weight_files=("depthpro2-b-xb7m9egktw.pt", "depthpro2-fov-ew55zg4kq7.pt"),
+        license_id="apple-research-only",
+        research_only=True,
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        compat_profile="onnx-inverse-depth",
+    ),
+    DepthModelSpec(
+        "DepthPro2-L",
+        "lc700x/DepthPro2",
+        "depth-pro-2",
+        "relative_inverse_depth",
+        weight_files=("depthpro2-l-tegstu7fim.pt", "depthpro2-fov-ew55zg4kq7.pt"),
+        license_id="apple-research-only",
+        research_only=True,
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        compat_profile="onnx-inverse-depth",
+    ),
+    DepthModelSpec(
+        "DepthPro2-H",
+        "lc700x/DepthPro2",
+        "depth-pro-2",
+        "relative_inverse_depth",
+        weight_files=("depthpro2-h-eivtm5w7m5.pt", "depthpro2-fov-ew55zg4kq7.pt"),
+        license_id="apple-research-only",
+        research_only=True,
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        compat_profile="onnx-inverse-depth",
+    ),
+    DepthModelSpec(
+        "MoGe3-L",
+        "Ruicheng/moge-3-vitl",
+        "moge-3",
+        "metric_z_depth",
+        weight_files=("model.pt",),
+        license_id="mit",
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        compat_profile="spatial-refine-off",
+    ),
+    DepthModelSpec(
+        "MoGe3-G",
+        "Ruicheng/moge-3-vitg",
+        "moge-3",
+        "metric_z_depth",
+        weight_files=("model.pt",),
+        license_id="mit",
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        compat_profile="spatial-refine-off",
+    ),
+    DepthModelSpec(
+        "FlashDepth-S",
+        "Eyeline-Labs/FlashDepth",
+        "flashdepth",
+        "relative_inverse_depth",
+        weight_files=("iter_14001.pth",),
+        model_subdir="flashdepth-s",
+        license_id="apache-2.0",
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        compat_profile="spatial-temporal-off",
+    ),
+    DepthModelSpec(
+        "FlashDepth-L",
+        "Eyeline-Labs/FlashDepth",
+        "flashdepth",
+        "relative_inverse_depth",
+        weight_files=("iter_10001.pth",),
+        model_subdir="flashdepth-l",
+        license_id="apache-2.0",
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        compat_profile="spatial-temporal-off",
+    ),
+    DepthModelSpec(
+        "FlashDepth-Full",
+        "Eyeline-Labs/FlashDepth",
+        "flashdepth",
+        "relative_inverse_depth",
+        weight_files=("iter_43002.pth",),
+        model_subdir="flashdepth",
+        license_id="apache-2.0",
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        compat_profile="spatial-temporal-off",
+    ),
 )

@@ -1,0 +1,2 @@
+model,backend,status,setup_ms,mean_ms,median_ms,p90_ms,preprocess_ms,model_ms,postprocess_ms,model_profile,zero_copy_output,host_readback_bytes,error
+MoGe3-L,tensorrt_native,ok,13.358399999560788,164.3695500006288,164.3695500006288,166.19690000152332,0.22309999985736795,2.3902999964775518,0.5552999991778051,spatial-refine-off,True,0,

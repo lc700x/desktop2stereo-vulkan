@@ -1,0 +1,78 @@
+{
+  "model": "MoGe3-L",
+  "backend": "tensorrt_native",
+  "reference_backend": "pytorch_cuda",
+  "candidate_backend": "tensorrt_native",
+  "shape": [
+    1,
+    1,
+    294,
+    518
+  ],
+  "finite": true,
+  "spearman": 0.9999729990959167,
+  "reference_stats": {
+    "min": 0.0,
+    "mean": 0.43008163571357727,
+    "max": 1.0
+  },
+  "candidate_stats": {
+    "min": 0.0,
+    "mean": 0.43034258484840393,
+    "max": 1.0
+  },
+  "normalized_mae": 0.0006189119303599,
+  "max_abs": 0.042537420988082886,
+  "reference_provider": {
+    "provider": "stereo_runtime.model_impl.moge-3",
+    "model_name": "MoGe3-L",
+    "model_id": "Ruicheng/moge-3-vitl",
+    "depth_resolution": 518,
+    "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+    "load_mode": "local_files_only",
+    "depth_backend": "pytorch_cuda",
+    "runtime": "moge-3",
+    "onnx_path": null,
+    "execution_provider": null,
+    "fallback_reason": null,
+    "io_binding": false,
+    "dlpack": false,
+    "native_io_binding": false,
+    "native_output_backing": false,
+    "native_io_reason": null,
+    "output_device": "cuda",
+    "trt_lib_dirs": null,
+    "raw_output_semantics": "metric_z_depth",
+    "dibr_output_semantics": "relative_inverse_depth",
+    "model_profile": "spatial-refine-off",
+    "zero_copy_output": true,
+    "host_readback_bytes": 0
+  },
+  "candidate_provider": {
+    "provider": "tensorrt.Runtime",
+    "model_name": "MoGe3-L",
+    "model_id": "Ruicheng/moge-3-vitl",
+    "depth_resolution": 518,
+    "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+    "load_mode": "local_onnx_native_tensorrt",
+    "depth_backend": "tensorrt_native",
+    "runtime": "tensorrt-native-async",
+    "onnx_path": "F:\\desktop2stereo-vulkan\\models\\models--Ruicheng--moge-3-vitl\\model_fp16_294x518.onnx",
+    "execution_provider": "TensorRT native",
+    "fallback_reason": null,
+    "io_binding": false,
+    "dlpack": false,
+    "native_io_binding": false,
+    "native_output_backing": false,
+    "native_io_reason": null,
+    "output_device": "cuda",
+    "trt_lib_dirs": [
+      "F:\\desktop2stereo-vulkan\\src\\python3_cuda\\Lib\\site-packages\\tensorrt_libs"
+    ],
+    "raw_output_semantics": "metric_z_depth",
+    "dibr_output_semantics": "relative_inverse_depth",
+    "model_profile": "spatial-refine-off",
+    "zero_copy_output": true,
+    "host_readback_bytes": 0
+  }
+}

@@ -1,0 +1,122 @@
+{
+  "rgb": "outputs\\depth-model-eval-20261128\\person_75s.png",
+  "environment": {
+    "python": "F:\\desktop2stereo-vulkan\\src\\python3_cuda\\python.exe",
+    "torch": "2.11.0+cu128",
+    "torch_cuda": "12.8",
+    "torch_hip": null,
+    "cuda_available": true,
+    "device": "cuda",
+    "gpu": "NVIDIA GeForce RTX 2070"
+  },
+  "models": {
+    "MoGe3-L": {
+      "tensorrt_native": {
+        "status": "ok",
+        "error": null,
+        "provider": {
+          "provider": "tensorrt.Runtime",
+          "model_name": "MoGe3-L",
+          "model_id": "Ruicheng/moge-3-vitl",
+          "depth_resolution": 518,
+          "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+          "load_mode": "local_onnx_native_tensorrt",
+          "depth_backend": "tensorrt_native",
+          "runtime": "tensorrt-native-async",
+          "onnx_path": "F:\\desktop2stereo-vulkan\\models\\models--Ruicheng--moge-3-vitl\\model_fp16_294x518.onnx",
+          "execution_provider": "TensorRT native",
+          "fallback_reason": null,
+          "io_binding": false,
+          "dlpack": false,
+          "native_io_binding": false,
+          "native_output_backing": false,
+          "native_io_reason": null,
+          "output_device": "cuda",
+          "trt_lib_dirs": [
+            "F:\\desktop2stereo-vulkan\\src\\python3_cuda\\Lib\\site-packages\\tensorrt_libs"
+          ],
+          "raw_output_semantics": "metric_z_depth",
+          "dibr_output_semantics": "relative_inverse_depth",
+          "model_profile": "spatial-refine-off",
+          "zero_copy_output": true,
+          "host_readback_bytes": 0
+        },
+        "output_shape": [
+          1,
+          1,
+          518,
+          518
+        ],
+        "setup_ms": 13.358399999560788,
+        "timings": {
+          "count": 2,
+          "mean_ms": 164.3695500006288,
+          "median_ms": 164.3695500006288,
+          "p90_ms": 166.19690000152332,
+          "min_ms": 162.5421999997343,
+          "max_ms": 166.19690000152332
+        },
+        "profile": {
+          "preprocess": {
+            "count": 2,
+            "mean_ms": 0.22309999985736795,
+            "median_ms": 0.22309999985736795,
+            "p90_ms": 0.23069999951985665,
+            "min_ms": 0.21550000019487925,
+            "max_ms": 0.23069999951985665
+          },
+          "model": {
+            "count": 2,
+            "mean_ms": 2.3902999964775518,
+            "median_ms": 2.3902999964775518,
+            "p90_ms": 2.532399994379375,
+            "min_ms": 2.2481999985757284,
+            "max_ms": 2.532399994379375
+          },
+          "postprocess": {
+            "count": 2,
+            "mean_ms": 0.5552999991778051,
+            "median_ms": 0.5552999991778051,
+            "p90_ms": 0.6088000009185635,
+            "min_ms": 0.5017999974370468,
+            "max_ms": 0.6088000009185635
+          }
+        },
+        "profile_raw": [
+          {
+            "preprocess_ms": 0.23069999951985665,
+            "model_ms": 2.532399994379375,
+            "postprocess_ms": 0.5017999974370468,
+            "slot_wait_ms": 0.01710000287857838,
+            "total_ms": 3.2648999913362786,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-refine-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "metric_z_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.21550000019487925,
+            "model_ms": 2.2481999985757284,
+            "postprocess_ms": 0.6088000009185635,
+            "slot_wait_ms": 0.014400000509340316,
+            "total_ms": 3.072499999689171,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "spatial-refine-off",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "metric_z_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          }
+        ]
+      }
+    }
+  }
+}

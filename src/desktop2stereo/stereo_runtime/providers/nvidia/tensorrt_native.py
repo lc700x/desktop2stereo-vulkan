@@ -21,6 +21,7 @@ from ...depth_provider import (
     DepthProviderConfig,
     DepthProviderInfo,
     _model_output_semantics,
+    _model_profile_for,
     _prepare_accelerated_artifacts,
     _postprocess_model_depth,
     default_lab_cache_dir,
@@ -632,7 +633,12 @@ class DistillAnyDepthBaseNativeTensorRt:
         self.onnx_dtype = str(onnx_dtype)
         self._explicit_engine_path = Path(engine_path) if engine_path is not None else None
         self.onnx_path = self._explicit_onnx_path or default_onnx_path(self.cache_dir)
-        self.engine_path = self._explicit_engine_path or default_native_tensorrt_engine_path(self.cache_dir)
+        if self._explicit_engine_path is not None:
+            self.engine_path = self._explicit_engine_path
+        elif self._explicit_onnx_path is not None:
+            self.engine_path = self._explicit_onnx_path.with_suffix(".trt")
+        else:
+            self.engine_path = default_native_tensorrt_engine_path(self.cache_dir)
         self.model_id, self.model_name = _infer_model_metadata_from_paths(
             self.onnx_path,
             self.engine_path,
@@ -663,6 +669,9 @@ class DistillAnyDepthBaseNativeTensorRt:
             onnx_path=str(self.onnx_path),
             io_binding=False,
             output_device="cuda",
+            model_profile=_model_profile_for(self.model_name or self.model_id),
+            zero_copy_output=True,
+            host_readback_bytes=0,
         )
         self._engine: NativeTensorRtEngine | None = None
         self._artifact_input_size: tuple[int, int] | None = None
@@ -908,6 +917,9 @@ class DistillAnyDepthBaseNativeTensorRt:
                 execution_slot_count=max(1, int(getattr(engine, "pipeline_slot_count", 1))),
                 slot_wait_ms=slot_wait_ms,
                 raw_output_semantics=_model_output_semantics(self.model_id),
+                model_profile=_model_profile_for(self.model_name or self.model_id),
+                zero_copy_output=True,
+                host_readback_bytes=0,
             )
         finally:
             mark_slot_available = getattr(

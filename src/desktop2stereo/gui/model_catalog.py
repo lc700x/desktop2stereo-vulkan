@@ -38,10 +38,31 @@ V25_GUI_MODEL_NAMES = (
     "depth-anything-indoor-large",
     "depth-anything-outdoor-large",
     "DepthPro-Large",
+    "DepthPro2-S",
+    "DepthPro2-B",
+    "DepthPro2-L",
+    "DepthPro2-H",
+    "MoGe3-L",
+    "MoGe3-G",
+    "FlashDepth-S",
+    "FlashDepth-L",
+    "FlashDepth-Full",
 )
 
 
+def _model_license(name):
+    if name.startswith("DepthPro2-"):
+        return {"license_id": "apple-research-only", "research_only": True}
+    if name.startswith("MoGe3-"):
+        return {"license_id": "mit", "research_only": False}
+    if name.startswith("FlashDepth-"):
+        return {"license_id": "apache-2.0", "research_only": False}
+    return {}
+
+
 def _resolutions_for_model(name):
+    if name.startswith(("DepthPro2-", "MoGe3-", "FlashDepth-")):
+        return [294, 336, 392, 448, 518]
     if name in {"ZipDepth-Base", "ZipDepth-Small"}:
         return [192, 224, 288, 352, 384, 448, 512]
     if name.startswith("InfiniDepth-"):
@@ -54,6 +75,9 @@ def _resolutions_for_model(name):
 
 
 GUI_MODEL_CATALOG = {
-    name: {"resolutions": _resolutions_for_model(name)}
+    name: {
+        "resolutions": _resolutions_for_model(name),
+        **_model_license(name),
+    }
     for name in V25_GUI_MODEL_NAMES
 }

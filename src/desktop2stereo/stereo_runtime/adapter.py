@@ -213,7 +213,7 @@ def runtime_config_from_d2s_settings(
     backend_override = os.environ.get("D2S_DEPTH_BACKEND", "").strip()
     if backend_override:
         depth_backend = _normalize_depth_backend(backend_override)
-    elif is_rocm and settings.get("MIGraphX", False):
+    elif is_rocm and device_type == "cuda" and settings.get("MIGraphX", False):
         depth_backend = "migraphx_rocm"
     elif settings.get("TensorRT", False) and device_type == "cuda" and not is_rocm:
         depth_backend = "tensorrt_native"
@@ -221,7 +221,7 @@ def runtime_config_from_d2s_settings(
         depth_backend = "onnx_cuda"
     elif settings.get("Depth Backend"):
         depth_backend = _normalize_depth_backend(settings["Depth Backend"])
-    elif is_rocm:
+    elif is_rocm and device_type == "cuda":
         depth_backend = "pytorch_rocm"
     else:
         depth_backend = "auto"
@@ -610,7 +610,13 @@ def depth_provider_config_from_runtime(config: StereoRuntimeConfig) -> "DepthPro
     engine_path = config.migraphx_graph_path if backend == "migraphx_rocm" else None
     build_engine = config.build_migraphx_graph if backend == "migraphx_rocm" else config.build_trt_engine
     force_rebuild = config.force_rebuild_migraphx if backend == "migraphx_rocm" else config.force_rebuild_trt
+    resolved_spec = ModelRegistry.default().get(config.model_id)
     is_zipdepth = "zipdepth" in config.resolved_model_id.lower()
+    patch_size = (
+        32
+        if resolved_spec.family == "depth-pro-2" or is_zipdepth
+        else 14
+    )
     execution_slot_count = config.parallel_inference_workers
     if config.use_cuda_graph:
         # CUDA graph inference has a fixed launch graph; a second execution
@@ -627,7 +633,7 @@ def depth_provider_config_from_runtime(config: StereoRuntimeConfig) -> "DepthPro
         onnx_path=onnx_path,
         engine_path=engine_path,
         depth_resolution=int(min(config.export_height, config.export_width) if is_zipdepth else config.export_width),
-        patch_size=32 if is_zipdepth else 14,
+        patch_size=patch_size,
         onnx_dtype=config.onnx_dtype,
         local_files_only=False,
         prefer_native_tensorrt=backend == "tensorrt_native",

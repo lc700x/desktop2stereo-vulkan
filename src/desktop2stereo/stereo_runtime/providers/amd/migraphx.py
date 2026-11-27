@@ -14,6 +14,7 @@ from stereo_runtime.depth_provider import (
     DepthProviderInfo,
     _is_zipdepth_model,
     _model_output_semantics,
+    _model_profile_for,
     ZipDepthProvider,
     _postprocess_generic_depth,
 )
@@ -213,9 +214,15 @@ class MIGraphXDepthProvider:
         self._zipdepth_fallback: ZipDepthProvider | None = None
         self._zipdepth_model_provider: ZipDepthProvider | None = None
         self._zipdepth_runtime_logged = False
+        from stereo_runtime.model_registry import ModelRegistry
+
+        try:
+            family = ModelRegistry.default().get(self.model_name or self.model_id).family
+        except KeyError:
+            family = ""
         self.patch_size = (
             32
-            if _is_zipdepth_model(self.model_id)
+            if _is_zipdepth_model(self.model_id) or family == "depth-pro-2"
             else int(patch_size or (16 if "infinidepth" in self.model_id.lower() else 14))
         )
         # The input dtype follows the ONNX artifact; MIGraphX quantizes model
@@ -241,6 +248,9 @@ class MIGraphXDepthProvider:
             onnx_path=str(self.onnx_path) if self.onnx_path else None,
             execution_provider="MIGraphX ROCm",
             output_device=str(self.device),
+            model_profile=_model_profile_for(self.model_name or self.model_id),
+            zero_copy_output=True,
+            host_readback_bytes=0,
         )
 
     def _zipdepth_encoder_input_size(self) -> tuple[int, int]:
@@ -438,6 +448,9 @@ class MIGraphXDepthProvider:
             postprocess_ms,
             cuda_timing_events=cuda_events,
             raw_output_semantics=_model_output_semantics(self.model_id),
+            model_profile=_model_profile_for(self.model_name or self.model_id),
+            zero_copy_output=True,
+            host_readback_bytes=0,
         )
         if self.model_name.strip().casefold() != "zipdepth-small" or self._zipdepth_parity_checked:
             return result
@@ -572,14 +585,23 @@ def create_migraphx_rocm_provider(
         else:
             export_width = max(1, int(depth_resolution))
             export_height = max(1, int(round(export_width * 294 / 518)))
-        artifacts = prepare_model_artifacts(
-            (
+        from stereo_runtime.model_registry import ModelRegistry
+
+        try:
+            artifact_model_key = (
                 model_name
+                if ModelRegistry.default().get(model_name or model_id).family
+                in {"depth-pro-2", "moge-3", "flashdepth"}
+                else model_name
                 if _is_zipdepth_model(model_id)
                 and model_name
                 and model_name.casefold() in {"zipdepth-base", "zipdepth-small"}
                 else model_id
-            ),
+            )
+        except KeyError:
+            artifact_model_key = model_id
+        artifacts = prepare_model_artifacts(
+            artifact_model_key,
             cache_dir=cache_dir or "./models",
             model_dir=Path(onnx_path).parent if onnx_path is not None else None,
             local_files_only=local_files_only,

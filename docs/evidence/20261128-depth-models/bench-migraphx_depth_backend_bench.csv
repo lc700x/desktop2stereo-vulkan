@@ -1,0 +1,2 @@
+model,backend,status,setup_ms,mean_ms,median_ms,p90_ms,preprocess_ms,model_ms,postprocess_ms,model_profile,zero_copy_output,host_readback_bytes,error
+FlashDepth-S,migraphx_rocm,ok,1115.8446000008553,4.2676199998822995,4.134099999646423,5.06630000018049,0.1285799990000669,0.9989600010158028,0.34124000085284933,spatial-temporal-off,True,0,

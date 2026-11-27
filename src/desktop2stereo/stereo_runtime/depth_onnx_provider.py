@@ -23,6 +23,7 @@ from .depth_provider import (
     _is_zipdepth_model,
     _model_input_size_for_model,
     _model_output_semantics,
+    _model_profile_for,
     _normalization_tensors_for_model,
     _postprocess_model_depth,
     default_lab_cache_dir,
@@ -239,6 +240,9 @@ class DistillAnyDepthBaseOnnxCuda:
             io_binding=self.use_iobinding,
             dlpack=self.use_dlpack,
             output_device="cuda" if self.use_iobinding else "cpu",
+            model_profile=_model_profile_for(self.model_name or self.model_id),
+            zero_copy_output=bool(self.use_iobinding),
+            host_readback_bytes=0,
         )
         self._session = None
         self._artifact_input_size: tuple[int, int] | None = None
@@ -372,6 +376,9 @@ class DistillAnyDepthBaseOnnxCuda:
             model_ms,
             postprocess_ms,
             raw_output_semantics=_model_output_semantics(self.model_id),
+            model_profile=_model_profile_for(self.model_name or self.model_id),
+            zero_copy_output=bool(self.use_iobinding),
+            host_readback_bytes=0 if self.use_iobinding else int(tensor.numel() * tensor.element_size()),
         )
 
     def _run_iobinding(self, session, ort_input) -> torch.Tensor:

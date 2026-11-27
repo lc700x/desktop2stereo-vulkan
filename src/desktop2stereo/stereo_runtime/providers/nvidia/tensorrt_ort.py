@@ -22,6 +22,7 @@ from ...depth_provider import (
     DepthProviderInfo,
     TorchDepthProvider,
     _model_output_semantics,
+    _model_profile_for,
     _prepare_accelerated_artifacts,
     _postprocess_model_depth,
     default_lab_cache_dir,
@@ -128,6 +129,9 @@ class DistillAnyDepthBaseTensorRtOrt:
             onnx_path=str(self.onnx_path),
             io_binding=True,
             output_device="cuda",
+            model_profile=_model_profile_for(self.model_name or self.model_id),
+            zero_copy_output=True,
+            host_readback_bytes=0,
         )
         self._session = None
         self._artifact_input_size: tuple[int, int] | None = None
@@ -305,6 +309,9 @@ class DistillAnyDepthBaseTensorRtOrt:
             model_ms,
             postprocess_ms,
             raw_output_semantics=_model_output_semantics(self.model_id),
+            model_profile=_model_profile_for(self.model_name or self.model_id),
+            zero_copy_output=True,
+            host_readback_bytes=0,
         )
 
 

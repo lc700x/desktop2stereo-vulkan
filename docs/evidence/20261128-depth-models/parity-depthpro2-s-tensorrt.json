@@ -1,0 +1,78 @@
+{
+  "model": "DepthPro2-S",
+  "backend": "tensorrt_native",
+  "reference_backend": "pytorch_cuda",
+  "candidate_backend": "tensorrt_native",
+  "shape": [
+    1,
+    1,
+    288,
+    512
+  ],
+  "finite": true,
+  "spearman": 0.9999947547912598,
+  "reference_stats": {
+    "min": 0.0,
+    "mean": 0.4043097496032715,
+    "max": 1.0
+  },
+  "candidate_stats": {
+    "min": 0.0,
+    "mean": 0.4048134386539459,
+    "max": 1.0
+  },
+  "normalized_mae": 0.0006466468330472708,
+  "max_abs": 0.013045072555541992,
+  "reference_provider": {
+    "provider": "stereo_runtime.model_impl.depth-pro-2",
+    "model_name": "DepthPro2-S",
+    "model_id": "lc700x/DepthPro2",
+    "depth_resolution": 512,
+    "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+    "load_mode": "local_files_only",
+    "depth_backend": "pytorch_cuda",
+    "runtime": "depth-pro-2",
+    "onnx_path": null,
+    "execution_provider": null,
+    "fallback_reason": null,
+    "io_binding": false,
+    "dlpack": false,
+    "native_io_binding": false,
+    "native_output_backing": false,
+    "native_io_reason": null,
+    "output_device": "cuda",
+    "trt_lib_dirs": null,
+    "raw_output_semantics": "relative_inverse_depth",
+    "dibr_output_semantics": "relative_inverse_depth",
+    "model_profile": "onnx-inverse-depth",
+    "zero_copy_output": true,
+    "host_readback_bytes": 0
+  },
+  "candidate_provider": {
+    "provider": "tensorrt.Runtime",
+    "model_name": "DepthPro2-S",
+    "model_id": "lc700x/DepthPro2",
+    "depth_resolution": 512,
+    "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+    "load_mode": "local_onnx_native_tensorrt",
+    "depth_backend": "tensorrt_native",
+    "runtime": "tensorrt-native-async",
+    "onnx_path": "F:\\desktop2stereo-vulkan\\models\\models--lc700x--DepthPro2\\depthpro2_s_model_fp16_288x512.onnx",
+    "execution_provider": "TensorRT native",
+    "fallback_reason": null,
+    "io_binding": false,
+    "dlpack": false,
+    "native_io_binding": false,
+    "native_output_backing": false,
+    "native_io_reason": null,
+    "output_device": "cuda",
+    "trt_lib_dirs": [
+      "F:\\desktop2stereo-vulkan\\src\\python3_cuda\\Lib\\site-packages\\tensorrt_libs"
+    ],
+    "raw_output_semantics": "relative_inverse_depth",
+    "dibr_output_semantics": "relative_inverse_depth",
+    "model_profile": "onnx-inverse-depth",
+    "zero_copy_output": true,
+    "host_readback_bytes": 0
+  }
+}

@@ -1,0 +1,122 @@
+{
+  "rgb": "outputs\\depth-model-eval-20261128\\person_75s.png",
+  "environment": {
+    "python": "F:\\desktop2stereo-vulkan\\src\\python3_cuda\\python.exe",
+    "torch": "2.11.0+cu128",
+    "torch_cuda": "12.8",
+    "torch_hip": null,
+    "cuda_available": true,
+    "device": "cuda",
+    "gpu": "NVIDIA GeForce RTX 2070"
+  },
+  "models": {
+    "DepthPro2-S": {
+      "tensorrt_native": {
+        "status": "ok",
+        "error": null,
+        "provider": {
+          "provider": "tensorrt.Runtime",
+          "model_name": "DepthPro2-S",
+          "model_id": "lc700x/DepthPro2",
+          "depth_resolution": 518,
+          "cache_dir": "F:\\desktop2stereo-vulkan\\models",
+          "load_mode": "local_onnx_native_tensorrt",
+          "depth_backend": "tensorrt_native",
+          "runtime": "tensorrt-native-async",
+          "onnx_path": "F:\\desktop2stereo-vulkan\\models\\models--lc700x--DepthPro2\\depthpro2_s_model_fp16_288x512.onnx",
+          "execution_provider": "TensorRT native",
+          "fallback_reason": null,
+          "io_binding": false,
+          "dlpack": false,
+          "native_io_binding": false,
+          "native_output_backing": false,
+          "native_io_reason": null,
+          "output_device": "cuda",
+          "trt_lib_dirs": [
+            "F:\\desktop2stereo-vulkan\\src\\python3_cuda\\Lib\\site-packages\\tensorrt_libs"
+          ],
+          "raw_output_semantics": "relative_inverse_depth",
+          "dibr_output_semantics": "relative_inverse_depth",
+          "model_profile": "onnx-inverse-depth",
+          "zero_copy_output": true,
+          "host_readback_bytes": 0
+        },
+        "output_shape": [
+          1,
+          1,
+          518,
+          518
+        ],
+        "setup_ms": 13.040899997577071,
+        "timings": {
+          "count": 2,
+          "mean_ms": 33.92424999947252,
+          "median_ms": 33.92424999947252,
+          "p90_ms": 34.16360000119312,
+          "min_ms": 33.68489999775193,
+          "max_ms": 34.16360000119312
+        },
+        "profile": {
+          "preprocess": {
+            "count": 2,
+            "mean_ms": 0.17110000044340268,
+            "median_ms": 0.17110000044340268,
+            "p90_ms": 0.1933999992616009,
+            "min_ms": 0.14880000162520446,
+            "max_ms": 0.1933999992616009
+          },
+          "model": {
+            "count": 2,
+            "mean_ms": 1.4665500002593035,
+            "median_ms": 1.4665500002593035,
+            "p90_ms": 1.707300001726253,
+            "min_ms": 1.225799998792354,
+            "max_ms": 1.707300001726253
+          },
+          "postprocess": {
+            "count": 2,
+            "mean_ms": 0.48534999950788915,
+            "median_ms": 0.48534999950788915,
+            "p90_ms": 0.5414999977801926,
+            "min_ms": 0.42920000123558566,
+            "max_ms": 0.5414999977801926
+          }
+        },
+        "profile_raw": [
+          {
+            "preprocess_ms": 0.1933999992616009,
+            "model_ms": 1.707300001726253,
+            "postprocess_ms": 0.5414999977801926,
+            "slot_wait_ms": 0.013699998817173764,
+            "total_ms": 2.4421999987680465,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "onnx-inverse-depth",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          },
+          {
+            "preprocess_ms": 0.14880000162520446,
+            "model_ms": 1.225799998792354,
+            "postprocess_ms": 0.42920000123558566,
+            "slot_wait_ms": 0.011299998732283711,
+            "total_ms": 1.8038000016531441,
+            "finite_depth": true,
+            "nonfinite_count": 0,
+            "native_io_binding": false,
+            "native_zero_copy": false,
+            "model_profile": "onnx-inverse-depth",
+            "zero_copy_output": true,
+            "host_readback_bytes": 0,
+            "raw_output_semantics": "relative_inverse_depth",
+            "dibr_output_semantics": "relative_inverse_depth"
+          }
+        ]
+      }
+    }
+  }
+}

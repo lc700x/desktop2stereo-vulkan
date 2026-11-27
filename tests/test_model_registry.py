@@ -168,7 +168,7 @@ def test_gui_model_catalog_matches_v25_model_list_without_legacy_models():
     assert settings.count("  dpt-") == 0
     assert settings.count("  zoedepth-") == 0
     assert settings.count("  depth-ai:") == 0
-    assert len(GUI_MODEL_CATALOG) == 37
+    assert len(GUI_MODEL_CATALOG) == 46
 
 
 def test_utils_model_mapping_delegates_to_runtime_registry():
