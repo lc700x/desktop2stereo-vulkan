@@ -187,7 +187,6 @@ def test_settings_menu_omits_the_global_title_and_left_aligns_section_headings()
     rgba = build_settings_menu_rgba(menu, {})
 
     shell = _token_rgba("surface", 250)
-    assert tuple(rgba[64, 636]) == shell
     assert tuple(rgba[20, SETTINGS_MENU_TEXTURE_SIZE[0] // 2]) == shell
     title_pixels = rgba[32:80, 272:500, :3]
     title_mask = np.all(title_pixels == _token_rgb("text_secondary"), axis=2)
@@ -253,17 +252,14 @@ def test_settings_menu_content_card_has_balanced_bottom_inset():
     assert tuple(rgba[height - 25, center_x]) == _token_rgba("surface", 250)
 
 
-def test_screen_subsections_render_as_flat_underlined_tabs():
+def test_screen_subsections_use_main_gui_navigation_palette():
     menu = OpenXrSettingsMenu()
     rgba = build_settings_menu_rgba(menu, {})
-    shell = _token_rgba("surface", 250)
-    primary = _token_rgba("primary")
-    card_alt = _token_rgba("surface_container_high")
 
-    assert tuple(rgba[80, 320]) == shell
-    assert tuple(rgba[80, 640]) == shell
-    assert tuple(rgba[102, 320]) == primary
-    assert tuple(rgba[102, 640]) == card_alt
+    assert tuple(rgba[80, 320]) == _token_rgba("selection_container")
+    assert tuple(rgba[80, 640]) == _token_rgba("primary_container")
+    assert tuple(rgba[102, 320]) == _token_rgba("selection_container")
+    assert tuple(rgba[102, 640]) == _token_rgba("primary_container")
 
 
 def test_settings_menu_shell_has_equal_texture_edge_margins():
@@ -438,7 +434,7 @@ def test_openxr_hover_keeps_the_selected_option_visual():
     assert tuple(hovered[sample_y, sample_x]) == _token_rgba("selection_container")
 
 
-def test_openxr_unselected_option_hover_uses_menu_item_highlight():
+def test_openxr_unselected_option_uses_main_gui_highlight():
     menu = OpenXrSettingsMenu()
     control = next(control for control in menu.controls() if control.key == "screen:type:subtle")
     normal = build_settings_menu_rgba(menu, {})
@@ -446,8 +442,63 @@ def test_openxr_unselected_option_hover_uses_menu_item_highlight():
     sample_x = round((control.rect[0] + control.rect[2]) * 1024 / 2)
     sample_y = round(control.rect[1] * 832) + 8
 
-    assert tuple(normal[sample_y, sample_x]) != _token_rgba("primary_container")
-    assert tuple(hovered[sample_y, sample_x]) == _token_rgba("primary_container")
+    assert tuple(normal[sample_y, sample_x]) == _token_rgba("primary_container")
+    assert tuple(hovered[sample_y, sample_x]) == _token_rgba("primary_hover")
+
+
+def test_openxr_step_buttons_use_main_gui_blue():
+    menu = OpenXrSettingsMenu()
+    menu.set_tab("picture")
+    control = next(
+        control
+        for control in menu.controls()
+        if control.key == "step:plus:vulkan_projection_min_lod"
+    )
+    rgba = build_settings_menu_rgba(menu, {}, lang="EN")
+    x0, y0, x1, y1 = control.rect
+    center_x = round(((x0 + x1) * 0.5) * rgba.shape[1])
+    center_y = round(((y0 + y1) * 0.5) * rgba.shape[0])
+
+    sample = tuple(rgba[center_y - 12, center_x])
+    assert sample == _token_rgba("primary_container")
+    assert sample != _token_rgba("surface_container_high")
+
+
+def test_openxr_unselected_navigation_tab_uses_main_gui_blue():
+    menu = OpenXrSettingsMenu()
+    menu.set_tab("screen")
+    control = next(
+        control for control in menu.controls() if control.key == "tab:depth"
+    )
+    rgba = build_settings_menu_rgba(menu, {})
+    x0, y0, _x1, y1 = control.rect
+    sample_x = round(x0 * rgba.shape[1]) + 8
+    sample_y = round(((y0 + y1) * 0.5) * rgba.shape[0])
+
+    assert tuple(rgba[sample_y, sample_x]) == _token_rgba("primary_container")
+    assert tuple(rgba[sample_y, sample_x]) != _token_rgba("surface_container_high")
+
+
+def test_openxr_stop_uses_main_gui_danger_palette():
+    from theme_tokens import MOONLIGHT_BLUE_COLORS
+
+    assert (
+        OPENXR_MENU_COLORS["destructive"]
+        == MOONLIGHT_BLUE_COLORS["action_destructive"]
+    )
+    assert (
+        OPENXR_MENU_COLORS["destructive_hover"]
+        == MOONLIGHT_BLUE_COLORS["action_destructive_hover"]
+    )
+    assert (
+        OPENXR_MENU_COLORS["destructive_pressed"]
+        == MOONLIGHT_BLUE_COLORS["action_destructive_pressed"]
+    )
+    assert (
+        OPENXR_MENU_COLORS["destructive_text"]
+        == MOONLIGHT_BLUE_COLORS["action_destructive_text"]
+    )
+    assert _token_rgb("destructive_text") == (255, 255, 255)
 
 
 def test_openxr_boolean_settings_render_as_borderless_meta_switches():

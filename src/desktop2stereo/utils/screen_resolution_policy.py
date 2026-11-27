@@ -243,7 +243,13 @@ def build_projection_screen_sampling_plan(
             quality_width=width,
             quality_height=height,
         )
-    unquantized_width = float(footprint_width) * oversample
+    # Oversampling may sharpen a minified screen, but it must not force an
+    # artificial upscale beyond the source texture. Preserve the existing
+    # EASU path when the requested footprint is already larger than the source.
+    oversampled_width = float(footprint_width) * oversample
+    unquantized_width = (
+        oversampled_width if oversampled_width <= width else float(footprint_width)
+    )
     quality_width = max(
         PROJECTION_QUALITY_WIDTH_QUANTUM,
         int(

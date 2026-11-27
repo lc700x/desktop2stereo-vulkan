@@ -1,12 +1,20 @@
 # OpenXR Vulkan 流水并行性能优化方案
 
-**文档状态**：实施方案  
-**更新时间**：2026-08-03  
+**文档状态**：实施方案
+
+**更新时间**：2026-08-03
+
+**2026-11-24 更新**：补充 RX 9060 XT / VDXR 实测基线、同口径采集要求和上游吞吐优先顺序。
+
+**2026-11-27 更新**：实现并实测单张全宽 `array_size=1` SBS Projection；增加 Vulkan controller proxy 隔离、启动前静默回退和显式诊断字段。完整数据见 [24 号 A/B](24-openxr-single-sbs-projection-ab.md)。
+
 **适用范围**：Vulkan Compute、Filament Vulkan、OpenXR Projection/Quad 提交路径
 
 ## 1. 目标与边界
 
 本方案用于降低 OpenXR Presenter 热路径中的 CPU 等待、GPU 空泡和重复提交，使已经实测达到约 55 FPS 的高吞吐路径能够长时间稳定运行，并为后续继续优化提供顺序、指标和回退条件。
+
+2026-11-24 在 RX 9060 XT / Quest 2 / VDXR 上完成的 70 秒 A/B 进一步确认：OpenGL 与 Vulkan 的合成呈现率都可稳定在约 72 Hz；Vulkan 的 PyTorch/ROCm 新内容吞吐约 42 FPS，而 MIGraphX 约 51 FPS。当前首要瓶颈是上游捕获/推理/立体处理，而不是 `xrEndFrame`。完整数据见 [23 号对比报告](23-vdxr-quest2-opengl-vulkan-performance-and-stereo-quad-report.md)。
 
 目标：
 
@@ -76,6 +84,7 @@ xrWaitFrame
 | P1 | Compute 移出 Presenter，交给 Output Worker | 未实现 | 必须在队列锁与资源所有权改造后进行 |
 | P1 | 左右眼 transition 合并为一个命令缓冲和一次提交 | 未实现 | 与 Output Worker 一起实施 |
 | P1 | Glow 合并到立体 Compute 后处理命令链 | 未实现 | 先测量独立 Glow 提交成本 |
+| P2 | `array_size=1` full-width SBS Projection | 已实现，默认关闭；RX 9060 XT / OpenXR Simulator 1.0 scale 投影 p50 中位数由 3.68 ms 降至 0.95 ms | 实机 10 分钟、GLB 和 Render Scale 2.0 后续处理 |
 | P2 | `array_size=2` projection swapchain | 规划中；创建或合成失败时回退双 swapchain 逐眼 | Runtime 能力、画质与稳定性验收 |
 | P2 | layered MIP/SPD 一次处理双眼 | 未实现 | 先完成视觉回归和 GPU timestamp 基线 |
 | P3 | Quad/MSDF 双缓冲或三缓冲异步更新 | 未实现 | 仅在 timeline wait 被测为瓶颈后实施 |
@@ -102,6 +111,23 @@ xrWaitFrame
    `eye1_deferred=0`，并持续消费每眼 Filament 完成信号。
 4. 新旧 Bridge 均使用逐眼完成路径，直到 array swapchain + multiview 通过长时间实机验收。
 5. 不得出现 `VK_ERROR_DEVICE_LOST`、access violation、30 Hz 锁定或 XR 输入帧率随 SBS 降低。
+
+### 阶段 0.5：固定同口径性能基线
+
+在继续改动任何 GPU 热路径前，先消除“把合成呈现率误当新内容吞吐率”的口径问题：
+
+1. OpenGL 与 Vulkan 各运行至少 70 秒，使用相同的控制器、Glow、工具 Quad、捕获源、模型和深度分辨率。
+2. 两条路径都采集 `screen_new`、`screen_reuse`、`screen_replay`、`capture_ready_p95`、`frame_exec_p95`、`rt_total_p95`、`xr_present_fps`。
+3. 记录 `rt_depth_backend`、`rt_pack`、`rt_sbs`、`xr_path`、Vulkan queue 拓扑和所有 fallback 标志。
+4. OpenGL 若缺少对应字段，先补充诊断采样器；不得用含义不明的 `fresh_input` 代替 `screen_new`。
+5. 固定 5 秒窗口并排除启动阶段，不用整轮平均值掩盖前 20 秒的初始化空帧。
+
+基线验收：同一输入下能够同时回答两个问题：
+
+- 合成器是否维持 72 Hz；
+- 新内容实际以多少 FPS 进入屏幕，以及每一段 GPU/CPU 工作的 p50/p95 是多少。
+
+2026-11-24 已完成第一轮：OpenGL 稳定呈现约 `71.84 Hz`，Vulkan/PyTorch 约 `71.50 Hz`，Vulkan/MIGraphX 约 `71.35 Hz`；Vulkan/PyTorch 的 `screen_new` 约 `38.95 FPS`，MIGraphX 约 `48.64 FPS`。因此下一阶段不应优先重写 Presenter，而应先压低 `rt_total_p95`、`capture_ready_p95` 和捕获覆盖。
 
 Virtual Desktop OpenXR 实机已经证明双 SwapChain deferred batch 不满足 Filament 帧
 生命周期：两个 Renderer 同时 in-flight 会触发 `VK_ERROR_DEVICE_LOST`；改成共享一个
@@ -159,6 +185,23 @@ CUDA 与 Vulkan 之间不再交替复用 binary ready/release semaphore。每个
 
 验收：graphics 与 compute 主机提交可重叠，且 Vulkan validation layer 无 queue 外部同步、布局或 ownership 错误。
 
+### 阶段 1.5：先处理上游吞吐与尾延迟
+
+在 Vulkan Context 大改之前，用现有开关完成可逆 A/B：
+
+1. **推理后端**：固定模型、深度分辨率和画质，比较 `pytorch_rocm` 与 `migraphx_rocm`；保留画面等价性证据。
+2. **捕获与预处理**：拆分 capture acquire、RGB/BGR 转换、resize/normalize 和 GPU upload，确认 `capture_ready_p95` 的主要组成。
+3. **立体后处理**：将 `rt_total` 拆成模型、深度上采样、warp/occlusion/fill、输出转换；优先处理 p95 最高的单阶段。
+4. **覆盖策略**：确认 `overwrite` 来自捕获超前而非 Presenter 阻塞；调整捕获 pacing，避免用无界队列或整帧 CPU 回读掩盖问题。
+5. **同步与跨 API handoff**：记录每个源帧的 ready/release timeline generation，确认没有重复 signal、空闲等待或设备丢失。
+
+阶段 1.5 的验收不是“最高瞬时 FPS”，而是：
+
+- `screen_new` 提升且 `xr_present_fps` 不下降；
+- `rt_total_p95` 和 `capture_ready_p95` 明显下降；
+- `overwrite`、`rt_pending_age` 和 source latency 不持续增长；
+- 左右眼画面与现有颜色/深度语义保持一致。
+
 ### 阶段 2：Compute 移到 Output Worker
 
 目标线程结构：
@@ -190,9 +233,21 @@ Capture
 
 每次只启用一项，通过相同输入、相同头部姿态和相同配置做 A/B；任何颜色、左右眼、锐度或 UI 合成差异都视为失败。
 
-### 阶段 4：Array Swapchain 与 Multiview
+当前 A/B 的投影合成 p95 约 `2.6–3.2 ms`，低于 72 Hz 每帧 13.9 ms 的预算，因此本阶段应排在阶段 1.5 之后。只有确认 `screen_new` 或呈现节奏仍受 GPU 提交限制时，才优先实施双眼 transition 合并。
 
-目标实现优先创建一个 `array_size=2` 的 Projection SwapChain，layer 0/1 分别对应左右眼。
+### 阶段 4：Single-SBS、Array Swapchain 与 Multiview
+
+2026-11-27 已实现首选的低风险路径：一张 `array_size=1` 的全宽 SBS Projection SwapChain，左右两个 Projection View 分别引用左/右半幅 `imageRect`，两边使用不同眼姿态，不是单 Quad `eyeVisibility=BOTH` 复制。RX 9060 XT / OpenXR Simulator 在同视频、同画质、Render Scale 1.0 下，Projection total 中位数从逐眼 `3.785 ms` 降到 `1.080 ms`，p50 从 `3.680 ms` 降到 `0.950 ms`，p95 从 `5.180 ms` 降到 `1.760 ms`；屏幕采样尺寸和 source-per-pixel 指标保持不变。
+
+这条路径同时暴露两个边界：Runtime 的 swapchain 单边宽度限制使 Render Scale 2.0 所需的 `5120x2800` 图像创建失败；当前 Filament Bridge 的 multiview/HDR 在 `3d_cinema` GLB 上不可用。两者都在首帧前静默回退到逐眼，不影响启动。后续优先级调整为：
+
+1. 为 Filament 增加左右眼目标矩形 viewport，使 GLB 背景可直接写入 SBS 两个半幅。
+2. 对 Render Scale 2.0 评估 `array_size=2` layered Projection；它是宽度受限时的回退，不再作为 1.0 路径的前置条件。
+3. 保持 Vulkan controller proxy 为 single-SBS 的默认手柄合成路径；Filament 全幅 controller pass 会拉伸单眼内容，禁止混用。
+4. 在物理 Quest 2 / VDXR 上完成 10 分钟稳定性和画面清晰度验收，再决定是否把开关默认值改为开启。
+
+下一段保留 `array_size=2` layered 设计，作为 Render Scale 较高或 Runtime 不接受全宽单图的路径。
+目标创建一个 `array_size=2` 的 Projection SwapChain，layer 0/1 分别对应左右眼。
 Vulkan Projection Composer 使用 layered draw/dispatch 合成两层；Filament 环境/手柄输出可先逐眼，稳定后再启用 multiview；
 OpenXR 仍提交两个 Projection View，但两者共享同一个 SwapChain handle，并分别引用 array
 layer 0/1。左右眼源图 ready semaphore 在进入 Filament 前由同一 graphics queue submit
@@ -203,9 +258,11 @@ layer 0/1。左右眼源图 ready semaphore 在进入 Filament 前由同一 grap
 - Runtime 不支持目标 Vulkan/OpenXR 特性。
 - 两眼推荐尺寸或采样要求不同。
 - Filament Bridge ABI 或 GPU 不支持所需的颜色/深度输出。
+- layered OpenXR 或 Filament 目标创建失败。
 
 Quad Layer 的 `array_size=2` 单独实验，不作为 Projection Layer 成功的前置条件；Runtime 创建或提交失败时回退为 per-eye Quad swapchain。
-- layered OpenXR 或 Filament 目标创建失败。
+
+2026-11-24 的 VDXR 实机验证已证明左右眼显示不同 Quad 内容可行，因此 Quad 方案不再需要证明运行时是否支持，而应验证 D2S 的左右眼资源所有权、提交顺序与回退。对设置菜单继续使用 `array_size=1` + `eyeVisibility=BOTH`；对需要每眼不同内容的立体屏幕，使用左/右独立 Quad 或经过验证的 layered Quad，不得把单张 SBS 纹理直接当作左右眼内容。
 
 初始化失败只销毁临时 layered SwapChain，不销毁原左右眼 SwapChain；运行路径不调用
 `end_frame_deferred()` 或 `finish_frame_batch()`。远程原生构建、视觉回归、性能和至少
@@ -243,12 +300,14 @@ CPU 提交耗时不能替代 GPU timestamp；`xrWaitFrame` 也不能计入应用
 
 | 类别 | 验收条件 |
 |---|---|
-| 性能 | 相同配置下比较 5 个固定窗口的中位数；目标恢复已观察到的 50-55 SBS FPS 区间 |
+| 性能 | 相同配置下比较 5 个固定窗口的中位数；同时满足约 72 Hz 合成呈现和可解释的新内容 FPS，不以整轮平均值代替窗口数据 |
 | 稳定性 | 至少连续运行 10 分钟，无卡死、device lost、access violation 或持续降至 30 Hz |
 | 延迟 | `rt_pending_age`、source latency 和 Presenter queue age 不持续增长 |
 | 同步 | 跨 API ready/release timeline generation 单调递增；每个新源帧的 Projection visible signal 只 signal/wait 一次 |
 | 画质 | 固定输入视觉回归通过；左右眼顺序、颜色空间、屏幕清晰度和 Glow 不变 |
 | 兼容 | 新 Bridge 在能力满足时走 array multiview，旧 Bridge 或初始化失败走逐眼回退；三平台远程构建通过 |
+
+补充性能判据：在 RX 9060 XT / VDXR 上，Vulkan/PyTorch 的参考窗口为 `xr_present_fps≈71.5`、`screen_new≈39 FPS`、`rt_total_p95≈21.6 ms`；任何优化应优先把 `screen_new` 提升并降低 `rt_total_p95`，不能只报告 `xr_present_fps`。
 
 ## 6. 风险与回退
 

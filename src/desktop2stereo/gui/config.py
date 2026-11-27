@@ -157,6 +157,7 @@ DEFAULTS = {
     "Vulkan Projection Max LOD": 0.35,
     "Vulkan Projection MIP LOD Bias": -0.35,
     "Vulkan Projection RCAS Sharpness": 0.5,
+    "Vulkan Projection Screen Oversample": 1.5,
     "Display Mode": "Half-SBS",
     "FP16": True,
     "torch.compile": False,

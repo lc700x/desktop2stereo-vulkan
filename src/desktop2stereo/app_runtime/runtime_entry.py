@@ -261,6 +261,13 @@ def _openxr_projection_config(settings: dict) -> dict[str, object]:
     return {
         "render_scale": _resolve_openxr_render_scale(settings),
         "render_scale_auto": _openxr_render_scale_is_auto(settings),
+        "screen_oversample": max(
+            1.0,
+            min(
+                2.0,
+                float(settings.get("Vulkan Projection Screen Oversample", 1.5)),
+            ),
+        ),
         "swapchain_color_mode": str(
             settings.get("OpenXR Color Mode", "sRGB")
         ).strip().lower(),

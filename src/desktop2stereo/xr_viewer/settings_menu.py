@@ -11,6 +11,16 @@ OPENXR_RENDER_SCALE_MIN = 0.5
 OPENXR_RENDER_SCALE_MAX = 4.0
 # Shared semantic tokens keep the in-headset and desktop OpenXR panels aligned.
 OPENXR_MENU_COLORS = dict(MOONLIGHT_BLUE_COLORS)
+# The OpenXR Stop action uses the same dark-red/white danger treatment as the
+# desktop main GUI. Keep the softer destructive tokens for media overlays.
+OPENXR_MENU_COLORS.update(
+    {
+        "destructive": MOONLIGHT_BLUE_COLORS["action_destructive"],
+        "destructive_hover": MOONLIGHT_BLUE_COLORS["action_destructive_hover"],
+        "destructive_pressed": MOONLIGHT_BLUE_COLORS["action_destructive_pressed"],
+        "destructive_text": MOONLIGHT_BLUE_COLORS["action_destructive_text"],
+    }
+)
 OPENXR_MENU_RADII = {
     "panel": 28,
     "group": 16,

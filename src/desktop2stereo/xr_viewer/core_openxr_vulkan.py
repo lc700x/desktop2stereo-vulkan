@@ -596,6 +596,7 @@ class OpenXrVulkanConfig:
     application_name: str = "Desktop2Stereo Vulkan"
     render_scale: float = 1.0
     render_scale_auto: bool = False
+    screen_oversample: float = 1.5
     clear_color: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     requested_vulkan_version: int = make_vulkan_version(1, 4, 0)
     # Keep the validated OpenXR projection target as sRGB. The Filament bridge
@@ -674,6 +675,8 @@ class _EyeSwapchain:
     height: int
     resources: list[VulkanImageResource] = field(default_factory=list)
     array_size: int = 1
+    # A single array_size=1 image holding two side-by-side eye rectangles.
+    sbs_split: bool = False
 
 
 class OpenXrCompositionBuilder:
@@ -688,15 +691,29 @@ class OpenXrCompositionBuilder:
         layer_flags: Any = 0,
     ) -> Any:
         layered = len(swapchains) == 1 and swapchains[0].array_size >= 2
-        eye_swapchains = (
-            [(swapchains[0], 0), (swapchains[0], 1)]
-            if layered
-            else [(eye, 0) for eye in swapchains]
+        sbs_split = bool(
+            len(swapchains) == 1
+            and swapchains[0].array_size == 1
+            and swapchains[0].sbs_split
         )
+        eye_swapchains = (
+            [(swapchains[0], 0, (0, 0, swapchains[0].width // 2, swapchains[0].height)),
+             (swapchains[0], 0, (swapchains[0].width // 2, 0, swapchains[0].width // 2, swapchains[0].height))]
+            if sbs_split
+            else (
+                [(swapchains[0], 0, (0, 0, swapchains[0].width, swapchains[0].height)),
+                 (swapchains[0], 1, (0, 0, swapchains[0].width, swapchains[0].height))]
+                if layered
+                else [(eye, 0, (0, 0, eye.width, eye.height)) for eye in swapchains]
+            )
+        )
+        if sbs_split and int(swapchains[0].width) % 2:
+            raise ValueError("single SBS projection swapchain width must be even")
         if len(views) < len(eye_swapchains):
             raise ValueError("projection layer requires one view per eye swapchain")
         projection_views = []
-        for eye_index, (eye, array_index) in enumerate(eye_swapchains):
+        for eye_index, (eye, array_index, rect) in enumerate(eye_swapchains):
+            rect_x, rect_y, rect_width, rect_height = rect
             projection_views.append(
                 self.xr.CompositionLayerProjectionView(
                     pose=views[eye_index].pose,
@@ -704,8 +721,8 @@ class OpenXrCompositionBuilder:
                     sub_image=self.xr.SwapchainSubImage(
                         swapchain=eye.handle,
                         image_rect=self.xr.Rect2Di(
-                            offset=self.xr.Offset2Di(x=0, y=0),
-                            extent=self.xr.Extent2Di(width=eye.width, height=eye.height),
+                            offset=self.xr.Offset2Di(x=rect_x, y=rect_y),
+                            extent=self.xr.Extent2Di(width=rect_width, height=rect_height),
                         ),
                         image_array_index=array_index,
                     ),
@@ -912,6 +929,12 @@ class OpenXrVulkanPresenter(
         self._vulkan_projection_laser_depth_available = False
         self._last_vulkan_projection_laser_depth_status: str | None = None
         self._last_vulkan_projection_laser_prepare_status: str | None = None
+        self._single_sbs_projection_requested = _env_flag(
+            "D2S_OPENXR_PROJECTION_SBS_SINGLE_SWAPCHAIN", default=False
+        )
+        self._single_sbs_projection_active = False
+        self._single_sbs_projection_fallback_reason: str | None = None
+        self._single_sbs_eye_extents: tuple[tuple[int, int], tuple[int, int]] | None = None
         screen_quad_reprojection_requested = _env_flag(
             "D2S_OPENXR_SCREEN_QUAD_REPROJECTION"
         )
@@ -953,6 +976,16 @@ class OpenXrVulkanPresenter(
             )
             self._on_breakdown_set_latest(
                 "openxr_screen_quad_reprojection_active", False
+            )
+            self._on_breakdown_set_latest(
+                "openxr_projection_layout",
+                "single_sbs" if self._single_sbs_projection_requested else "per_eye",
+            )
+            self._on_breakdown_set_latest(
+                "openxr_projection_swapchain_count", 0
+            )
+            self._on_breakdown_set_latest(
+                "openxr_projection_array_size", 1
             )
         self._quad_swapchains: list[_EyeSwapchain] = []
         self._quad_swapchain_format: int | None = None
@@ -7974,6 +8007,17 @@ class OpenXrVulkanPresenter(
             > int(view_config.max_image_rect_height)
             for view_config in view_configs[:2]
         )
+        self._single_sbs_eye_extents = (eye_extents[0], eye_extents[1])
+        single_sbs = bool(
+            self._single_sbs_projection_requested
+            and not self._projection_array_eye_diagnostic
+            and not self._vulkan_multiview_eye_diagnostic
+            and eye_extents[0] == eye_extents[1]
+        )
+        if self._single_sbs_projection_requested and not single_sbs:
+            self._single_sbs_projection_fallback_reason = (
+                "eye extents differ or a Projection diagnostic is active"
+            )
         if (
             self._projection_array_eye_diagnostic
             or self._vulkan_multiview_eye_diagnostic
@@ -7994,22 +8038,66 @@ class OpenXrVulkanPresenter(
                 f"array_size=2 extent={width}x{height}",
                 flush=True,
             )
+        elif single_sbs:
+            width, height = eye_extents[0]
+            try:
+                swapchain = self._create_projection_swapchain(
+                    width * 2, height, array_size=1
+                )
+                swapchain.sbs_split = True
+                self.swapchains.append(swapchain)
+                self._single_sbs_projection_active = True
+                # Filament's controller overlay renders one full swapchain
+                # extent. In the single-SBS layout that would stretch one eye's
+                # controllers across both halves. Use the independent Vulkan
+                # controller proxy, which has a real per-eye composition layer.
+                self._vulkan_controller_proxy_enabled = True
+                print(
+                    "[OpenXRViewer] Single-SBS Projection created: "
+                    f"array_size=1 extent={width * 2}x{height} eye={width}x{height}",
+                    flush=True,
+                )
+                print(
+                    "[OpenXRViewer] Single-SBS controller isolation active: "
+                    "Vulkan controller proxy",
+                    flush=True,
+                )
+            except Exception as exc:
+                self._single_sbs_projection_active = False
+                self._single_sbs_projection_fallback_reason = (
+                    f"swapchain creation failed: {type(exc).__name__}"
+                )
+                print(
+                    "[OpenXRViewer] Single-SBS Projection fallback: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                for width, height in eye_extents:
+                    self.swapchains.append(
+                        self._create_projection_swapchain(width, height)
+                    )
         else:
             for width, height in eye_extents:
                 self.swapchains.append(
                     self._create_projection_swapchain(width, height)
                 )
-        if self._vulkan_controller_proxy_enabled and len(self.swapchains) == 2:
+        if self._vulkan_controller_proxy_enabled:
             try:
                 self._vulkan_controller_proxy_swapchains = [
                     self._create_projection_swapchain(width, height)
                     for width, height in eye_extents
                 ]
-            except Exception:
+            except Exception as exc:
                 for eye in reversed(self._vulkan_controller_proxy_swapchains):
                     self._destroy_projection_swapchain(eye)
                 self._vulkan_controller_proxy_swapchains.clear()
-                raise
+                if self._single_sbs_projection_active and self._fallback_single_sbs_projection(
+                    "Vulkan controller proxy swapchains unavailable: "
+                    f"{type(exc).__name__}"
+                ):
+                    self._vulkan_controller_proxy_enabled = False
+                else:
+                    raise
         # Only create the optional panorama pipeline for a selected panorama.
         # ROCm still requires the Vulkan implementation even when the runtime
         # advertises native equirect support; Default has no panorama asset.
@@ -8022,12 +8110,56 @@ class OpenXrVulkanPresenter(
                 )
             )
         )
-        # VDXR/AMD rejects xrCreateSwapchain/xrEnumerateSwapchainImages once
-        # the frame loop is active (RuntimeFailureError), while the identical
-        # create/enumerate succeeds at session start (probed: warm OK at
-        # 512x128 fmt=43 vs mid-frame fail at 786x58). Pre-create one pooled
-        # swapchain per overlay key here; mid-frame upload paths then only
-        # reuse. Unknown keys created mid-frame are skipped on VDXR.
+        self._publish_projection_layout_metrics()
+
+    def _publish_projection_layout_metrics(self) -> None:
+        if self._on_breakdown_set_latest is None:
+            return
+        self._on_breakdown_set_latest(
+            "openxr_projection_layout",
+            "single_sbs" if self._single_sbs_projection_active else "per_eye",
+        )
+        self._on_breakdown_set_latest(
+            "openxr_projection_swapchain_count", len(self.swapchains)
+        )
+        self._on_breakdown_set_latest(
+            "openxr_projection_array_size",
+            int(self.swapchains[0].array_size) if len(self.swapchains) == 1 else 1,
+        )
+        self._on_breakdown_set_latest(
+            "openxr_projection_single_sbs_requested",
+            self._single_sbs_projection_requested,
+        )
+        self._on_breakdown_set_latest(
+            "openxr_projection_single_sbs_fallback_reason",
+            self._single_sbs_projection_fallback_reason,
+        )
+
+    def _fallback_single_sbs_projection(self, reason: str) -> bool:
+        """Replace the experimental single-SBS target before the first frame."""
+        if not self._single_sbs_projection_active:
+            return False
+        eye_extents = self._single_sbs_eye_extents
+        if eye_extents is None or len(self.swapchains) != 1:
+            return False
+        if self.vulkan is not None:
+            self.vulkan.wait_idle()
+        for eye in reversed(self.swapchains):
+            self._destroy_projection_swapchain(eye)
+        self.swapchains.clear()
+        self._single_sbs_projection_active = False
+        self._single_sbs_projection_fallback_reason = reason
+        for width, height in eye_extents:
+            self.swapchains.append(
+                self._create_projection_swapchain(width, height)
+            )
+        print(
+            "[OpenXRViewer] Single-SBS Projection fallback before first frame: "
+            f"{reason}; using per-eye swapchains",
+            flush=True,
+        )
+        self._publish_projection_layout_metrics()
+        return True
 
     def _tool_quad_pool_size(self) -> tuple[int, int]:
         """Return the fixed canvas used by pre-created tool quads."""
@@ -8168,6 +8300,7 @@ class OpenXrVulkanPresenter(
         self._last_screen_quad_layers = []
         self._screen_quad_reprojection_frame_id = None
         self._screen_quad_reprojection_active = False
+        self._single_sbs_projection_active = False
         self._destroy_quad_swapchains()
         if self.filament_bridge is not None:
             self.filament_bridge.close()
@@ -8575,6 +8708,10 @@ class OpenXrVulkanPresenter(
         self.xr.destroy_swapchain(eye.handle)
 
     def _projection_eye_extents(self) -> tuple[tuple[int, int], ...]:
+        if self._single_sbs_projection_active and len(self.swapchains) == 1:
+            eye = self.swapchains[0]
+            extent = (int(eye.width) // 2, int(eye.height))
+            return (extent, extent)
         if len(self.swapchains) == 1 and self.swapchains[0].array_size >= 2:
             extent = (self.swapchains[0].width, self.swapchains[0].height)
             return (extent, extent)
@@ -9329,7 +9466,19 @@ class OpenXrVulkanPresenter(
             "D2S_FILAMENT_BRIDGE"
         )
         if not bridge_path:
+            if self._single_sbs_projection_active and self.config.filament_glb_path:
+                self._fallback_single_sbs_projection(
+                    "GLB background requires Filament, but the bridge is unavailable"
+                )
             return
+
+        single_sbs_multiview_background = bool(
+            self._single_sbs_projection_active and self.config.filament_glb_path
+        )
+        if single_sbs_multiview_background:
+            # Direct Filament rendering clears a whole target. Resolve the
+            # private per-eye HDR pair into the left/right SBS rectangles.
+            self._filament_multiview_requested = True
 
         from .filament_vulkan_bridge import FilamentVulkanBridge
 
@@ -9351,6 +9500,10 @@ class OpenXrVulkanPresenter(
                 self._filament_multiview_requested
                 and self._try_enable_filament_multiview(bridge)
             )
+            if single_sbs_multiview_background and not self._multiview_active:
+                self._fallback_single_sbs_projection(
+                    "Filament multiview/HDR background is unavailable"
+                )
             if (
                 not self._multiview_active
             ):
@@ -9850,17 +10003,28 @@ class OpenXrVulkanPresenter(
         ):
             raise RuntimeError("Filament multiview HDR resolve has no valid targets")
         layered = len(acquired_images) == 1 and acquired_images[0][0].array_size >= 2
+        single_sbs = bool(
+            len(acquired_images) == 1
+            and self._single_sbs_projection_active
+            and acquired_images[0][0].sbs_split
+        )
         if self._vulkan_projection_screen_pass is None:
             raise RuntimeError("Vulkan projection pass is unavailable")
         if projection_draws is None:
             projection_draws = []
             for eye_index in range(2):
-                target_eye, image_index = (
-                    acquired_images[0] if layered else acquired_images[eye_index]
+                target_eye, image_index, array_layer, target_rect = (
+                    self._projection_target_for_eye(
+                        acquired_images,
+                        eye_index,
+                        layered=layered,
+                        single_sbs=single_sbs,
+                    )
                 )
                 projection_draws.append({
                     "target": target_eye.resources[image_index],
-                    "array_layer": eye_index if layered else 0,
+                    "array_layer": array_layer,
+                    "target_rect": target_rect,
                     "frame_slot": int(self.frame_count) % 3,
                 })
         timeline = self._vulkan_projection_screen_pass.submit_filament_hdr(
@@ -9935,6 +10099,39 @@ class OpenXrVulkanPresenter(
             flush=True,
         )
 
+    def _projection_target_for_eye(
+        self,
+        acquired_images: list[tuple[_EyeSwapchain, int]],
+        eye_index: int,
+        *,
+        layered: bool,
+        single_sbs: bool,
+    ) -> tuple[_EyeSwapchain, int, int, tuple[int, int, int, int]]:
+        if single_sbs:
+            eye, image_index = acquired_images[0]
+            eye_width = int(eye.width) // 2
+            return (
+                eye,
+                image_index,
+                0,
+                (eye_width * int(eye_index), 0, eye_width, int(eye.height)),
+            )
+        if layered:
+            eye, image_index = acquired_images[0]
+            return (
+                eye,
+                image_index,
+                int(eye_index),
+                (0, 0, int(eye.width), int(eye.height)),
+            )
+        eye, image_index = acquired_images[eye_index]
+        return (
+            eye,
+            image_index,
+            0,
+            (0, 0, int(eye.width), int(eye.height)),
+        )
+
     def _render_vulkan_projection_composer(
         self,
         frame: VulkanStereoOutputFrame,
@@ -9948,6 +10145,11 @@ class OpenXrVulkanPresenter(
             raise RuntimeError("Vulkan Projection Composer has no valid targets")
         diagnostic = _env_flag("D2S_VULKAN_PROJECTION_COMPOSER_EYE_DIAGNOSTIC")
         layered = len(acquired_images) == 1 and acquired_images[0][0].array_size >= 2
+        single_sbs = bool(
+            len(acquired_images) == 1
+            and self._single_sbs_projection_active
+            and acquired_images[0][0].sbs_split
+        )
         if diagnostic:
             target_eye, image_index = acquired_images[0]
             colors = ((1.0, 0.0, 0.0, 1.0), (0.0, 1.0, 0.0, 1.0))
@@ -10076,8 +10278,13 @@ class OpenXrVulkanPresenter(
                     time.perf_counter() - source_prepare_started,
                 )
             draw_prepare_started = time.perf_counter()
-            target_eye, image_index = (
-                acquired_images[0] if layered else acquired_images[eye_index]
+            target_eye, image_index, array_layer, target_rect = (
+                self._projection_target_for_eye(
+                    acquired_images,
+                    eye_index,
+                    layered=layered,
+                    single_sbs=single_sbs,
+                )
             )
             sampling_constants = self._projection_screen_sampling_constants(
                 source,
@@ -10090,7 +10297,8 @@ class OpenXrVulkanPresenter(
             projection_draw = {
                 "source": source,
                 "target": target_eye.resources[image_index],
-                "array_layer": eye_index if layered else 0,
+                "array_layer": array_layer,
+                "target_rect": target_rect,
                 "eye_index": eye_index,
                 "frame_slot": int(self.frame_count) % 3,
                 "push_constants": screen_push_constants,
@@ -10453,13 +10661,23 @@ class OpenXrVulkanPresenter(
             and getattr(bridge, "image_ready_semaphore_abi_available", False)
             and getattr(bridge, "finished_drawing_semaphore_abi_available", False)
             and self.vulkan is not None
-            and len(self.swapchains) == 2
+            and (len(self.swapchains) == 2 or self._single_sbs_projection_active)
             and self._vulkan_projection_composer_requested
             and self._filament_multiview_requested
         ):
             return False
-        left, right = self.swapchains
-        if (left.width, left.height) != (right.width, right.height):
+        if self._single_sbs_projection_active:
+            extents = self._single_sbs_eye_extents
+            if extents is None:
+                return False
+            left_extent, right_extent = extents
+            left_width, left_height = left_extent
+            right_width, right_height = right_extent
+        else:
+            left, right = self.swapchains
+            left_width, left_height = left.width, left.height
+            right_width, right_height = right.width, right.height
+        if (left_width, left_height) != (right_width, right_height):
             print(
                 "[OpenXRViewer] Filament multiview unavailable: eye extents differ",
                 flush=True,
@@ -10473,8 +10691,8 @@ class OpenXrVulkanPresenter(
         try:
             depth_attachment = VulkanDepthAttachment(
                 self.vulkan,
-                left.width,
-                left.height,
+                left_width,
+                left_height,
                 label="filament-multiview-depth",
                 array_layers=2,
             )
@@ -10482,8 +10700,8 @@ class OpenXrVulkanPresenter(
                 hdr_images.append(
                     VulkanTransientImage(
                         self.vulkan,
-                        left.width,
-                        left.height,
+                        left_width,
+                        left_height,
                         format=hdr_format,
                         array_layers=2,
                         label=f"filament-multiview-hdr-slot{slot}",
@@ -10501,8 +10719,8 @@ class OpenXrVulkanPresenter(
             bridge.create_stereo_swapchain_with_depth(
                 (image.image for image in hdr_images),
                 format=hdr_format,
-                width=left.width,
-                height=left.height,
+                width=left_width,
+                height=left_height,
                 depth_image=depth_attachment.image,
                 depth_format=depth_attachment.format,
             )
@@ -10539,7 +10757,7 @@ class OpenXrVulkanPresenter(
         print(
             "[OpenXRViewer] Filament projection path: "
             f"multiview_hdr slots={len(hdr_images)} array_size=2 "
-            f"format=R16G16B16A16_SFLOAT extent={left.width}x{left.height} "
+            f"format=R16G16B16A16_SFLOAT extent={left_width}x{left_height} "
             f"depth_layers=2 depth_format={depth_attachment.format} "
             "controllers=foreground_projection",
             flush=True,
@@ -10625,6 +10843,19 @@ class OpenXrVulkanPresenter(
                 rotation,
             )
 
+    def _screen_oversample_factor(self) -> float:
+        return max(
+            1.0,
+            min(
+                2.0,
+                _env_number(
+                    "D2S_OPENXR_SCREEN_OVERSAMPLE",
+                    self.config.screen_oversample,
+                    minimum=1.0,
+                ),
+            ),
+        )
+
     def _apply_screen_sampling_policy(
         self,
         output_frame: VulkanStereoOutputFrame | None,
@@ -10689,6 +10920,7 @@ class OpenXrVulkanPresenter(
                     source_size[1],
                     footprint_width,
                     footprint_height,
+                    oversample=self._screen_oversample_factor(),
                 )
             else:
                 # Compatibility fallback for callers without view geometry.
@@ -10766,6 +10998,7 @@ class OpenXrVulkanPresenter(
                 f"recommended={log_plan.recommended_headset_tier_k}K "
                 f"effective={log_plan.effective_tier_k}K "
                 f"quality={log_plan.quality_width}x{log_plan.quality_height} "
+                f"oversample={self._screen_oversample_factor():.2f} "
                 f"filter_scale={log_plan.filter_scale:.2f} mode={log_plan.mode} "
                 f"upscale_scale={log_plan.upscale_scale:.2f} "
                 "sampling_owner="
@@ -12179,6 +12412,8 @@ class OpenXrVulkanPresenter(
             not self._filament_controller_overlay_after_composer
             or bridge is None
             or self._multiview_active
+            or self._vulkan_controller_proxy_enabled
+            or self._single_sbs_projection_active
             or getattr(self, "_filament_controller_overlay_empty", False)
         ):
             return
@@ -12485,7 +12720,11 @@ class OpenXrVulkanPresenter(
         views: list[Any],
         output_frame: VulkanStereoOutputFrame | None | object = _OUTPUT_FRAME_UNSET,
     ) -> Any | None:
-        required_views = 2 if self._multiview_active else len(self.swapchains)
+        required_views = (
+            2
+            if self._multiview_active or self._single_sbs_projection_active
+            else len(self.swapchains)
+        )
         if len(views) < required_views:
             return None
         # The profile adjusts the Filament camera relative to the model. The

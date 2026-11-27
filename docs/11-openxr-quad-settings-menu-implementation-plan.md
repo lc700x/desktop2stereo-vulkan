@@ -1,5 +1,9 @@
 # OpenXR Quad 设置菜单实施计划
 
+**更新时间**：2026-11-24
+
+**关联实测**：[23 号 VDXR 性能与立体 Quad 报告](23-vdxr-quest2-opengl-vulkan-performance-and-stereo-quad-report.md)
+
 ## 1. 目标与交互入口
 
 在 OpenXR Vulkan 路径新增一个 `array_size=1`、`eyeVisibility=BOTH` 的设置菜单 Quad。菜单采用单面板三页签：
@@ -35,6 +39,8 @@ Controller Projection 复用同一个 Filament Engine 和现有 multiview 相机
 文字和图元在一次 Compute dispatch 中绘制，避免拖动滑块时由 CPU 重画并上传整张位图。菜单画布固定约为 `1024×768`，物理尺寸约 `0.95×0.71 m`，使用深色半透明背景、黄色选中状态和蓝白激光光标。
 
 菜单内容未变化时复用当前 Swapchain 图像，仅在悬停、页签或参数变化时重绘；连续滑块更新限制为最高 `20 Hz`。关闭菜单时停止提交该 Quad Layer，重新打开时复用既有 Swapchain 和 GPU 资源。
+
+**界面 Quad 与立体屏幕 Quad 的边界**：本节的 `eyeVisibility=BOTH` Quad 只用于设置菜单、提示和激光光标，它不需要左右眼不同内容。需要每眼不同画面的立体屏幕必须使用独立的左右眼内容路径；单一 `BOTH` Quad 不能替代立体屏幕。2026-11-24 已在 Quest 2 / VDXR 上确认 Quad 左右不同画面可行，后续只需验证 D2S 的资源接入与生命周期。
 
 ## 3. 画面页
 
@@ -96,6 +102,14 @@ Min/Max LOD 始终保持 `Min LOD ≤ Max LOD`。拖动时通过新增的菜单�
 
 屏幕修改立即同步到 Presenter 的屏幕几何、Glow、键盘锚点和激光命中计算。释放滑块或切换开关后原子写回当前 `profile.json`。
 
+若屏幕页后续选择 Quad 呈现虚拟屏幕，必须把“立体内容”作为独立契约处理：
+
+- 左、右眼分别读取对应眼的 GPU 图像，禁止用同一张单眼/SBS 纹理冒充双眼内容。
+- 首版优先使用左/右独立 Quad swapchain（`eyeVisibility=LEFT/RIGHT`），共享同一世界姿态与物理尺寸。
+- 双眼内容必须支持一次性左右交换诊断，确保 OpenXR 的 eye index 映射不会反转。
+- 若后续采用 layered `array_size=2` Quad，保留独立双 Quad 回退，并在同一 pose、同一输入下做视觉与性能 A/B。
+- 立体屏幕 Quad 与设置菜单 Quad 使用独立的资源所有权、更新时钟和生命周期；菜单关闭不能影响屏幕内容。
+
 ## 6. 数据流与内部接口
 
 新增独立菜单状态与布局模块，负责：
@@ -131,6 +145,8 @@ Presenter 新增统一菜单设置回调：
 ### 7.2 渲染与性能测试
 
 - 菜单使用单 Quad、`eyeVisibility=BOTH`，左右眼位置和物理尺寸一致。
+- 立体屏幕使用左右眼独立内容；若采用左/右独立 Quad，分别设置 `eyeVisibility=LEFT` 与 `eyeVisibility=RIGHT`，并验证左右眼不会交换。
+- 若评估 `array_size=2` layered Quad，必须与双 Quad 做画面、同步和性能 A/B；单 Quad `BOTH` 只用于非立体 UI。
 - 验证 `主 Projection → Quad → Controller Projection` 的稳定层顺序、Swapchain 复用和关闭时停止提交。
 - 验证 GPU MSDF 图元容量、shader manifest 和 SPIR-V 构建。
 - 菜单未变化时不重复上传；滑块连续更新不超过 `20 Hz`。
@@ -140,6 +156,8 @@ Presenter 新增统一菜单设置回调：
 
 - 屏幕外 Trigger 短按稳定弹出菜单，菜单打开后世界锁定且不随转头漂移。
 - 菜单双眼显示一致，不被虚拟屏幕、Glow 或房间遮挡。
+- 左右立体 Quad 显示不同内容，左右交换测试能明确发现；单眼黑屏、重影或姿态不一致均判失败。
+- 菜单 Quad 与立体屏幕 Quad 同时存在时层顺序和资源回收正确，连续 10 分钟无 device lost。
 - 颜色、LOD 和 RCAS 实时可见，重启后保留。
 - 座位、座位高度、灯光和屏幕调整即时生效，重新启动同一房间后保持。
 - 菜单关闭后，原有桌面鼠标、键盘、手柄快捷键和屏幕拖动行为不变。
@@ -147,6 +165,7 @@ Presenter 新增统一菜单设置回调：
 ## 8. 首版边界
 
 - 仅实现 OpenXR Vulkan 路径，不为桌面预览窗口增加菜单。
+- 菜单首版保持单个 `eyeVisibility=BOTH` Quad；左右眼独立内容的立体屏幕是独立能力，不以菜单 Quad 的完成作为前置条件。
 - 所有菜单修改均持久化。
 - 当前运行中的 GUI 不实时同步；下次加载 `settings.yaml` 时显示新值。
 - 首版不提供任意颜色选择器、环境模型切换、媒体播放控制或手柄模型配置。

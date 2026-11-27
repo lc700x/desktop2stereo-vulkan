@@ -251,6 +251,7 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
         "disabled": rgba("text_disabled"),
         "stop": rgba("destructive"),
         "stop_hover": rgba("destructive_hover"),
+        "stop_pressed": rgba("destructive_pressed"),
         "stop_text": rgba("destructive_text"),
     }
     locale = normalize_locale(lang)
@@ -539,7 +540,9 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
             elif step_hovered:
                 button_fill, glyph_color = colors["blue_hover"], colors["blue_state_text"]
             else:
-                button_fill, glyph_color = colors["card_alt"], colors["text"]
+                button_fill, glyph_color = (
+                    colors["blue_container"], colors["blue_state_text"]
+                )
             target.ellipse(
                 (step_x - 16, center_y - 16, step_x + 16, center_y + 16),
                 fill=button_fill,
@@ -616,35 +619,28 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
             return
 
         if control.key.startswith("screen:section:"):
-            indicator_color = (
-                colors["blue"] if active or pressed
+            section_fill = (
+                colors["selection_container"] if active or pressed
                 else colors["blue_hover"] if hovered
-                else colors["card_alt"]
+                else colors["blue_container"]
             )
-            target.line(
-                (x0, y1 - 2, x1 - 1, y1 - 2),
-                fill=colors["card_alt"], width=2,
-            )
-            if active or hovered or pressed:
-                target.rounded_rectangle(
-                    (x0, y1 - 4, x1 - 1, y1 - 1),
-                    radius=2, fill=indicator_color,
-                )
-            text_color = (
-                colors["text"] if active
-                else colors["blue_hover"] if hovered or pressed
-                else colors["muted"]
+            target.rounded_rectangle(
+                box, radius=OPENXR_MENU_RADII["control"], fill=section_fill,
             )
             centered_text(
                 target, label, (x0 + 8, y0 + 2, x1 - 8, y1 - 8),
-                18, bold=active, minimum=18, color=text_color,
+                18, bold=active, minimum=18,
+                color=colors["selection_text"],
             )
             return
 
+        is_tab = control.key.startswith("tab:")
         if control.key == "runtime:stop":
             fill = (
                 colors["card_alt"] if not control.enabled
-                else colors["stop_hover"] if hovered or pressed else colors["stop"]
+                else colors["stop_pressed"] if pressed
+                else colors["stop_hover"] if hovered
+                else colors["stop"]
             )
         elif not control.enabled:
             fill = colors["card"]
@@ -653,9 +649,9 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
         elif active:
             fill = colors["selection_container"]
         elif hovered:
-            fill = colors["blue_container"]
+            fill = colors["blue_hover"]
         else:
-            fill = colors["card_alt"]
+            fill = colors["blue_container"]
         if control.kind == "toggle":
             fill = colors["blue"] if pressed else colors["blue_hover"] if hovered else colors["card"]
         target.rounded_rectangle(
@@ -664,8 +660,7 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
         text_color = (
             colors["disabled"] if not control.enabled
             else colors["stop_text"] if control.key == "runtime:stop"
-            else colors["selection_text"] if active or hovered or pressed
-            else colors["text"]
+            else colors["selection_text"]
         )
         if control.kind == "toggle":
             switch_width = min(72, max(48, (x1 - x0) // 4))
@@ -731,11 +726,8 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
             )
             return
 
-        if control.key.startswith("tab:"):
-            icon_color = (
-                colors["selection_text"] if active or hovered or pressed
-                else colors["muted"]
-            )
+        if is_tab:
+            icon_color = colors["blue_state_text"]
             icon_left = x0 + 16
             icon_top = (y0 + y1 - 24) // 2
             draw_navigation_icon(

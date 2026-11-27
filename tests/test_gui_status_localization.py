@@ -94,11 +94,28 @@ def test_main_menu_actions_use_theme_colors_for_all_interaction_states():
         ("run_btn", "primary"),
         ("report_issue_btn", "secondary"),
         ("open_log_file_btn", "secondary"),
+        ("openxr_controls_button", "secondary"),
+        ("media_open_file_btn", "secondary"),
+        ("media_open_folder_btn", "secondary"),
+        ("media_input_file_btn", "secondary"),
+        ("media_input_folder_btn", "secondary"),
     ):
         start = builder_source.index(f"self.{button_name} = ft.Button(")
         end = builder_source.find("\n        self.", start + 1)
         button_source = builder_source[start:end if end >= 0 else None]
         assert f'_main_menu_action_style("{variant}")' in button_source
+
+    streamer_source = inspect.getsource(GUIBuilderMixin._build_streamer_rows)
+    for button_name in (
+        "preview_btn",
+        "stream_calibration_btn",
+        "moonlight_pairing_btn",
+        "moonlight_pair_btn",
+    ):
+        start = streamer_source.index(f"self.{button_name} = ft.Button(")
+        end = streamer_source.find("\n        self.", start + 1)
+        button_source = streamer_source[start:end if end >= 0 else None]
+        assert '_main_menu_action_style("secondary")' in button_source
 
 
 def test_blue_theme_disables_material_hover_overlay_for_rounded_children():

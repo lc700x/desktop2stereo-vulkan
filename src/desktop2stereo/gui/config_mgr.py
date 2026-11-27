@@ -214,6 +214,11 @@ class GUIConfigMixin:
         self.projection_max_lod_dd.value = f'{self._parse_float(cfg.get("Vulkan Projection Max LOD", DEFAULTS["Vulkan Projection Max LOD"]), DEFAULTS["Vulkan Projection Max LOD"]):.2f}'
         self.projection_mip_lod_bias_dd.value = f'{self._parse_float(cfg.get("Vulkan Projection MIP LOD Bias", DEFAULTS["Vulkan Projection MIP LOD Bias"]), DEFAULTS["Vulkan Projection MIP LOD Bias"]):.2f}'
         self.projection_rcas_sharpness_dd.value = f'{self._parse_float(cfg.get("Vulkan Projection RCAS Sharpness", DEFAULTS["Vulkan Projection RCAS Sharpness"]), DEFAULTS["Vulkan Projection RCAS Sharpness"]):.2f}'
+        oversample = max(1.0, min(2.0, self._parse_float(
+            cfg.get("Vulkan Projection Screen Oversample", DEFAULTS["Vulkan Projection Screen Oversample"]),
+            DEFAULTS["Vulkan Projection Screen Oversample"],
+        )))
+        self.projection_screen_oversample_dd.value = f"{oversample:.2f}"
         self.advanced_stereo_cb.value = False
         self._sync_advanced_stereo_visibility()
         self._sync_device_advanced_visibility(cfg.get("Run Mode", DEFAULTS.get("Run Mode", "Local Viewer")))
@@ -468,6 +473,8 @@ class GUIConfigMixin:
             "Vulkan Projection Max LOD": self._parse_float(self.projection_max_lod_dd.value, DEFAULTS["Vulkan Projection Max LOD"]),
             "Vulkan Projection MIP LOD Bias": self._parse_float(self.projection_mip_lod_bias_dd.value, DEFAULTS["Vulkan Projection MIP LOD Bias"]),
             "Vulkan Projection RCAS Sharpness": self._parse_float(self.projection_rcas_sharpness_dd.value, DEFAULTS["Vulkan Projection RCAS Sharpness"]),
+            "Vulkan Projection Screen Oversample": max(1.0, min(2.0,
+                self._parse_float(self.projection_screen_oversample_dd.value, DEFAULTS["Vulkan Projection Screen Oversample"]))),
             "Depth Pop": depth_pop,
             "Foreground Pop": self._parse_float(self.foreground_pop_dd.value, DEFAULTS["Foreground Pop"]),
             "Midground Pop": self._parse_float(self.midground_pop_dd.value, DEFAULTS["Midground Pop"]),
@@ -686,6 +693,8 @@ class GUIConfigMixin:
             "Vulkan Projection Max LOD": self._parse_float(self.projection_max_lod_dd.value, DEFAULTS["Vulkan Projection Max LOD"]),
             "Vulkan Projection MIP LOD Bias": self._parse_float(self.projection_mip_lod_bias_dd.value, DEFAULTS["Vulkan Projection MIP LOD Bias"]),
             "Vulkan Projection RCAS Sharpness": self._parse_float(self.projection_rcas_sharpness_dd.value, DEFAULTS["Vulkan Projection RCAS Sharpness"]),
+            "Vulkan Projection Screen Oversample": max(1.0, min(2.0,
+                self._parse_float(self.projection_screen_oversample_dd.value, DEFAULTS["Vulkan Projection Screen Oversample"]))),
             "XR Render": self._display_to_openxr_render_resolution(
                 self.openxr_render_resolution_dd.value
             ),

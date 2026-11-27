@@ -2100,11 +2100,17 @@ class GUIHandlerMixin:
         self.projection_max_lod_label.value = t["Projection Max LOD:"]
         self.projection_mip_lod_bias_label.value = t["Projection MIP Bias:"]
         self.projection_rcas_sharpness_label.value = t["Projection RCAS:"]
+        self.projection_screen_oversample_label.value = t["Projection Screen SS:"]
         projection_tooltips = (
             (self.projection_min_lod_label, self.projection_min_lod_dd, t["Projection Min LOD tooltip"]),
             (self.projection_max_lod_label, self.projection_max_lod_dd, t["Projection Max LOD tooltip"]),
             (self.projection_mip_lod_bias_label, self.projection_mip_lod_bias_dd, t["Projection MIP Bias tooltip"]),
             (self.projection_rcas_sharpness_label, self.projection_rcas_sharpness_dd, t["Projection RCAS tooltip"]),
+            (
+                self.projection_screen_oversample_label,
+                self.projection_screen_oversample_dd,
+                t["Projection Screen SS tooltip"],
+            ),
         )
         for label, dropdown, tooltip in projection_tooltips:
             label.tooltip = tooltip

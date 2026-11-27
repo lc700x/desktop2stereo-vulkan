@@ -271,6 +271,53 @@ def test_flet_controls_use_one_compact_dimension_step():
     assert _compact_flet_dimension(236) == 176
 
 
+def test_flet_navigation_tabs_match_main_gui_action_palette():
+    import flet as ft
+
+    from xr_viewer.desktop_settings_menu import _navigation_button_style
+    from xr_viewer.settings_menu import OPENXR_MENU_COLORS
+
+    state = ft.ControlState
+    inactive = _navigation_button_style(ft, False)
+    active = _navigation_button_style(ft, True)
+
+    assert (
+        inactive.bgcolor[state.DEFAULT]
+        == OPENXR_MENU_COLORS["primary_container"]
+    )
+    assert (
+        active.bgcolor[state.DEFAULT]
+        == OPENXR_MENU_COLORS["selection_container"]
+    )
+    assert inactive.color[state.DEFAULT] == OPENXR_MENU_COLORS["selection_text"]
+    assert inactive.icon_color == OPENXR_MENU_COLORS["primary_state_text"]
+
+
+def test_flet_content_buttons_match_main_gui_action_palette():
+    from theme_tokens import MOONLIGHT_BLUE_COLORS
+    from xr_viewer.desktop_settings_menu import _action_button_colors
+    from xr_viewer.settings_menu import OPENXR_MENU_COLORS
+
+    background, text, hover, pressed = _action_button_colors(False, False, True)
+    selected, selected_text, _selected_hover, _selected_pressed = (
+        _action_button_colors(True, False, True)
+    )
+    stop, stop_text, stop_hover, stop_pressed = _action_button_colors(
+        False, True, True
+    )
+
+    assert background == OPENXR_MENU_COLORS["primary_container"]
+    assert text == OPENXR_MENU_COLORS["selection_text"]
+    assert hover == OPENXR_MENU_COLORS["primary_hover"]
+    assert pressed == OPENXR_MENU_COLORS["primary"]
+    assert selected == OPENXR_MENU_COLORS["selection_container"]
+    assert selected_text == OPENXR_MENU_COLORS["selection_text"]
+    assert stop == OPENXR_MENU_COLORS["destructive"]
+    assert stop_text == MOONLIGHT_BLUE_COLORS["action_destructive_text"]
+    assert stop_hover == OPENXR_MENU_COLORS["destructive_hover"]
+    assert stop_pressed == OPENXR_MENU_COLORS["destructive_pressed"]
+
+
 def test_flet_rotation_and_section_controls_use_consistent_icon_and_height():
     import flet as ft
 
@@ -314,11 +361,15 @@ def test_flet_step_button_symbols_use_centered_zero_padding_style():
         _make_step_button_label,
         _make_step_button_style,
     )
+    from xr_viewer.settings_menu import OPENXR_MENU_COLORS
 
     style = _make_step_button_style(ft)
     minus = _make_step_button_label(ft, "step:minus:color_brightness")
     plus = _make_step_button_label(ft, "step:plus:color_brightness")
+    state = ft.ControlState
 
+    assert style.bgcolor[state.DEFAULT] == OPENXR_MENU_COLORS["primary_container"]
+    assert style.color[state.DEFAULT] == OPENXR_MENU_COLORS["selection_text"]
     assert style.alignment == ft.Alignment.CENTER
     assert style.padding == ft.Padding.symmetric(horizontal=0, vertical=0)
     assert minus.value == "-" and plus.value == "+"
@@ -644,6 +695,26 @@ def test_flet_launcher_starts_visible_and_restores_after_panel_and_hide(monkeypa
         asyncio.run(main(Page()))
 
     monkeypatch.setattr(ft, "run", run)
+    snapshots.put(
+        {
+            "lang": "EN",
+            "tab": "picture",
+            "controls": (
+                _control("tab:picture", label="Picture"),
+                _control("depth:toggle_stereo", label="Stereo"),
+                _control(
+                    "color_brightness",
+                    label="Brightness",
+                    kind="slider",
+                ),
+            ),
+            "groups": (
+                SimpleNamespace(key="color_adjustment", title="Color"),
+            ),
+            "values": {"color_brightness": 0.5},
+            "input_monitor_rect": (0, 0, 3840, 2160),
+        }
+    )
     settings_menu._run_flet_desktop_settings_app(snapshots, queue.Queue(), commands, (0, 0, 3840, 2160))
 
     launcher = (192, 57, True, 0.4, False, True)
