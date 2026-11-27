@@ -11,9 +11,9 @@ Distill-Any-Depth baselines available:
 | MoGe-3 | L, G | `Ruicheng/moge-3-vitl`, `Ruicheng/moge-3-vitg` | MIT |
 | FlashDepth | S, L, Full | `Eyeline-Labs/FlashDepth` | Apache-2.0 |
 
-The GUI model list now contains 46 entries. DepthPro2 is shown but gated by an explicit
-research-license acknowledgement. The acknowledgement is checked in the model-selection handler
-before a DepthPro2 download or run is allowed.
+The GUI model list now contains 46 entries. DepthPro2 is selectable, downloadable, and runnable
+directly like the other registered models. The bundled Apple license remains in the repository for
+attribution, but selection does not require an in-app acknowledgement.
 
 ## 2. Runtime implementation
 
@@ -21,13 +21,12 @@ before a DepthPro2 download or run is allowed.
 
 - All nine variants have explicit `DepthModelSpec` entries, artifact names, weight files,
   output semantics, license metadata, and compatibility profiles.
-- The public, manually gated Hugging Face mirror is live at `lc700x/DepthPro2` (commit
+- The public, ungated Hugging Face mirror is live at `lc700x/DepthPro2` (commit
   `d6001e7cbfecc10bd57f58cd92307b28e72f0e93`). It contains all five checkpoints, the Apple
   research license, and a SHA-256 manifest; the runtime downloads only the selected model and its
   shared FOV checkpoint.
 - The GUI exposes a **Download Model** action beside the model selectors. It downloads into the
-  runtime cache with live progress; gated repositories prompt for a Hugging Face token that is used
-  only for that download and is never written to settings.
+  runtime cache with live progress. DepthPro2 requires no Hugging Face token or access request.
 - DepthPro2 requires both the selected checkpoint and the shared FOV checkpoint before the cache is
   considered complete.
 - FlashDepth shared-repository checkpoints resolve through `flashdepth-s/`, `flashdepth-l/`, and
@@ -168,9 +167,8 @@ as evidence.
 
 ## 9. Remaining limitations
 
-- The `lc700x/DepthPro2` mirror uses manual review. A user must be approved on Hugging Face and
-  authenticate the runtime before an automatic download can succeed; the in-app research-license
-  acknowledgement does not bypass the Hub gate.
+- The `lc700x/DepthPro2` mirror is public and ungated. The Apple research-only license and
+  attribution files remain included in the repository.
 - Performance was measured on representative S/L/Full variants. The B/L/H DepthPro2 variants and
   MoGe3-G use the same provider and export paths and are covered by registry/configuration tests,
   but their multi-GB weights were not downloaded for a full timing sweep in this run.

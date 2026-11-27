@@ -74,14 +74,14 @@ def _write_mirror_metadata(folder: Path, manifest: dict[str, object]) -> None:
         "and the official checkpoint host is https://ml-site.cdn-apple.com/models/depth-pro-2. "
         "The mirror exists to provide a stable Hugging Face download path; license "
         "and attribution remain with Apple.\n\n"
-        "Access is gated. Review `LICENSE_MODEL` before use. These weights are "
-        "research-only and are not licensed for commercial use.\n",
+        "Review `LICENSE_MODEL` before use. These weights are research-only and "
+        "are not licensed for commercial use.\n",
         encoding="utf-8",
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare and upload the gated lc700x/DepthPro2 mirror.")
+    parser = argparse.ArgumentParser(description="Prepare and upload the public lc700x/DepthPro2 mirror.")
     parser.add_argument("--repo-id", default="lc700x/DepthPro2")
     parser.add_argument("--source-dir", default=None, help="Existing directory containing the five .pt files.")
     parser.add_argument("--prepare-only", action="store_true", help="Build the local mirror without uploading.")
@@ -125,12 +125,12 @@ def main() -> None:
 
     api = HfApi()
     api.create_repo(repo_id=args.repo_id, repo_type="model", private=False, exist_ok=True)
-    api.update_repo_settings(repo_id=args.repo_id, repo_type="model", gated="manual")
+    api.update_repo_settings(repo_id=args.repo_id, repo_type="model", gated=False)
     api.upload_folder(
         repo_id=args.repo_id,
         repo_type="model",
         folder_path=str(folder),
-        commit_message="Add gated DepthPro2 weights and SHA-256 manifest",
+        commit_message="Add public DepthPro2 weights and SHA-256 manifest",
     )
     print(f"[uploaded] https://huggingface.co/{args.repo_id}")
 
