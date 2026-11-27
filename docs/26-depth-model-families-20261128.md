@@ -21,6 +21,10 @@ before a DepthPro2 download or run is allowed.
 
 - All nine variants have explicit `DepthModelSpec` entries, artifact names, weight files,
   output semantics, license metadata, and compatibility profiles.
+- The public, manually gated Hugging Face mirror is live at `lc700x/DepthPro2` (commit
+  `d6001e7cbfecc10bd57f58cd92307b28e72f0e93`). It contains all five checkpoints, the Apple
+  research license, and a SHA-256 manifest; the runtime downloads only the selected model and its
+  shared FOV checkpoint.
 - DepthPro2 requires both the selected checkpoint and the shared FOV checkpoint before the cache is
   considered complete.
 - FlashDepth shared-repository checkpoints resolve through `flashdepth-s/`, `flashdepth-l/`, and
@@ -161,11 +165,9 @@ as evidence.
 
 ## 9. Remaining limitations
 
-- The HF mirror upload was implemented in
-  `scripts/tools/mirror_depthpro2_hf.py`, but this workstation has no Hugging Face login. The script
-  intentionally refuses to invent credentials and instructs the operator to run `hf auth login`.
-  Once authenticated it creates the public gated `lc700x/DepthPro2` repository, writes the original
-  license and SHA-256 manifest, and uploads the five Apple checkpoints.
+- The `lc700x/DepthPro2` mirror uses manual review. A user must be approved on Hugging Face and
+  authenticate the runtime before an automatic download can succeed; the in-app research-license
+  acknowledgement does not bypass the Hub gate.
 - Performance was measured on representative S/L/Full variants. The B/L/H DepthPro2 variants and
   MoGe3-G use the same provider and export paths and are covered by registry/configuration tests,
   but their multi-GB weights were not downloaded for a full timing sweep in this run.

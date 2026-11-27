@@ -128,6 +128,9 @@ def resolve_output_semantics(name_or_model_id: str) -> DepthOutputSemantics:
     return ModelRegistry.default().resolve_output_semantics(name_or_model_id)
 
 
+DEPTHPRO2_MODEL_ID = "lc700x/DepthPro2"
+
+
 DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
     DepthModelSpec("Distill-Any-Depth-Small", "xingyang1/Distill-Any-Depth-Small-hf", "distill-any-depth"),
     DepthModelSpec("Distill-Any-Depth-Base", "lc700x/Distill-Any-Depth-Base-hf", "distill-any-depth"),
@@ -185,7 +188,7 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
     DepthModelSpec("DepthPro-Large", "apple/DepthPro-hf", "depthpro", "metric_z_depth"),
     DepthModelSpec(
         "DepthPro2-S",
-        "lc700x/DepthPro2",
+        DEPTHPRO2_MODEL_ID,
         "depth-pro-2",
         "relative_inverse_depth",
         weight_files=("depthpro2-s-bgcc6f8bg3.pt", "depthpro2-fov-ew55zg4kq7.pt"),
@@ -196,7 +199,7 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
     ),
     DepthModelSpec(
         "DepthPro2-B",
-        "lc700x/DepthPro2",
+        DEPTHPRO2_MODEL_ID,
         "depth-pro-2",
         "relative_inverse_depth",
         weight_files=("depthpro2-b-xb7m9egktw.pt", "depthpro2-fov-ew55zg4kq7.pt"),
@@ -207,7 +210,7 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
     ),
     DepthModelSpec(
         "DepthPro2-L",
-        "lc700x/DepthPro2",
+        DEPTHPRO2_MODEL_ID,
         "depth-pro-2",
         "relative_inverse_depth",
         weight_files=("depthpro2-l-tegstu7fim.pt", "depthpro2-fov-ew55zg4kq7.pt"),
@@ -218,7 +221,7 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
     ),
     DepthModelSpec(
         "DepthPro2-H",
-        "lc700x/DepthPro2",
+        DEPTHPRO2_MODEL_ID,
         "depth-pro-2",
         "relative_inverse_depth",
         weight_files=("depthpro2-h-eivtm5w7m5.pt", "depthpro2-fov-ew55zg4kq7.pt"),

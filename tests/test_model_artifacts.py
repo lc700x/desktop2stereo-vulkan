@@ -463,6 +463,29 @@ def test_generic_download_confirms_snapshot_even_when_cache_dir_exists(monkeypat
     assert calls["force_download"] is False
 
 
+def test_depthpro2_download_uses_published_gated_hub_repo(monkeypatch, tmp_path: Path):
+    spec = ModelRegistry.default().get("DepthPro2-S")
+    model_dir = spec.model_dir(tmp_path)
+    calls = {}
+
+    def fake_snapshot_download(**kwargs):
+        calls.update(kwargs)
+        model_dir.mkdir(parents=True, exist_ok=True)
+        for filename in spec.weight_files:
+            (model_dir / filename).write_bytes(b"weights")
+        return str(model_dir / "snapshots" / "fake")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(
+        "stereo_runtime.depth_provider._reachable_hf_endpoints",
+        lambda model_id: ("https://huggingface.co",),
+    )
+
+    assert ensure_model_downloaded(spec, cache_dir=tmp_path, local_files_only=False) == model_dir
+    assert calls["repo_id"] == "lc700x/DepthPro2"
+    assert calls["allow_patterns"] == [*spec.weight_files, "LICENSE*", "README.md"]
+
+
 def test_generic_snapshot_download_uses_selected_hf_endpoint(monkeypatch, tmp_path: Path):
     spec = ModelRegistry.default().get("Distill-Any-Depth-Base")
     model_dir = spec.model_dir(tmp_path)
