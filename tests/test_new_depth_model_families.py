@@ -27,7 +27,10 @@ def test_native_family_registry_variants_and_licenses():
         "DepthPro2-L",
         "DepthPro2-H",
     ]
-    assert registry.get("DepthPro2-H").research_only is True
+    assert all(
+        registry.get(name).research_only is False
+        for name in ("DepthPro2-S", "DepthPro2-B", "DepthPro2-L", "DepthPro2-H")
+    )
     assert registry.get("DepthPro2-H").license_id == "apple-research-only"
     assert registry.get("DepthPro2-H").output_semantics == "relative_inverse_depth"
     assert registry.get("MoGe3-G").output_semantics == "metric_z_depth"

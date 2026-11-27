@@ -52,7 +52,7 @@ V25_GUI_MODEL_NAMES = (
 
 def _model_license(name):
     if name.startswith("DepthPro2-"):
-        return {"license_id": "apple-research-only", "research_only": True}
+        return {"license_id": "apple-research-only", "research_only": False}
     if name.startswith("MoGe3-"):
         return {"license_id": "mit", "research_only": False}
     if name.startswith("FlashDepth-"):
