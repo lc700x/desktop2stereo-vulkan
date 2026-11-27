@@ -356,6 +356,196 @@ class GUIHandlerMixin:
         self.page.show_dialog(dialog)
         return False
 
+    def on_download_model(self, e=None):
+        """Download the selected model without starting the pipeline."""
+        t = UI_MESSAGES[self.locale]
+        if getattr(self, "_model_download_running", False):
+            self.set_status(t["A model download is already in progress"])
+            return
+        if self._starting or (self.process and self.process.returncode is None):
+            self.set_status(t["Stop the running pipeline before downloading a model"])
+            return
+        model = self.current_model_name
+        if not self._confirm_research_model_if_needed(model):
+            return
+        self._begin_model_download(model)
+
+    def _begin_model_download(self, model, token=None):
+        t = UI_MESSAGES[self.locale]
+        self._model_download_running = True
+        self.download_model_btn.disabled = True
+        self.download_model_btn.content.value = t["Downloading"]
+        self.run_btn.disabled = True
+        self._set_log_panel_visible(True)
+        self._update_download_progress({
+            "desc": f"{t['Downloading model']}: {model}",
+            "percent": None,
+            "downloaded": "",
+            "size": "",
+            "speed": "",
+            "eta": "",
+        })
+        self.set_status(f"{t['Downloading model']}: {model}")
+        self._safe_update(
+            self.download_model_btn,
+            self.run_btn,
+            self.download_progress_panel,
+        )
+        self._model_download_task = asyncio.create_task(
+            self._download_model_async(model, token=token)
+        )
+
+    async def _download_model_async(self, model, *, token=None):
+        from .model_download import download_model_to_gui_cache, resolve_model_spec
+
+        t = UI_MESSAGES[self.locale]
+        spec = None
+        try:
+            spec = resolve_model_spec(model)
+            path = await asyncio.to_thread(
+                download_model_to_gui_cache,
+                model,
+                token=token,
+            )
+            logger.info("Model download complete: %s -> %s", model, path)
+            self.set_status(f"{t['Model download complete']}: {model}")
+            self._update_download_progress({
+                "desc": f"{t['Model download complete']}: {model}",
+                "percent": 100.0,
+                "downloaded": "",
+                "size": "",
+                "speed": "",
+                "eta": "",
+            })
+            self._safe_update(self.download_progress_panel)
+        except Exception as exc:
+            needs_token = token is None and (
+                bool(spec and spec.research_only)
+                or self._looks_like_hf_authorization_error(exc)
+            )
+            if needs_token:
+                logger.warning("Hugging Face authorization required for %s", model)
+            else:
+                logger.exception("Model download failed for %s", model)
+            self.set_status(f"{t['Model download failed']}: {model}")
+            self._update_download_progress({
+                "desc": f"{t['Model download failed']}: {model}",
+                "percent": 0.0,
+                "downloaded": "",
+                "size": "",
+                "speed": "",
+                "eta": "",
+                "state": "failed",
+            })
+            self._safe_update(self.download_progress_panel)
+            if needs_token:
+                self._prompt_model_download_token(model)
+            else:
+                self._show_model_download_error(model, exc)
+        finally:
+            self._model_download_running = False
+            self._model_download_task = None
+            self.download_model_btn.disabled = False
+            self.download_model_btn.content.value = t["Download Model"]
+            self.run_btn.disabled = bool(
+                self._starting or (self.process and self.process.returncode is None)
+            )
+            self._safe_update(self.download_model_btn, self.run_btn)
+
+    @staticmethod
+    def _looks_like_hf_authorization_error(exc):
+        text = str(exc).casefold()
+        return any(
+            marker in text
+            for marker in (
+                "401",
+                "403",
+                "gated",
+                "authentication",
+                "authorization",
+                "forbidden",
+                "token",
+                "unauthorized",
+            )
+        )
+
+    def _prompt_model_download_token(self, model):
+        from .model_download import resolve_model_spec
+
+        t = UI_MESSAGES[self.locale]
+        spec = resolve_model_spec(model)
+        token_field = ft.TextField(
+            label=t["Hugging Face token"],
+            password=True,
+            can_reveal_password=True,
+            autofocus=True,
+            width=S(460),
+        )
+        validation_text = ft.Text("", color=ft.Colors.RED, size=11)
+
+        def open_model_page(_event):
+            webbrowser.open(f"https://huggingface.co/{spec.model_id}")
+
+        def submit(_event):
+            token = str(token_field.value or "").strip()
+            if not token:
+                validation_text.value = t["Enter a Hugging Face token or cancel"]
+                self._safe_update(validation_text)
+                return
+            self.page.pop_dialog()
+            self._begin_model_download(model, token=token)
+
+        def dismiss(_event):
+            self.page.pop_dialog()
+            self.set_status(t["Model download canceled"])
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(t["Hugging Face access required"]),
+            content=ft.Column(
+                [
+                    ft.Text(
+                        t["This model is gated. Enter a token approved by the repository owner."]
+                    ),
+                    ft.Text(
+                        t["The token is used only for this download and is not saved."],
+                        size=11,
+                        color=ft.Colors.GREY,
+                    ),
+                    token_field,
+                    validation_text,
+                ],
+                tight=True,
+                spacing=8,
+            ),
+            actions=[
+                ft.TextButton(t["Open model page"], on_click=open_model_page),
+                ft.TextButton(t["Cancel"], on_click=dismiss),
+                ft.Button(t["Use token and download"], on_click=submit),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.show_dialog(dialog)
+
+    def _show_model_download_error(self, model, exc):
+        t = UI_MESSAGES[self.locale]
+        detail = str(exc).strip()
+        if len(detail) > 900:
+            detail = detail[:897] + "..."
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(t["Model download failed"]),
+            content=ft.Text(f"{model}\n\n{detail}" if detail else model, selectable=True),
+            actions=[
+                ft.Button(
+                    t["Close"],
+                    on_click=lambda _event: self.page.pop_dialog(),
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.show_dialog(dialog)
+
     # ── device / accelerator handlers ──
 
     def on_device_change(self, e):
@@ -2104,6 +2294,13 @@ class GUIHandlerMixin:
         self.video_backend_label.value = t["Video Encoder:"]
         self.video_backend_label.width = S(110 if self.locale == "CN" else 130)
         self.depth_model_label.value = t["Depth Model:"]
+        if getattr(self, "download_model_btn", None) is not None:
+            self.download_model_btn.content.value = (
+                t["Downloading"]
+                if getattr(self, "_model_download_running", False)
+                else t["Download Model"]
+            )
+            self.download_model_btn.tooltip = t["tooltip_download_model"]
         self.fp16_cb.label = t["FP16"]
         self.depth_resolution_label.value = t["Depth Resolution:"]
         self.convergence_label.value = t["Convergence:"]

@@ -447,6 +447,22 @@ class GUIBuilderMixin:
             value=default_size,
             on_select=self.on_model_size_change,
             width=S(110))
+        self.download_model_btn = ft.Button(
+            content=ft.Text(
+                UI_MESSAGES[self.locale].get("Download Model", "Download Model"),
+                size=FONT_SIZE,
+                max_lines=1,
+                no_wrap=True,
+            ),
+            width=S(150),
+            height=S(32),
+            on_click=self.on_download_model,
+            tooltip=UI_MESSAGES[self.locale].get(
+                "tooltip_download_model",
+                "Download the selected model into the runtime cache",
+            ),
+            style=_main_menu_action_style("secondary"),
+        )
         self.fp16_cb = ft.Checkbox(scale=SCALE, visual_density=ft.VisualDensity.COMPACT, label="FP16")
         parallel_inference_tooltip = (
             "Pipelines depth inference with SBS synthesis. Two workers are recommended; "
@@ -466,6 +482,7 @@ class GUIBuilderMixin:
         row0 = ft.Row([
             self.depth_model_label, self.depth_model_dd,
             ft.Container(width=S(8)), self.model_size_dd,
+            ft.Container(width=S(18)), self.download_model_btn,
         ], spacing=1)
 
         # Row 2: Depth resolution + Depth Quick

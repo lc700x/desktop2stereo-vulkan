@@ -89,6 +89,7 @@ def test_main_menu_actions_use_theme_colors_for_all_interaction_states():
 
     builder_source = inspect.getsource(GUIBuilderMixin.build_ui)
     for button_name, variant in (
+        ("download_model_btn", "secondary"),
         ("reset_btn", "secondary"),
         ("stop_btn", "danger"),
         ("run_btn", "primary"),

@@ -656,6 +656,14 @@ class GUIProcessMixin:
         if self.run_btn.disabled != running:
             self.run_btn.disabled = running
             changed_controls.append(self.run_btn)
+        model_download_btn = getattr(self, "download_model_btn", None)
+        if model_download_btn is not None:
+            download_disabled = bool(
+                running or getattr(self, "_model_download_running", False)
+            )
+            if model_download_btn.disabled != download_disabled:
+                model_download_btn.disabled = download_disabled
+                changed_controls.append(model_download_btn)
         if self.stop_btn.disabled:
             self.stop_btn.disabled = False
             changed_controls.append(self.stop_btn)
@@ -1598,6 +1606,10 @@ class GUIProcessMixin:
         return True, ""
 
     def save_and_run(self, e):
+        if getattr(self, "_model_download_running", False):
+            self.set_status(UI_MESSAGES[self.locale]["A model download is already in progress"])
+            self.page.update()
+            return
         if self._starting or (self.process and self.process.returncode is None):
             self.set_status(UI_MESSAGES[self.locale]["A thread already running!"])
             self.page.update()

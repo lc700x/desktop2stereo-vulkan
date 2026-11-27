@@ -25,6 +25,9 @@ before a DepthPro2 download or run is allowed.
   `d6001e7cbfecc10bd57f58cd92307b28e72f0e93`). It contains all five checkpoints, the Apple
   research license, and a SHA-256 manifest; the runtime downloads only the selected model and its
   shared FOV checkpoint.
+- The GUI exposes a **Download Model** action beside the model selectors. It downloads into the
+  runtime cache with live progress; gated repositories prompt for a Hugging Face token that is used
+  only for that download and is never written to settings.
 - DepthPro2 requires both the selected checkpoint and the shared FOV checkpoint before the cache is
   considered complete.
 - FlashDepth shared-repository checkpoints resolve through `flashdepth-s/`, `flashdepth-l/`, and
