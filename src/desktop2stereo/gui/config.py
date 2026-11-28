@@ -306,13 +306,24 @@ def get_environment_model_options(lang="EN", return_keys=False):
 HAVE_YAML = True
 
 
+class _IndentedSafeDumper(yaml.SafeDumper):
+    def increase_indent(self, flow=False, indentless=False):
+        return super().increase_indent(flow, False)
+
+
 def save_yaml(path, cfg):
     if not HAVE_YAML:
         return False, "PyYAML not installed"
     try:
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+            yaml.dump(
+                cfg,
+                f,
+                Dumper=_IndentedSafeDumper,
+                allow_unicode=True,
+                sort_keys=False,
+            )
         os.replace(tmp, path)
         return True, ""
     except Exception as e:

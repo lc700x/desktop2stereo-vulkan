@@ -67,7 +67,7 @@ def _weight_paths(
 
 def _module_dtype(device: torch.device) -> torch.dtype:
     if device.type == "mps":
-        return torch.float16
+        return torch.bfloat16
     if device.type == "cuda":
         index = device.index or torch.cuda.current_device()
         major, _ = torch.cuda.get_device_capability(index)
@@ -196,7 +196,10 @@ def _moge_point_map_to_depth(
         - normal[:, 1, 0] * rhs_normal[:, 0]
     ) / determinant
     depth = points[..., 2] + shift[..., None, None]
-    return torch.where(valid, depth, torch.zeros_like(depth))
+    # MoGe's official infer() marks invalid pixels as infinite Z. Preserve that
+    # far-plane meaning so the shared Z-to-disparity conversion yields far=0
+    # instead of incorrectly turning masked pixels into near foreground.
+    return torch.where(valid, depth, torch.full_like(depth, torch.inf))
 
 
 def predict_moge_3_depth(

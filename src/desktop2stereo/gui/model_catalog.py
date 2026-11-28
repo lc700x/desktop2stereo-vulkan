@@ -61,7 +61,13 @@ def _model_license(name):
 
 
 def _resolutions_for_model(name):
-    if name.startswith(("DepthPro2-", "MoGe3-", "FlashDepth-")):
+    if name.startswith("DepthPro2-"):
+        # Depth Pro 2 pads native input to multiples of 32; its DINOv3
+        # backbone uses patch 16. Keep both constraints exact.
+        return [320, 352, 384, 448, 512, 640, 768]
+    if name.startswith(("MoGe3-", "FlashDepth-")):
+        # MoGe-3 uses DINOv2 patch 14. FlashDepth-S/L train at 518
+        # (37x14); Full supports the higher 2K streaming inference profile.
         return [294, 336, 392, 448, 518]
     if name in {"ZipDepth-Base", "ZipDepth-Small"}:
         return [192, 224, 288, 352, 384, 448, 512]

@@ -52,7 +52,9 @@ def normalized_view_plane_uv(width: int, height: int, aspect_ratio: float = None
 
     u = torch.linspace(-span_x * (width - 1) / width, span_x * (width - 1) / width, width, dtype=dtype, device=device)
     v = torch.linspace(-span_y * (height - 1) / height, span_y * (height - 1) / height, height, dtype=dtype, device=device)
-    u, v = torch.meshgrid(u, v, indexing='xy')
+    # Explicit broadcast avoids CoreML/ONNX meshgrid shape inference issues.
+    u = u.view(1, width).expand(height, width)
+    v = v.view(height, 1).expand(height, width)
     uv = torch.stack([u, v], dim=-1)
     return uv
 

@@ -85,6 +85,9 @@ class DepthProviderInfo:
     model_profile: str | None = None
     zero_copy_output: bool = False
     host_readback_bytes: int = 0
+    coreml_compute_units: str | None = None
+    coreml_compute_plan: dict[str, Any] | None = None
+    coreml_artifact_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.raw_output_semantics is None:
@@ -1331,6 +1334,28 @@ class AutoDepthProvider:
         except KeyError:
             spec = None
         if spec is not None and spec.family in {"depth-pro-2", "moge-3", "flashdepth"}:
+            if torch.device(device).type == "mps" and cfg.use_coreml and os.name == "posix":
+                from .providers.apple import create_coreml_family_provider
+
+                return create_coreml_family_provider(
+                    family=spec.family,
+                    model_id=spec.model_id,
+                    model_name=spec.name,
+                    device=device,
+                    depth_resolution=cfg.depth_resolution,
+                    local_files_only=cfg.local_files_only,
+                    force_download=cfg.force_download,
+                    use_coreml=True,
+                    recompile_coreml=cfg.recompile_coreml,
+                    coreml_compute_units=os.environ.get(
+                        "D2S_COREML_COMPUTE_UNITS", "gpu"
+                    ),
+                    **{
+                        key: value
+                        for key, value in common.items()
+                        if key not in {"local_files_only", "force_download"}
+                    },
+                )
             from .new_model_providers import create_family_provider
 
             return create_family_provider(
@@ -1795,6 +1820,7 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
                 force_download=cfg.force_download,
                 model_id=cfg.model_id,
                 model_name=cfg.model_name,
+                depth_resolution=cfg.depth_resolution,
                 depth_upsample=cfg.depth_upsample,
                 depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
             )
@@ -1813,6 +1839,7 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
                 onnx_dtype=cfg.onnx_dtype,
                 model_id=cfg.model_id,
                 model_name=cfg.model_name,
+                depth_resolution=cfg.depth_resolution,
                 use_iobinding=cfg.use_iobinding,
                 use_dlpack=cfg.use_dlpack,
                 local_files_only=cfg.local_files_only,

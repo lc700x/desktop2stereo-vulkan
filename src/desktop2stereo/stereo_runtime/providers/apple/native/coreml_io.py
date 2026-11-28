@@ -111,6 +111,13 @@ class _NativeWarpConfig(ctypes.Structure):
     ]
 
 
+class _NativeNormalization(ctypes.Structure):
+    _fields_ = [
+        ("mean", ctypes.c_float * 3),
+        ("std", ctypes.c_float * 3),
+    ]
+
+
 class NativeCoreMLBusy(RuntimeError):
     """The bounded native resource ring has no reusable slot yet."""
 
@@ -339,7 +346,15 @@ class NativeCoreMLFrame:
 class NativeCoreMLIOBridge:
     """ctypes owner for the native Core ML/Metal resource ring."""
 
-    def __init__(self, model_path: str | Path, input_width: int, input_height: int):
+    def __init__(
+        self,
+        model_path: str | Path,
+        input_width: int,
+        input_height: int,
+        *,
+        normalization: tuple[tuple[float, ...], tuple[float, ...]] | None = None,
+        compute_units: str | None = None,
+    ):
         if not native_io_enabled():
             raise RuntimeError("native CoreML IO is disabled")
         library_path, build_error = _build_library()
@@ -358,6 +373,7 @@ class NativeCoreMLIOBridge:
             ctypes.c_int32,
             ctypes.c_int32,
             ctypes.c_int32,
+            ctypes.POINTER(_NativeNormalization),
             ctypes.c_char_p,
             ctypes.c_size_t,
         ]
@@ -410,14 +426,37 @@ class NativeCoreMLIOBridge:
         self._library.d2s_coreml_io_destroy.restype = None
 
         error = ctypes.create_string_buffer(512)
-        compute_units = {"cpu": 0, "cpu_and_gpu": 1, "ane": 3}.get(
-            os.environ.get("D2S_COREML_COMPUTE_UNITS", "all").strip().lower(), 2
+        selected_units = str(
+            compute_units
+            or os.environ.get("D2S_COREML_COMPUTE_UNITS", "all")
+        ).strip().lower()
+        unit_id = {
+            "cpu": 0,
+            "gpu": 1,
+            "cpu_and_gpu": 1,
+            "all": 2,
+            "ane": 3,
+        }.get(selected_units, 2)
+        native_normalization = None
+        if normalization is not None:
+            mean, std = normalization
+            if len(mean) != 3 or len(std) != 3:
+                raise ValueError("native CoreML normalization requires three mean and std values")
+            native_normalization = _NativeNormalization(
+                mean=(ctypes.c_float * 3)(*map(float, mean)),
+                std=(ctypes.c_float * 3)(*map(float, std)),
+            )
+        normalization_pointer = (
+            ctypes.pointer(native_normalization)
+            if native_normalization is not None
+            else None
         )
         self._handle = self._library.d2s_coreml_io_create(
             str(model_path).encode(),
             int(input_width),
             int(input_height),
-            compute_units,
+            unit_id,
+            normalization_pointer,
             error,
             len(error),
         )
@@ -428,9 +467,15 @@ class NativeCoreMLIOBridge:
         self.last_error = ""
 
     @classmethod
-    def try_create(cls, model_path: str | Path, input_width: int, input_height: int):
+    def try_create(
+        cls,
+        model_path: str | Path,
+        input_width: int,
+        input_height: int,
+        **kwargs: Any,
+    ):
         try:
-            return cls(model_path, input_width, input_height), None
+            return cls(model_path, input_width, input_height, **kwargs), None
         except Exception as exc:
             return None, f"{type(exc).__name__}: {exc}"
 

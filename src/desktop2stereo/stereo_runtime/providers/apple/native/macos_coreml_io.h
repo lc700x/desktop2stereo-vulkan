@@ -79,8 +79,14 @@ typedef struct {
     int32_t stream_bgra;
 } D2SCoreMLIOWarpConfig;
 
+typedef struct {
+    float mean[3];
+    float std[3];
+} D2SCoreMLIONormalization;
+
 void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
                            int32_t input_height, int32_t compute_units,
+                           const D2SCoreMLIONormalization *normalization,
                            char *error_buffer, size_t error_capacity);
 
 int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,

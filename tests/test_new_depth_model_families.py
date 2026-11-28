@@ -121,6 +121,18 @@ def test_moge_gpu_solver_is_finite_and_preserves_metric_depth_direction():
     assert float(depth.abs().max()) > 0.0
 
 
+def test_moge_masked_depth_is_far_plane_instead_of_near_foreground():
+    points = torch.zeros(1, 4, 4, 3)
+    points[..., 2] = 2.0
+    mask = torch.ones(1, 4, 4)
+    mask[..., 0] = 0.0
+
+    depth = _moge_point_map_to_depth(points, mask=mask)
+
+    assert torch.isinf(depth[..., 0]).all()
+    assert torch.isfinite(depth[..., 1:]).all()
+
+
 def test_new_family_auto_chain_does_not_append_cpu_fallback():
     provider = AutoDepthProvider(
         DepthProviderConfig(

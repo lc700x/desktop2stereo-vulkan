@@ -1,7 +1,7 @@
 """CoreML provider plumbing tests (ported macOS behavior)."""
 
-from types import SimpleNamespace
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -44,7 +44,11 @@ def test_native_coreml_startup_does_not_load_a_second_python_model(monkeypatch) 
     bridge = SimpleNamespace(predict=lambda buffer, frame_id: (buffer, frame_id))
     monkeypatch.setattr("stereo_runtime.providers.apple.pytorch_mps.sys.platform", "darwin")
     monkeypatch.setenv("D2S_COREML_NATIVE_IO", "1")
-    monkeypatch.setattr(NativeCoreMLIOBridge, "try_create", lambda *_: (bridge, None))
+    monkeypatch.setattr(
+        NativeCoreMLIOBridge,
+        "try_create",
+        lambda *_args, **_kwargs: (bridge, None),
+    )
     monkeypatch.setattr(CoreMLEngine, "_load_python_model", lambda _: calls.append("load"))
 
     engine = CoreMLEngine("cached.mlpackage", "cpu")

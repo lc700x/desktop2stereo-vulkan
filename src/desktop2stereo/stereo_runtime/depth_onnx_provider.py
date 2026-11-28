@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from pathlib import Path
-import re
 
 import torch
 import torch.nn.functional as F
+from utils.cpu_warnings import describe_tensor, warn_cpu_fallback, warn_cpu_transfer
 
 from .depth_provider import (
     DISTILL_ANY_DEPTH_BASE_MODEL_ID,
@@ -13,12 +14,10 @@ from .depth_provider import (
     DISTILL_ANY_DEPTH_BASE_RESOLUTION,
     DISTILL_ANY_DEPTH_PATCH_SIZE,
     INFINIDEPTH_PATCH_SIZE,
-    ZIPDEPTH_PATCH_SIZE,
     DepthProfileResult,
-    DepthProviderInfo,
     DepthProviderConfig,
+    DepthProviderInfo,
     TorchDepthProvider,
-    _prepare_accelerated_artifacts,
     _is_infinidepth_model,
     _is_zipdepth_model,
     _model_input_size_for_model,
@@ -26,11 +25,12 @@ from .depth_provider import (
     _model_profile_for,
     _normalization_tensors_for_model,
     _postprocess_model_depth,
+    _prepare_accelerated_artifacts,
     default_lab_cache_dir,
 )
 from .depth_upsample import DepthUpsampleMode, _upsample_depth_canonical
+from .model_registry import FAMILY_INPUT_MULTIPLE
 from .output import ensure_bchw
-from utils.cpu_warnings import describe_tensor, warn_cpu_fallback, warn_cpu_transfer
 
 
 def default_distill_base_onnx_path(cache_dir: str | Path | None = None) -> Path:
@@ -88,23 +88,39 @@ class ModelOnnxPreprocessor:
         device: torch.device,
         dtype: torch.dtype,
         fixed_input_size: tuple[int, int] | None = None,
-        target_resolution: int = DISTILL_ANY_DEPTH_BASE_RESOLUTION,
+        target_resolution: int | None = None,
         patch_size: int | None = None,
     ) -> None:
         self.model_id = model_id
         self.device = device
         self.dtype = dtype
         self.fixed_input_size = fixed_input_size
-        self._target_resolution = max(1, int(target_resolution))
+        family = ""
+        default_resolution = DISTILL_ANY_DEPTH_BASE_RESOLUTION
+        try:
+            from .model_registry import ModelRegistry
+
+            spec = ModelRegistry.default().get(model_id)
+            family = spec.family
+            default_resolution = spec.default_resolution
+        except KeyError:
+            pass
+        self._target_resolution = max(
+            1,
+            int(target_resolution if target_resolution is not None else default_resolution),
+        )
         self._shape_cache: dict[tuple[int, int], tuple[int, int]] = {}
         self._is_infinidepth = _is_infinidepth_model(model_id)
         self._is_zipdepth = _is_zipdepth_model(model_id)
         self._is_distill = "distill-any-depth" in model_id.casefold()
+        self._native_family = family in {"depth-pro-2", "moge-3", "flashdepth"}
         self._patch_size = int(
             patch_size
             if patch_size is not None
             else (
-                ZIPDEPTH_PATCH_SIZE
+                FAMILY_INPUT_MULTIPLE[family]
+                if family in FAMILY_INPUT_MULTIPLE
+                else 32
                 if self._is_zipdepth
                 else INFINIDEPTH_PATCH_SIZE
                 if self._is_infinidepth
@@ -144,7 +160,9 @@ class ModelOnnxPreprocessor:
         rgb = self._prepare_rgb(rgb)
         _, _, height, width = rgb.shape
         input_h, input_w = self.input_size(height, width)
-        use_antialias = self._is_zipdepth or self.device.type == "cuda"
+        use_antialias = (
+            self._is_zipdepth or (self.device.type == "cuda" and not self._native_family)
+        )
         use_bicubic = use_antialias and not self._is_distill and not self._is_zipdepth
         tensor = F.interpolate(
             rgb,
@@ -166,7 +184,9 @@ class ModelOnnxPreprocessor:
         input size computation.
         """
         rgb = self._prepare_rgb(rgb)
-        use_antialias = self._is_zipdepth or self.device.type == "cuda"
+        use_antialias = (
+            self._is_zipdepth or (self.device.type == "cuda" and not self._native_family)
+        )
         use_bicubic = use_antialias and not self._is_distill and not self._is_zipdepth
         tensor = F.interpolate(
             rgb,
@@ -206,6 +226,7 @@ class DistillAnyDepthBaseOnnxCuda:
         onnx_dtype: str = "auto",
         model_id: str = DISTILL_ANY_DEPTH_BASE_MODEL_ID,
         model_name: str = DISTILL_ANY_DEPTH_BASE_NAME,
+        depth_resolution: int = DISTILL_ANY_DEPTH_BASE_RESOLUTION,
         use_iobinding: bool = True,
         use_dlpack: bool = False,
         local_files_only: bool = False,
@@ -221,6 +242,7 @@ class DistillAnyDepthBaseOnnxCuda:
         self.dtype = _dtype_from_onnx_name(self.onnx_path, torch.float16 if self.device.type == "cuda" else torch.float32)
         self.model_id = model_id
         self.model_name = model_name
+        self.depth_resolution = max(1, int(depth_resolution))
         self.use_iobinding = bool(use_iobinding and self.device.type == "cuda")
         self.use_dlpack = bool(use_dlpack and self.use_iobinding)
         self.local_files_only = bool(local_files_only)
@@ -231,7 +253,7 @@ class DistillAnyDepthBaseOnnxCuda:
             provider="onnxruntime.InferenceSession",
             model_name=self.model_name,
             model_id=self.model_id,
-            depth_resolution=DISTILL_ANY_DEPTH_BASE_RESOLUTION,
+            depth_resolution=self.depth_resolution,
             cache_dir=str(self.cache_dir),
             load_mode="local_onnx",
             depth_backend="onnx_cuda" if self.device.type == "cuda" else "onnx_cpu",
@@ -251,6 +273,7 @@ class DistillAnyDepthBaseOnnxCuda:
             device=self.device,
             dtype=self.dtype,
             fixed_input_size=_input_size_from_artifact_name(self.onnx_path) if self._explicit_onnx_path else None,
+            target_resolution=self.depth_resolution,
         )
 
     def _set_onnx_path(self, path: Path, input_size: tuple[int, int]) -> None:
@@ -265,6 +288,7 @@ class DistillAnyDepthBaseOnnxCuda:
             device=self.device,
             dtype=self.dtype,
             fixed_input_size=input_size,
+            target_resolution=self.depth_resolution,
         )
         self.info = replace(self.info, onnx_path=str(self.onnx_path))
 

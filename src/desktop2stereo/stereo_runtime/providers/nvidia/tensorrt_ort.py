@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import os
-from pathlib import Path
 import sys
+from dataclasses import replace
+from pathlib import Path
 
 import torch
+from runtime_paths import python_site_packages
+from utils.cpu_warnings import describe_tensor, warn_cpu_fallback, warn_cpu_transfer
 
 from ...depth_onnx_provider import (
     ModelOnnxPreprocessor,
@@ -23,15 +25,13 @@ from ...depth_provider import (
     TorchDepthProvider,
     _model_output_semantics,
     _model_profile_for,
-    _prepare_accelerated_artifacts,
     _postprocess_model_depth,
+    _prepare_accelerated_artifacts,
     default_lab_cache_dir,
 )
 from ...depth_upsample import DepthUpsampleMode, _upsample_depth_canonical
 from ...output import ensure_bchw
 from .onnx_cuda import OnnxCudaDepthProvider
-from runtime_paths import python_site_packages
-from utils.cpu_warnings import describe_tensor, warn_cpu_fallback, warn_cpu_transfer
 
 
 def default_distill_base_trt_cache_dir(cache_dir: str | Path | None = None) -> Path:
@@ -97,6 +97,7 @@ class DistillAnyDepthBaseTensorRtOrt:
         trt_cache_dir: str | Path | None = None,
         model_id: str = DISTILL_ANY_DEPTH_BASE_MODEL_ID,
         model_name: str = DISTILL_ANY_DEPTH_BASE_NAME,
+        depth_resolution: int = DISTILL_ANY_DEPTH_BASE_RESOLUTION,
         local_files_only: bool = False,
         force_download: bool = False,
         depth_upsample: DepthUpsampleMode = "bilinear",
@@ -113,6 +114,7 @@ class DistillAnyDepthBaseTensorRtOrt:
         self.dtype = _dtype_from_onnx_name(self.onnx_path, torch.float16)
         self.model_id = model_id
         self.model_name = model_name
+        self.depth_resolution = max(1, int(depth_resolution))
         self.local_files_only = bool(local_files_only)
         self.force_download = bool(force_download)
         self.depth_upsample = depth_upsample
@@ -121,7 +123,7 @@ class DistillAnyDepthBaseTensorRtOrt:
             provider="onnxruntime.InferenceSession",
             model_name=self.model_name,
             model_id=self.model_id,
-            depth_resolution=DISTILL_ANY_DEPTH_BASE_RESOLUTION,
+            depth_resolution=self.depth_resolution,
             cache_dir=str(self.cache_dir),
             load_mode="local_onnx_tensorrt_ep",
             depth_backend="tensorrt",
@@ -140,6 +142,7 @@ class DistillAnyDepthBaseTensorRtOrt:
             device=self.device,
             dtype=self.dtype,
             fixed_input_size=_input_size_from_artifact_name(self.onnx_path) if self._explicit_onnx_path else None,
+            target_resolution=self.depth_resolution,
         )
 
     def _set_onnx_path(self, path: Path, input_size: tuple[int, int]) -> None:
@@ -154,6 +157,7 @@ class DistillAnyDepthBaseTensorRtOrt:
             device=self.device,
             dtype=self.dtype,
             fixed_input_size=input_size,
+            target_resolution=self.depth_resolution,
         )
         self.info = replace(self.info, onnx_path=str(self.onnx_path))
 

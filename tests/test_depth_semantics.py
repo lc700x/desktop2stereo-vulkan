@@ -88,6 +88,44 @@ def test_z_depth_is_inverted_before_normalization():
     assert actual[0, 0, 0, 0] > actual[0, 0, 0, 2]
 
 
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "lc700x/DepthPro2",
+        "Ruicheng/moge-3-vitl",
+        "Ruicheng/moge-3-vitg",
+        "Eyeline-Labs/FlashDepth",
+    ],
+)
+def test_shared_new_model_ids_keep_declared_semantics(model_id):
+    expected = ModelRegistry.default().get(model_id).output_semantics
+    assert _model_output_semantics(model_id) == expected
+
+
+def test_moge_onnx_wrapper_keeps_training_mask_semantics(monkeypatch):
+    from stereo_runtime import onnx_export
+    from stereo_runtime.model_impl import custom_models
+
+    calls = {}
+
+    def fake_predict(model, pixel_values, *, target_resolution, apply_mask=True):
+        calls.update(
+            model=model,
+            pixel_values=pixel_values,
+            target_resolution=target_resolution,
+            apply_mask=apply_mask,
+        )
+        return pixel_values
+
+    monkeypatch.setattr(custom_models, "predict_moge_3_depth", fake_predict)
+    wrapper = onnx_export.NativeMoGeOnnxExportWrapper(object(), target_resolution=518)
+    pixel_values = torch.zeros(1, 3, 14, 14)
+
+    assert wrapper(pixel_values) is pixel_values
+    assert calls["target_resolution"] == 518
+    assert calls["apply_mask"] is True
+
+
 def test_raw_disparity_is_not_inverted():
     disparity = torch.tensor([[[[1.0, 0.5, 0.25]]]])
 

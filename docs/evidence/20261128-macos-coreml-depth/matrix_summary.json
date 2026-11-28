@@ -1,0 +1,34 @@
+{
+  "media": "outputs/macos_coreml_matrix/media/depth_models_60fps_loop.mp4",
+  "models": [
+    "DepthPro2-S",
+    "DepthPro2-B",
+    "DepthPro2-L",
+    "DepthPro2-H",
+    "MoGe3-L",
+    "MoGe3-G",
+    "FlashDepth-S",
+    "FlashDepth-L",
+    "FlashDepth-Full"
+  ],
+  "compute_units": "gpu",
+  "viewer_seconds": 30,
+  "viewer_resolutions": {
+    "DepthPro2-S": 512,
+    "DepthPro2-B": 512,
+    "DepthPro2-L": 512,
+    "DepthPro2-H": 512,
+    "MoGe3-L": 336,
+    "MoGe3-G": 336,
+    "FlashDepth-S": 518,
+    "FlashDepth-L": 518,
+    "FlashDepth-Full": 518
+  },
+  "local_viewer_checks": {
+    "depth_backend": "coreml",
+    "fallback": false,
+    "coreml_input_shared": 1,
+    "coreml_output_zero_copy": 1
+  },
+  "failures": []
+}

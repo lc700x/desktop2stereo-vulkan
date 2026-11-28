@@ -1,5 +1,9 @@
 """Apple CoreML and MPS depth providers."""
 
+from .coreml_families import (
+    CoreMLFamilyAccelerationError,
+    create_coreml_family_provider,
+)
 from .pytorch_mps import (
     DistillAnyDepthBaseMps,
     GenericAutoDepthMpsProvider,
@@ -14,6 +18,8 @@ __all__ = [
     "GenericTorchMpsDepthProvider",
     "DistillAnyDepthBaseMps",
     "GenericAutoDepthMpsProvider",
+    "CoreMLFamilyAccelerationError",
+    "create_coreml_family_provider",
     "create_pytorch_mps_provider",
     "is_mps_torch_available",
 ]

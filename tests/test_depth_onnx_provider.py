@@ -2,25 +2,30 @@ import sys
 import threading
 from pathlib import Path
 
-from path_config import APP_ROOT
-
 import pytest
 import torch
+from path_config import APP_ROOT
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
 
+from stereo_runtime.depth_onnx_provider import (
+    DistillPreprocessor,
+    ModelOnnxPreprocessor,
+    _preprocess_distill_rgb,
+    estimate_depth_onnx_cuda,
+)
 from stereo_runtime.depth_provider import (
     DepthProviderConfig,
     DepthProviderInfo,
     DistillAnyDepthBase518,
     GenericAutoDepthProvider,
     TorchDepthProvider,
+    _normalize_depth,
     create_depth_provider,
     estimate_depth,
-    _normalize_depth,
 )
-from stereo_runtime.depth_onnx_provider import DistillPreprocessor, ModelOnnxPreprocessor, _preprocess_distill_rgb, estimate_depth_onnx_cuda
+from stereo_runtime.new_model_providers import create_family_provider
 from stereo_runtime.providers.nvidia.tensorrt_ort import estimate_depth_nvidia_chain
 
 
@@ -417,6 +422,52 @@ def test_infinidepth_onnx_preprocessor_uses_patch_16_without_normalization():
     assert actual.shape[-1] % 16 == 0
     assert float(actual.min()) >= 0.0
     assert float(actual.max()) <= 1.0
+
+
+def test_depthpro2_onnx_preprocessor_uses_training_alignment():
+    preprocessor = ModelOnnxPreprocessor(
+        model_id="lc700x/DepthPro2",
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert preprocessor._target_resolution == 512
+    assert preprocessor._patch_size == 32
+
+
+@pytest.mark.parametrize(
+    ("family", "model_name", "model_id", "resolution", "multiple"),
+    [
+        ("depth-pro-2", "DepthPro2-S", "lc700x/DepthPro2", 512, 32),
+        ("moge-3", "MoGe3-L", "Ruicheng/moge-3-vitl", 518, 14),
+        ("flashdepth", "FlashDepth-S", "Eyeline-Labs/FlashDepth", 518, 14),
+    ],
+)
+def test_new_family_onnx_preprocessor_matches_shared_pytorch_math(
+    family, model_name, model_id, resolution, multiple
+):
+    rgb = torch.rand(1, 3, 63, 97)
+    preprocessor = ModelOnnxPreprocessor(
+        model_id=model_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        target_resolution=resolution,
+    )
+    provider = create_family_provider(
+        family=family,
+        model_id=model_id,
+        model_name=model_name,
+        device="cpu",
+        depth_resolution=resolution,
+    )
+
+    actual = preprocessor(rgb)
+    expected = provider._prepare_input(rgb)
+
+    assert actual.shape == expected.shape
+    assert actual.shape[-2] % multiple == 0
+    assert actual.shape[-1] % multiple == 0
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm is unavailable")

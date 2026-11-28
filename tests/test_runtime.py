@@ -231,6 +231,38 @@ def test_macos_stream_native_coreml_defers_gpu_pack_to_output(monkeypatch):
     runtime.close()
 
 
+def test_strict_native_depth_provider_never_falls_back_to_host_path():
+    class StrictProvider(FakeDepthProvider):
+        strict_native_io = True
+
+        def predict_profile_native(self, rgb, pixel_buffer, frame_id):
+            raise RuntimeError("native bridge failed")
+
+    provider = StrictProvider()
+    runtime = StereoRuntime(
+        StereoRuntimeConfig(
+            model_id="lc700x/Distill-Any-Depth-Base-hf",
+            device="cpu",
+            depth_backend="pytorch_mps",
+            stereo_quality="fast",
+            output_format="half_sbs",
+            temporal=False,
+        ),
+        depth_provider=provider,
+        collect_memory_stats=False,
+    )
+
+    with pytest.raises(RuntimeError, match="native bridge failed"):
+        runtime._predict_depth_profile_impl(
+            torch.empty(1, 3, 8, 12),
+            native_capture=object(),
+            capture_frame_id=1,
+        )
+
+    assert provider.predict_count == 0
+    runtime.close()
+
+
 def test_runtime_inference_gate_pauses_processing_and_reports_state():
     provider = FakeDepthProvider()
     config = StereoRuntimeConfig(

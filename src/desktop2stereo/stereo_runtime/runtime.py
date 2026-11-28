@@ -216,6 +216,8 @@ class DepthRuntime:
                     self._native_io_last_error = f"{type(exc).__name__}: {exc}"
                     if type(exc).__name__ == "NativeCoreMLBusy":
                         raise
+                    if getattr(self.depth_provider, "strict_native_io", False):
+                        raise
                     if not getattr(self, "_native_io_error_logged", False):
                         self._native_io_error_logged = True
                         print(
@@ -2751,6 +2753,8 @@ class StereoRuntime:
                 except Exception as exc:
                     self._native_io_last_error = f"{type(exc).__name__}: {exc}"
                     if type(exc).__name__ == "NativeCoreMLBusy":
+                        raise
+                    if getattr(self.depth_provider, "strict_native_io", False):
                         raise
                     if not getattr(self, "_native_io_error_logged", False):
                         self._native_io_error_logged = True

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal
-
+from typing import Literal
 
 DepthOutputSemantics = Literal[
     "relative_inverse_depth",
@@ -90,7 +90,7 @@ class ModelRegistry:
             self._by_id.setdefault(_key(spec.model_id), spec)
 
     @classmethod
-    def default(cls) -> "ModelRegistry":
+    def default(cls) -> ModelRegistry:
         return cls(DEFAULT_MODEL_SPECS)
 
     def get(self, name_or_model_id: str) -> DepthModelSpec:
@@ -129,6 +129,11 @@ def resolve_output_semantics(name_or_model_id: str) -> DepthOutputSemantics:
 
 
 DEPTHPRO2_MODEL_ID = "lc700x/DepthPro2"
+FAMILY_INPUT_MULTIPLE = {
+    "depth-pro-2": 32,
+    "moge-3": 14,
+    "flashdepth": 14,
+}
 
 
 DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
@@ -191,10 +196,11 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
         DEPTHPRO2_MODEL_ID,
         "depth-pro-2",
         "relative_inverse_depth",
+        default_resolution=512,
         weight_files=("depthpro2-s-bgcc6f8bg3.pt", "depthpro2-fov-ew55zg4kq7.pt"),
         license_id="apple-research-only",
         research_only=False,
-        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps", "coreml"),
         compat_profile="onnx-inverse-depth",
     ),
     DepthModelSpec(
@@ -202,10 +208,11 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
         DEPTHPRO2_MODEL_ID,
         "depth-pro-2",
         "relative_inverse_depth",
+        default_resolution=512,
         weight_files=("depthpro2-b-xb7m9egktw.pt", "depthpro2-fov-ew55zg4kq7.pt"),
         license_id="apple-research-only",
         research_only=False,
-        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps", "coreml"),
         compat_profile="onnx-inverse-depth",
     ),
     DepthModelSpec(
@@ -213,10 +220,11 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
         DEPTHPRO2_MODEL_ID,
         "depth-pro-2",
         "relative_inverse_depth",
+        default_resolution=512,
         weight_files=("depthpro2-l-tegstu7fim.pt", "depthpro2-fov-ew55zg4kq7.pt"),
         license_id="apple-research-only",
         research_only=False,
-        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps", "coreml"),
         compat_profile="onnx-inverse-depth",
     ),
     DepthModelSpec(
@@ -224,10 +232,11 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
         DEPTHPRO2_MODEL_ID,
         "depth-pro-2",
         "relative_inverse_depth",
+        default_resolution=512,
         weight_files=("depthpro2-h-eivtm5w7m5.pt", "depthpro2-fov-ew55zg4kq7.pt"),
         license_id="apple-research-only",
         research_only=False,
-        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps", "coreml"),
         compat_profile="onnx-inverse-depth",
     ),
     DepthModelSpec(
@@ -237,7 +246,7 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
         "metric_z_depth",
         weight_files=("model.pt",),
         license_id="mit",
-        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps", "coreml"),
         compat_profile="spatial-refine-off",
     ),
     DepthModelSpec(
@@ -247,7 +256,7 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
         "metric_z_depth",
         weight_files=("model.pt",),
         license_id="mit",
-        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps", "coreml"),
         compat_profile="spatial-refine-off",
     ),
     DepthModelSpec(
@@ -258,7 +267,7 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
         weight_files=("iter_14001.pth",),
         model_subdir="flashdepth-s",
         license_id="apache-2.0",
-        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps", "coreml"),
         compat_profile="spatial-temporal-off",
     ),
     DepthModelSpec(
@@ -269,7 +278,7 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
         weight_files=("iter_10001.pth",),
         model_subdir="flashdepth-l",
         license_id="apache-2.0",
-        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps", "coreml"),
         compat_profile="spatial-temporal-off",
     ),
     DepthModelSpec(
@@ -280,7 +289,7 @@ DEFAULT_MODEL_SPECS: tuple[DepthModelSpec, ...] = (
         weight_files=("iter_43002.pth",),
         model_subdir="flashdepth",
         license_id="apache-2.0",
-        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps"),
+        full_fidelity_backends=("pytorch_cuda", "pytorch_rocm", "pytorch_mps", "coreml"),
         compat_profile="spatial-temporal-off",
     ),
 )

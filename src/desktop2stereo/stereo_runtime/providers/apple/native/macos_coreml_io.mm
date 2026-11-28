@@ -1790,6 +1790,8 @@ typedef struct {
     int32_t depth_width;
     int32_t depth_height;
     size_t depth_count;
+    float normalization_mean[3];
+    float normalization_std[3];
     D2SSlot slots[3];
     pthread_mutex_t mutex;
     int32_t mutex_initialized;
@@ -2084,8 +2086,12 @@ static BOOL d2s_get_model_contract(D2SCoreMLIO *ctx, NSError **error) {
     ctx->depth_height = ctx->output_shape[ctx->output_shape.count - 2].intValue;
     ctx->depth_width = ctx->output_shape.lastObject.intValue;
     ctx->depth_count = d2s_shape_count(ctx->output_shape);
-    if (ctx->depth_count != (size_t)ctx->depth_height * (size_t)ctx->depth_width &&
-        ctx->output_shape.count != 3) {
+    size_t leading_count = 1;
+    for (NSUInteger index = 0; index + 2 < ctx->output_shape.count; ++index) {
+        leading_count *= (size_t)ctx->output_shape[index].unsignedIntegerValue;
+    }
+    if (leading_count != 1 ||
+        ctx->depth_count != (size_t)ctx->depth_height * (size_t)ctx->depth_width) {
         d2s_set_error(ctx, @"unsupported CoreML depth output shape");
         return NO;
     }
@@ -2100,6 +2106,7 @@ static BOOL d2s_get_model_contract(D2SCoreMLIO *ctx, NSError **error) {
 
 void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
                            int32_t input_height, int32_t compute_units,
+                           const D2SCoreMLIONormalization *normalization,
                            char *error_buffer, size_t error_capacity) {
     @autoreleasepool {
         if (model_path == NULL || input_width <= 0 || input_height <= 0) {
@@ -2126,6 +2133,21 @@ void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
         ctx->pack_mutex_initialized = 1;
         ctx->input_width = input_width;
         ctx->input_height = input_height;
+        const float default_mean[3] = {0.485f, 0.456f, 0.406f};
+        const float default_std[3] = {0.229f, 0.224f, 0.225f};
+        for (int i = 0; i < 3; ++i) {
+            ctx->normalization_mean[i] = normalization != NULL
+                ? normalization->mean[i] : default_mean[i];
+            ctx->normalization_std[i] = normalization != NULL
+                ? normalization->std[i] : default_std[i];
+            if (!isfinite(ctx->normalization_std[i]) ||
+                fabsf(ctx->normalization_std[i]) < 1e-8f) {
+                d2s_set_create_error(error_buffer, error_capacity,
+                                     @"invalid CoreML normalization");
+                d2s_destroy_context(ctx);
+                return NULL;
+            }
+        }
         ctx->depth_range_interval = 2;
         const char *range_interval = getenv("D2S_COREML_DEPTH_RANGE_INTERVAL");
         if (range_interval != NULL && range_interval[0] != '\0') {
@@ -2252,8 +2274,8 @@ static BOOL d2s_dispatch_preprocess(D2SCoreMLIO *ctx, D2SSlot *slot,
     D2SPreprocessParams params = {
         source_width, source_height,
         (uint32_t)ctx->input_width, (uint32_t)ctx->input_height,
-        0.485f, 0.456f, 0.406f,
-        0.229f, 0.224f, 0.225f,
+        ctx->normalization_mean[0], ctx->normalization_mean[1], ctx->normalization_mean[2],
+        ctx->normalization_std[0], ctx->normalization_std[1], ctx->normalization_std[2],
     };
     if (slot->input_is_p010) {
         [encoder setTexture:slot->luma_texture atIndex:0];
@@ -2558,8 +2580,14 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
                 strides:input_strides deallocator:nil error:&error];
         }
         if (slot->output_array == nil) {
-            NSArray<NSNumber *> *output_strides = @[
-                @(ctx->depth_width * ctx->depth_height), @(ctx->depth_width), @1];
+            NSMutableArray<NSNumber *> *output_strides =
+                [NSMutableArray arrayWithCapacity:ctx->output_shape.count];
+            NSUInteger stride = 1;
+            for (NSInteger index = (NSInteger)ctx->output_shape.count - 1;
+                 index >= 0; --index) {
+                [output_strides insertObject:@(stride) atIndex:0];
+                stride *= (NSUInteger)ctx->output_shape[(NSUInteger)index].unsignedIntegerValue;
+            }
             slot->output_array = [[MLMultiArray alloc]
                 initWithDataPointer:slot->raw_depth_buffer.contents
                 shape:ctx->output_shape dataType:ctx->output_type

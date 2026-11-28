@@ -140,11 +140,20 @@ class CoreMLEngine:
     both provider base classes run their normal postprocessing unchanged.
     """
 
-    def __init__(self, model_path: str | Path, device: str | torch.device) -> None:
+    def __init__(
+        self,
+        model_path: str | Path,
+        device: str | torch.device,
+        *,
+        compute_units_choice: str | None = None,
+    ) -> None:
         self._model_path = str(model_path)
         self._model = None
         self._model_lock = threading.Lock()
-        self._compute_units_choice = os.environ.get("D2S_COREML_COMPUTE_UNITS", "all").strip().lower()
+        self._compute_units_choice = (
+            compute_units_choice
+            or os.environ.get("D2S_COREML_COMPUTE_UNITS", "all")
+        ).strip().lower()
         self.device = torch.device(device)
         self.native_io = None
         self.native_io_reason = "not_attempted"
@@ -174,6 +183,7 @@ class CoreMLEngine:
         # D2S_COREML_COMPUTE_UNITS: all (default) | ane | cpu_and_gpu
         units = {
             "ane": getattr(ct.ComputeUnit, "CPU_AND_NE", ct.ComputeUnit.ALL),
+            "gpu": ct.ComputeUnit.CPU_AND_GPU,
             "cpu_and_gpu": ct.ComputeUnit.CPU_AND_GPU,
             "cpu": ct.ComputeUnit.CPU_ONLY,
         }.get(self._compute_units_choice, ct.ComputeUnit.ALL)
@@ -183,7 +193,13 @@ class CoreMLEngine:
         )
 
     def enable_native_io(
-        self, model_path: str | Path, input_width: int, input_height: int
+        self,
+        model_path: str | Path,
+        input_width: int,
+        input_height: int,
+        *,
+        normalization: tuple[tuple[float, ...], tuple[float, ...]] | None = None,
+        compute_units: str | None = None,
     ) -> None:
         """Try native shared-buffer IO without changing Python CoreML fallback."""
         if sys.platform != "darwin" or os.environ.get(
@@ -195,7 +211,11 @@ class CoreMLEngine:
             from .native import NativeCoreMLIOBridge
 
             bridge, reason = NativeCoreMLIOBridge.try_create(
-                model_path, int(input_width), int(input_height)
+                model_path,
+                int(input_width),
+                int(input_height),
+                normalization=normalization,
+                compute_units=compute_units or self._compute_units_choice,
             )
             self.native_io = bridge
             self.native_io_reason = reason or "active"

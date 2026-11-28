@@ -170,10 +170,7 @@ class NativeMoGeOnnxExportWrapper(torch.nn.Module):
             self.model,
             pixel_values,
             target_resolution=self.target_resolution,
-            # The ONNX export graph does not preserve the training-time mask
-            # head reliably across all TensorRT/MIGraphX targets.  The point
-            # map is still finite, and the shared postprocessor sanitizes it.
-            apply_mask=False,
+            apply_mask=True,
         )
 
 

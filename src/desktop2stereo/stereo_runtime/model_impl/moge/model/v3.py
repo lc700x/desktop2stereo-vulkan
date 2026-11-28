@@ -179,13 +179,17 @@ class MoGeModel(MoGeModelV2):
             coords = torch.stack(coord_per_step, dim=1) if return_per_step else current_coord.unsqueeze(1)
 
         # Resize and remap outputs
-        resize = lambda x, channel_last=False: F.interpolate(
-            x.movedim(-1, -3) if channel_last else x,
-            (img_h, img_w),
-            mode='bilinear',
-            align_corners=False,
-            antialias=False,
-        ).movedim(-3, -1 if channel_last else -3)
+        def resize(x, channel_last=False):
+            if channel_last:
+                x = x.permute(0, 3, 1, 2)
+            x = F.interpolate(
+                x,
+                (img_h, img_w),
+                mode='bilinear',
+                align_corners=False,
+                antialias=False,
+            )
+            return x.permute(0, 2, 3, 1) if channel_last else x
 
         if coords is not None:
             num_point_steps = coords.shape[1]

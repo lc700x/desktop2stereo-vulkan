@@ -22,17 +22,12 @@ from .model_impl.custom_models import (
     normalize_imagenet,
     predict_flashdepth,
     predict_moge_3_depth,
-    resize_rgb,
     resolve_spec,
 )
-from .model_registry import DepthModelSpec
+from .model_registry import FAMILY_INPUT_MULTIPLE, DepthModelSpec
 from .output import ensure_bchw
 
-FAMILY_PATCH_SIZE = {
-    "depth-pro-2": 32,
-    "moge-3": 14,
-    "flashdepth": 14,
-}
+FAMILY_PATCH_SIZE = FAMILY_INPUT_MULTIPLE
 
 
 def _backend_for_device(device: torch.device) -> str:
@@ -175,7 +170,14 @@ class _FamilyProvider:
             patch,
             self.spec.model_id,
         )
-        rgb = resize_rgb(rgb, input_h, input_w)
+        if tuple(rgb.shape[-2:]) != (input_h, input_w):
+            rgb = torch.nn.functional.interpolate(
+                rgb,
+                size=(input_h, input_w),
+                mode="bilinear",
+                align_corners=False,
+                antialias=False,
+            )
         if self.family in {"depth-pro-2", "flashdepth"}:
             rgb = normalize_imagenet(rgb, dtype=torch.float32)
         return rgb

@@ -12,11 +12,8 @@ from ...depth_onnx_provider import ModelOnnxPreprocessor, _dtype_from_onnx_name,
 from ...depth_provider import (
     DISTILL_ANY_DEPTH_BASE_MODEL_ID,
     DISTILL_ANY_DEPTH_BASE_NAME,
-    DISTILL_ANY_DEPTH_PATCH_SIZE,
     DISTILL_ANY_DEPTH_BASE_RESOLUTION,
-    ZIPDEPTH_PATCH_SIZE,
     _is_zipdepth_model,
-    _model_input_size_for_model,
     DepthProfileResult,
     DepthProviderConfig,
     DepthProviderInfo,
@@ -677,20 +674,12 @@ class DistillAnyDepthBaseNativeTensorRt:
         self._artifact_input_size: tuple[int, int] | None = None
         self._cuda_graph_disabled_reason: str | None = None
         self._cuda_graph_prepared = False
-        configured_input_size = None
-        if self._explicit_onnx_path is None:
-            configured_input_size = _model_input_size_for_model(
-                294,
-                518,
-                self.depth_resolution,
-                ZIPDEPTH_PATCH_SIZE if _is_zipdepth_model(self.model_id) else DISTILL_ANY_DEPTH_PATCH_SIZE,
-                self.model_id,
-            )
         self._preprocessor = ModelOnnxPreprocessor(
             model_id=self.model_id,
             device=self.device,
             dtype=self.dtype,
-            fixed_input_size=_input_size_from_artifact_name(self.onnx_path) if self._explicit_onnx_path else configured_input_size,
+            fixed_input_size=_input_size_from_artifact_name(self.onnx_path) if self._explicit_onnx_path else None,
+            target_resolution=self.depth_resolution,
         )
 
     @property
