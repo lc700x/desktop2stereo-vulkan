@@ -53,7 +53,7 @@ def _main_menu_action_style(variant: str) -> ft.ButtonStyle:
         }
         foregrounds = {
             state.DEFAULT: color("primary_state_text"),
-            state.HOVERED: color("surface"),
+            state.HOVERED: color("primary_state_text"),
             state.PRESSED: color("primary_state_text"),
             state.FOCUSED: color("primary_state_text"),
             state.DISABLED: color("text_disabled"),
@@ -83,9 +83,9 @@ def _main_menu_action_style(variant: str) -> ft.ButtonStyle:
         }
         foregrounds = {
             state.DEFAULT: color("primary_state_text"),
-            state.HOVERED: color("surface"),
+            state.HOVERED: color("primary_state_text"),
             state.PRESSED: color("primary_state_text"),
-            state.FOCUSED: color("surface"),
+            state.FOCUSED: color("primary_state_text"),
             state.DISABLED: color("text_disabled"),
         }
     else:
@@ -1358,22 +1358,32 @@ class GUIBuilderMixin:
             border_radius=6,
             visible=False,
         )
+        self._log_scroll_pixels = 0.0
+        self._log_scroll_event_max_extent = 0.0
+        self._log_scroll_viewport_dimension = 0.0
+        self._log_text_height = 0.0
+        self._log_viewport_height = 0.0
+        self._log_scroll_track_height = 0.0
         self.log_text = ft.Text(
             spans=[],
             selectable=True,
             no_wrap=True,
             overflow=ft.TextOverflow.VISIBLE,
             size=12,
+            on_size_change=self.on_log_text_size_change,
         )
         self.log_viewport = ft.Column(
             [self.log_text],
             width=S(900),
             scroll=ft.Scrollbar(
                 orientation=ft.ScrollbarOrientation.RIGHT,
-                thumb_visibility=True,
-                thickness=S(6),
-                radius=S(3),
+                thumb_visibility=False,
+                track_visibility=False,
+                thickness=0,
+                interactive=False,
             ),
+            on_scroll=self.on_log_viewport_scroll,
+            on_size_change=self.on_log_viewport_size_change,
             expand=True,
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
             spacing=0,
@@ -1392,10 +1402,52 @@ class GUIBuilderMixin:
             ),
             vertical_alignment=ft.CrossAxisAlignment.STRETCH,
         )
+        self.log_vertical_thumb = ft.Container(
+            top=0,
+            width=S(6),
+            height=S(40),
+            bgcolor=ft.Colors.with_opacity(0.62, ft.Colors.WHITE),
+            border_radius=S(3),
+            visible=False,
+        )
+        self.log_vertical_track = ft.Container(
+            content=ft.Stack([self.log_vertical_thumb], expand=True),
+            width=S(6),
+            bgcolor=ft.Colors.with_opacity(0.14, ft.Colors.WHITE),
+            border_radius=S(3),
+            expand=True,
+            visible=False,
+        )
+        self.log_vertical_scrollbar = ft.GestureDetector(
+            content=ft.Container(
+                content=self.log_vertical_track,
+                width=S(12),
+                padding=ft.Padding(S(3), 0, S(3), 0),
+                expand=True,
+            ),
+            width=S(12),
+            expand=True,
+            mouse_cursor=ft.MouseCursor.RESIZE_UP_DOWN,
+            on_tap_down=self.on_log_vertical_scrollbar_tap,
+            on_pan_update=self.on_log_vertical_scrollbar_pan,
+            on_hover=self.on_log_vertical_scrollbar_hover,
+        )
+        self.log_scroll_overlay = ft.Container(
+            content=self.log_vertical_scrollbar,
+            right=0,
+            top=0,
+            bottom=S(6),
+            width=S(12),
+        )
+        self.log_body_stack = ft.Stack(
+            [self.log_scroll_row, self.log_scroll_overlay],
+            expand=True,
+        )
         self.log_body = ft.Container(
-            content=self.log_scroll_row,
+            content=self.log_body_stack,
             expand=True,
             visible=True,
+            on_size_change=self.on_log_body_size_change,
         )
         self.log_panel = ft.Container(
             content=ft.Column([

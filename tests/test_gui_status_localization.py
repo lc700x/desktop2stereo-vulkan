@@ -77,6 +77,8 @@ def test_main_menu_actions_use_theme_colors_for_all_interaction_states():
     assert primary.bgcolor[states.DEFAULT] == color("primary")
     assert primary.bgcolor[states.HOVERED] == color("primary_hover")
     assert primary.color[states.DEFAULT] == color("primary_state_text")
+    assert primary.color[states.HOVERED] == color("primary_state_text")
+    assert primary.color[states.FOCUSED] == color("primary_state_text")
     assert danger.bgcolor[states.DEFAULT] == color("action_destructive")
     assert danger.bgcolor[states.HOVERED] == color("action_destructive_hover")
     assert danger.bgcolor[states.PRESSED] == color("action_destructive_pressed")
@@ -86,6 +88,8 @@ def test_main_menu_actions_use_theme_colors_for_all_interaction_states():
     assert secondary.bgcolor[states.DEFAULT] == color("primary_container")
     assert secondary.bgcolor[states.HOVERED] == color("primary_hover")
     assert secondary.color[states.DEFAULT] == color("primary_state_text")
+    assert secondary.color[states.HOVERED] == color("primary_state_text")
+    assert secondary.color[states.FOCUSED] == color("primary_state_text")
 
     builder_source = inspect.getsource(GUIBuilderMixin.build_ui)
     for button_name, variant in (

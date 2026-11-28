@@ -40,6 +40,7 @@ from .paths import (
     STREAM_CALIBRATION_STATE_FILE,
 )
 from .capture_sources import get_primary_monitor_index, list_windows
+from .controls import S
 from .localization import UI_MESSAGES, translate_status
 from .log_handler import GuiLogHandler
 from utils.logging_setup import _NoisyThirdPartyDebugFilter
@@ -2788,6 +2789,7 @@ class GUIProcessMixin:
                     getattr(self, "log_title", None),
                     getattr(self, "report_issue_btn", None),
                 )
+                self._update_log_vertical_scrollbar()
             await asyncio.sleep(0.1)
 
     def _set_log_problem_state(self):
@@ -2798,11 +2800,141 @@ class GUIProcessMixin:
         if getattr(self, "report_issue_btn", None) is not None:
             self.report_issue_btn.visible = True
 
+    @staticmethod
+    def _log_vertical_scrollbar_geometry(
+        content_height: float,
+        viewport_height: float,
+        track_height: float,
+        pixels: float,
+    ) -> tuple[float, float, float, bool]:
+        viewport_height = max(0.0, float(viewport_height))
+        content_height = max(viewport_height, float(content_height))
+        max_extent = max(0.0, content_height - viewport_height)
+        track_height = max(0.0, float(track_height))
+        if max_extent <= 0.5 or viewport_height <= 0 or track_height <= 0:
+            return max_extent, 0.0, 0.0, False
+
+        thumb_height = max(S(28), track_height * viewport_height / content_height)
+        thumb_height = min(track_height, thumb_height)
+        thumb_travel = max(0.0, track_height - thumb_height)
+        progress = min(1.0, max(0.0, float(pixels)) / max_extent)
+        return max_extent, thumb_height, thumb_travel * progress, True
+
+    def _log_scroll_metrics(self) -> tuple[float, float, float, bool]:
+        viewport_height = max(
+            float(getattr(self, "_log_viewport_height", 0.0) or 0.0),
+            float(getattr(self, "_log_scroll_viewport_dimension", 0.0) or 0.0),
+        )
+        spans = getattr(getattr(self, "log_text", None), "spans", None) or []
+        estimated_content_height = sum(
+            max(1, str(getattr(span, "text", "")).count("\n"))
+            for span in spans
+        ) * 18
+        content_height = max(
+            float(getattr(self, "_log_text_height", 0.0) or 0.0),
+            viewport_height + float(getattr(self, "_log_scroll_event_max_extent", 0.0) or 0.0),
+            estimated_content_height,
+        )
+        return self._log_vertical_scrollbar_geometry(
+            content_height,
+            viewport_height,
+            float(getattr(self, "_log_scroll_track_height", 0.0) or 0.0),
+            float(getattr(self, "_log_scroll_pixels", 0.0) or 0.0),
+        )
+
+    def _update_log_vertical_scrollbar(self):
+        track = getattr(self, "log_vertical_track", None)
+        thumb = getattr(self, "log_vertical_thumb", None)
+        if track is None or thumb is None:
+            return
+
+        max_extent, thumb_height, thumb_top, visible = self._log_scroll_metrics()
+        self._log_scroll_max_extent = max_extent
+        changed = False
+        if track.visible != visible:
+            track.visible = visible
+            changed = True
+        if thumb.visible != visible:
+            thumb.visible = visible
+            changed = True
+        if visible and abs(float(thumb.height or 0) - thumb_height) > 0.25:
+            thumb.height = thumb_height
+            changed = True
+        if visible and abs(float(thumb.top or 0) - thumb_top) > 0.25:
+            thumb.top = thumb_top
+            changed = True
+        if changed:
+            self._safe_update(track, thumb)
+
+    def on_log_text_size_change(self, e=None):
+        if e is not None:
+            self._log_text_height = max(0.0, float(e.height))
+        self._update_log_vertical_scrollbar()
+
+    def on_log_viewport_size_change(self, e=None):
+        if e is not None:
+            self._log_viewport_height = max(0.0, float(e.height))
+        self._update_log_vertical_scrollbar()
+
+    def on_log_body_size_change(self, e=None):
+        if e is not None:
+            self._log_scroll_track_height = max(0.0, float(e.height) - S(6))
+        self._update_log_vertical_scrollbar()
+
+    def on_log_viewport_scroll(self, e=None):
+        if e is not None:
+            self._log_scroll_pixels = max(0.0, float(e.pixels))
+            self._log_scroll_event_max_extent = max(0.0, float(e.max_scroll_extent))
+            self._log_scroll_viewport_dimension = max(0.0, float(e.viewport_dimension))
+        self._update_log_vertical_scrollbar()
+
+    def _scroll_log_viewport(self, *, offset=None, delta=None):
+        viewport = getattr(self, "log_viewport", None)
+        if viewport is None:
+            return
+        try:
+            asyncio.create_task(viewport.scroll_to(offset=offset, delta=delta, duration=0))
+        except RuntimeError:
+            pass
+
+    def on_log_vertical_scrollbar_tap(self, e=None):
+        position = getattr(e, "local_position", None)
+        if position is None:
+            return
+        max_extent, thumb_height, _, visible = self._log_scroll_metrics()
+        track_height = float(getattr(self, "_log_scroll_track_height", 0.0) or 0.0)
+        thumb_travel = max(0.0, track_height - thumb_height)
+        if not visible or max_extent <= 0:
+            return
+        thumb_top = min(thumb_travel, max(0.0, float(position.y) - thumb_height / 2))
+        progress = thumb_top / thumb_travel if thumb_travel else 0.0
+        self._scroll_log_viewport(offset=max_extent * progress)
+
+    def on_log_vertical_scrollbar_pan(self, e=None):
+        delta = getattr(e, "local_delta", None)
+        if delta is None:
+            return
+        max_extent, thumb_height, _, visible = self._log_scroll_metrics()
+        track_height = float(getattr(self, "_log_scroll_track_height", 0.0) or 0.0)
+        thumb_travel = max(0.0, track_height - thumb_height)
+        if not visible or max_extent <= 0 or thumb_travel <= 0:
+            return
+        self._scroll_log_viewport(delta=float(delta.y) * max_extent / thumb_travel)
+
+    def on_log_vertical_scrollbar_hover(self, e=None):
+        thumb = getattr(self, "log_vertical_thumb", None)
+        if thumb is None:
+            return
+        hovered = str(getattr(e, "data", "false")).casefold() == "true"
+        thumb.bgcolor = ft.Colors.with_opacity(0.92 if hovered else 0.62, ft.Colors.WHITE)
+        self._safe_update(thumb)
+
     def on_log_toggle(self, e=None):
         self.log_body.visible = not self.log_body.visible
         self.log_toggle_btn.content.value = "▼" if self.log_body.visible else "▶"
         self._fit_window_to_content()
         self._safe_update(self.log_toggle_btn, self.log_body)
+        self._update_log_vertical_scrollbar()
 
     def on_log_level_filter(self, e=None):
         self.log_text.spans = []
@@ -2823,6 +2955,7 @@ class GUIProcessMixin:
             getattr(self, "log_scroll_row", None),
             self.log_text,
         )
+        self._update_log_vertical_scrollbar()
 
     def on_log_clear(self, e=None):
         self.log_text.spans = []
@@ -2847,6 +2980,7 @@ class GUIProcessMixin:
             getattr(self, "download_progress_panel", None),
             getattr(self, "log_title", None),
         )
+        self._update_log_vertical_scrollbar()
 
     def on_report_issue(self, e=None):
         handler = getattr(self, "gui_log_handler", None)
