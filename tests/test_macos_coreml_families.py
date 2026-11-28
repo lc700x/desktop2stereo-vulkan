@@ -174,3 +174,23 @@ def test_family_provider_rejects_non_gpu_accelerator(tmp_path):
             cache_dir=tmp_path,
             coreml_compute_units="ane",
         )
+
+
+def test_only_depthpro2_s_enables_native_temporal_stabilization(tmp_path):
+    depthpro2 = create_coreml_family_provider(
+        family="depth-pro-2",
+        model_id="lc700x/DepthPro2",
+        model_name="DepthPro2-S",
+        device=torch.device("mps"),
+        cache_dir=tmp_path,
+    )
+    flashdepth = create_coreml_family_provider(
+        family="flashdepth",
+        model_id="Eyeline-Labs/FlashDepth",
+        model_name="FlashDepth-S",
+        device=torch.device("mps"),
+        cache_dir=tmp_path,
+    )
+
+    assert depthpro2.native_temporal_history_weight() == 0.85
+    assert flashdepth.native_temporal_history_weight() == 0.0

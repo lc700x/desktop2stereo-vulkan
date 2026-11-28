@@ -174,6 +174,9 @@ def test_native_local_half_sbs_has_raw_depth_fast_kernels() -> None:
     fast_end = source.index("static inline float projected_target_x", fast_start)
     assert "p.source_width != p.output_width" not in source[fast_start:fast_end]
     assert "float(p.source_height) / float(p.output_height)" in source
+    assert "d2s_temporal_blend_float" in source
+    assert "d2s_apply_temporal_depth" in source
+    assert "temporal_history_weight" in source
 
 
 def test_native_warp_supports_target_resolution_different_from_source() -> None:

@@ -87,6 +87,8 @@ typedef struct {
 void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
                            int32_t input_height, int32_t compute_units,
                            const D2SCoreMLIONormalization *normalization,
+                           float temporal_history_weight,
+                           float temporal_change_threshold,
                            char *error_buffer, size_t error_capacity);
 
 int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,

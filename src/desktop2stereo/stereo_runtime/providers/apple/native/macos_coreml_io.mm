@@ -41,6 +41,13 @@ typedef struct {
 } D2SNormalizeParams;
 
 typedef struct {
+    uint32_t count;
+    float history_weight;
+    float threshold_fraction;
+    float span;
+} D2STemporalBlendParams;
+
+typedef struct {
     uint32_t depth_width;
     uint32_t depth_height;
     float strength;
@@ -100,6 +107,13 @@ struct NormalizeParams {
     uint count;
     float lo;
     float hi;
+};
+
+struct TemporalBlendParams {
+    uint count;
+    float history_weight;
+    float threshold_fraction;
+    float span;
 };
 
 static inline uint d2s_float_order_key(float value) {
@@ -410,6 +424,42 @@ kernel void d2s_normalize_float(
         atomic_fetch_add_explicit(status, 1u, memory_order_relaxed);
     }
     output[gid] = clamp((value - p.lo) / max(p.hi - p.lo, 1.0e-6f), 0.0f, 1.0f);
+}
+
+kernel void d2s_temporal_blend_half(
+    device half *source [[buffer(0)]],
+    device const half *history [[buffer(1)]],
+    constant TemporalBlendParams& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.count) return;
+    float current_value = float(source[gid]);
+    float history_value = float(history[gid]);
+    if (!isfinite(current_value) || !isfinite(history_value)) return;
+    float threshold = max(p.span * p.threshold_fraction, 1.0e-6f);
+    float similarity = clamp(
+        1.0f - fabs(current_value - history_value) / threshold,
+        0.0f,
+        1.0f);
+    float weight = clamp(p.history_weight * similarity, 0.0f, 0.95f);
+    source[gid] = half(mix(current_value, history_value, weight));
+}
+
+kernel void d2s_temporal_blend_float(
+    device float *source [[buffer(0)]],
+    device const float *history [[buffer(1)]],
+    constant TemporalBlendParams& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.count) return;
+    float current_value = source[gid];
+    float history_value = history[gid];
+    if (!isfinite(current_value) || !isfinite(history_value)) return;
+    float threshold = max(p.span * p.threshold_fraction, 1.0e-6f);
+    float similarity = clamp(
+        1.0f - fabs(current_value - history_value) / threshold,
+        0.0f,
+        1.0f);
+    float weight = clamp(p.history_weight * similarity, 0.0f, 0.95f);
+    source[gid] = mix(current_value, history_value, weight);
 }
 
 static inline float depth_sample(device float *depth, uint width, uint height,
@@ -1762,6 +1812,9 @@ typedef struct {
     __strong id<MTLComputePipelineState> preprocess_p010_pipeline;
     __strong id<MTLComputePipelineState> normalize_half_pipeline;
     __strong id<MTLComputePipelineState> normalize_float_pipeline;
+    __strong id<MTLComputePipelineState> temporal_blend_half_pipeline;
+    __strong id<MTLComputePipelineState> temporal_blend_float_pipeline;
+    __strong id<MTLBuffer> temporal_depth_buffer;
     __strong id<MTLComputePipelineState> depth_range_reset_pipeline;
     __strong id<MTLComputePipelineState> depth_range_minmax_half_pipeline;
     __strong id<MTLComputePipelineState> depth_range_minmax_float_pipeline;
@@ -1802,6 +1855,9 @@ typedef struct {
     float depth_range_hi;
     int32_t depth_range_initialized;
     uint32_t depth_range_interval;
+    float temporal_history_weight;
+    float temporal_change_threshold;
+    int32_t temporal_history_valid;
     double last_pack_gpu_ms;
     int32_t last_pack_gpu_valid;
     char error[512];
@@ -1921,6 +1977,9 @@ static void d2s_destroy_context(D2SCoreMLIO *ctx) {
     ctx->preprocess_p010_pipeline = nil;
     ctx->normalize_half_pipeline = nil;
     ctx->normalize_float_pipeline = nil;
+    ctx->temporal_blend_half_pipeline = nil;
+    ctx->temporal_blend_float_pipeline = nil;
+    ctx->temporal_depth_buffer = nil;
     ctx->depth_range_reset_pipeline = nil;
     ctx->depth_range_minmax_half_pipeline = nil;
     ctx->depth_range_minmax_float_pipeline = nil;
@@ -1964,6 +2023,8 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
     id<MTLFunction> preprocess_p010 = [library newFunctionWithName:@"d2s_preprocess_p010"];
     id<MTLFunction> norm_half = [library newFunctionWithName:@"d2s_normalize_half"];
     id<MTLFunction> norm_float = [library newFunctionWithName:@"d2s_normalize_float"];
+    id<MTLFunction> temporal_half = [library newFunctionWithName:@"d2s_temporal_blend_half"];
+    id<MTLFunction> temporal_float = [library newFunctionWithName:@"d2s_temporal_blend_float"];
     id<MTLFunction> range_reset = [library newFunctionWithName:@"d2s_depth_range_reset"];
     id<MTLFunction> range_minmax_half = [library newFunctionWithName:@"d2s_depth_range_minmax_half"];
     id<MTLFunction> range_minmax_float = [library newFunctionWithName:@"d2s_depth_range_minmax_float"];
@@ -1980,7 +2041,8 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
         [library newFunctionWithName:@"d2s_warp_pack_half_sbs_fast_float"];
     id<MTLFunction> fast_half_sbs_half =
         [library newFunctionWithName:@"d2s_warp_pack_half_sbs_fast_half"];
-    if (!preprocess || !p010_color || !preprocess_p010 || !norm_half || !norm_float || !range_reset ||
+    if (!preprocess || !p010_color || !preprocess_p010 || !norm_half || !norm_float ||
+        !temporal_half || !temporal_float || !range_reset ||
         !range_minmax_half || !range_minmax_float || !range_histogram_half ||
         !range_histogram_float || !range_reduce || !warp || !half_sbs_2d ||
         !fast_half_sbs || !fast_half_sbs_float || !fast_half_sbs_half) return NO;
@@ -1991,6 +2053,10 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
         newComputePipelineStateWithFunction:preprocess_p010 error:error];
     ctx->normalize_half_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_half error:error];
     ctx->normalize_float_pipeline = [ctx->device newComputePipelineStateWithFunction:norm_float error:error];
+    ctx->temporal_blend_half_pipeline = [ctx->device
+        newComputePipelineStateWithFunction:temporal_half error:error];
+    ctx->temporal_blend_float_pipeline = [ctx->device
+        newComputePipelineStateWithFunction:temporal_float error:error];
     ctx->depth_range_reset_pipeline = [ctx->device newComputePipelineStateWithFunction:range_reset error:error];
     ctx->depth_range_minmax_half_pipeline = [ctx->device newComputePipelineStateWithFunction:range_minmax_half error:error];
     ctx->depth_range_minmax_float_pipeline = [ctx->device newComputePipelineStateWithFunction:range_minmax_float error:error];
@@ -2012,6 +2078,7 @@ static BOOL d2s_compile_pipelines(D2SCoreMLIO *ctx, NSError **error) {
            ctx->preprocess_p010_pipeline &&
            ctx->normalize_half_pipeline &&
            ctx->normalize_float_pipeline && ctx->depth_range_reset_pipeline &&
+           ctx->temporal_blend_half_pipeline && ctx->temporal_blend_float_pipeline &&
            ctx->depth_range_minmax_half_pipeline && ctx->depth_range_minmax_float_pipeline &&
            ctx->depth_range_histogram_half_pipeline && ctx->depth_range_histogram_float_pipeline &&
            ctx->depth_range_reduce_pipeline && ctx->warp_pipeline &&
@@ -2107,6 +2174,8 @@ static BOOL d2s_get_model_contract(D2SCoreMLIO *ctx, NSError **error) {
 void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
                            int32_t input_height, int32_t compute_units,
                            const D2SCoreMLIONormalization *normalization,
+                           float temporal_history_weight,
+                           float temporal_change_threshold,
                            char *error_buffer, size_t error_capacity) {
     @autoreleasepool {
         if (model_path == NULL || input_width <= 0 || input_height <= 0) {
@@ -2133,6 +2202,10 @@ void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
         ctx->pack_mutex_initialized = 1;
         ctx->input_width = input_width;
         ctx->input_height = input_height;
+        ctx->temporal_history_weight = isfinite(temporal_history_weight)
+            ? fminf(fmaxf(temporal_history_weight, 0.0f), 0.95f) : 0.0f;
+        ctx->temporal_change_threshold = isfinite(temporal_change_threshold) &&
+            temporal_change_threshold > 0.0f ? temporal_change_threshold : 0.1f;
         const float default_mean[3] = {0.485f, 0.456f, 0.406f};
         const float default_std[3] = {0.229f, 0.224f, 0.225f};
         for (int i = 0; i < 3; ++i) {
@@ -2373,6 +2446,63 @@ static BOOL d2s_gpu_depth_range(D2SCoreMLIO *ctx, D2SSlot *slot,
     *hi = range[1];
     *nonfinite = state[3];
     return isfinite(*lo) && isfinite(*hi) && *hi > *lo;
+}
+
+static BOOL d2s_apply_temporal_depth(D2SCoreMLIO *ctx, D2SSlot *slot,
+                                     float lo, float hi) {
+    if (ctx->temporal_history_weight <= 0.0f || !isfinite(lo) ||
+        !isfinite(hi) || hi <= lo) {
+        return YES;
+    }
+    id<MTLBuffer> current = slot->raw_depth_buffer;
+    if (current == nil) return NO;
+    if (ctx->temporal_depth_buffer == nil ||
+        ctx->temporal_depth_buffer.length < current.length) {
+        ctx->temporal_depth_buffer = [ctx->device
+            newBufferWithLength:current.length
+            options:MTLResourceStorageModePrivate];
+        ctx->temporal_history_valid = 0;
+    }
+    if (ctx->temporal_depth_buffer == nil) return NO;
+
+    id<MTLCommandBuffer> command = [ctx->queue commandBuffer];
+    if (command == nil) return NO;
+    if (ctx->temporal_history_valid) {
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (encoder == nil) return NO;
+        D2STemporalBlendParams params = {
+            (uint32_t)ctx->depth_count,
+            ctx->temporal_history_weight,
+            ctx->temporal_change_threshold,
+            hi - lo,
+        };
+        [encoder setComputePipelineState:slot->output_is_float16
+            ? ctx->temporal_blend_half_pipeline
+            : ctx->temporal_blend_float_pipeline];
+        [encoder setBuffer:current offset:0 atIndex:0];
+        [encoder setBuffer:ctx->temporal_depth_buffer offset:0 atIndex:1];
+        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+        NSUInteger width = 256;
+        MTLSize grid = MTLSizeMake(ctx->depth_count, 1, 1);
+        MTLSize groups = MTLSizeMake(
+            (grid.width + width - 1) / width, 1, 1);
+        [encoder dispatchThreadgroups:groups
+            threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+        [encoder endEncoding];
+    }
+    id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+    if (blit == nil) return NO;
+    [blit copyFromBuffer:current
+            sourceOffset:0
+                toBuffer:ctx->temporal_depth_buffer
+       destinationOffset:0
+                    size:current.length];
+    [blit endEncoding];
+    [command commit];
+    [command waitUntilCompleted];
+    if (command.status != MTLCommandBufferStatusCompleted) return NO;
+    ctx->temporal_history_valid = 1;
+    return YES;
 }
 
 static BOOL d2s_reuse_depth_range(D2SCoreMLIO *ctx, uint64_t frame_id,
@@ -2641,6 +2771,11 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
         if (!reused_depth_range &&
             !d2s_gpu_depth_range(ctx, slot, &lo, &hi, &nonfinite)) {
             d2s_set_error(ctx, @"Metal depth range reduction failed");
+            d2s_release_slot(slot, NO);
+            return D2S_COREML_ERROR;
+        }
+        if (!d2s_apply_temporal_depth(ctx, slot, lo, hi)) {
+            d2s_set_error(ctx, @"Metal temporal depth stabilization failed");
             d2s_release_slot(slot, NO);
             return D2S_COREML_ERROR;
         }

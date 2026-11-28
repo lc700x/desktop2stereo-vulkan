@@ -88,6 +88,7 @@ class DepthProviderInfo:
     coreml_compute_units: str | None = None
     coreml_compute_plan: dict[str, Any] | None = None
     coreml_artifact_path: str | None = None
+    temporal_history_weight: float = 0.0
 
     def __post_init__(self) -> None:
         if self.raw_output_semantics is None:

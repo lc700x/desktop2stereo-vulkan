@@ -46,6 +46,10 @@ second normalization is applied inside a model wrapper.
   requests are rejected.
 - Local Viewer resolves compute units by model family before launch, so the
   legacy monitor-mode ANE default cannot be applied to the new GPU-only models.
+- DepthPro2-S uses a native Metal temporal stabilizer on raw inverse depth.
+  Small frame-to-frame output differences are blended with the previous depth
+  frame, while large differences reduce the history weight to avoid ghosting.
+  `D2S_COREML_DP2_S_TEMPORAL_WEIGHT` tunes or disables this path.
 - No fallback from the new families to PyTorch MPS or CPU.
 - The native Core ML/Metal bridge accepts model-specific normalization and
   retains the IOSurface-to-Metal input path.
@@ -115,6 +119,10 @@ and contact sheets are under `docs/evidence/20261128-macos-coreml-depth/`.
 - All generated depth maps were finite and in the canonical `[0, 1]` range.
 - Contact sheets compare each new model at 336 against Distill-Small at 336,
   and at 518 against Distill-Base at 518.
+- On a static native Core ML sequence with sub-quantization input noise,
+  DepthPro2-S raw normalized frame-to-frame delta fell from `2.96e-4` to
+  `3.58e-5`; display-normalized delta fell from `2.21e-4` to `7.63e-5`.
+  FlashDepth-S remained unchanged at roughly `2.5e-7`.
 
 Representative Local Viewer p50/p95 latency on the validated M1:
 

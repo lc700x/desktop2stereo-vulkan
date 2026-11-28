@@ -268,6 +268,15 @@ class _CoreMLFamilyProvider(_FamilyProvider):
     def pipeline_slot_count(self) -> int:
         return 1
 
+    def native_temporal_history_weight(self) -> float:
+        if self.spec.name != "DepthPro2-S":
+            return 0.0
+        raw = os.environ.get("D2S_COREML_DP2_S_TEMPORAL_WEIGHT", "0.85")
+        try:
+            return min(0.95, max(0.0, float(raw)))
+        except ValueError:
+            return 0.85
+
     def load(self) -> None:
         if not self.use_coreml:
             raise CoreMLFamilyAccelerationError(
@@ -474,6 +483,8 @@ class _CoreMLFamilyProvider(_FamilyProvider):
                 tuple(float(value) for value in std.flatten().tolist()),
             ),
             compute_units=selected_units,
+            temporal_history_weight=self.native_temporal_history_weight(),
+            temporal_change_threshold=0.1,
         )
         if engine.native_io is None:
             _ = engine.model
@@ -491,6 +502,7 @@ class _CoreMLFamilyProvider(_FamilyProvider):
                 "coreml_compute_units": selected_units,
                 "coreml_compute_plan": plan,
                 "coreml_artifact_path": str(model_path),
+                "temporal_history_weight": self.native_temporal_history_weight(),
             }
         )
         return engine

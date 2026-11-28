@@ -354,6 +354,8 @@ class NativeCoreMLIOBridge:
         *,
         normalization: tuple[tuple[float, ...], tuple[float, ...]] | None = None,
         compute_units: str | None = None,
+        temporal_history_weight: float = 0.0,
+        temporal_change_threshold: float = 0.1,
     ):
         if not native_io_enabled():
             raise RuntimeError("native CoreML IO is disabled")
@@ -374,6 +376,8 @@ class NativeCoreMLIOBridge:
             ctypes.c_int32,
             ctypes.c_int32,
             ctypes.POINTER(_NativeNormalization),
+            ctypes.c_float,
+            ctypes.c_float,
             ctypes.c_char_p,
             ctypes.c_size_t,
         ]
@@ -457,6 +461,8 @@ class NativeCoreMLIOBridge:
             int(input_height),
             unit_id,
             normalization_pointer,
+            float(temporal_history_weight),
+            float(temporal_change_threshold),
             error,
             len(error),
         )

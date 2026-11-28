@@ -200,6 +200,8 @@ class CoreMLEngine:
         *,
         normalization: tuple[tuple[float, ...], tuple[float, ...]] | None = None,
         compute_units: str | None = None,
+        temporal_history_weight: float = 0.0,
+        temporal_change_threshold: float = 0.1,
     ) -> None:
         """Try native shared-buffer IO without changing Python CoreML fallback."""
         if sys.platform != "darwin" or os.environ.get(
@@ -216,6 +218,8 @@ class CoreMLEngine:
                 int(input_height),
                 normalization=normalization,
                 compute_units=compute_units or self._compute_units_choice,
+                temporal_history_weight=temporal_history_weight,
+                temporal_change_threshold=temporal_change_threshold,
             )
             self.native_io = bridge
             self.native_io_reason = reason or "active"
