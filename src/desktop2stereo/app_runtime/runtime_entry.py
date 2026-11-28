@@ -14,6 +14,7 @@ from typing import Any
 from capture import capture_frame_to_rgb, prepare_rgb_for_stereo_runtime
 from capture.adaptive_rate import AdaptiveCaptureRate, adaptive_capture_enabled_for_mode
 from capture.session import CaptureSessionLoop
+from stereo_runtime.model_registry import FAMILY_INPUT_MULTIPLE, ModelRegistry
 from stereo_runtime.nvfruc import probe_nvfruc
 from stereo_runtime.nvfruc_calibration import (
     NvFrucCalibrationCache,
@@ -87,6 +88,25 @@ def _openxr_auto_capture_floor(base_fps: int) -> int:
     except (TypeError, ValueError):
         requested = 0
     return min(max(0, requested), max(1, int(base_fps)))
+
+
+def _macos_local_viewer_coreml_compute_units(
+    settings: dict[str, Any],
+    *,
+    media_capture: bool,
+    requested: str | None = None,
+) -> str:
+    model_name = str(settings.get("Depth Model", ""))
+    try:
+        family = ModelRegistry.default().get(model_name).family
+    except KeyError:
+        family = ""
+    if family in FAMILY_INPUT_MULTIPLE:
+        return "gpu"
+    explicit = str(requested or "").strip().lower()
+    if explicit:
+        return explicit
+    return "all" if media_capture else "ane"
 
 
 def _inference_gpu_adapter_luid(device: Any) -> tuple[int | None, str | None]:
@@ -784,10 +804,13 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             # duration. Users can tighten or disable it with the env override.
             os.environ.setdefault("D2S_MEDIA_DEPTH_REUSE_MAX_AGE_MS", "5000")
         if coreml_requested:
-            if media_capture:
-                os.environ["D2S_COREML_COMPUTE_UNITS"] = "all"
-            else:
-                os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")
+            os.environ["D2S_COREML_COMPUTE_UNITS"] = (
+                _macos_local_viewer_coreml_compute_units(
+                    settings,
+                    media_capture=media_capture,
+                    requested=os.environ.get("D2S_COREML_COMPUTE_UNITS"),
+                )
+            )
             os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")
             if media_capture:
                 # The media decoder also publishes a retained CVPixelBuffer;

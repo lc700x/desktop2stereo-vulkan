@@ -44,6 +44,8 @@ second normalization is applied inside a model wrapper.
   support and prefer GPU. CPU-only operations fail the model.
 - New-family `auto`/`all` requests are normalized to GPU; explicit ANE or CPU
   requests are rejected.
+- Local Viewer resolves compute units by model family before launch, so the
+  legacy monitor-mode ANE default cannot be applied to the new GPU-only models.
 - No fallback from the new families to PyTorch MPS or CPU.
 - The native Core ML/Metal bridge accepts model-specific normalization and
   retains the IOSurface-to-Metal input path.

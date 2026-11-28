@@ -479,7 +479,7 @@ def test_macos_local_viewer_selects_coreml_compute_units_by_source_type() -> Non
 
     assert 'coreml_requested = str(settings.get("CoreML", False))' in local_viewer_branch
     assert "if coreml_requested:" in local_viewer_branch
-    assert 'os.environ["D2S_COREML_COMPUTE_UNITS"] = "all"' in local_viewer_branch
+    assert "_macos_local_viewer_coreml_compute_units(" in local_viewer_branch
     assert 'os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")' in local_viewer_branch
 
 
@@ -494,11 +494,36 @@ def test_macos_media_playback_enables_native_coreml_io_by_default() -> None:
     assert '"file", "video"' in source
     assert 'os.environ["D2S_COREML_NATIVE_IO"] = "1"' in local_viewer_branch
     assert 'settings["CoreML"] = True' in local_viewer_branch
-    assert 'os.environ.setdefault("D2S_COREML_COMPUTE_UNITS", "ane")' in local_viewer_branch
+    assert "_macos_local_viewer_coreml_compute_units(" in local_viewer_branch
     assert 'os.environ["D2S_MEDIA_P010_CPU"] = "0"' in local_viewer_branch
     assert 'os.environ.setdefault("D2S_MEDIA_CADENCE_ADAPTIVE", "0")' in local_viewer_branch
     assert 'os.environ["D2S_VIEWER_HOST_FRAME"] = "0" if media_capture' in local_viewer_branch
     assert 'if not media_capture:' in source
+
+
+@pytest.mark.parametrize(
+    ("model_name", "media_capture", "requested", "expected"),
+    [
+        ("DepthPro2-S", False, None, "gpu"),
+        ("MoGe3-L", False, "ane", "gpu"),
+        ("FlashDepth-Full", True, None, "gpu"),
+        ("Distill-Any-Depth-Small", False, None, "ane"),
+        ("Distill-Any-Depth-Base", True, None, "all"),
+        ("Distill-Any-Depth-Base", False, "gpu", "gpu"),
+    ],
+)
+def test_macos_local_viewer_compute_units_are_family_aware(
+    model_name, media_capture, requested, expected
+):
+    from app_runtime.runtime_entry import _macos_local_viewer_coreml_compute_units
+
+    actual = _macos_local_viewer_coreml_compute_units(
+        {"Depth Model": model_name},
+        media_capture=media_capture,
+        requested=requested,
+    )
+
+    assert actual == expected
 
 
 def test_macos_local_media_does_not_apply_hidden_render_downscale(monkeypatch) -> None:
