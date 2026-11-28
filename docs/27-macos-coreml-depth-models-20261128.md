@@ -123,6 +123,11 @@ and contact sheets are under `docs/evidence/20261128-macos-coreml-depth/`.
   DepthPro2-S raw normalized frame-to-frame delta fell from `2.96e-4` to
   `3.58e-5`; display-normalized delta fell from `2.21e-4` to `7.63e-5`.
   FlashDepth-S remained unchanged at roughly `2.5e-7`.
+- An exclusive Metal Local Viewer run for DepthPro2-S at 320 measured
+  `23.5-28.8` content FPS, `64-70` present FPS, `23.1-24.6 ms` depth p95,
+  `21.8-23.2 ms` model p95, and `0.53 ms` postprocess p95. A second Viewer
+  running concurrently with the benchmark reduces these figures and is not a
+  valid performance comparison.
 
 Representative Local Viewer p50/p95 latency on the validated M1:
 

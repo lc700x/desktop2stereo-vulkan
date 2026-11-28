@@ -175,7 +175,7 @@ def test_native_local_half_sbs_has_raw_depth_fast_kernels() -> None:
     assert "p.source_width != p.output_width" not in source[fast_start:fast_end]
     assert "float(p.source_height) / float(p.output_height)" in source
     assert "d2s_temporal_blend_float" in source
-    assert "d2s_apply_temporal_depth" in source
+    assert "initialize_temporal_history" in source
     assert "temporal_history_weight" in source
 
 
@@ -375,6 +375,8 @@ def test_native_coreml_uses_documented_device_and_precision_configuration() -> N
     assert "MLMultiArrayDataTypeFloat32" in contract
     assert "configuration.preferredMetalDevice = ctx->device;" in create
     assert "configuration.allowLowPrecisionAccumulationOnGPU = YES;" in create
+    assert "MLReshapeFrequencyHintInfrequent" in create
+    assert "MLSpecializationStrategyFastPrediction" in create
     assert "predictionFromFeatures:slot->features" in source
     assert "slot->prediction_options.outputBackings" in source
 
